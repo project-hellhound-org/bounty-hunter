@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>HELLHOUND - Pentest Dashboard 🐶💀</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        body { background: #1a1a1a; color: #00ff41; font-family: 'Courier New', monospace; }
+        .terminal { background: #000; padding: 20px; border-radius: 5px; margin: 20px; }
+        .status { color: #ff4444; font-weight: bold; }
+        button { background: #ff4444; color: white; border: none; padding: 10px 20px; font-family: inherit; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="terminal">
+        <h1>🐶 HELLHOUND v0.1 - LIVE</h1>
+        <div id="status" class="status">TARGET: READY</div>
+        <button onclick="launchAttack()">💀 HUNT TARGET</button>
+        <div id="output">hellhound@pentest:~$ </div>
+    </div>
+
+    <script>
+        const socket = io();
+        socket.on('connect', () => document.getElementById('status').innerText = 'LIVE - Socket Connected');
+        
+        function launchAttack() {
+            document.getElementById('output').innerHTML += 'hellhound hunt 192.168.1.100<br>';
+        }
+    </script>
+</body>
+</html>

@@ -1,19 +1,13 @@
-# HELLHOUND
+# HELLHOUND - Pentesting AI 🐶💀
 
-AI-powered pentesting platform with CLI + web dashboard
+AI-powered CLI + Web pentesting framework
 
-Hellhound is an autonomous offensive security toolkit designed to accelerate modern penetration testing workflows. It automates reconnaissance, scales vulnerability discovery, and intelligently prioritizes attack paths — all from a single unified interface.
+## 🚀 Quickstart
+```bash
+# Install
+pip install -e .
 
-## Features
+# Hunt target
+hellhound hunt 192.168.1.100
 
-- Automated reconnaissance and attack surface mapping
-
-- Large-scale vulnerability scanning with Nuclei templates
-
-- Smart result correlation to reduce noise
-
-- CLI-first workflow with optional web dashboard
-
-- Modular design for easy expansion
-
-- Built for learners, researchers, and red teamers
+# Web opens automatically: http://localhost:8080
