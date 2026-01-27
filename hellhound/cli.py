@@ -1,21 +1,159 @@
-#!/usr/bin/env python3
 import click
+import yaml
+import importlib.resources as pkg_resources
 import subprocess
-import webbrowser
 import time
-import os
-import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+# ----------------------------
+# Config Loader
+# ----------------------------
+def load_config():
+    try:
+        with pkg_resources.files("hellhound").joinpath("config.yaml").open("r") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        click.echo(f"[!] Failed to load config: {e}")
+        return {"modules": {}}
+
+
+# ----------------------------
+# Banner
+# ----------------------------
+def print_hellhound_banner():
+    banner = r"""
+       / \__
+      (    @\___
+      /         O    HELLHOUND v1.0
+     /   (_____/
+    /_____/   U     Modular Pentest Framework
+    """
+    click.echo(banner)
+
+
+# ----------------------------
+# CLI Root
+# ----------------------------
+@click.group()
+def cli():
+    """Hellhound Pentesting Framework"""
+    pass
+
+
+# ----------------------------
+# List Modules
+# ----------------------------
+@cli.command()
+def modules():
+    """List available modules"""
+    config = load_config()
+
+    click.echo("\nAvailable modules:\n")
+    for name, meta in config.get("modules", {}).items():
+        desc = meta.get("description", "No description")
+        click.echo(f"  {name:<10} - {desc}")
+    click.echo()
+
+
+# ----------------------------
+# Hunt Command (Interactive)
+# ----------------------------
+@cli.command()
+@click.argument("target")
+@click.option("--port", default=8080)
+def hunt(target, port):
+    print_hellhound_banner()
+
+    config = load_config()
+    available = list(config.get("modules", {}).keys())
+
+    if not available:
+        click.echo("[!] No modules found in config.yaml")
+        return
+
+    click.echo(f"[+] Target locked: {target}\n")
+
+    # Interactive selection
+    click.echo("Select modules to run:\n")
+    for i, mod in enumerate(available, 1):
+        desc = config["modules"][mod].get("description", "")
+        click.echo(f"  [{i}] {mod} - {desc}")
+    click.echo(f"  [{len(available)+1}] all - Run everything\n")
+
+    choice = click.prompt("Enter choice (comma separated)", default="1")
+
+    try:
+        if choice.strip() == str(len(available) + 1):
+            selected = available
+        else:
+            selected = [available[int(i.strip()) - 1] for i in choice.split(",")]
+    except:
+        click.echo("[!] Invalid selection")
+        return
+
+    click.echo(f"\n[+] Selected modules: {', '.join(selected)}")
+
+    # Ask wordlist only if vhost chosen
+    wordlist = ""
+    if "vhost" in selected:
+        use_custom = click.confirm("Use custom wordlist for VHOST fuzzing?", default=False)
+        if use_custom:
+            wordlist = click.prompt("Enter path to wordlist")
+
+    # Launch dashboard server
+    cmd = [
+        "python", "-m", "hellhound.web.server",
+        f"--port={port}",
+        f"--target={target}",
+        f"--modules={','.join(selected)}",
+        f"--wordlist={wordlist}"
+    ]
+
+    proc = subprocess.Popen(cmd)
+
+    click.echo("\n[+] Hellhound unleashed.")
+    click.echo("[*] Press Ctrl+C to disengage.")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        click.echo("\n[+] Shutting down Hellhound...")
+        proc.terminate()
+        click.echo("[✓] Hellhound terminated cleanly.")
+
+
+# ----------------------------
+# Entry point
+# ----------------------------
+def main():
+    cli()
+
+
+if __name__ == "__main__":
+    main()
+import click
+import yaml
+import importlib.resources as pkg_resources
+import subprocess
+import time
+import webbrowser
+import requests
+
+def load_config():
+    try:
+        with pkg_resources.files("hellhound").joinpath("config.yaml").open("r") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        click.echo(f"[!] Failed to load config: {e}")
+        return {"profiles": {}, "modules": {}}
 
 def print_hellhound_banner():
     banner = r"""
        / \__
       (    @\___
-      /         O    HELLHOUND v0.5
+      /         O    HELLHOUND v1.0
      /   (_____/
-    /_____/   U     Professional Pentest Framework
+    /_____/   U     Modular Pentest Framework
     """
     click.echo(banner)
 
@@ -24,52 +162,71 @@ def cli():
     pass
 
 @cli.command()
-@click.argument('target')
-@click.option('--port', default=8080, type=int)
+def modules():
+    """List available modules"""
+    config = load_config()
+    click.echo("\nAvailable modules:\n")
+
+    for name, meta in config["modules"].items():
+        desc = meta.get("description", "No description")
+        click.echo(f"  {name:<10} - {desc}")
+
+    click.echo()
+
+@cli.command()
+@click.argument("target")
+@click.option("--port", default=8080)
 def hunt(target, port):
-    """Full pentest chain"""
     print_hellhound_banner()
-    click.echo(f"[+] Target: {target}")
-    click.echo(f"[+] Dashboard: http://localhost:{port}")
-    
-    # SILENT Flask launch
-    cmd = [
-        'python', 'hellhound/web/server.py',
-        f'--port={port}'
-    ]
-    devnull = open(os.devnull, 'w')
-    web_process = subprocess.Popen(cmd, cwd=os.getcwd(), stdout=devnull, stderr=devnull)
-    
-    # Healthcheck
-    click.echo("[+] Booting dashboard...")
-    for i in range(10):
-        try:
-            requests.get(f'http://localhost:{port}', timeout=1)
-            click.echo(f"[+] LIVE: http://localhost:{port}")
-            webbrowser.open(f'http://localhost:{port}')
-            break
-        except:
-            time.sleep(1)
-    
-    # Clean Nmap
-    click.echo("\n[+] Recon: nmap -sV -sC")
-    result = subprocess.run(['nmap', '-sV', '-sC', '-oN', 'recon.txt', target], 
-                           capture_output=True, text=True)
-    output = result.stdout[:2000]
-    click.echo("Nmap scan complete. Results saved to recon.txt")
-    click.echo(f"[+] Services discovered: {len([l for l in output.split('\n') if '/tcp' in l])} open ports")
-    
-    click.echo(f"\n[*] Interactive dashboard: http://localhost:{port}")
-    click.echo("[*] Ctrl+C to disengage")
-    
+
+    config = load_config()
+    available = list(config["modules"].keys())
+
+    click.echo(f"[+] Target locked: {target}\n")
+
+    click.echo("Select modules to run:\n")
+    for i, mod in enumerate(available, 1):
+        desc = config["modules"][mod].get("description", "")
+        click.echo(f"  [{i}] {mod} - {desc}")
+    click.echo(f"  [{len(available)+1}] all - Run everything\n")
+
+    choice = click.prompt("Enter choice (comma separated)", default="1")
+
     try:
-        web_process.wait()
+        if choice.strip() == str(len(available)+1):
+            selected = available
+        else:
+            selected = [available[int(i.strip())-1] for i in choice.split(",")]
+    except:
+        click.echo("[!] Invalid selection")
+        return
+
+    click.echo(f"\n[+] Selected modules: {', '.join(selected)}")
+
+    # Ask for wordlist only if vhost selected
+    wordlist = ""
+    if "vhost" in selected:
+        use_custom = click.confirm("Use custom wordlist for VHOST fuzzing?", default=False)
+        if use_custom:
+            wordlist = click.prompt("Enter path to wordlist")
+
+    cmd = [
+        "python", "-m", "hellhound.web.server",
+        f"--port={port}",
+        f"--target={target}",
+        f"--modules={','.join(selected)}",
+        f"--wordlist={wordlist}"
+    ]
+
+    proc = subprocess.Popen(cmd)
+
+    click.echo("\n[+] Hellhound unleashed.")
+    click.echo("[*] Press Ctrl+C to disengage.")
+
+    try:
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        web_process.terminate()
-        click.echo("\n[+] Hellhound terminated")
-
-def main():
-    cli()
-
-if __name__ == '__main__':
-    cli()
+        click.echo("\n[+] Shutting down Hellhound...")
+        proc.terminate()
+        click.echo("[✓] Hellhound terminated cleanly.")

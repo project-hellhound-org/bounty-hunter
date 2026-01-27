@@ -1,0 +1,19 @@
+profiles:
+  quick:
+    - nmap
+
+  web:
+    - nmap
+    - vhost
+
+  full:
+    - nmap
+    - vhost
+
+default_wordlist: "wordlists/default.txt"
+
+modules:
+  nmap:
+    description: "Service and port discovery"
+  vhost:
+    description: "Virtual host fuzzing using ffuf"
