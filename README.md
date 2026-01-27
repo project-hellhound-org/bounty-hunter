@@ -168,11 +168,6 @@ You are responsible for your actions.
 
 ---
 
-## 👨‍💻 Author
-
-Built by a cybersecurity student as a final-year project to learn real-world tooling, architecture, and automation.
-
----
 
 ## 🐺 Final Note
 
