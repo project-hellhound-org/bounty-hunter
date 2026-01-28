@@ -223,53 +223,60 @@ exit      → Exit console
 auto      → Intelligent attack chain
 clear     → Clear the console screen
 status    → Show framework status
+sessions  → List previous hunts
 """)
     
-    def do_auto(self, arg):
-        """auto → intelligent attack chain"""
+def do_auto(self, arg):
+    """auto → intelligent attack chain"""
 
-        if not self.target:
-            print("[!] No prey set. Use: prey <ip>")
-            return
+    if not self.target:
+        print(Fore.RED + "[!] No prey set. Use: prey <ip>")
+        return
 
-        print(Fore.YELLOW + "[*] Auto mode engaged...")
+    print(Fore.YELLOW + "[*] Auto mode engaged...\n")
 
-        # 1. Always run Nmap first
-        print("[*] Running reconnaissance (nmap)...")
-        nmap_output = self.engine.run_single("nmap", self.target)
-        self.results["nmap"] = nmap_output
+    # 1. Always run Nmap first
+    print(Fore.CYAN + "[*] Running reconnaissance (nmap)...")
+    nmap_output = self.engine.run_single("nmap", self.target)
+    self.results["nmap"] = nmap_output
 
-        # 2. Analyze Nmap output
-        open_ports = []
+    # 2. Extract open ports
+    open_ports = []
+    for line in nmap_output.splitlines():
+        if "/tcp" in line and "open" in line:
+            port = line.split("/")[0].strip()
+            open_ports.append(port)
 
-        for line in nmap_output.splitlines():
-            if "/tcp" in line and "open" in line:
-                port = line.split("/")[0].strip()
-                open_ports.append(port)
+    print(Fore.GREEN + f"[+] Open ports detected: {', '.join(open_ports) or 'none'}")
 
-        print(f"[+] Open ports detected: {', '.join(open_ports) or 'none'}")
+    # 3. Decide which modules make sense
+    selected_modules = []
 
-        # 3. Decide what modules to run
-        selected_modules = []
+    web_ports = {"80", "443", "8080"}
+    if any(p in web_ports for p in open_ports):
+        if "vhost" in self.modules:
+            selected_modules.append("vhost")
+        if "dirsearch" in self.modules:
+            selected_modules.append("dirsearch")
 
-        web_ports = {"80", "443", "8080"}
-        if any(p in web_ports for p in open_ports):
-            if "vhost" in self.modules:
-                selected_modules.append("vhost")
+    if "21" in open_ports and "ftp" in self.modules:
+        selected_modules.append("ftp")
 
-        # 4. Run selected modules
-        if not selected_modules:
-            print("[!] No additional modules relevant for detected services.")
-            return
+    # 4. No relevant modules
+    if not selected_modules:
+        print(Fore.YELLOW + "[!] No additional modules relevant for detected services.")
+        return
 
-        print(f"[*] Auto-selected modules: {', '.join(selected_modules)}\n")
+    print(Fore.CYAN + f"\n[*] Auto-selected modules: {', '.join(selected_modules)}\n")
 
-        for module in selected_modules:
-            print(f"[*] Executing: {module}")
-            output = self.engine.run_single(module, self.target)
-            self.results[module] = output
+    # 5. Execute selected modules
+    for module in selected_modules:
+        print(Fore.YELLOW + f"[*] Executing: {module}")
+        output = self.engine.run_single(module, self.target)
+        self.results[module] = output
 
-        print("\n[✓] Auto mode completed.")
+    print(Fore.GREEN + "\n[✓] Auto mode completed.")
+
 
     def do_status(self, arg):
         """status → show current session state"""
@@ -298,3 +305,28 @@ status    → Show framework status
             return len(os.listdir(base))
         except:
             return 0
+
+    def do_sessions(self, arg):
+        """sessions → List all previous hunts"""
+
+        import os
+
+        base = os.path.join(os.path.dirname(__file__), "storage")
+
+        if not os.path.exists(base):
+            print("[!] No sessions directory found.")
+            return
+
+        sessions = sorted(os.listdir(base))
+
+        if not sessions:
+            print("[!] No previous sessions found.")
+            return
+
+        print("\n[ Hellhound Sessions ]")
+        print("======================")
+
+        for i, s in enumerate(sessions, 1):
+            print(f"{i}. {s}")
+
+        print(f"\nTotal sessions: {len(sessions)}\n")
