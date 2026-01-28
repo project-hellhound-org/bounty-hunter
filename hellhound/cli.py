@@ -12,7 +12,7 @@ def load_config():
         with pkg_resources.files("hellhound").joinpath("config.yaml").open("r") as f:
             return yaml.safe_load(f)
     except Exception as e:
-        click.echo(f"[!] Failed to load config: {e}")
+        click.echo("[!] Failed to load config: {}".format(e))
         return {"modules": {}}
 
 
