@@ -15,7 +15,21 @@ def load_modules():
 
 
 class HellhoundConsole(cmd.Cmd):
-    intro = "\nHellhound Console v1.0\nType help or ? to list commands.\n"
+    intro = r"""
+     ██╗  ██╗███████╗██╗     ██╗     ██╗  ██╗ ██████╗ ██╗   ██╗███╗   ██╗██████╗ 
+     ██║  ██║██╔════╝██║     ██║     ██║  ██║██╔═══██╗██║   ██║████╗  ██║██╔══██╗
+     ███████║█████╗  ██║     ██║     ███████║██║   ██║██║   ██║██╔██╗ ██║██║  ██║
+     ██╔══██║██╔══╝  ██║     ██║     ██╔══██║██║   ██║██║   ██║██║╚██╗██║██║  ██║
+     ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
+     ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝ 
+
+              Hellhound Pentest Framework v1.0
+        Modular Red-Team Assistant | CLI + Dashboard Mode
+                  Developed by Team Hellhound
+
+Type 'help' to view available commands.
+"""
+
     prompt = "hellhound > "
 
     def __init__(self):
