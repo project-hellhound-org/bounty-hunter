@@ -1,72 +1,44 @@
-import os
-import json
-import threading
-from datetime import datetime
-from hellhound.modules import nmap, vhost
-
-BASE = os.path.dirname(os.path.dirname(__file__))
-SESSIONS = os.path.join(BASE, "storage")
-
+import importlib
 
 class HellhoundEngine:
     def __init__(self, socketio=None):
         self.socketio = socketio
 
-    # ---- Web dashboard emit ----
     def emit(self, msg):
         print(msg)
         if self.socketio:
             self.socketio.emit("log", {"message": msg})
 
-    # ---- Start threaded scan (dashboard mode) ----
-    def start_scan(self, target, modules, wordlist):
-        thread = threading.Thread(
-            target=self.run,
-            args=(target, modules, wordlist),
-            daemon=True
-        )
-        thread.start()
+    def run_single(self, module_name, target, **kwargs):
+        try:
+            module = self.load_module(module_name)
+        except Exception as e:
+            self.emit(f"[!] Failed to load module '{module_name}': {e}")
+            return ""
 
-    # ---- Main execution flow (dashboard mode) ----
-    def run(self, target, modules, wordlist):
-        os.makedirs(SESSIONS, exist_ok=True)
+        if not hasattr(module, "run"):
+            self.emit(f"[!] Module '{module_name}' has no run() function")
+            return ""
 
-        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        session_dir = os.path.join(SESSIONS, f"{target}_{session_id}")
-        os.makedirs(session_dir, exist_ok=True)
+        return module.run(target, self.emit, **kwargs)
 
-        self.emit(f"[+] Session created: {session_dir}")
-        self.emit(f"[+] Modules selected: {', '.join(modules)}")
+    def load_module(self, name):
+        # Try network
+        try:
+            return importlib.import_module(f"hellhound.modules.network.{name}")
+        except:
+            pass
 
-        results = {}
+        # Try web
+        try:
+            return importlib.import_module(f"hellhound.modules.web.{name}")
+        except:
+            pass
 
-        if "nmap" in modules:
-            self.emit("[*] Running Nmap")
-            results["nmap"] = nmap.run(target, self.emit)
+        # Try enum
+        try:
+            return importlib.import_module(f"hellhound.modules.enum.{name}")
+        except:
+            pass
 
-        if "vhost" in modules:
-            self.emit("[*] Running VHOST fuzzing")
-            results["vhost"] = vhost.run(target, self.emit, wordlist)
-
-        report_path = os.path.join(session_dir, "results.json")
-        with open(report_path, "w") as f:
-            json.dump(results, f, indent=4)
-
-        self.emit(f"[+] Results saved: {report_path}")
-        self.emit("[✓] Scan completed")
-
-    # =====================================================
-    # NEW: Console support (CLI framework mode)
-    # =====================================================
-
-    def emit_console(self, msg):
-        print(msg)
-
-    def run_single(self, module, target, wordlist=None):
-        if module == "nmap":
-            return nmap.run(target, self.emit_console)
-
-        if module == "vhost":
-            return vhost.run(target, self.emit_console, wordlist)
-
-        print(f"[!] Unknown module: {module}")
+        raise ImportError(f"Module '{name}' not found")
