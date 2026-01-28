@@ -9,13 +9,16 @@ SESSIONS = os.path.join(BASE, "storage")
 
 
 class HellhoundEngine:
-    def __init__(self, socketio):
+    def __init__(self, socketio=None):
         self.socketio = socketio
 
+    # ---- Web dashboard emit ----
     def emit(self, msg):
         print(msg)
-        self.socketio.emit("log", {"message": msg})
+        if self.socketio:
+            self.socketio.emit("log", {"message": msg})
 
+    # ---- Start threaded scan (dashboard mode) ----
     def start_scan(self, target, modules, wordlist):
         thread = threading.Thread(
             target=self.run,
@@ -24,8 +27,8 @@ class HellhoundEngine:
         )
         thread.start()
 
+    # ---- Main execution flow (dashboard mode) ----
     def run(self, target, modules, wordlist):
-        # Create session folder
         os.makedirs(SESSIONS, exist_ok=True)
 
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -37,7 +40,6 @@ class HellhoundEngine:
 
         results = {}
 
-        # Run modules only if user selected them
         if "nmap" in modules:
             self.emit("[*] Running Nmap")
             results["nmap"] = nmap.run(target, self.emit)
@@ -46,14 +48,25 @@ class HellhoundEngine:
             self.emit("[*] Running VHOST fuzzing")
             results["vhost"] = vhost.run(target, self.emit, wordlist)
 
-        # Future-ready:
-        # if "nuclei" in modules:
-        #     results["nuclei"] = nuclei.run(...)
-
-        # Save results
         report_path = os.path.join(session_dir, "results.json")
         with open(report_path, "w") as f:
             json.dump(results, f, indent=4)
 
         self.emit(f"[+] Results saved: {report_path}")
         self.emit("[✓] Scan completed")
+
+    # =====================================================
+    # NEW: Console support (CLI framework mode)
+    # =====================================================
+
+    def emit_console(self, msg):
+        print(msg)
+
+    def run_single(self, module, target, wordlist=None):
+        if module == "nmap":
+            return nmap.run(target, self.emit_console)
+
+        if module == "vhost":
+            return vhost.run(target, self.emit_console, wordlist)
+
+        print(f"[!] Unknown module: {module}")
