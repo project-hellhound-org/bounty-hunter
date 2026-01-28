@@ -30,14 +30,14 @@ class HellhoundConsole(cmd.Cmd):
     # CORE COMMANDS
     # -------------------
 
-    def do_set(self, arg):
-        """set target <ip>"""
-        args = arg.split()
-        if len(args) == 2 and args[0] == "target":
-            self.target = args[1]
-            print(f"[+] Target set to {self.target}")
-        else:
-            print("Usage: set target <ip>")
+    def do_prey(self, arg):
+        """prey <ip> → lock onto a target"""
+        if not arg.strip():
+            print("Usage: prey <ip>")
+            return
+
+        self.target = arg.strip()
+        print(f"[+] Prey acquired: {self.target}")
 
     def do_exit(self, arg):
         """Exit console"""
@@ -45,7 +45,7 @@ class HellhoundConsole(cmd.Cmd):
         return True
 
     # -------------------
-    # SHOW COMMANDS
+    # DISPLAY
     # -------------------
 
     def do_show(self, arg):
@@ -74,17 +74,13 @@ class HellhoundConsole(cmd.Cmd):
             print("Usage: show modules | show results")
 
     # -------------------
-    # SCANNING
+    # RECON
     # -------------------
 
-    def do_scan(self, arg):
-        """scan nmap"""
+    def do_nmap(self, arg):
+        """nmap → Run reconnaissance"""
         if not self.target:
-            print("[!] Set target first: set target <ip>")
-            return
-
-        if arg.strip() != "nmap":
-            print("Usage: scan nmap")
+            print("[!] Set prey first: prey <ip>")
             return
 
         print("[*] Running Nmap...")
@@ -92,36 +88,36 @@ class HellhoundConsole(cmd.Cmd):
         self.results["nmap"] = output
 
     # -------------------
-    # MODULE EXECUTION
+    # EXECUTION
     # -------------------
 
-    def do_run(self, arg):
-        """run (runs active module) or run <module>"""
+    def do_strike(self, arg):
+        """strike → run module"""
 
         if not self.target:
-            print("[!] Set target first")
+            print("[!] No prey set. Use: prey <ip>")
             return
 
         module = self.active_module or arg.strip()
 
         if not module:
-            print("Usage: run OR use <module> then run")
+            print("Usage: strike OR equip <module> then strike")
             return
 
         if module not in self.modules:
             print(f"[!] Unknown module: {module}")
             return
 
-        print(f"[*] Running module: {module}")
+        print(f"[*] Executing: {module}")
         output = self.engine.run_single(module, self.target)
         self.results[module] = output
 
     # -------------------
-    # METASPLOIT STYLE MODE
+    # TOOL CONTROL
     # -------------------
 
-    def do_use(self, arg):
-        """use <module>"""
+    def do_equip(self, arg):
+        """equip <module>"""
         module = arg.strip()
 
         if module not in self.modules:
@@ -130,21 +126,21 @@ class HellhoundConsole(cmd.Cmd):
 
         self.active_module = module
         self.prompt = f"hellhound({module}) > "
-        print(f"[+] Using module: {module}")
+        print(f"[+] {module} equipped")
 
-    def do_back(self, arg):
-        """Exit module context"""
+    def do_release(self, arg):
+        """release tool"""
         self.active_module = None
         self.prompt = "hellhound > "
 
-    def do_options(self, arg):
-        """Show options for current module"""
+    def do_scope(self, arg):
+        """scope → show module options"""
 
         if not self.active_module:
-            print("[!] No active module. Use: use <module>")
+            print("[!] No tool equipped. Use: equip <module>")
             return
 
-        print(f"\nOptions for module '{self.active_module}':")
+        print(f"\nScope for '{self.active_module}':")
 
         if self.active_module == "vhost":
             print("  TARGET     - Target IP or domain")
@@ -156,18 +152,35 @@ class HellhoundConsole(cmd.Cmd):
         print()
 
     # -------------------
-    # SUGGESTIONS
+    # INTELLIGENCE
     # -------------------
 
-    def do_suggest(self, arg):
-        """Suggest next actions based on scan results"""
+    def do_howl(self, arg):
+        """howl → suggest next actions"""
 
         if "nmap" not in self.results:
-            print("[!] Run scan nmap first")
+            print("[!] No scent yet. Run: nmap")
             return
 
         suggestions = suggest_actions(self.results["nmap"])
-        print("\nSuggestions:")
+        print("\n[Howl: recommended actions]")
         for s in suggestions:
-            print(f"  - {s}")
+            print(f"  → {s}")
         print()
+    def do_help(self, arg):
+        """Show Hellhound command manual"""
+
+        print("""
+Documented commands:
+=====================
+prey      → Set target (lock onto a host)
+nmap      → Run reconnaissance scan
+arsenal   → List available tools
+equip     → Select a tool/module
+scope     → View tool configuration
+strike    → Execute selected tool
+howl      → Get suggested next actions
+loot      → View gathered results
+release   → Exit tool mode
+lair      → Exit console
+""")
