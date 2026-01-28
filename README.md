@@ -1,177 +1,189 @@
-# 🐺 Hellhound Pentest Framework
+# 🐺 Hellhound – Modular Red Team Framework
 
-Hellhound is a modular, interactive pentesting framework that combines a clean CLI experience with a real-time web dashboard. It is designed for learning, automation, and building professional security tooling — not just running commands.
+Hellhound is a modular penetration testing framework that combines an interactive CLI console with a real-time web dashboard to streamline reconnaissance, enumeration, and attack workflows.
 
-> Think: lightweight Metasploit-style orchestration for recon workflows.
-
----
-
-## ✨ Features
-
-* Interactive CLI (SEToolkit-style module selection)
-* Modular architecture (easy to add new tools/modules)
-* Live web dashboard using Flask + Socket.IO
-* Session folders per scan
-* JSON result export for every run
-* External tool integration (Nmap, ffuf, etc.)
-* Custom or built-in wordlist support
-* Clean process lifecycle (Ctrl+C shuts everything down)
+This is not a simple automation script.
+Hellhound is designed as a framework where tools are orchestrated, results are interpreted, and actions are suggested.
 
 ---
 
-## 📂 Project Structure
+## Features
+
+- Interactive CLI console (hellhound console)
+- Web dashboard with live scan visualization
+- Modular architecture (easy to extend)
+- Session-based result storage
+- Intelligent auto attack chaining
+- Suggestion engine for next attack paths
+- Custom command language (Hellhound themed)
+- Real-time logging using Socket.IO
+- Clean extensible project structure
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/<your-username>/hellhound.git
+cd hellhound
+pip install .
+```
+
+### Requirements
+
+- Python 3.8+
+- nmap
+- ffuf
+- bash
+- Flask
+- Click
+- PyYAML
+- colorama
+
+---
+
+## Usage
+
+### Launch Console Mode
+```bash
+hellhound console
+```
+
+### Launch Dashboard Mode
+```bash
+hellhound hunt <target-ip>
+```
+
+Dashboard opens at:
+```
+http://127.0.0.1:8080
+```
+
+---
+
+## Hellhound Console Commands
+
+| Command   | Description |
+|-----------|--------------|
+| prey `<ip>` | Lock onto a target |
+| nmap | Run reconnaissance |
+| arsenal | List available tools |
+| equip `<tool>` | Select a module |
+| scope | View module configuration |
+| strike | Execute selected module |
+| howl | Suggest next actions |
+| loot | View gathered results |
+| release | Exit module mode |
+| exit | Exit console |
+| auto | Intelligent attack chain |
+| clear | Clear screen |
+| status | Show framework status |
+| sessions | List previous hunts |
+
+---
+
+## Example Workflow
+
+```text
+hellhound > prey 192.168.1.10
+hellhound > nmap
+hellhound > howl
+hellhound > equip vhost
+hellhound(vhost) > strike
+hellhound > loot
+```
+
+---
+
+## Modules
+
+Modules are organized by category:
+
+```
+hellhound/modules/
+  network/
+  web/
+  enum/
+```
+
+Example modules:
+- nmap – service discovery
+- vhost – virtual host fuzzing
+- dirsearch – directory enumeration
+- ftp – FTP enumeration
+- nuclei – vulnerability scanning
+
+Each module follows a standard interface:
+
+```python
+def run(target, emit):
+    ...
+    return output
+```
+
+Add a module → register in config.yaml → it appears automatically.
+
+---
+
+## Sessions & Results
+
+Each run creates a session:
+
+```
+hellhound/storage/<target>_<timestamp>/results.json
+```
+
+View inside console:
+```bash
+sessions
+```
+
+---
+
+## Project Structure
 
 ```
 hellhound/
-├── cli.py                 # Command line interface
-├── config.yaml            # Module descriptions
-├── core/
-│   └── engine.py          # Orchestrates module execution
-├── modules/
-│   ├── nmap.py
-│   ├── vhost.py
-│   └── ...                 # Other modules (nuclei, nikto, etc.)
-├── scripts/
-│   └── vhost-fuzzer.sh     # External helper scripts
-├── wordlists/
-│   └── default.txt
-├── web/
-│   ├── server.py           # Flask dashboard server
-│   └── templates/index.html
-└── storage/
-    └── <target_timestamp>/ # Session folders with results.json
+├── cli.py        → Entry point
+├── console.py    → Interactive shell
+├── core/         → Engine, logic, intelligence
+├── modules/      → Tool modules
+├── scripts/      → External helpers
+├── web/          → Dashboard server
+├── storage/      → Sessions and results
+├── config.yaml   → Module registry
 ```
 
 ---
 
-## ⚙️ Requirements
+## Vision
 
-Before running Hellhound, make sure you have:
+Hellhound is built to evolve toward:
 
-* Python 3.9+
-* pip
-* External tools installed:
+- Intelligent service-aware attack chaining
+- CVE correlation from version detection
+- Automated enumeration workflows
+- AI-assisted exploitation planning
+- Advanced reporting and evidence collection
 
-  * `nmap`
-  * `ffuf`
-  * (optional) `nuclei`, `nikto`, etc.
-
-Python dependencies (auto-installed via pip):
-
-* click
-* flask
-* flask-socketio
-* requests
-* pyyaml
+The long-term goal is a lightweight, extensible alternative to heavy frameworks.
 
 ---
 
-## 🚀 Installation
+## Disclaimer
 
-From the project root:
+This project is intended for:
 
-```bash
-pip install .
-```
+- Educational use  
+- Security research  
+- Authorized penetration testing only  
 
-To reinstall after changes:
-
-```bash
-pip uninstall hellhound -y
-pip install .
-```
+Do NOT use against systems you do not own or have permission to test.
 
 ---
 
-## 🧪 Usage
+## Developed By
 
-### Show help
-
-```bash
-hellhound --help
-```
-
-### List available modules
-
-```bash
-hellhound modules
-```
-
-### Run a scan
-
-```bash
-hellhound hunt 192.168.56.6
-```
-
-You will be prompted to:
-
-* Select which modules to run (e.g., nmap, vhost, etc.)
-* Provide a custom wordlist (only if VHOST is selected)
-
-The dashboard will launch automatically in your browser.
-
----
-
-## 📊 Results
-
-Each scan creates a new session folder:
-
-```
-hellhound/storage/192.168.56.6_20260127_111852/results.json
-```
-
-This JSON file contains all collected outputs from selected modules.
-
----
-
-## 🧩 Adding New Modules
-
-Create a new file in:
-
-```
-hellhound/modules/<tool>.py
-```
-
-Each module must expose a function like:
-
-```python
-def run(target, emit, *args):
-    emit("[+] Module started")
-    # tool logic here
-    emit("[✓] Module finished")
-    return "results"
-```
-
-Then register it in `config.yaml`:
-
-```yaml
-modules:
-  newtool:
-    description: "My custom module"
-```
-
-It will automatically appear in:
-
-```bash
-hellhound modules
-```
-
----
-
-## ⚠️ Disclaimer
-
-Hellhound is built for **educational and authorized security testing only**.
-
-Do not use this tool against systems you do not own or have explicit permission to test.
-
-You are responsible for your actions.
-
----
-
-
-## 🐺 Final Note
-
-Hellhound is not just a script.
-It is a framework you can grow into your own professional toolkit.
-
-Fork it. Extend it. Break it. Improve it. That’s the point.
+Team Hellhound  
+L4ZZ3RJ0D  
+alph4_rc
