@@ -4,7 +4,8 @@ import importlib.resources as pkg_resources
 
 from hellhound.core.engine import HellhoundEngine
 from hellhound.core.suggest import suggest_actions
-
+from colorama import Fore, Style, init
+init(autoreset=True)
 
 def load_modules():
     try:
@@ -26,6 +27,7 @@ class HellhoundConsole(cmd.Cmd):
               Hellhound Pentest Framework v1.0
         Modular Red-Team Assistant | CLI + Dashboard Mode
                   Developed by Team Hellhound
+                     L4ZZ3RJ0D & alph4_rc
 
 Type 'help' to view available commands.
 """
@@ -39,6 +41,21 @@ Type 'help' to view available commands.
         self.results = {}
         self.active_module = None
         self.modules = load_modules()
+    
+    def preloop(self):
+        import time
+        self.loading("Initializing Hellhound core")
+        self.loading(f"Loading modules ({len(self.modules)})")
+        self.loading("Bringing intelligence engine online")
+        print(Fore.GREEN + "[✓] Console ready\n")
+
+
+    def loading(self, text, seconds=1.2):
+        import time
+        for _ in range(3):
+            print(Fore.CYAN + f"\r{text}" + "." * (_ + 1), end="")
+            time.sleep(seconds / 3)
+        print()
 
     # -------------------
     # CORE COMMANDS
@@ -51,7 +68,7 @@ Type 'help' to view available commands.
             return
 
         self.target = arg.strip()
-        print(f"[+] Prey acquired: {self.target}")
+        print(Fore.GREEN + f"[+] Prey acquired: {self.target}")
 
     def do_exit(self, arg):
         """Exit console"""
@@ -109,7 +126,7 @@ Type 'help' to view available commands.
         """strike → run module"""
 
         if not self.target:
-            print("[!] No prey set. Use: prey <ip>")
+            print(Fore.RED + "[!] No prey set. Use: prey <ip>")
             return
 
         module = self.active_module or arg.strip()
@@ -181,9 +198,15 @@ Type 'help' to view available commands.
         for s in suggestions:
             print(f"  → {s}")
         print()
+
+    def do_clear(self, arg):
+        """clear → Clear the console screen"""
+        import os
+        os.system("clear" if os.name == "posix" else "cls")
+
+       
     def do_help(self, arg):
         """Show Hellhound command manual"""
-
         print("""
 Documented commands:
 =====================
@@ -196,5 +219,82 @@ strike    → Execute selected tool
 howl      → Get suggested next actions
 loot      → View gathered results
 release   → Exit tool mode
-lair      → Exit console
+exit      → Exit console
+auto      → Intelligent attack chain
+clear     → Clear the console screen
+status    → Show framework status
 """)
+    
+    def do_auto(self, arg):
+        """auto → intelligent attack chain"""
+
+        if not self.target:
+            print("[!] No prey set. Use: prey <ip>")
+            return
+
+        print(Fore.YELLOW + "[*] Auto mode engaged...")
+
+        # 1. Always run Nmap first
+        print("[*] Running reconnaissance (nmap)...")
+        nmap_output = self.engine.run_single("nmap", self.target)
+        self.results["nmap"] = nmap_output
+
+        # 2. Analyze Nmap output
+        open_ports = []
+
+        for line in nmap_output.splitlines():
+            if "/tcp" in line and "open" in line:
+                port = line.split("/")[0].strip()
+                open_ports.append(port)
+
+        print(f"[+] Open ports detected: {', '.join(open_ports) or 'none'}")
+
+        # 3. Decide what modules to run
+        selected_modules = []
+
+        web_ports = {"80", "443", "8080"}
+        if any(p in web_ports for p in open_ports):
+            if "vhost" in self.modules:
+                selected_modules.append("vhost")
+
+        # 4. Run selected modules
+        if not selected_modules:
+            print("[!] No additional modules relevant for detected services.")
+            return
+
+        print(f"[*] Auto-selected modules: {', '.join(selected_modules)}\n")
+
+        for module in selected_modules:
+            print(f"[*] Executing: {module}")
+            output = self.engine.run_single(module, self.target)
+            self.results[module] = output
+
+        print("\n[✓] Auto mode completed.")
+
+    def do_status(self, arg):
+        """status → show current session state"""
+
+        print("\n[ Hellhound Status ]")
+        print("----------------------------")
+
+        print(f"Prey        : {self.target or 'not set'}")
+        print(f"Equipped    : {self.active_module or 'none'}")
+        print(f"Modules     : {len(self.modules)} loaded")
+        print(f"Loot        : {len(self.results)} results collected")
+        print(f"Sessions    : {self.get_session_count()}")
+
+
+        if "nmap" in self.results:
+            print("Recon       : completed")
+        else:
+            print("Recon       : not yet run")
+
+        print("----------------------------\n")
+
+    def get_session_count(self):
+        import os
+        base = os.path.join(os.path.dirname(__file__), "storage")
+        try:
+            return len(os.listdir(base))
+        except:
+            return 0

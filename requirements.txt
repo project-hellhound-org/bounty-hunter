@@ -3,3 +3,4 @@ flask==3.0.0
 flask-socketio==5.3.6
 reportlab==4.2.0
 pyyaml
+colorama
