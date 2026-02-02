@@ -30,6 +30,7 @@ git clone https://github.com/l4zz3rj0d/Hellhound-Pentest.git
 
 cd hellhound
 pip install .
+sudo apt install -y subfinder httpx-toolkit ffuf nuclei feroxbuster dirsearch git python3-pip
 ```
 
 ### Requirements
