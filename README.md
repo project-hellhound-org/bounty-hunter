@@ -1,7 +1,8 @@
 #  Hellhound – Modular Red Team Framework
 
 Hellhound is a modular penetration testing framework that combines an interactive CLI console with a real-time web dashboard to streamline reconnaissance, enumeration, and attack workflows.
-`
+
+``
      ██╗  ██╗███████╗██╗     ██╗     ██╗  ██╗ ██████╗ ██╗   ██╗███╗   ██╗██████╗ 
      ██║  ██║██╔════╝██║     ██║     ██║  ██║██╔═══██╗██║   ██║████╗  ██║██╔══██╗
      ███████║█████╗  ██║     ██║     ███████║██║   ██║██║   ██║██╔██╗ ██║██║  ██║
@@ -9,6 +10,7 @@ Hellhound is a modular penetration testing framework that combines an interactiv
      ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
      ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝ 
 
+     
 This is not a simple automation script.
 Hellhound is designed as a framework where tools are orchestrated, results are interpreted, and actions are suggested.
 
