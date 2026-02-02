@@ -52,7 +52,7 @@ Type 'help' to view available commands.
         self.results = {}
         self.active_module = None
         self.modules = load_modules()
-        MODULE_SCOPE = {
+        self.MODULE_SCOPE = {
             "host": {
                 "nmap", "ftp", "ssh"
             },
@@ -211,7 +211,7 @@ Type 'help' to view available commands.
             print(f"[!] Unknown module: {module}")
             return
 
-        allowed = MODULE_SCOPE.get(self.target_type, set())
+        allowed = self.MODULE_SCOPE.get(self.target_type, set())
         if module not in allowed:
             print(Fore.RED + f"[!] Module '{module}' not suitable for {self.target_type} targets")
             return
@@ -237,7 +237,7 @@ Type 'help' to view available commands.
             print("Usage: strike OR equip <module> then strike")
             return
 
-        allowed = MODULE_SCOPE.get(self.target_type, set())
+        allowed = self.MODULE_SCOPE.get(self.target_type, set())
         if module not in allowed:
             print(Fore.RED + f"[!] '{module}' not allowed for {self.target_type} prey")
             return
