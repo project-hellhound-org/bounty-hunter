@@ -74,29 +74,6 @@ git clone https://github.com/tomnomnom/gf.git ~/.gf
 
 ---
 
-### PATH & Environment Configuration (zsh)
-```bash
-echo 'export GF_PATH="$HOME/.gf"' >> ~/.zshrc
-echo 'export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
----
-
-### Verify Installation
-```bash
-which subfinder httpx gau anew katana uro gf
-```
-
-All tools must resolve without errors.
-
----
-
-### Run ReconCombo
-```bash
-reconcomboGo -url https://example.com
-```
-
 
 ### Requirements
 
