@@ -4,18 +4,21 @@ import importlib.resources as pkg_resources
 import os
 import time
 
-from hellhound.core.engine import HellhoundEngine
-from hellhound.core.suggest import suggest_actions
-
 from colorama import Fore, init
 init(autoreset=True)
 
+from hellhound.core.engine import HellhoundEngine
+from hellhound.core.suggest import suggest_actions
 
+
+# ----------------------------
+# Load modules from config.yaml
+# ----------------------------
 def load_modules():
     try:
         with pkg_resources.files("hellhound").joinpath("config.yaml").open("r") as f:
             return yaml.safe_load(f).get("modules", {})
-    except:
+    except Exception:
         return {}
 
 
@@ -32,57 +35,119 @@ class HellhoundConsole(cmd.Cmd):
               Hellhound Pentest Framework v1.0
         Modular Red-Team Assistant | CLI + Dashboard Mode
                   Developed by Team Hellhound
-                     L4ZZ3RJ0D & alph4_rc
 
 Type 'help' to view available commands.
 """
 
     prompt = "hellhound > "
 
+    # ----------------------------
+    # Init
+    # ----------------------------
     def __init__(self):
         super().__init__()
         self.target = None
+        self.target_type = None   # host | web
         self.engine = HellhoundEngine(socketio=None)
         self.results = {}
         self.active_module = None
         self.modules = load_modules()
+        self.aliases = {
+            "hunt": "prey",
+            "run": "strike",
+            "use": "equip",
+            "back": "release",
+            "ls": "arsenal",
+            "results": "loot",
+            "quit": "exit",
+            "q": "exit",
+            "cls": "clear",
+        }
 
-    # -------------------
-    # Startup
-    # -------------------
 
+        self.quotes = [
+            "The prey never knows when the hunt begins.",
+            "No firewall outruns a hungry hound.",
+            "Silence means enumeration succeeded.",
+            "If it’s listening, it’s already too late.",
+            "Packets don’t lie. Targets do.",
+            "Every open port is a broken promise.",
+            "The hunt starts before the scan."
+        ]
+
+
+    # ----------------------------
+    # Startup animation
+    # ----------------------------
     def preloop(self):
-        self.loading("Initializing Hellhound core")
-        self.loading(f"Loading modules ({len(self.modules)})")
-        self.loading("Bringing intelligence engine online")
+        import random
+
+        self._stage("Awakening Hellhound core", "CORE ONLINE")
+        self._stage("Loading weapon modules", f"{len(self.modules)} TOOLS ARMED")
+        self._stage("Calibrating intelligence engine", "PREDICTION READY")
+        self._stage("Sniffing network scent", "PREY DETECTION ENABLED")
+        self._stage("Releasing restraints", "LEASH REMOVED")
+
+        print(Fore.RED + f"\n“{random.choice(self.quotes)}”\n")
         print(Fore.GREEN + "[✓] Console ready\n")
 
-    def loading(self, text, seconds=1.2):
+
+    def _stage(self, text, result, delay=0.9):
+        dots = ""
+        for i in range(3):
+            dots += "."
+            print(Fore.CYAN + f"\r[*] {text}{dots}", end="")
+            time.sleep(delay / 3)
+
+        print(Fore.GREEN + f"\r[✓] {text:<35} {result}")
+
+
+
+    def _loading(self, text, delay=1.2):
         for i in range(3):
             print(Fore.CYAN + f"\r{text}" + "." * (i + 1), end="")
-            time.sleep(seconds / 3)
+            time.sleep(delay / 3)
         print()
 
-    # -------------------
-    # CORE
-    # -------------------
+    # ============================
+    # CORE COMMANDS
+    # ============================
 
     def do_prey(self, arg):
-        """prey <ip> → Lock onto a target host"""
+        """prey <ip|domain> → Lock onto a target"""
+
         if not arg.strip():
-            print("Usage: prey <ip>")
+            print("Usage: prey <ip | domain>")
             return
+
         self.target = arg.strip()
-        print(Fore.GREEN + f"[+] Prey acquired: {self.target}")
+
+        print("\nWhat kind of prey is this?")
+        print("  [1] Full machine / host (CTF, server, network)")
+        print("  [2] Web application / domain\n")
+
+        choice = input("Select type [1/2]: ").strip()
+
+        if choice == "1":
+            self.target_type = "host"
+        elif choice == "2":
+            self.target_type = "web"
+        else:
+            print(Fore.RED + "[!] Invalid choice")
+            self.target = None
+            self.target_type = None
+            return
+
+        print(Fore.GREEN + f"[+] Prey acquired: {self.target} ({self.target_type.upper()})")
 
     def do_exit(self, arg):
         """exit → Leave console"""
         print("[+] Exiting Hellhound console")
         return True
 
-    # -------------------
+    # ============================
     # DISPLAY
-    # -------------------
+    # ============================
 
     def do_arsenal(self, arg):
         """arsenal → List available tools"""
@@ -103,32 +168,36 @@ Type 'help' to view available commands.
             print(f"\n[{mod.upper()}]")
             print(output[:500] if isinstance(output, str) else output)
 
-    # -------------------
+    # ============================
     # RECON
-    # -------------------
+    # ============================
 
     def do_nmap(self, arg):
-        """nmap → Run reconnaissance"""
+        """nmap → Run reconnaissance scan"""
+
         if not self.target:
-            print("[!] Set prey first: prey <ip>")
+            print("[!] Set prey first")
             return
+
         print(Fore.YELLOW + "[*] Running Nmap...")
         output = self.engine.run_single("nmap", self.target)
         self.results["nmap"] = output
 
-    # -------------------
+    # ============================
     # MODULE CONTROL
-    # -------------------
+    # ============================
 
     def do_equip(self, arg):
         """equip <module> → Select a tool"""
         module = arg.strip()
+
         if module not in self.modules:
-            print(f"[!] Unknown module: {module}")
+            print("[!] Unknown module")
             return
+
         self.active_module = module
         self.prompt = f"hellhound({module}) > "
-        print(f"[+] {module} equipped")
+        print(Fore.GREEN + f"[+] {module} equipped")
 
     def do_release(self, arg):
         """release → Exit tool mode"""
@@ -137,6 +206,7 @@ Type 'help' to view available commands.
 
     def do_strike(self, arg):
         """strike → Execute selected tool"""
+
         if not self.target:
             print("[!] No prey set")
             return
@@ -154,33 +224,43 @@ Type 'help' to view available commands.
         output = self.engine.run_single(module, self.target)
         self.results[module] = output
 
-    # -------------------
+    # ============================
     # INTELLIGENCE
-    # -------------------
+    # ============================
 
     def do_howl(self, arg):
         """howl → Suggest next actions"""
-        if "nmap" not in self.results:
-            print("[!] No scent yet. Run nmap first.")
+
+        if not self.target_type:
+            print("[!] Prey not defined")
             return
 
-        suggestions = suggest_actions(self.results["nmap"])
+        if "nmap" not in self.results:
+            print("[!] Run nmap first")
+            return
+
+        suggestions = suggest_actions(
+            self.results["nmap"],
+            target_type=self.target_type
+        )
+
         print("\n[ Howl — recommended actions ]")
         for s in suggestions:
             print(f"  → {s}")
         print()
 
-    # -------------------
-    # AUTO MODE
-    # -------------------
+    # ============================
+    # AUTO MODE (basic)
+    # ============================
 
     def do_auto(self, arg):
         """auto → Intelligent attack chain"""
+
         if not self.target:
             print("[!] No prey set")
             return
 
-        print(Fore.YELLOW + "[*] Auto mode engaged...\n")
+        print(Fore.YELLOW + "[*] Auto mode engaged...")
 
         nmap_output = self.engine.run_single("nmap", self.target)
         self.results["nmap"] = nmap_output
@@ -192,29 +272,14 @@ Type 'help' to view available commands.
 
         print(Fore.GREEN + f"[+] Open ports: {', '.join(open_ports)}")
 
-        selected = []
+        if self.target_type == "web" and "reconcombo" in self.modules:
+            print(Fore.YELLOW + "[*] Suggest running reconcombo manually")
 
-        if any(p in {"80", "443", "8080"} for p in open_ports):
-            for m in ("vhost", "dirsearch"):
-                if m in self.modules:
-                    selected.append(m)
+        print(Fore.GREEN + "[✓] Auto mode finished")
 
-        if "21" in open_ports and "ftp" in self.modules:
-            selected.append("ftp")
-
-        if not selected:
-            print(Fore.YELLOW + "[!] No relevant modules identified.")
-            return
-
-        for mod in selected:
-            print(Fore.YELLOW + f"[*] Auto executing: {mod}")
-            self.results[mod] = self.engine.run_single(mod, self.target)
-
-        print(Fore.GREEN + "\n[✓] Auto complete")
-
-    # -------------------
+    # ============================
     # SYSTEM
-    # -------------------
+    # ============================
 
     def do_clear(self, arg):
         """clear → Clear the screen"""
@@ -222,8 +287,10 @@ Type 'help' to view available commands.
 
     def do_status(self, arg):
         """status → Show framework status"""
+
         print("\n[ Hellhound Status ]")
         print(f"Target     : {self.target or 'not set'}")
+        print(f"Type       : {self.target_type or 'unknown'}")
         print(f"Equipped   : {self.active_module or 'none'}")
         print(f"Modules    : {len(self.modules)}")
         print(f"Results    : {len(self.results)}")
@@ -231,6 +298,7 @@ Type 'help' to view available commands.
 
     def do_sessions(self, arg):
         """sessions → List previous hunts"""
+
         base = os.path.join(os.path.dirname(__file__), "storage")
         if not os.path.exists(base):
             print("[!] No sessions directory")
@@ -241,9 +309,9 @@ Type 'help' to view available commands.
             print(f"  - {s}")
         print()
 
-    # -------------------
+    # ============================
     # CUSTOM HELP
-    # -------------------
+    # ============================
 
     def do_help(self, arg):
         """Show Hellhound command manual"""
@@ -254,7 +322,6 @@ prey      → Set target (lock onto a host)
 nmap      → Run reconnaissance scan
 arsenal   → List available tools
 equip     → Select a tool/module
-scope     → View tool configuration
 strike    → Execute selected tool
 howl      → Get suggested next actions
 loot      → View gathered results
@@ -264,4 +331,32 @@ auto      → Intelligent attack chain
 clear     → Clear the console screen
 status    → Show framework status
 sessions  → List previous hunts
+
+Aliases:
+=====================
+hunt <ip>     → prey <ip>
+use <module>  → equip <module>
+run           → strike
+back          → release
+ls            → arsenal
+results       → loot
+quit / q      → exit
+cls           → clear
 """)
+    def default(self, line):
+        """
+        Handle command aliases and unknown commands
+        """
+        parts = line.split()
+        if not parts:
+            return
+
+        cmd = parts[0]
+        args = " ".join(parts[1:])
+
+        if cmd in self.aliases:
+            real_cmd = self.aliases[cmd]
+            rewritten = f"{real_cmd} {args}".strip()
+            return self.onecmd(rewritten)
+
+        print(f"[!] Unknown command: {cmd}")
