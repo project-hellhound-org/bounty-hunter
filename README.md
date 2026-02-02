@@ -50,7 +50,7 @@ Hellhound focuses on **control, intelligence, and extensibility**, giving operat
 
 ---
 
-##  ReconCombo Integration
+##  ReconCombo Integration - Thanks to nickyqqq
 
 Hellhound integrates **ReconComboGo**, a powerful Go-based reconnaissance pipeline that includes:
 
