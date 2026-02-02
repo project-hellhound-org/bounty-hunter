@@ -24,7 +24,7 @@ Hellhound is designed as a framework where tools are orchestrated, results are i
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/hellhound.git
+git clone https://github.com/l4zz3rj0d/hellhound.git
 cd hellhound
 pip install .
 ```
