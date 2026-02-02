@@ -1,3 +1,4 @@
+# hellhound/modules/web/vhost.py
 import subprocess
 import os
 
@@ -8,14 +9,16 @@ DESCRIPTION = "Virtual host fuzzing using ffuf wrapper"
 def run(target, emit, options=None):
     emit("[*] VHOST fuzzing started")
 
-    base_dir = os.path.dirname(os.path.dirname(__file__))  # go up to hellhound/
+    # hellhound/modules/web -> hellhound/
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     script_path = os.path.join(base_dir, "scripts", "vhost-fuzzer.sh")
     default_wordlist = os.path.join(base_dir, "wordlists", "default.txt")
 
-    wordlist = None
-    if options and "wordlist" in options:
-        wordlist = options["wordlist"]
+    if not os.path.exists(script_path):
+        emit(f"[!] VHOST script not found: {script_path}")
+        return ""
 
+    wordlist = options.get("wordlist") if options else None
     if not wordlist:
         wordlist = default_wordlist
         emit(f"[i] Using default wordlist: {wordlist}")
@@ -29,7 +32,6 @@ def run(target, emit, options=None):
     emit(f"[*] Executing: {' '.join(cmd)}")
 
     output = ""
-
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -44,6 +46,5 @@ def run(target, emit, options=None):
             output += line
 
     process.wait()
-
     emit("[✓] VHOST fuzzing completed")
     return output

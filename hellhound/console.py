@@ -57,7 +57,7 @@ Type 'help' to view available commands.
                 "nmap", "ftp", "ssh"
             },
             "web": {
-                "nmap", "vhost", "dirsearch", "nikto", "nuclei"
+                "nmap", "vhost", "dirsearch", "nikto", "nuclei", "reconcombo"
             }
         }
         self.aliases = {
@@ -162,12 +162,23 @@ Type 'help' to view available commands.
     # ============================
 
     def do_arsenal(self, arg):
-        """arsenal → List available tools"""
-        print("\n[ Arsenal ]")
+        """arsenal → List available tools for current prey"""
+
+        if not self.target_type:
+            print("[!] No prey set. Use: prey <target>")
+            return
+
+        allowed = self.MODULE_SCOPE.get(self.target_type, set())
+
+        print(f"\n[ Arsenal — {self.target_type.upper()} ]")
+
         for name, meta in self.modules.items():
-            desc = meta.get("description", "No description")
-            print(f"  {name:<12} - {desc}")
+            if name in allowed:
+                desc = meta.get("description", "No description")
+                print(f"  {name:<12} - {desc}")
+
         print()
+
 
     def do_loot(self, arg):
         """loot → View gathered results"""

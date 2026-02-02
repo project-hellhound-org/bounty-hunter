@@ -1,8 +1,19 @@
+# hellhound/core/engine.py
 import importlib
+import subprocess
+import shutil
 
 class HellhoundEngine:
     def __init__(self, socketio=None):
         self.socketio = socketio
+
+        # External binary-backed modules
+        self.external_modules = {
+            "reconcombo": {
+                "binary": "reconcomboGo",
+                "args": lambda target: ["--url", target]
+            }
+        }
 
     def emit(self, msg):
         print(msg)
@@ -10,6 +21,12 @@ class HellhoundEngine:
             self.socketio.emit("log", {"message": msg})
 
     def run_single(self, module_name, target, **kwargs):
+
+        # 1️⃣ External module handling
+        if module_name in self.external_modules:
+            return self.run_external(module_name, target)
+
+        # 2️⃣ Python module handling
         try:
             module = self.load_module(module_name)
         except Exception as e:
@@ -21,6 +38,37 @@ class HellhoundEngine:
             return ""
 
         return module.run(target, self.emit, **kwargs)
+
+    def run_external(self, name, target):
+        meta = self.external_modules[name]
+        binary = meta["binary"]
+
+        if not shutil.which(binary):
+            self.emit(f"[!] External tool '{binary}' not found in PATH")
+            return ""
+
+        args = meta["args"](target)
+        cmd = [binary] + args
+
+        self.emit(f"[*] Executing external tool: {' '.join(cmd)}")
+
+        output = ""
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        for line in process.stdout:
+            if line.strip():
+                self.emit(line.strip())
+                output += line
+
+        process.wait()
+        self.emit(f"[✓] External module '{name}' completed")
+        return output
 
     def load_module(self, name):
         # Try network
