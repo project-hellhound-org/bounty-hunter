@@ -265,23 +265,17 @@ Type 'help' to view available commands.
     def do_howl(self, arg):
         """howl → Suggest next actions"""
 
-        if not self.target_type:
-            print("[!] Prey not defined")
-            return
-
         if "nmap" not in self.results:
             print("[!] Run nmap first")
             return
 
-        suggestions = suggest_actions(
-            self.results["nmap"],
-            target_type=self.target_type
-        )
+        suggestions = suggest_actions(self.results["nmap"])
 
         print("\n[ Howl — recommended actions ]")
         for s in suggestions:
             print(f"  → {s}")
         print()
+
 
     # ============================
     # AUTO MODE (basic)
