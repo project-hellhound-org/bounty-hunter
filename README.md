@@ -2,14 +2,7 @@
 
 Hellhound is a modular penetration testing framework that combines an interactive CLI console with a real-time web dashboard to streamline reconnaissance, enumeration, and attack workflows.
 
-
-     ██╗  ██╗███████╗██╗     ██╗     ██╗  ██╗ ██████╗ ██╗   ██╗███╗   ██╗██████╗ 
-     ██║  ██║██╔════╝██║     ██║     ██║  ██║██╔═══██╗██║   ██║████╗  ██║██╔══██╗
-     ███████║█████╗  ██║     ██║     ███████║██║   ██║██║   ██║██╔██╗ ██║██║  ██║
-     ██╔══██║██╔══╝  ██║     ██║     ██╔══██║██║   ██║██║   ██║██║╚██╗██║██║  ██║
-     ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
-     ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝ 
-
+![project hell](hellhound.png)
      
 This is not a simple automation script.
 Hellhound is designed as a framework where tools are orchestrated, results are interpreted, and actions are suggested.
