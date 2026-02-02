@@ -14,6 +14,16 @@ default_wordlist: "wordlists/default.txt"
 
 modules:
   nmap:
-    description: "Service and port discovery"
+    description: Network reconnaissance and service detection
+
+  reconcombo:
+    description: Full web reconnaissance pipeline (subdomains, URLs, JS, GF, nuclei)
+
+  dirsearch:
+    description: Directory and endpoint discovery for web targets
+
   vhost:
-    description: "Virtual host fuzzing using ffuf"
+    description: Virtual host enumeration using ffuf
+
+  ftp:
+    description: FTP enumeration and anonymous login checks
