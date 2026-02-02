@@ -52,6 +52,14 @@ Type 'help' to view available commands.
         self.results = {}
         self.active_module = None
         self.modules = load_modules()
+        MODULE_SCOPE = {
+            "host": {
+                "nmap", "ftp", "ssh"
+            },
+            "web": {
+                "nmap", "vhost", "dirsearch", "nikto", "nuclei"
+            }
+        }
         self.aliases = {
             "hunt": "prey",
             "run": "strike",
@@ -130,10 +138,14 @@ Type 'help' to view available commands.
 
         if choice == "1":
             self.target_type = "host"
+            print(Fore.GREEN + f"[+] Prey locked as FULL MACHINE: {self.target}")
+        
         elif choice == "2":
             self.target_type = "web"
+            print(Fore.GREEN + f"[+] Prey locked as WEB APPLICATION: {self.target}")
+
         else:
-            print(Fore.RED + "[!] Invalid choice")
+            print(Fore.RED + "[!] Invalid choice. Prey not set.")
             self.target = None
             self.target_type = None
             return
@@ -189,10 +201,19 @@ Type 'help' to view available commands.
 
     def do_equip(self, arg):
         """equip <module> → Select a tool"""
-        module = arg.strip()
 
+        if not self.target or not self.target_type:
+            print("[!] Set prey first using: prey <target>")
+            return
+
+        module = arg.strip()
         if module not in self.modules:
-            print("[!] Unknown module")
+            print(f"[!] Unknown module: {module}")
+            return
+
+        allowed = MODULE_SCOPE.get(self.target_type, set())
+        if module not in allowed:
+            print(Fore.RED + f"[!] Module '{module}' not suitable for {self.target_type} targets")
             return
 
         self.active_module = module
@@ -207,7 +228,7 @@ Type 'help' to view available commands.
     def do_strike(self, arg):
         """strike → Execute selected tool"""
 
-        if not self.target:
+        if not self.target or not self.target_type:
             print("[!] No prey set")
             return
 
@@ -216,13 +237,15 @@ Type 'help' to view available commands.
             print("Usage: strike OR equip <module> then strike")
             return
 
-        if module not in self.modules:
-            print("[!] Unknown module")
+        allowed = MODULE_SCOPE.get(self.target_type, set())
+        if module not in allowed:
+            print(Fore.RED + f"[!] '{module}' not allowed for {self.target_type} prey")
             return
 
         print(Fore.YELLOW + f"[*] Executing {module}...")
         output = self.engine.run_single(module, self.target)
         self.results[module] = output
+
 
     # ============================
     # INTELLIGENCE
