@@ -30,8 +30,73 @@ git clone https://github.com/l4zz3rj0d/Hellhound-Pentest.git
 
 cd hellhound
 pip install .
+```
+
+## ReconCombo – Pre-Requisites & Setup
+
+ReconCombo relies on multiple open-source reconnaissance tools.  
+Please install the following dependencies **before running the framework**.
+
+---
+
+### 📦 System Dependencies
+```bash
+sudo apt update
 sudo apt install -y subfinder httpx-toolkit ffuf nuclei feroxbuster dirsearch git python3-pip
 ```
+
+---
+
+### 🧰 Go-Based Tools
+```bash
+go install github.com/lc/gau/v2/cmd/gau@latest
+go install github.com/tomnomnom/anew@latest
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+go install github.com/tomnomnom/gf@latest
+```
+
+---
+
+### 🧪 Python-Based Tools
+```bash
+git clone https://github.com/s0md3v/uro.git
+cd uro
+python3 setup.py install --user
+cd ..
+```
+
+---
+
+### 📁 GF Patterns (Required)
+```bash
+git clone https://github.com/tomnomnom/gf.git ~/.gf
+```
+
+---
+
+### 🔑 PATH & Environment Configuration (zsh)
+```bash
+echo 'export GF_PATH="$HOME/.gf"' >> ~/.zshrc
+echo 'export PATH="$HOME/go/bin:$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+---
+
+### ✅ Verify Installation
+```bash
+which subfinder httpx gau anew katana uro gf
+```
+
+All tools must resolve without errors.
+
+---
+
+### 🚀 Run ReconCombo
+```bash
+reconcomboGo -url https://example.com
+```
+
 
 ### Requirements
 
