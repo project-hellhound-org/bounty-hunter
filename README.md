@@ -22,106 +22,113 @@ Hellhound focuses on **control, intelligence, and extensibility**, giving operat
 
 ---
 
+## Core Design Philosophy
+
+- Human-in-the-loop decision making
+- Evidence-based recommendations
+- Strict separation of responsibilities:
+  - Asset reconnaissance
+  - DNS reconnaissance
+  - Network scanning
+  - Web intelligence
+- Modular, replaceable components
+- Console safety over automation
+
+---
+
 ##  Key Features
 
 ### Console Mode (Primary)
 - Interactive Metasploit-style CLI
 - Custom Hellhound command language
-- Target-type aware logic (host vs web)
-- Modular tool execution (`equip → run`)
-- Intelligent suggestions (`howl`)
-- Session & loot management
+- Target-type awareness (host vs web)
+- Modular execution (`equip → strike`)
+- Intelligent, ranked suggestions (`howl`)
+- Session and loot management
 - Alias system (hunt, use, run, ls, etc.)
-- Colored, animated startup & output
+- Clean, colorized output
 - Extensible module system
 
-### Dashboard Mode (Secondary)
-- GUI-based hunting & exploitation
-- Attack execution from UI (not just live logs)
-- Target selection & module triggering
-- Designed for users who prefer GUI over CLI
+### Intelligence Engine
+- Combines results from:
+  - Asset reconnaissance
+  - DNS reconnaissance
+  - Network scans (Nmap)
+  - Web reconnaissance (`stalk`)
+- Produces ranked, evidence-based next steps
+- Designed to support future automation safely
 
-### Framework Core
-- Modular architecture
-- Rule-based attack chaining (Hunting Mode – WIP)
-- ReconCombo integration
-- Session-based result storage
-- Socket.IO-based live logging
+### Dashboard Mode (Planned)
+- GUI-based hunting and exploitation
+- Module execution from UI
+- Session visualization
+- Intended for users who prefer GUI over CLI
 
 ---
+## Prerequisites
 
-##  ReconCombo Integration - Thanks to nickyqqq
+Hellhound does not bundle heavy tools.
+You must install and manage external tools yourself.
 
-Hellhound integrates **ReconComboGo**, a powerful Go-based reconnaissance pipeline that includes:
+### Required
 
-- Subdomain enumeration (subfinder)
-- URL collection (gau, katana, ffuf)
-- Directory discovery (feroxbuster, dirsearch)
-- GF pattern extraction (XSS, SQLi, SSRF, etc.)
-- JavaScript file extraction & analysis
-- Resume interrupted scans
-- Concurrent multi-target processing
+- Linux (Kali Linux recommended)
 
-ReconCombo is treated as a **first-class web reconnaissance module** inside Hellhound.
+- Python 3.10+
 
+- pip
+
+- git
+
+### Recommended System Tools
+
+- nmap
+
+- curl
+
+- wget
+
+### Recommended Web Recon Tools
+
+- httpx
+
+- ffuf
+
+- dirsearch
+
+- feroxbuster
+
+- whatweb
+
+- waybackurls
+
+- gau
+
+### Optional (Advanced Recon)
+
+- subfinder
+
+- dnsx
+
+- nuclei
+
+Ensure all tools are available in your PATH.
 ---
 
 ##  Installation
 
-### Clone Repository
-```bash
+```
 git clone https://github.com/l4zz3rj0d/Hellhound-Pentest.git
 cd Hellhound-Pentest
-```
-### Install Hellhound
-```
 pip install .
 pip install -r requirements.txt
 
-```
-
-### ReconCombo & Toolchain Setup (Required)
-
-Hellhound does not bundle heavy tools.
-You must install them system-wide.
-
-### System Dependencies
-```
-sudo apt update
-sudo apt install -y \
-  nmap \
-  ffuf \
-  nuclei \
-  feroxbuster \
-  dirsearch \
-  git \
-  python3-pip
-
-```
+````
 
 ### Go-Based Tools
 ```
 go install github.com/lc/gau/v2/cmd/gau@latest
-go install github.com/tomnomnom/anew@latest
 go install github.com/projectdiscovery/katana/cmd/katana@latest
-go install github.com/tomnomnom/gf@latest
-
-```
-Make sure $GOPATH/bin is in your PATH.
-
-### Python Tools
-```
-git clone https://github.com/s0md3v/uro.git
-cd uro
-python3 setup.py install --user
-
-```
-
-### GF Patterns (Mandatory)
-
-```
-git clone https://github.com/tomnomnom/gf.git ~/.gf
-
 ```
 
 ## Usage
@@ -170,25 +177,17 @@ cls  → clear
 hellhound > prey example.com
 [Select target type: WEB]
 
+hellhound > asset_recon
+hellhound > dns_recon
 hellhound > nmap
+hellhound > stalk
 hellhound > howl
 
-hellhound > equip reconcombo
-hellhound(reconcombo) > run
-
 hellhound > equip vhost
-hellhound(vhost) > run
+hellhound(vhost) > strike
 
 hellhound > loot
-````
-## Module System
 
-Modules are organized by category:
-````
-hellhound/modules/
-├── network/
-├── web/
-├── enum/
 ````
 
 Each module exposes:
@@ -210,18 +209,7 @@ View inside console:
 ```
 sessions
 ```
-## Project Structure
-```
-hellhound/
-├── cli.py          → Entry point
-├── console.py      → Interactive shell
-├── core/           → Engine & intelligence
-├── modules/        → Tool modules
-├── scripts/        → External helpers
-├── web/            → Dashboard server
-├── storage/        → Sessions & loot
-├── config.yaml     → Module registry
-```
+
 ## Roadmap
 
 - Rule-based Hunting Mode
