@@ -70,24 +70,6 @@ Hellhound focuses on **control, intelligence, and extensibility**, giving operat
 Hellhound does not bundle heavy tools.
 You must install and manage external tools yourself.
 
-### Required
-
-- Linux (Kali Linux recommended)
-
-- Python 3.10+
-
-- pip
-
-- git
-
-### Recommended System Tools
-
-- nmap
-
-- curl
-
-- wget
-
 ### Recommended Web Recon Tools
 
 - httpx
