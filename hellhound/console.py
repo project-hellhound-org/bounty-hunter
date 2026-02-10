@@ -3,23 +3,51 @@ import yaml
 import importlib.resources as pkg_resources
 import os
 import time
+import sys
+import random
 
-from colorama import Fore, init
+from colorama import Fore, Style, init
 init(autoreset=True)
 
 from hellhound.core.engine import HellhoundEngine
 from hellhound.core.suggest import suggest_actions
 
-
 # ----------------------------
-# Load modules from config.yaml
+# Load modules from filesystem + config.yaml (descriptions only)
 # ----------------------------
 def load_modules():
+    modules = {}
+
+    yaml_modules = {}
     try:
         with pkg_resources.files("hellhound").joinpath("config.yaml").open("r") as f:
-            return yaml.safe_load(f).get("modules", {})
+            yaml_modules = yaml.safe_load(f).get("modules", {})
     except Exception:
-        return {}
+        pass
+
+    base = pkg_resources.files("hellhound").joinpath("modules")
+
+    for category in os.listdir(base):
+        cat_path = base.joinpath(category)
+        if not cat_path.is_dir():
+            continue
+
+        for file in os.listdir(cat_path):
+            if not file.endswith(".py") or file.startswith("__"):
+                continue
+
+            name = file[:-3]
+            desc = yaml_modules.get(name, {}).get(
+                "description",
+                f"{category.capitalize()} module"
+            )
+
+            modules[name] = {
+                "category": category,
+                "description": desc
+            }
+
+    return modules
 
 
 class HellhoundConsole(cmd.Cmd):
@@ -39,7 +67,7 @@ class HellhoundConsole(cmd.Cmd):
 Type 'help' to view available commands.
 """
 
-    prompt = "hellhound > "
+    prompt = Fore.RED + "hellhound > " + Style.RESET_ALL
 
     # ----------------------------
     # Init
@@ -52,14 +80,15 @@ Type 'help' to view available commands.
         self.results = {}
         self.active_module = None
         self.modules = load_modules()
+
+        # 🔓 Host = FULL UNLOCK
         self.MODULE_SCOPE = {
-            "host": {
-                "nmap", "ftp", "ssh"
-            },
+            "host": "ALL",
             "web": {
-                "nmap", "vhost", "dirsearch", "nikto", "nuclei", "reconcombo"
+                "nmap", "vhost", "dirsearch", "nikto", "nuclei", "stalk"
             }
         }
+
         self.aliases = {
             "hunt": "prey",
             "run": "strike",
@@ -71,7 +100,6 @@ Type 'help' to view available commands.
             "q": "exit",
             "cls": "clear",
         }
-
 
         self.quotes = [
             "The prey never knows when the hunt begins.",
@@ -85,37 +113,36 @@ Type 'help' to view available commands.
 
 
     # ----------------------------
-    # Startup animation
+    # Hackeristic Boot Sequence (UNCHANGED)
     # ----------------------------
     def preloop(self):
-        import random
+        os.system("clear" if os.name == "posix" else "cls")
 
-        self._stage("Awakening Hellhound core", "CORE ONLINE")
-        self._stage("Loading weapon modules", f"{len(self.modules)} TOOLS ARMED")
-        self._stage("Calibrating intelligence engine", "PREDICTION READY")
-        self._stage("Sniffing network scent", "PREY DETECTION ENABLED")
-        self._stage("Releasing restraints", "LEASH REMOVED")
+        print(Style.DIM + Fore.RED + "ACCESSING RESTRICTED MEMORY...")
+        for _ in range(6):
+            hex_line = " ".join([f"{random.randint(0, 255):02X}" for _ in range(16)])
+            print(f"  0x{random.randint(1000, 9999):X}  {hex_line}")
+            time.sleep(0.05)
 
-        print(Fore.RED + f"\n“{random.choice(self.quotes)}”\n")
-        print(Fore.GREEN + "[✓] Console ready\n")
+        print("\n" + Fore.RED + Style.BRIGHT + "  [ SYSTEM BREACH DETECTED ]")
+        self._glitch_text("INITIATING HELLHOUND PROTOCOLS...")
 
-
-    def _stage(self, text, result, delay=0.9):
-        dots = ""
-        for i in range(3):
-            dots += "."
-            print(Fore.CYAN + f"\r[*] {text}{dots}", end="")
-            time.sleep(delay / 3)
-
-        print(Fore.GREEN + f"\r[✓] {text:<35} {result}")
-
-
-
-    def _loading(self, text, delay=1.2):
-        for i in range(3):
-            print(Fore.CYAN + f"\r{text}" + "." * (i + 1), end="")
-            time.sleep(delay / 3)
+        print("\n" + Fore.RED + Style.BRIGHT)
+        self._glitch_text(f"“{random.choice(self.quotes)}”")
         print()
+
+
+    def _glitch_text(self, text):
+        chars = "!@#$%^&*()_+-=[]{}|;:,.<>?/~`"
+        for char in text:
+            for _ in range(3):
+                sys.stdout.write(Style.DIM + Fore.RED + random.choice(chars))
+                sys.stdout.flush()
+                time.sleep(0.01)
+            sys.stdout.write('\b\b\b' + Style.BRIGHT + Fore.RED + char)
+            sys.stdout.flush()
+            time.sleep(0.02)
+        print(Style.RESET_ALL)
 
     # ============================
     # CORE COMMANDS
@@ -139,7 +166,7 @@ Type 'help' to view available commands.
         if choice == "1":
             self.target_type = "host"
             print(Fore.GREEN + f"[+] Prey locked as FULL MACHINE: {self.target}")
-        
+
         elif choice == "2":
             self.target_type = "web"
             print(Fore.GREEN + f"[+] Prey locked as WEB APPLICATION: {self.target}")
@@ -154,7 +181,7 @@ Type 'help' to view available commands.
 
     def do_exit(self, arg):
         """exit → Leave console"""
-        print("[+] Exiting Hellhound console")
+        print(Fore.RED + "[+] Exiting Hellhound console")
         return True
 
     # ============================
@@ -162,20 +189,23 @@ Type 'help' to view available commands.
     # ============================
 
     def do_arsenal(self, arg):
-        """arsenal → List available tools for current prey"""
+        """arsenal → List available tools"""
 
+        # 🔹 No prey → show everything
         if not self.target_type:
-            print("[!] No prey set. Use: prey <target>")
+            print("\n[ Arsenal — ALL MODULES ]")
+            for name, meta in sorted(self.modules.items()):
+                print(f"  {name:<12} - {meta['description']}")
+            print()
             return
 
-        allowed = self.MODULE_SCOPE.get(self.target_type, set())
+        scope = self.MODULE_SCOPE.get(self.target_type)
 
         print(f"\n[ Arsenal — {self.target_type.upper()} ]")
 
-        for name, meta in self.modules.items():
-            if name in allowed:
-                desc = meta.get("description", "No description")
-                print(f"  {name:<12} - {desc}")
+        for name, meta in sorted(self.modules.items()):
+            if scope == "ALL" or name in scope:
+                print(f"  {name:<12} - {meta['description']}")
 
         print()
 
@@ -189,7 +219,7 @@ Type 'help' to view available commands.
         print("\n[ Loot ]")
         for mod, output in self.results.items():
             print(f"\n[{mod.upper()}]")
-            print(output[:500] if isinstance(output, str) else output)
+            print(output if not isinstance(output, dict) else output)
 
     # ============================
     # RECON
@@ -213,7 +243,7 @@ Type 'help' to view available commands.
     def do_equip(self, arg):
         """equip <module> → Select a tool"""
 
-        if not self.target or not self.target_type:
+        if not self.target_type:
             print("[!] Set prey first using: prey <target>")
             return
 
@@ -222,19 +252,19 @@ Type 'help' to view available commands.
             print(f"[!] Unknown module: {module}")
             return
 
-        allowed = self.MODULE_SCOPE.get(self.target_type, set())
-        if module not in allowed:
+        scope = self.MODULE_SCOPE.get(self.target_type)
+        if scope != "ALL" and module not in scope:
             print(Fore.RED + f"[!] Module '{module}' not suitable for {self.target_type} targets")
             return
 
         self.active_module = module
-        self.prompt = f"hellhound({module}) > "
+        self.prompt = Fore.RED + f"hellhound({module}) > " + Style.RESET_ALL
         print(Fore.GREEN + f"[+] {module} equipped")
 
     def do_release(self, arg):
         """release → Exit tool mode"""
         self.active_module = None
-        self.prompt = "hellhound > "
+        self.prompt = Fore.RED + "hellhound > " + Style.RESET_ALL
 
     def do_strike(self, arg):
         """strike → Execute selected tool"""
@@ -248,15 +278,14 @@ Type 'help' to view available commands.
             print("Usage: strike OR equip <module> then strike")
             return
 
-        allowed = self.MODULE_SCOPE.get(self.target_type, set())
-        if module not in allowed:
+        scope = self.MODULE_SCOPE.get(self.target_type)
+        if scope != "ALL" and module not in scope:
             print(Fore.RED + f"[!] '{module}' not allowed for {self.target_type} prey")
             return
 
         print(Fore.YELLOW + f"[*] Executing {module}...")
         output = self.engine.run_single(module, self.target)
         self.results[module] = output
-
 
     # ============================
     # INTELLIGENCE
@@ -275,35 +304,6 @@ Type 'help' to view available commands.
         for s in suggestions:
             print(f"  → {s}")
         print()
-
-
-    # ============================
-    # AUTO MODE (basic)
-    # ============================
-
-    def do_auto(self, arg):
-        """auto → Intelligent attack chain"""
-
-        if not self.target:
-            print("[!] No prey set")
-            return
-
-        print(Fore.YELLOW + "[*] Auto mode engaged...")
-
-        nmap_output = self.engine.run_single("nmap", self.target)
-        self.results["nmap"] = nmap_output
-
-        open_ports = []
-        for line in nmap_output.splitlines():
-            if "/tcp" in line and "open" in line:
-                open_ports.append(line.split("/")[0])
-
-        print(Fore.GREEN + f"[+] Open ports: {', '.join(open_ports)}")
-
-        if self.target_type == "web" and "reconcombo" in self.modules:
-            print(Fore.YELLOW + "[*] Suggest running reconcombo manually")
-
-        print(Fore.GREEN + "[✓] Auto mode finished")
 
     # ============================
     # SYSTEM
@@ -371,6 +371,7 @@ results       → loot
 quit / q      → exit
 cls           → clear
 """)
+
     def default(self, line):
         """
         Handle command aliases and unknown commands
@@ -381,6 +382,10 @@ cls           → clear
 
         cmd = parts[0]
         args = " ".join(parts[1:])
+
+        # Allow real commands always
+        if hasattr(self, f"do_{cmd}"):
+            return self.onecmd(line)
 
         if cmd in self.aliases:
             real_cmd = self.aliases[cmd]

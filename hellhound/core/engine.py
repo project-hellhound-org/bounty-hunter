@@ -3,9 +3,43 @@ import importlib
 import subprocess
 import shutil
 
+
+class Emit:
+    """
+    Unified emit handler.
+
+    Supports:
+      emit("message")
+      emit.info("message")
+      emit.warn("message")
+      emit.success("message")
+    """
+
+    def __init__(self, socketio=None):
+        self.socketio = socketio
+
+    def __call__(self, msg):
+        self._send(msg)
+
+    def info(self, msg):
+        self._send(f"[*] {msg}")
+
+    def warn(self, msg):
+        self._send(f"[!] {msg}")
+
+    def success(self, msg):
+        self._send(f"[✓] {msg}")
+
+    def _send(self, msg):
+        print(msg)
+        if self.socketio:
+            self.socketio.emit("log", {"message": msg})
+
+
 class HellhoundEngine:
     def __init__(self, socketio=None):
         self.socketio = socketio
+        self.emit = Emit(socketio)
 
         # External binary-backed modules
         self.external_modules = {
@@ -14,11 +48,6 @@ class HellhoundEngine:
                 "args": lambda target: ["--url", target]
             }
         }
-
-    def emit(self, msg):
-        print(msg)
-        if self.socketio:
-            self.socketio.emit("log", {"message": msg})
 
     def run_single(self, module_name, target, **kwargs):
 
@@ -30,27 +59,31 @@ class HellhoundEngine:
         try:
             module = self.load_module(module_name)
         except Exception as e:
-            self.emit(f"[!] Failed to load module '{module_name}': {e}")
+            self.emit.warn(f"Failed to load module '{module_name}': {e}")
             return ""
 
         if not hasattr(module, "run"):
-            self.emit(f"[!] Module '{module_name}' has no run() function")
+            self.emit.warn(f"Module '{module_name}' has no run() function")
             return ""
 
-        return module.run(target, self.emit, **kwargs)
+        try:
+            return module.run(target, self.emit, **kwargs)
+        except Exception as e:
+            self.emit.warn(f"Module '{module_name}' crashed: {e}")
+            return ""
 
     def run_external(self, name, target):
         meta = self.external_modules[name]
         binary = meta["binary"]
 
         if not shutil.which(binary):
-            self.emit(f"[!] External tool '{binary}' not found in PATH")
+            self.emit.warn(f"External tool '{binary}' not found in PATH")
             return ""
 
         args = meta["args"](target)
         cmd = [binary] + args
 
-        self.emit(f"[*] Executing external tool: {' '.join(cmd)}")
+        self.emit.info(f"Executing external tool: {' '.join(cmd)}")
 
         output = ""
         process = subprocess.Popen(
@@ -67,26 +100,16 @@ class HellhoundEngine:
                 output += line
 
         process.wait()
-        self.emit(f"[✓] External module '{name}' completed")
+        self.emit.success(f"External module '{name}' completed")
         return output
 
     def load_module(self, name):
-        # Try network
-        try:
-            return importlib.import_module(f"hellhound.modules.network.{name}")
-        except:
-            pass
-
-        # Try web
-        try:
-            return importlib.import_module(f"hellhound.modules.web.{name}")
-        except:
-            pass
-
-        # Try enum
-        try:
-            return importlib.import_module(f"hellhound.modules.enum.{name}")
-        except:
-            pass
+        for category in ("network", "web", "enum", "recon"):
+            try:
+                return importlib.import_module(
+                    f"hellhound.modules.{category}.{name}"
+                )
+            except ModuleNotFoundError:
+                continue
 
         raise ImportError(f"Module '{name}' not found")

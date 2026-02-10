@@ -1,50 +1,31 @@
-# hellhound/modules/web/vhost.py
 import subprocess
-import os
+import shutil
+import importlib.resources as pkg_resources
 
 NAME = "vhost"
 CATEGORY = "web"
-DESCRIPTION = "Virtual host fuzzing using ffuf wrapper"
+DESCRIPTION = "Virtual host enumeration using ffuf"
 
 def run(target, emit, options=None):
-    emit("[*] VHOST fuzzing started")
+    emit.info("Starting virtual host enumeration")
 
-    # hellhound/modules/web -> hellhound/
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    script_path = os.path.join(base_dir, "scripts", "vhost-fuzzer.sh")
-    default_wordlist = os.path.join(base_dir, "wordlists", "default.txt")
-
-    if not os.path.exists(script_path):
-        emit(f"[!] VHOST script not found: {script_path}")
+    if not shutil.which("ffuf"):
+        emit.warn("ffuf not found")
         return ""
 
-    wordlist = options.get("wordlist") if options else None
-    if not wordlist:
-        wordlist = default_wordlist
-        emit(f"[i] Using default wordlist: {wordlist}")
-    else:
-        emit(f"[i] Using custom wordlist: {wordlist}")
-
-    url = f"http://{target}"
-    fs_filter = "4242"
-
-    cmd = ["bash", script_path, target, wordlist, url, fs_filter]
-    emit(f"[*] Executing: {' '.join(cmd)}")
-
-    output = ""
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
+    wordlist = pkg_resources.files("hellhound").joinpath(
+        "wordlists/vhosts/vhosts.txt"
     )
 
-    for line in process.stdout:
-        if line.strip():
-            emit(line.strip())
-            output += line
+    cmd = [
+        "ffuf",
+        "-u", f"http://{target}",
+        "-H", "Host: FUZZ",
+        "-w", str(wordlist),
+        "-mc", "200,301,302,403",
+        "-s"
+    ]
 
-    process.wait()
-    emit("[✓] VHOST fuzzing completed")
+    output = subprocess.run(cmd, capture_output=True, text=True).stdout
+    emit.success("VHOST fuzzing completed")
     return output
