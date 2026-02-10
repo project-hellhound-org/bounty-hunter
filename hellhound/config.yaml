@@ -16,9 +16,6 @@ modules:
   nmap:
     description: Network reconnaissance and service detection
 
-  reconcombo:
-    description: Full web reconnaissance pipeline (subdomains, URLs, JS, GF, nuclei)
-
   dirsearch:
     description: Directory and endpoint discovery for web targets
 

@@ -9,7 +9,6 @@ def run(target, emit, options=None):
 
     args = ["nmap", "-sV", "-sC", target]
 
-    # Optional future customization
     if options and options.get("fast"):
         args = ["nmap", "-F", target]
 
@@ -29,6 +28,5 @@ def run(target, emit, options=None):
             output += line
 
     process.wait()
-
-    emit("[✓] Nmap finished")
+    emit.success("Nmap finished")
     return output

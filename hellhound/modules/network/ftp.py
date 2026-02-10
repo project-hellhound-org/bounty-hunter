@@ -1,34 +1,24 @@
 import subprocess
+import shutil
 
-NAME = "nmap"
+NAME = "ftp"
 CATEGORY = "network"
-DESCRIPTION = "Service and version detection using Nmap"
+DESCRIPTION = "FTP enumeration and anonymous login checks"
 
 def run(target, emit, options=None):
-    emit(f"[*] Nmap scan started against {target}")
+    emit.info("Checking FTP service")
 
-    args = ["nmap", "-sV", "-sC", target]
+    if not shutil.which("nmap"):
+        emit.warn("nmap not found")
+        return ""
 
-    # Optional future customization
-    if options and options.get("fast"):
-        args = ["nmap", "-F", target]
+    cmd = [
+        "nmap",
+        "-p", "21",
+        "--script", "ftp-anon,ftp-syst",
+        target
+    ]
 
-    output = ""
-
-    process = subprocess.Popen(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
-    )
-
-    for line in process.stdout:
-        if line.strip():
-            emit(line.strip())
-            output += line
-
-    process.wait()
-
-    emit("[✓] Nmap finished")
+    output = subprocess.run(cmd, capture_output=True, text=True).stdout
+    emit.success("FTP enumeration completed")
     return output
