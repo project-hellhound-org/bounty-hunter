@@ -6,6 +6,7 @@ NAME = "nmap"
 CATEGORY = "network"
 DESCRIPTION = "Adaptive recon, versioning, and vulnerability extraction"
 
+
 # -------------------------------------------------
 # Helpers
 # -------------------------------------------------

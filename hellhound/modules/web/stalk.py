@@ -5,6 +5,7 @@ NAME = "stalk"
 CATEGORY = "web"
 DESCRIPTION = "Passive-first web intelligence gathering (quick/deep)"
 
+
 def tool_exists(tool):
     return shutil.which(tool) is not None
 
