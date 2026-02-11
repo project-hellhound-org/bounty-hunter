@@ -209,17 +209,150 @@ Type 'help' to view available commands.
 
         print()
 
+    def do_hunt(self, arg):
+            """
+            hunt → Intelligent, automated attack chain.
+            Runs Nmap, analyzes results, and strikes automatically.
+            """
+            if not self.target:
+                print("[!] No prey set. Use: prey <target>")
+                return
+
+            from hellhound.core.strategies import HUNT_RULES
+
+            print(Fore.YELLOW + "\n[!] HUNT MODE ENGAGED")
+            print(Fore.YELLOW + "[*] Phase 1: Reconnaissance (Nmap)")
+
+            # 1. Run Nmap (Fast + Version detection for speed)
+            nmap_result = self.engine.run_single("nmap", self.target, options={"mode": "default"})
+            self.results["nmap"] = nmap_result
+
+            # 2. Analyze Intel
+            intel = nmap_result.get("intel", {})
+            services = intel.get("services", {})
+            found_vulns = intel.get("vulnerabilities", [])
+
+            if not services:
+                print(Fore.RED + "[!] No services found. Hunt aborted.")
+                return
+
+            print(Fore.GREEN + f"[✓] Nmap found {len(services)} services.")
+
+            # 3. Check for immediate vulnerabilities found by Nmap scripts
+            if found_vulns:
+                print(Fore.RED + f"\n[!!!] CRITICAL VULNERABILITIES DETECTED:")
+                for v in found_vulns:
+                    print(f"    - {v['description']}")
+
+            # 4. Plan the Attack
+            print(Fore.YELLOW + "\n[*] Phase 2: Planning Attacks")
+            
+            attack_plan = []
+
+            for port_proto, data in services.items():
+                service_name = data.get("service", "").lower()
+                
+                # Find matching rule
+                for rule in HUNT_RULES:
+                    # Simple matching: if rule service is inside detected service
+                    if rule["service"] in service_name:
+                        attack_plan.append({
+                            "port": port_proto,
+                            "service": service_name,
+                            "modules": rule["modules"],
+                            "desc": rule["description"]
+                        })
+                        break # One rule per service is enough
+
+            if not attack_plan:
+                print("[*] No automatic attack rules match these services.")
+                return
+
+            print(f"[*] Generated Attack Plan:")
+            for idx, attack in enumerate(attack_plan):
+                print(f"    {idx+1}. {attack['port']} ({attack['service']}) -> {attack['desc']}")
+
+            # 5. Execute
+            print(Fore.YELLOW + "\n[*] Phase 3: The Strike")
+            
+            for attack in attack_plan:
+                for module_name in attack["modules"]:
+                    # Check if module exists
+                    if module_name not in self.modules:
+                        continue
+                    
+                    print(Fore.CYAN + f"\n>> Hound is striking: {module_name} on {attack['port']}")
+                    
+                    # Inject port info into options if module needs it (future logic)
+                    # For now, engine targets the main self.target
+                    
+                    try:
+                        output = self.engine.run_single(module_name, self.target)
+                        self.results[module_name] = output
+                        print(Fore.GREEN + f"[✓] {module_name} finished.")
+                    except Exception as e:
+                        print(Fore.RED + f"[x] {module_name} failed: {str(e)}")
+
+            print(Fore.GREEN + "\n[✓] HUNT COMPLETE. Check 'loot' for results.")
+
 
     def do_loot(self, arg):
         """loot → View gathered results"""
+
         if not self.results:
             print("[!] No loot collected yet")
             return
 
         print("\n[ Loot ]")
+
         for mod, output in self.results.items():
             print(f"\n[{mod.upper()}]")
-            print(output if not isinstance(output, dict) else output)
+
+            # -------------------------
+            # Structured Nmap Output
+            # -------------------------
+            if mod == "nmap" and isinstance(output, dict):
+                intel = output.get("intel", {})
+                services = intel.get("services", {})
+
+                print("  Open Ports:")
+                for port_proto, data in services.items():
+                    service = data.get("service", "unknown")
+                    product = data.get("product", "")
+                    version = data.get("version", "")
+                    print(f"    {port_proto:<8} {service:<10} {product} {version}")
+                continue
+
+
+            # -------------------------
+            # Stalk structured output
+            # -------------------------
+            elif mod == "stalk" and isinstance(output, dict):
+
+                http = output.get("http", {})
+                urls = output.get("urls", {})
+                tech = output.get("tech", {})
+                signals = output.get("signals", [])
+
+                print(f"  Alive Hosts: {len(http.get('alive', []))}")
+                print(f"  URLs Found: {len(urls.get('endpoints', []))}")
+                print(f"  JS Files:   {len(urls.get('js_files', []))}")
+                print(f"  Tech Hits:  {len(tech.get('fingerprints', []))}")
+
+                if signals:
+                    print("  Signals:")
+                    for s in signals:
+                        print(f"    - {s}")
+
+            # -------------------------
+            # Raw text modules
+            # -------------------------
+            else:
+                if isinstance(output, str):
+                    print(output.strip())
+                else:
+                    print(output)
+
 
     # ============================
     # RECON
@@ -227,13 +360,32 @@ Type 'help' to view available commands.
 
     def do_nmap(self, arg):
         """nmap → Run reconnaissance scan"""
-
+        
         if not self.target:
             print("[!] Set prey first")
             return
 
-        print(Fore.YELLOW + "[*] Running Nmap...")
-        output = self.engine.run_single("nmap", self.target)
+        # 1. Ask user for mode (This logic belongs in the UI, not the module)
+        print("\nSelect Scan Profile:")
+        print("  [1] Default (Version & Scripts)")
+        print("  [2] Quick (Top 100 ports)")
+        print("  [3] Full (All 65535 ports)")
+        print("  [4] Stealth (Syn Scan)")
+        
+        try:
+            choice = input("Choice [1]: ").strip() or "1"
+        except:
+            choice = "1"
+
+        modes = {"1": "default", "2": "quick", "3": "full", "4": "stealth"}
+        selected_mode = modes.get(choice, "default")
+
+        # 2. Call Module with options
+        print(Fore.YELLOW + f"[*] Running Nmap ({selected_mode} mode)...")
+        
+        # Pass the mode in the options dictionary
+        output = self.engine.run_single("nmap", self.target, options={"mode": selected_mode})
+        
         self.results["nmap"] = output
 
     # ============================
