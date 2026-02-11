@@ -5,6 +5,7 @@ NAME = "ssh"
 CATEGORY = "network"
 DESCRIPTION = "SSH service enumeration"
 
+
 def run(target, emit, options=None):
     emit.info("Enumerating SSH service")
 
