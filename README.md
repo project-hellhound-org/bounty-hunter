@@ -1,68 +1,67 @@
 #  Hellhound – Modular Red Team Framework
 
-Hellhound is a **modular red team framework** designed to orchestrate reconnaissance, enumeration, and attack workflows through an interactive CLI console and an optional GUI dashboard.
+Hellhound Banner
 
-This is **not** a one-click auto-hack tool.
-Hellhound focuses on **control, intelligence, and extensibility**, giving operators the power to decide *how* the hunt proceeds.
+Hellhound is a modular red team framework designed to orchestrate reconnaissance, enumeration, and controlled attack workflows through an interactive CLI console and an optional dashboard interface.
+
+It is built for operators who value structure, intelligence, and extensibility over blind automation.
 
 ![Hellhound Banner](Images/hellhound.png)
 
 ---
 
-##  What Hellhound Is (and Isn’t)
+##  Overview
 
-✔ A **framework** that orchestrates tools  
-✔ A **Metasploit-style interactive console**  
-✔ A **rule-aware hunting engine** (in progress)  
-✔ A **GUI dashboard that can actively attack from UI**  
+Hellhound provides a structured environment for:
 
-✖ Not just a script runner  
-✖ Not blind automation  
-✖ Not “scan and forget”
+  - Target classification (Host vs Web)
+  - Service-aware reconnaissance
+  - Module-driven execution
+  - Evidence-based decision support
+  - Extensible attack chaining
 
----
-
-## Core Design Philosophy
-
-- Human-in-the-loop decision making
-- Evidence-based recommendations
-- Strict separation of responsibilities:
-  - Asset reconnaissance
-  - DNS reconnaissance
-  - Network scanning
-  - Web intelligence
-- Modular, replaceable components
-- Console safety over automation
+The framework emphasizes control, visibility, and modularity.
 
 ---
 
-##  Key Features
+## What Hellhound Is
 
-### Console Mode (Primary)
-- Interactive Metasploit-style CLI
-- Custom Hellhound command language
-- Target-type awareness (host vs web)
-- Modular execution (`equip → strike`)
-- Intelligent, ranked suggestions (`howl`)
-- Session and loot management
-- Alias system (hunt, use, run, ls, etc.)
-- Clean, colorized output
-- Extensible module system
+  - A modular orchestration framework
+  - A Metasploit-style interactive console
+  - A service-aware reconnaissance engine
+  - A structured hunting environment
+  - A platform for extending custom red team modules
+
+---
+## Architecture Principles
+
+  - Human-in-the-loop operation
+  - Strict module separation (Network, Web, Recon, Enum)
+  - Service-aware intelligence engine
+  - Structured output and session management
+  - Clean CLI abstraction layer
+  - Replaceable and extensible components
+
+##  Core Capabilities
+### Interactive Console
+
+  - Metasploit-style CLI
+  - Target locking (prey)
+  - Context-aware module listing (arsenal)
+  - Controlled execution (equip → strike)
+  - Structured results storage (loot)
+  - Ranked recommendations (howl)
+  - Alias system for operator efficiency
+  - Session management
 
 ### Intelligence Engine
-- Combines results from:
-  - Asset reconnaissance
-  - DNS reconnaissance
-  - Network scans (Nmap)
-  - Web reconnaissance (`stalk`)
-- Produces ranked, evidence-based next steps
-- Designed to support future automation safely
 
-### Dashboard Mode (Planned)
-- GUI-based hunting and exploitation
-- Module execution from UI
-- Session visualization
-- Intended for users who prefer GUI over CLI
+  - Nmap XML parsing
+  - Service detection and version extraction
+  - NSE script analysis
+  - Vulnerability hint detection
+  - Suggestion engine based on detected services
+  - Planned rule-based autonomous hunt mode
 
 ---
 ## Prerequisites
@@ -100,15 +99,15 @@ Ensure all tools are available in your PATH.
 ##  Installation
 
 ```
+# Clone the repository
 git clone https://github.com/l4zz3rj0d/Hellhound-Pentest.git
 cd Hellhound-Pentest
+
+# Install Python dependencies
 pip install .
 pip install -r requirements.txt
 
-````
-
-### Go-Based Tools
-```
+# Install Go-based tools
 go install github.com/lc/gau/v2/cmd/gau@latest
 go install github.com/projectdiscovery/katana/cmd/katana@latest
 ```
@@ -118,15 +117,11 @@ Launch Console Mode
 ```
 hellhound console
 ```
-Launch Dashboard Mode
+Launch Hunting MOde
 ````
 hellhound hunt <target>
 ````
 
-Dashboard runs at:
-````
-http://127.0.0.1:8080
-````
 ## Hellhound Console Commands
 | Command          | Description                    |                    
 | ---------------- | ------------------------------ | 
@@ -172,14 +167,6 @@ hellhound > loot
 
 ````
 
-Each module exposes:
-````
-def run(target, emit, options=None):
-    ...
-    return output
-````
-
-Add a module → register in config.yaml → instantly usable.
 
 ## Sessions & Results
 
