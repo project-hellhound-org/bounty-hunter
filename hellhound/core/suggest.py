@@ -9,7 +9,7 @@ import re
 SERVICE_MODULES = {
     # File Transfer
     "ftp": {
-        "modules": ["ftp_enum", "ftp_bruteforce"],
+        "modules": ["ftp"],
         "reason": "FTP service detected (Cleartext credentials)",
         "severity": 4
     },

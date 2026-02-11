@@ -7,15 +7,16 @@
 HUNT_RULES = [
     {
         "service": "ftp",
-        "modules": ["ftp_enum"],
-        "weight": 5,
-        "description": "FTP Anonymous Check"
+        "modules": ["ftp"],
+        "options": {"mode": "enum"},  # SAFE: Checks for Anonymous first
+        "weight": 9, # High priority (Anonymous FTP is gold)
+        "description": "FTP Anonymous Login Check"
     },
     {
         "service": "ssh",
-        "modules": ["ssh_bruteforce"], # Be careful with bruteforce in auto mode
-        "weight": 4,
-        "description": "SSH Credential Check"
+        "modules": ["ssh_enum"],
+        "weight": 5,
+        "description": "SSH Enumeration"
     },
     {
         "service": "http",

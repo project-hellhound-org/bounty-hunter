@@ -81,13 +81,38 @@ Type 'help' to view available commands.
         self.active_module = None
         self.modules = load_modules()
 
-        # 🔓 Host = FULL UNLOCK
-        self.MODULE_SCOPE = {
-            "host": "ALL",
-            "web": {
-                "nmap", "vhost", "dirsearch", "nikto", "nuclei", "stalk"
+        # ----------------------------
+        # Module Flag Registry
+        # ----------------------------
+        self.MODULE_FLAGS = {
+            "nmap": {
+                "--fast": {"mode": "quick"},
+                "--full": {"mode": "full"},
+                "--udp": {"mode": "udp"},
+                "--vuln": {"mode": "vuln"},
+                "--stealth": {"mode": "stealth"},
+            },
+            "ftp": {
+                "--enum": {"mode": "enum"},
+                "--brute": {"mode": "bruteforce"},
+            },
+            "ssh": {
+                "--enum": {"mode": "enum"},
+                "--brute": {"mode": "bruteforce"},
+            },
+            "dirsearch": {
+                "--deep": {"mode": "deep"}
+            },
+            "nuclei": {
+                "--critical": {"severity": "critical"}
             }
         }
+
+        self.MODULE_SCOPE = {
+            "host": set(self.modules.keys()),  # unlock everything
+            "web": set(self.modules.keys())
+        }
+
 
         self.aliases = {
             "hunt": "prey",
@@ -191,23 +216,32 @@ Type 'help' to view available commands.
     def do_arsenal(self, arg):
         """arsenal → List available tools"""
 
-        # 🔹 No prey → show everything
+        print()
+
         if not self.target_type:
-            print("\n[ Arsenal — ALL MODULES ]")
+            print("[ Arsenal — ALL MODULES ]\n")
             for name, meta in sorted(self.modules.items()):
                 print(f"  {name:<12} - {meta['description']}")
             print()
             return
 
-        scope = self.MODULE_SCOPE.get(self.target_type)
-
-        print(f"\n[ Arsenal — {self.target_type.upper()} ]")
+        print(f"[ Arsenal — {self.target_type.upper()} ]\n")
 
         for name, meta in sorted(self.modules.items()):
-            if scope == "ALL" or name in scope:
+
+            category = meta.get("category", "")
+
+            # WEB prey → only web + recon + nmap
+            if self.target_type == "web":
+                if category in ["web", "recon"] or name == "nmap":
+                    print(f"  {name:<12} - {meta['description']}")
+
+            # HOST prey → show everything
+            elif self.target_type == "host":
                 print(f"  {name:<12} - {meta['description']}")
 
         print()
+
 
     def do_hunt(self, arg):
             """
@@ -277,23 +311,21 @@ Type 'help' to view available commands.
             
             for attack in attack_plan:
                 for module_name in attack["modules"]:
-                    # Check if module exists
                     if module_name not in self.modules:
                         continue
                     
                     print(Fore.CYAN + f"\n>> Hound is striking: {module_name} on {attack['port']}")
                     
-                    # Inject port info into options if module needs it (future logic)
-                    # For now, engine targets the main self.target
+                    # GET OPTIONS FROM STRATEGY
+                    module_opts = attack.get("options", {})
                     
                     try:
-                        output = self.engine.run_single(module_name, self.target)
+                        # PASS OPTIONS TO ENGINE
+                        output = self.engine.run_single(module_name, self.target, options=module_opts)
                         self.results[module_name] = output
                         print(Fore.GREEN + f"[✓] {module_name} finished.")
                     except Exception as e:
                         print(Fore.RED + f"[x] {module_name} failed: {str(e)}")
-
-            print(Fore.GREEN + "\n[✓] HUNT COMPLETE. Check 'loot' for results.")
 
 
     def do_loot(self, arg):
@@ -419,25 +451,68 @@ Type 'help' to view available commands.
         self.prompt = Fore.RED + "hellhound > " + Style.RESET_ALL
 
     def do_strike(self, arg):
-        """strike → Execute selected tool"""
+        """
+        strike [module] [--flags]
+        Executes selected module with validated flags.
+        """
 
         if not self.target or not self.target_type:
             print("[!] No prey set")
             return
 
-        module = self.active_module or arg.strip()
+        parts = arg.split()
+
+        # Determine module
+        module = self.active_module
+        if parts and not parts[0].startswith("--"):
+            module = parts[0]
+            parts = parts[1:]  # Remove module name from flag parsing
+
         if not module:
-            print("Usage: strike OR equip <module> then strike")
+            print("Usage: strike <module> [--flags]")
+            print("       strike (if tool equipped)")
             return
 
-        scope = self.MODULE_SCOPE.get(self.target_type)
-        if scope != "ALL" and module not in scope:
+        # Scope check
+        allowed = self.MODULE_SCOPE.get(self.target_type, set())
+        if module not in allowed:
             print(Fore.RED + f"[!] '{module}' not allowed for {self.target_type} prey")
             return
 
+        # Handle help flag
+        if "--help" in parts:
+            self._show_module_help(module)
+            return
+
+        # Validate flags
+        module_flags = self.MODULE_FLAGS.get(module, {})
+        options = {}
+
+        for flag in parts:
+            if flag not in module_flags:
+                print(Fore.RED + f"[!] Unsupported flag '{flag}' for module '{module}'")
+                return
+
+            # Merge mapped options
+            options.update(module_flags[flag])
+
         print(Fore.YELLOW + f"[*] Executing {module}...")
-        output = self.engine.run_single(module, self.target)
+        output = self.engine.run_single(module, self.target, options=options if options else None)
         self.results[module] = output
+
+    def _show_module_help(self, module):
+        print(f"\n[ Help — {module} ]")
+
+        flags = self.MODULE_FLAGS.get(module, {})
+        if not flags:
+            print("  No flags available.")
+            return
+
+        for flag in flags:
+            print(f"  {flag}")
+
+        print()
+
 
     # ============================
     # INTELLIGENCE
