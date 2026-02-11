@@ -67,7 +67,7 @@ class HellhoundEngine:
             return ""
 
         try:
-            return module.run(target, self.emit, **kwargs)
+            return module.run(target, self.emit, options=kwargs.get("options"))
         except Exception as e:
             self.emit.warn(f"Module '{module_name}' crashed: {e}")
             return ""

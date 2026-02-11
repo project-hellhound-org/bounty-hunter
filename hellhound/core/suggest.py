@@ -1,153 +1,198 @@
 import re
 
 # -------------------------------------------------
-# Port-based suggestions (new structured format)
+# 1. THE KNOWLEDGE BASE (No more hardcoding ports)
 # -------------------------------------------------
 
-PORT_SUGGESTIONS = {
-    21: {
+# Maps Nmap Service Names -> Hellhound Modules
+# Keys are lowercased service names detected by Nmap
+SERVICE_MODULES = {
+    # File Transfer
+    "ftp": {
         "modules": ["ftp_enum", "ftp_bruteforce"],
-        "reason": "FTP service detected",
-        "severity": 4,
-        "confidence": 4
+        "reason": "FTP service detected (Cleartext credentials)",
+        "severity": 4
     },
-    22: {
+    # Remote Access
+    "ssh": {
         "modules": ["ssh_enum", "ssh_bruteforce"],
-        "reason": "SSH service detected",
-        "severity": 4,
-        "confidence": 4
+        "reason": "SSH service detected (Brute force target)",
+        "severity": 3
     },
-    23: {
+    "telnet": {
         "modules": ["telnet_enum"],
-        "reason": "Telnet uses cleartext communication",
-        "severity": 5,
-        "confidence": 5
+        "reason": "Telnet detected (Insecure cleartext)",
+        "severity": 5
     },
-    25: {
-        "modules": ["smtp_enum"],
-        "reason": "SMTP service detected",
-        "severity": 4,
-        "confidence": 4
-    },
-    53: {
-        "modules": ["dns_zone_transfer", "dns_enum"],
-        "reason": "DNS service detected",
-        "severity": 3,
-        "confidence": 4
-    },
-    80: {
-        "modules": ["dirsearch", "vhost"],
-        "reason": "HTTP service detected",
-        "severity": 3,
-        "confidence": 4
-    },
-    443: {
-        "modules": ["dirsearch", "vhost", "ssl_enum"],
-        "reason": "HTTPS service detected",
-        "severity": 3,
-        "confidence": 4
-    },
-    445: {
-        "modules": ["smb_enum", "smb_vuln_check"],
-        "reason": "SMB service detected",
-        "severity": 5,
-        "confidence": 5
-    },
-    3306: {
-        "modules": ["mysql_enum", "mysql_bruteforce"],
-        "reason": "MySQL service detected",
-        "severity": 4,
-        "confidence": 4
-    },
-    3389: {
+    "rdp": {
         "modules": ["rdp_enum"],
-        "reason": "RDP service detected",
-        "severity": 4,
-        "confidence": 4
+        "reason": "Remote Desktop Protocol detected",
+        "severity": 3
+    },
+    # Web Services (Covers http, https, ssl/http, etc)
+    "http": {
+        "modules": ["dirsearch", "vhost", "nuclei"],
+        "reason": "Web service detected (Application attack surface)",
+        "severity": 3
+    },
+    "https": {
+        "modules": ["dirsearch", "vhost", "nuclei", "ssl_scan"],
+        "reason": "Secure web service detected",
+        "severity": 3
+    },
+    # Database
+    "mysql": {
+        "modules": ["mysql_enum", "mysql_bruteforce"],
+        "reason": "MySQL database detected",
+        "severity": 4
+    },
+    "ms-sql-s": {
+        "modules": ["mssql_enum", "mssql_bruteforce"],
+        "reason": "MSSQL database detected",
+        "severity": 4
+    },
+    # Windows / SMB
+    "microsoft-ds": {
+        "modules": ["smb_enum", "smb_vuln"],
+        "reason": "SMB/File sharing detected",
+        "severity": 5
+    },
+    "netbios-ssn": {
+        "modules": ["smb_enum"],
+        "reason": "NetBIOS detected",
+        "severity": 3
+    },
+    # Infrastructure
+    "domain": {
+        "modules": ["dns_zone_transfer", "dns_enum"],
+        "reason": "DNS server detected",
+        "severity": 3
+    },
+    "smtp": {
+        "modules": ["smtp_enum"],
+        "reason": "Mail server detected (User enumeration)",
+        "severity": 3
     }
 }
 
 # -------------------------------------------------
-# Helpers
+# 2. VERSION HEURISTICS (Smart Hints)
 # -------------------------------------------------
 
-def extract_open_ports(nmap_output: str):
-    ports = set()
-    for line in nmap_output.splitlines():
-        match = re.match(r"(\d+)/tcp\s+open", line)
-        if match:
-            ports.add(int(match.group(1)))
-    return ports
-
-
-def score(entry):
-    return entry.get("severity", 1) * entry.get("confidence", 1)
-
+# Regex patterns to match specific vulnerable versions
+VERSION_HINTS = [
+    {
+        "match": r"vsftpd\s*2\.3\.4",
+        "hint": "CHECK: Vsftpd 2.3.4 Backdoor (CVE-2011-2523)",
+        "priority": 10
+    },
+    {
+        "match": r"openssh\s*7\.[2-4]",
+        "hint": "CHECK: OpenSSH User Enumeration (CVE-2018-15473)",
+        "priority": 6
+    },
+    {
+        "match": r"apache\s*2\.4\.49",
+        "hint": "CRITICAL: Apache Path Traversal (CVE-2021-41773)",
+        "priority": 10
+    },
+    {
+        "match": r"smb.*?smtp",
+        "hint": "CHECK: SMB Vulnerable to EternalBlue (MS17-010)",
+        "priority": 10
+    }
+]
 
 # -------------------------------------------------
-# Core Suggest Engine (internal)
+# 3. CORE ENGINE
 # -------------------------------------------------
 
-def _build_suggestions(nmap_output: str):
+def get_service_rule(service_name):
+    """
+    Lookup modules based on service name.
+    Normalizes names like 'ssl/http' -> 'http'
+    """
+    service_name = service_name.lower()
+    
+    # Direct match
+    if service_name in SERVICE_MODULES:
+        return SERVICE_MODULES[service_name]
+    
+    # Partial match (e.g., 'ssl/http' contains 'http')
+    for key in SERVICE_MODULES:
+        if key in service_name:
+            return SERVICE_MODULES[key]
+
+    return None
+
+
+def analyze_version(version_string):
+    """
+    Check version string against known vulnerable patterns
+    """
+    hints = []
+    if not version_string:
+        return hints
+
+    for rule in VERSION_HINTS:
+        if re.search(rule["match"], version_string, re.IGNORECASE):
+            hints.append({
+                "type": "VULNERABILITY_HINT",
+                "hint": rule["hint"],
+                "priority": rule["priority"]
+            })
+    return hints
+
+
+def suggest_actions(nmap_result):
+    intel = nmap_result.get("intel", {})
+    if intel.get("vulnerabilities"):
+        for vuln in intel['vulnerabilities']:
+            suggestions.append(f"CRITICAL: {vuln['script']} found on port {vuln['port']}")
+    
+    if not nmap_result:
+        return ["[!] No scan data provided"]
+
+    # Backward compatibility: Handle if raw string is passed by accident
+    if isinstance(nmap_result, str):
+        return ["[!] Legacy nmap output detected. Please re-run scan to use intel engine."]
+
+    intel = nmap_result.get("intel", {})
+    services = intel.get("services", {})
+    
+    if not services:
+        return ["[!] No services found. Try 'nmap mode=full'"]
+
     suggestions = []
 
-    if not nmap_output:
-        return []
-
-    open_ports = extract_open_ports(nmap_output)
-
-    for port in sorted(open_ports):
-        entry = PORT_SUGGESTIONS.get(port)
-        if entry:
-            suggestions.append({
-                "port": port,
-                "modules": entry["modules"],
-                "reason": entry["reason"],
-                "priority": score(entry),
-                "severity": entry["severity"],
-                "confidence": entry["confidence"]
-            })
+    # Iterate over found services
+    for port_proto, data in services.items():
+        
+        port = port_proto.split("/")[0]
+        service = data.get("service", "unknown")
+        version = data.get("version", "")
+        
+        # 1. Check Service Rules
+        rule = get_service_rule(service)
+        if rule:
+            mods = ", ".join(rule["modules"])
+            suggestions.append(
+                f"[PORT {port}] {service.upper()} → {mods} ({rule['reason']})"
+            )
         else:
-            suggestions.append({
-                "port": port,
-                "modules": [],
-                "reason": "Unknown service – manual analysis required",
-                "priority": 1,
-                "severity": 1,
-                "confidence": 1
-            })
+            # Unknown service generic advice
+            suggestions.append(
+                f"[PORT {port}] UNKNOWN SERVICE ({service}) → Manual analysis required"
+            )
 
-    suggestions.sort(key=lambda x: x["priority"], reverse=True)
+        # 2. Check Version Heuristics (CVE checks)
+        v_hints = analyze_version(version)
+        for hint in v_hints:
+            suggestions.append(
+                f"[CRITICAL] {hint['hint']} (Detected on port {port})"
+            )
+
+    # Remove duplicates and sort
+    suggestions = list(dict.fromkeys(suggestions))
+    
     return suggestions
-
-
-# -------------------------------------------------
-# PUBLIC API (Legacy Console Compatible)
-# -------------------------------------------------
-
-def suggest_actions(nmap_output: str):
-    """
-    Legacy-compatible API.
-    Returns a LIST OF STRINGS (required by console).
-    """
-
-    structured = _build_suggestions(nmap_output)
-
-    if not structured:
-        return ["No actionable suggestions available"]
-
-    output = []
-
-    for s in structured:
-        if s["modules"]:
-            mods = ", ".join(s["modules"])
-            output.append(
-                f"[PRIORITY {s['priority']}] "
-                f"[{s['port']}] {mods} — {s['reason']}"
-            )
-        else:
-            output.append(
-                f"[{s['port']}] {s['reason']}"
-            )
-
-    return output
