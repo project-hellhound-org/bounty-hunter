@@ -18,13 +18,6 @@ from hellhound.core.suggest import suggest_actions
 def load_modules():
     modules = {}
 
-    yaml_modules = {}
-    try:
-        with pkg_resources.files("hellhound").joinpath("config.yaml").open("r") as f:
-            yaml_modules = yaml.safe_load(f).get("modules", {})
-    except Exception:
-        pass
-
     base = pkg_resources.files("hellhound").joinpath("modules")
 
     for category in os.listdir(base):
@@ -36,18 +29,29 @@ def load_modules():
             if not file.endswith(".py") or file.startswith("__"):
                 continue
 
-            name = file[:-3]
-            desc = yaml_modules.get(name, {}).get(
-                "description",
-                f"{category.capitalize()} module"
-            )
+            module_name = file[:-3]
 
-            modules[name] = {
-                "category": category,
-                "description": desc
+            try:
+                # Dynamically import module
+                module = __import__(
+                    f"hellhound.modules.{category}.{module_name}",
+                    fromlist=["*"]
+                )
+
+                description = getattr(module, "DESCRIPTION", "No description provided")
+                real_category = getattr(module, "CATEGORY", category)
+
+            except Exception:
+                description = "No description available"
+                real_category = category
+
+            modules[module_name] = {
+                "category": real_category,
+                "description": description
             }
 
     return modules
+
 
 
 class HellhoundConsole(cmd.Cmd):
@@ -107,12 +111,6 @@ Type 'help' to view available commands.
                 "--critical": {"severity": "critical"}
             }
         }
-
-        self.MODULE_SCOPE = {
-            "host": set(self.modules.keys()),  # unlock everything
-            "web": set(self.modules.keys())
-        }
-
 
         self.aliases = {
             "hunt": "prey",
@@ -218,6 +216,7 @@ Type 'help' to view available commands.
 
         print()
 
+        # If no prey selected
         if not self.target_type:
             print("[ Arsenal — ALL MODULES ]\n")
             for name, meta in sorted(self.modules.items()):
@@ -228,19 +227,22 @@ Type 'help' to view available commands.
         print(f"[ Arsenal — {self.target_type.upper()} ]\n")
 
         for name, meta in sorted(self.modules.items()):
-
             category = meta.get("category", "")
 
-            # WEB prey → only web + recon + nmap
+            # WEB prey
             if self.target_type == "web":
-                if category in ["web", "recon"] or name == "nmap":
+                # Allow web + recon + network + nmap
+                if category in ["web", "recon", "network"] or name == "nmap":
                     print(f"  {name:<12} - {meta['description']}")
 
-            # HOST prey → show everything
+            # HOST prey
             elif self.target_type == "host":
+                # Host sees everything
                 print(f"  {name:<12} - {meta['description']}")
 
         print()
+
+
 
 
     def do_hunt(self, arg):
@@ -327,63 +329,123 @@ Type 'help' to view available commands.
                     except Exception as e:
                         print(Fore.RED + f"[x] {module_name} failed: {str(e)}")
 
-
     def do_loot(self, arg):
         """loot → View gathered results"""
 
         if not self.results:
-            print("[!] No loot collected yet")
+            print(Fore.RED + "[!] No loot collected yet")
             return
 
-        print("\n[ Loot ]")
+        print("\n" + Fore.CYAN + "========== [ LOOT ] ==========\n")
 
         for mod, output in self.results.items():
-            print(f"\n[{mod.upper()}]")
 
-            # -------------------------
-            # Structured Nmap Output
-            # -------------------------
-            if mod == "nmap" and isinstance(output, dict):
+            print(Fore.YELLOW + f"[{mod.upper()}]")
+
+            # -----------------------------------------
+            # 1️⃣ Structured Modules (Preferred Design)
+            # -----------------------------------------
+            if isinstance(output, dict) and "intel" in output:
+
                 intel = output.get("intel", {})
-                services = intel.get("services", {})
 
-                print("  Open Ports:")
-                for port_proto, data in services.items():
-                    service = data.get("service", "unknown")
-                    product = data.get("product", "")
-                    version = data.get("version", "")
-                    print(f"    {port_proto:<8} {service:<10} {product} {version}")
-                continue
+                # --- NMAP STYLE ---
+                if "services" in intel:
+                    services = intel.get("services", {})
+                    if services:
+                        print(Fore.GREEN + "  Open Services:")
+                        for port_proto, data in services.items():
+                            service = data.get("service", "unknown")
+                            product = data.get("product", "")
+                            version = data.get("version", "")
+                            print(
+                                f"    {Fore.CYAN}{port_proto:<8} "
+                                f"{Fore.WHITE}{service:<12} "
+                                f"{Fore.YELLOW}{product} {version}"
+                            )
+                    print()
 
+                # --- ENDPOINT STYLE (sniff, stalk, etc.) ---
+                if "endpoints" in intel:
+                    endpoints = intel.get("endpoints", [])
+                    stats = intel.get("stats", {})
 
-            # -------------------------
-            # Stalk structured output
-            # -------------------------
-            elif mod == "stalk" and isinstance(output, dict):
+                    if stats:
+                        print(Fore.GREEN + "  Attack Surface Summary:")
+                        print(f"    GET  : {stats.get('get', 0)}")
+                        print(f"    POST : {stats.get('post', 0)}")
+                        print(f"    TOTAL: {stats.get('total', 0)}")
+                        print()
 
-                http = output.get("http", {})
-                urls = output.get("urls", {})
-                tech = output.get("tech", {})
-                signals = output.get("signals", [])
+                    for idx, ep in enumerate(endpoints, 1):
+                        method = ep.get("method", "GET")
+                        url = ep.get("url", "")
 
-                print(f"  Alive Hosts: {len(http.get('alive', []))}")
-                print(f"  URLs Found: {len(urls.get('endpoints', []))}")
-                print(f"  JS Files:   {len(urls.get('js_files', []))}")
-                print(f"  Tech Hits:  {len(tech.get('fingerprints', []))}")
+                        method_color = Fore.BLUE if method == "GET" else Fore.MAGENTA
+                        print(method_color + f"  [{idx}] {method}  {url}")
 
-                if signals:
-                    print("  Signals:")
-                    for s in signals:
-                        print(f"    - {s}")
+                        # Parameters
+                        for p in ep.get("params", []):
+                            pname = p.get("name", "")
+                            ptype = p.get("type", "")
 
-            # -------------------------
-            # Raw text modules
-            # -------------------------
+                            risk_color = (
+                                Fore.RED if pname.lower() in ["id", "token", "password", "uid"]
+                                else Fore.WHITE
+                            )
+
+                            print(f"       - {risk_color}{pname} {Fore.YELLOW}({ptype})")
+
+                        # Tags
+                        if ep.get("tags"):
+                            print(Fore.RED + f"       Tags: {', '.join(ep['tags'])}")
+
+                        print()
+
+                # --- JS FILES ---
+                if "js_files" in intel:
+                    js_files = intel.get("js_files", [])
+                    if js_files:
+                        print(Fore.GREEN + "  JavaScript Files:")
+                        for js in js_files:
+                            print(f"    - {js}")
+                        print()
+
+                # --- SIGNALS ---
+                if "signals" in intel:
+                    signals = intel.get("signals", [])
+                    if signals:
+                        print(Fore.GREEN + "  Signals:")
+                        for s in signals:
+                            print(f"    - {s}")
+                        print()
+
+                # --- VULNERABILITIES ---
+                if "vulnerabilities" in intel:
+                    vulns = intel.get("vulnerabilities", [])
+                    if vulns:
+                        print(Fore.RED + "  ⚠ Vulnerabilities Detected:")
+                        for v in vulns:
+                            print(f"    - Port {v.get('port')} | {v.get('description')}")
+                        print()
+
+            # -----------------------------------------
+            # 2️⃣ Raw Text Fallback
+            # -----------------------------------------
+            elif isinstance(output, str):
+                print(Fore.WHITE + output.strip()[:1000])
+                print()
+
+            # -----------------------------------------
+            # 3️⃣ Unknown Format Fallback
+            # -----------------------------------------
             else:
-                if isinstance(output, str):
-                    print(output.strip())
-                else:
-                    print(output)
+                print(Fore.WHITE + str(output))
+                print()
+
+        print(Fore.CYAN + "================================\n")
+
+
 
 
     # ============================
@@ -432,15 +494,10 @@ Type 'help' to view available commands.
             return
 
         module = arg.strip()
+
         if module not in self.modules:
             print(f"[!] Unknown module: {module}")
             return
-
-        scope = self.MODULE_SCOPE.get(self.target_type)
-        if scope != "ALL" and module not in scope:
-            print(Fore.RED + f"[!] Module '{module}' not suitable for {self.target_type} targets")
-            return
-
         self.active_module = module
         self.prompt = Fore.RED + f"hellhound({module}) > " + Style.RESET_ALL
         print(Fore.GREEN + f"[+] {module} equipped")
@@ -473,10 +530,13 @@ Type 'help' to view available commands.
             print("       strike (if tool equipped)")
             return
 
-        # Scope check
-        allowed = self.MODULE_SCOPE.get(self.target_type, set())
-        if module not in allowed:
-            print(Fore.RED + f"[!] '{module}' not allowed for {self.target_type} prey")
+        # Category-based scope enforcement
+        category = self.modules[module]["category"]
+
+        ALLOWED_FOR_WEB = {"web", "recon", "network"}
+
+        if self.target_type == "web" and category not in ALLOWED_FOR_WEB:
+            print(Fore.RED + f"[!] '{module}' not suitable for WEB targets")
             return
 
         # Handle help flag
