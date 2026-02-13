@@ -8,21 +8,46 @@ import time
 
 NAME = "spider"
 CATEGORY = "recon"
-DESCRIPTION = "Advanced intelligent crawler (Deep mapping, GET/POST extraction, JS APIs, Auth detection, Security posture)"
+DESCRIPTION = "Advanced intelligent crawler (Deep mapping, GET/POST extraction, Risk tagging, Auth detection, JS/API discovery)"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Hellhound Spider v4.0)"
+    "User-Agent": "Mozilla/5.0 (Hellhound Spider v5.0)"
 }
 
 RISK_KEYWORDS = {
+    # Command injection
+    "cmd": "COMMAND_INJECTION",
+    "exec": "COMMAND_INJECTION",
+    "system": "COMMAND_INJECTION",
+    "shell": "COMMAND_INJECTION",
+
+    # OS interaction
+    "ip": "SYSTEM_INTERACTION",
+    "host": "SYSTEM_INTERACTION",
+    "target": "SYSTEM_INTERACTION",
+    "ping": "SYSTEM_INTERACTION",
+
+    # File interaction
+    "file": "FILE_OPERATION",
+    "path": "FILE_OPERATION",
+    "page": "LFI_RFI_POTENTIAL",
+
+    # ID based
     "id": "IDOR_POTENTIAL",
-    "user_id": "IDOR_POTENTIAL",
+    "user": "IDOR_POTENTIAL",
+    "uid": "IDOR_POTENTIAL",
+
+    # Auth
     "token": "AUTH_BYPASS",
     "password": "AUTH_SURFACE",
-    "file": "FILE_UPLOAD",
-    "cmd": "COMMAND_INJECTION",
+
+    # Redirect
+    "redirect": "OPEN_REDIRECT",
+    "url": "OPEN_REDIRECT",
+
+    # DB
     "search": "SQLI_POTENTIAL",
-    "redirect": "OPEN_REDIRECT"
+    "query": "SQLI_POTENTIAL",
 }
 
 
@@ -52,7 +77,6 @@ class SpiderEngine:
 
         self.intel = {
             "endpoints": [],
-            "js_files": [],
             "api_endpoints": [],
             "auth_surfaces": [],
             "security_headers": {},
@@ -80,23 +104,45 @@ class SpiderEngine:
 
     def classify_risks(self, params):
         risks = []
+
         for p in params:
             name = p["name"].lower()
+
+            # Exact
             if name in RISK_KEYWORDS:
                 risks.append(RISK_KEYWORDS[name])
+                continue
+
+            # Partial
+            for key in RISK_KEYWORDS:
+                if key in name:
+                    risks.append(RISK_KEYWORDS[key])
+                    break
+
         return list(set(risks))
+
+    def calculate_priority(self, risks):
+        score = 1
+        if "COMMAND_INJECTION" in risks:
+            score += 5
+        if "SYSTEM_INTERACTION" in risks:
+            score += 4
+        if "SQLI_POTENTIAL" in risks:
+            score += 3
+        if "IDOR_POTENTIAL" in risks:
+            score += 2
+        return score
 
     # =================================================
     # Authentication
     # =================================================
 
     def attempt_login(self, login_url):
-        self.emit.info("Attempting authentication bypass...")
+        self.emit.info("Attempting basic authentication bypass...")
 
         try:
             r = self.session.get(login_url, timeout=5)
             soup = BeautifulSoup(r.text, "html.parser")
-
             form = soup.find("form")
             if not form:
                 return False
@@ -110,9 +156,9 @@ class SpiderEngine:
                 name = inp.get("name")
                 if not name:
                     continue
-                if name.lower() == "username":
+                if "user" in name.lower():
                     data[name] = "admin"
-                elif name.lower() == "password":
+                elif "pass" in name.lower():
                     data[name] = "password"
                 else:
                     data[name] = inp.get("value", "")
@@ -124,12 +170,11 @@ class SpiderEngine:
 
             self.emit.success("Authentication attempt completed.")
             return True
-
         except:
             return False
 
     # =================================================
-    # Worker Thread
+    # Worker
     # =================================================
 
     def worker(self):
@@ -158,9 +203,6 @@ class SpiderEngine:
                 self.detect_tech(r)
                 self.parse_html(r.text, url, depth)
 
-            elif "javascript" in content_type or url.endswith(".js"):
-                self.analyze_js(r.text)
-
     # =================================================
     # HTML Parsing
     # =================================================
@@ -168,18 +210,19 @@ class SpiderEngine:
     def parse_html(self, html, base_url, depth):
         soup = BeautifulSoup(html, "html.parser")
 
-        # Detect login form
         if soup.find("input", {"type": "password"}):
             self.login_detected = True
 
-        # Extract links
+        # GET params on current URL
+        self.extract_get_params(base_url)
+
+        # Links
         for tag in soup.find_all("a", href=True):
             link = urljoin(base_url, tag["href"])
             if self.in_scope(link):
                 self.queue.append((link, depth + 1))
-                self.extract_get_params(link)
 
-        # Extract forms
+        # Forms
         for form in soup.find_all("form"):
             self.process_form(form, base_url)
 
@@ -189,7 +232,7 @@ class SpiderEngine:
                 self.analyze_js(script.string)
 
     # =================================================
-    # GET Parameter Extraction
+    # GET Extraction
     # =================================================
 
     def extract_get_params(self, url):
@@ -199,12 +242,14 @@ class SpiderEngine:
 
         params = [{"name": k, "type": "query"} for k in parse_qs(parsed.query)]
         risks = self.classify_risks(params)
+        priority = self.calculate_priority(risks)
 
         endpoint = {
             "method": "GET",
             "url": url,
             "params": params,
             "risks": risks,
+            "priority": priority,
             "tags": ["GET_PARAM"]
         }
 
@@ -213,6 +258,11 @@ class SpiderEngine:
                 self.intel["endpoints"].append(endpoint)
                 self.intel["stats"]["get"] += 1
                 self.intel["stats"]["total"] += 1
+
+                if risks:
+                    self.intel["signals"].append("HIGH_RISK_PARAMETERS_DETECTED")
+                    if "SYSTEM_INTERACTION" in risks:
+                        self.intel["signals"].append("POSSIBLE_OS_COMMAND_SURFACE")
 
     # =================================================
     # Form Handling
@@ -237,6 +287,7 @@ class SpiderEngine:
                 })
 
         risks = self.classify_risks(params)
+        priority = self.calculate_priority(risks)
 
         if any(p["name"].lower() == "password" for p in params):
             self.intel["auth_surfaces"].append(full_url)
@@ -247,6 +298,7 @@ class SpiderEngine:
             "url": full_url,
             "params": params,
             "risks": risks,
+            "priority": priority,
             "tags": ["FORM"]
         }
 
@@ -259,27 +311,22 @@ class SpiderEngine:
                     self.intel["stats"]["post"] += 1
                 self.intel["stats"]["total"] += 1
 
+                if risks:
+                    self.intel["signals"].append("HIGH_RISK_PARAMETERS_DETECTED")
+                    if "SYSTEM_INTERACTION" in risks:
+                        self.intel["signals"].append("POSSIBLE_OS_COMMAND_SURFACE")
+
     # =================================================
     # JS Analysis
     # =================================================
 
     def analyze_js(self, content):
 
-        # API discovery
         api_matches = re.findall(r"(\/api\/[A-Za-z0-9\/_\-]+)", content)
-        versioned = re.findall(r"(\/v[0-9]+\/[A-Za-z0-9\/_\-]+)", content)
-
-        for match in api_matches + versioned:
+        for match in api_matches:
             if match not in self.intel["api_endpoints"]:
                 self.intel["api_endpoints"].append(match)
 
-        # Fetch / axios detection
-        fetch_calls = re.findall(r"(fetch|axios)\(['\"]([^'\"]+)", content)
-        for _, endpoint in fetch_calls:
-            if endpoint.startswith("/"):
-                self.intel["api_endpoints"].append(endpoint)
-
-        # JWT detection
         if re.search(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.", content):
             self.intel["signals"].append("JWT_DETECTED")
 
@@ -308,18 +355,14 @@ class SpiderEngine:
         server = response.headers.get("Server", "").lower()
         x_powered = response.headers.get("X-Powered-By", "").lower()
 
-        tech = []
-
         if "php" in x_powered:
-            tech.append("PHP")
+            self.intel["tech_stack"].append("PHP")
         if "express" in x_powered:
-            tech.append("Node/Express")
+            self.intel["tech_stack"].append("Node/Express")
         if "django" in server:
-            tech.append("Django")
+            self.intel["tech_stack"].append("Django")
         if "nginx" in server:
-            tech.append("Nginx")
-
-        self.intel["tech_stack"].extend(tech)
+            self.intel["tech_stack"].append("Nginx")
 
     # =================================================
     # Run
@@ -350,7 +393,6 @@ class SpiderEngine:
         for t in threads:
             t.join()
 
-        # Login wall detection
         if self.login_detected and not self.auth_enabled and self.intel["stats"]["links"] < 3:
             self.intel["signals"].append("LOGIN_WALL_DETECTED")
             self.emit.warn("Authentication wall detected.")

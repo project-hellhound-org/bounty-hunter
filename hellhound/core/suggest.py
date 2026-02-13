@@ -32,6 +32,18 @@ SERVICE_MODULES = {
     }
 }
 
+# =================================================
+# Spider Risk → Module Mapping
+# =================================================
+
+RISK_MODULE_MAP = {
+    "COMMAND_INJECTION": "cmdinj",
+    "SQLI_POTENTIAL": "sqli",
+    "IDOR_POTENTIAL": "idor",
+    "FILE_OPERATION": "lfi",
+    "OPEN_REDIRECT": "redirect",
+    "AUTH_SURFACE": "auth",
+}
 
 # =================================================
 # VERSION HEURISTICS
@@ -95,6 +107,42 @@ def suggest_actions(results):
 
         if not services:
             suggestions.append("No services found. Try full Nmap scan.")
+    # =================================================
+    # 1️⃣ Spider-Based Intelligence
+    # =================================================
+
+    if "spider" in results:
+
+        spider_data = results["spider"]
+        intel = spider_data.get("intel", {})
+        endpoints = intel.get("endpoints", [])
+        signals = intel.get("signals", [])
+
+        if not endpoints:
+            suggestions.append("[SPIDER] No endpoints discovered. Increase depth or check auth.")
+        else:
+            # Sort by priority
+            sorted_eps = sorted(
+                endpoints,
+                key=lambda x: x.get("priority", 1),
+                reverse=True
+            )
+
+            for ep in sorted_eps[:5]:  # top 5 highest priority
+                risks = ep.get("risks", [])
+                url = ep.get("url")
+
+                for risk in risks:
+                    module = RISK_MODULE_MAP.get(risk)
+                    if module:
+                        suggestions.append(
+                            f"[SPIDER] High-Risk → {risk} at {url} → try: strike {module}"
+                        )
+
+        if "LOGIN_WALL_DETECTED" in signals:
+            suggestions.append(
+                "[SPIDER] Authentication wall detected → try: strike spider --auth"
+            )
 
     # -------------------------------------------------
     # 2️⃣ SPIDER / SNIFF INTEL
