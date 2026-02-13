@@ -109,7 +109,11 @@ Type 'help' to view available commands.
             },
             "nuclei": {
                 "--critical": {"severity": "critical"}
+            },
+            "cmdinj": {
+                "--auto": {"auto": True}
             }
+
         }
 
         self.aliases = {
@@ -232,7 +236,7 @@ Type 'help' to view available commands.
             # WEB prey
             if self.target_type == "web":
                 # Allow web + recon + network + nmap
-                if category in ["web", "recon", "network"] or name == "nmap":
+                if category in ["web", "recon", "network", "vuln"] or name == "nmap":
                     print(f"  {name:<12} - {meta['description']}")
 
             # HOST prey
@@ -523,23 +527,26 @@ Type 'help' to view available commands.
         module = self.active_module
         if parts and not parts[0].startswith("--"):
             module = parts[0]
-            parts = parts[1:]  # Remove module name from flag parsing
+            parts = parts[1:]
 
         if not module:
             print("Usage: strike <module> [--flags]")
             print("       strike (if tool equipped)")
             return
 
-        # Category-based scope enforcement
-        category = self.modules[module]["category"]
+        if module not in self.modules:
+            print(Fore.RED + f"[!] Unknown module: {module}")
+            return
 
-        ALLOWED_FOR_WEB = {"web", "recon", "network"}
+        # Scope enforcement
+        category = self.modules[module]["category"]
+        ALLOWED_FOR_WEB = {"web", "recon", "network", "vuln"}
 
         if self.target_type == "web" and category not in ALLOWED_FOR_WEB:
             print(Fore.RED + f"[!] '{module}' not suitable for WEB targets")
             return
 
-        # Handle help flag
+        # Handle help
         if "--help" in parts:
             self._show_module_help(module)
             return
@@ -552,13 +559,23 @@ Type 'help' to view available commands.
             if flag not in module_flags:
                 print(Fore.RED + f"[!] Unsupported flag '{flag}' for module '{module}'")
                 return
-
-            # Merge mapped options
             options.update(module_flags[flag])
 
+        # Auto-inject spider intel into cmdinj
+        if module == "cmdinj":
+            if "spider" in self.results:
+                options["spider_results"] = self.results["spider"]
+                options.setdefault("auto", True)
+
         print(Fore.YELLOW + f"[*] Executing {module}...")
-        output = self.engine.run_single(module, self.target, options=options if options else None)
-        self.results[module] = output
+
+        try:
+            output = self.engine.run_single(module, self.target, options=options if options else None)
+            self.results[module] = output
+            print(Fore.GREEN + f"[✓] {module} finished.")
+        except Exception as e:
+            print(Fore.RED + f"[x] {module} failed: {str(e)}")
+
 
     def _show_module_help(self, module):
         print(f"\n[ Help — {module} ]")
