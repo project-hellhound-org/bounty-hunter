@@ -1,8 +1,13 @@
 # hellhound/core/engine.py
+
 import importlib
 import subprocess
 import shutil
 
+
+# =================================================
+# Emit Handler
+# =================================================
 
 class Emit:
     """
@@ -36,7 +41,12 @@ class Emit:
             self.socketio.emit("log", {"message": msg})
 
 
+# =================================================
+# Hellhound Engine
+# =================================================
+
 class HellhoundEngine:
+
     def __init__(self, socketio=None):
         self.socketio = socketio
         self.emit = Emit(socketio)
@@ -49,7 +59,22 @@ class HellhoundEngine:
             }
         }
 
-    def run_single(self, module_name, target, **kwargs):
+        # 🔥 Single source of truth for categories
+        self.module_categories = [
+            "network",
+            "web",
+            "enum",
+            "recon",
+            "vuln",      # ✅ ADDED
+            "post",      # future-proof
+            "exploit"    # future-proof
+        ]
+
+    # =================================================
+    # Run Single Module
+    # =================================================
+
+    def run_single(self, module_name, target, options=None):
 
         # 1️⃣ External module handling
         if module_name in self.external_modules:
@@ -67,10 +92,16 @@ class HellhoundEngine:
             return ""
 
         try:
-            return module.run(target, self.emit, options=kwargs.get("options"))
+            result = module.run(target, self.emit, options=options)
+            self.emit.success(f"{module_name} finished.")
+            return result
         except Exception as e:
             self.emit.warn(f"Module '{module_name}' crashed: {e}")
             return ""
+
+    # =================================================
+    # External Module Runner
+    # =================================================
 
     def run_external(self, name, target):
         meta = self.external_modules[name]
@@ -103,8 +134,13 @@ class HellhoundEngine:
         self.emit.success(f"External module '{name}' completed")
         return output
 
+    # =================================================
+    # Module Loader (FIXED + FUTURE PROOF)
+    # =================================================
+
     def load_module(self, name):
-        for category in ("network", "web", "enum", "recon"):
+
+        for category in self.module_categories:
             try:
                 return importlib.import_module(
                     f"hellhound.modules.{category}.{name}"
