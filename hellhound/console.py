@@ -592,7 +592,7 @@ Type 'help' to view available commands.
         for s in suggestions:
             print(f"  → {s}")
 
-        print()
+        print("\n==========================================================\n")
 
     # ============================
     # SYSTEM
