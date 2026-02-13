@@ -8,24 +8,11 @@ import time
 
 NAME = "spider"
 CATEGORY = "recon"
-DESCRIPTION = "Advanced multi-threaded web intelligence crawler (Endpoints, JS APIs, Secrets, Auth, Tech stack, Security posture)"
+DESCRIPTION = "Advanced intelligent crawler (Deep mapping, GET/POST extraction, JS APIs, Auth detection, Security posture)"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Hellhound Spider v3.0)"
+    "User-Agent": "Mozilla/5.0 (Hellhound Spider v4.0)"
 }
-
-SENSITIVE_PATHS = [
-    "/robots.txt",
-    "/sitemap.xml",
-    "/.env",
-    "/.git/",
-    "/admin/",
-    "/backup/",
-    "/config/",
-    "/swagger",
-    "/api/docs",
-    "/console"
-]
 
 RISK_KEYWORDS = {
     "id": "IDOR_POTENTIAL",
@@ -45,12 +32,13 @@ RISK_KEYWORDS = {
 
 class SpiderEngine:
 
-    def __init__(self, base_url, emit, depth=3, threads=8):
+    def __init__(self, base_url, emit, depth=3, threads=8, auth=False):
         self.base_url = self.normalize(base_url)
         self.base_domain = urlparse(self.base_url).netloc
         self.emit = emit
         self.max_depth = depth
         self.max_threads = threads
+        self.auth_enabled = auth
 
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
@@ -60,17 +48,22 @@ class SpiderEngine:
         self.lock = threading.Lock()
         self.running = True
 
+        self.login_detected = False
+
         self.intel = {
             "endpoints": [],
             "js_files": [],
             "api_endpoints": [],
             "auth_surfaces": [],
             "security_headers": {},
-            "sensitive_paths": [],
             "tech_stack": [],
-            "secrets": [],
             "signals": [],
-            "stats": {"get": 0, "post": 0, "total": 0, "links": 0}
+            "stats": {
+                "get": 0,
+                "post": 0,
+                "total": 0,
+                "links": 0
+            }
         }
 
     # =================================================
@@ -94,7 +87,49 @@ class SpiderEngine:
         return list(set(risks))
 
     # =================================================
-    # Worker
+    # Authentication
+    # =================================================
+
+    def attempt_login(self, login_url):
+        self.emit.info("Attempting authentication bypass...")
+
+        try:
+            r = self.session.get(login_url, timeout=5)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            form = soup.find("form")
+            if not form:
+                return False
+
+            action = form.get("action")
+            method = form.get("method", "POST").upper()
+            target = urljoin(login_url, action)
+
+            data = {}
+            for inp in form.find_all("input"):
+                name = inp.get("name")
+                if not name:
+                    continue
+                if name.lower() == "username":
+                    data[name] = "admin"
+                elif name.lower() == "password":
+                    data[name] = "password"
+                else:
+                    data[name] = inp.get("value", "")
+
+            if method == "POST":
+                self.session.post(target, data=data, timeout=5)
+            else:
+                self.session.get(target, params=data, timeout=5)
+
+            self.emit.success("Authentication attempt completed.")
+            return True
+
+        except:
+            return False
+
+    # =================================================
+    # Worker Thread
     # =================================================
 
     def worker(self):
@@ -122,8 +157,9 @@ class SpiderEngine:
                 self.analyze_headers(r)
                 self.detect_tech(r)
                 self.parse_html(r.text, url, depth)
+
             elif "javascript" in content_type or url.endswith(".js"):
-                self.analyze_js(r.text, url)
+                self.analyze_js(r.text)
 
     # =================================================
     # HTML Parsing
@@ -132,54 +168,55 @@ class SpiderEngine:
     def parse_html(self, html, base_url, depth):
         soup = BeautifulSoup(html, "html.parser")
 
-        # Links
+        # Detect login form
+        if soup.find("input", {"type": "password"}):
+            self.login_detected = True
+
+        # Extract links
         for tag in soup.find_all("a", href=True):
             link = urljoin(base_url, tag["href"])
             if self.in_scope(link):
                 self.queue.append((link, depth + 1))
+                self.extract_get_params(link)
 
-        # Forms
+        # Extract forms
         for form in soup.find_all("form"):
             self.process_form(form, base_url)
 
-        # Query endpoints
-        parsed = urlparse(base_url)
-        if parsed.query:
-            params = [{"name": k, "type": "query"} for k in parse_qs(parsed.query)]
-            risks = self.classify_risks(params)
-
-            self.add_endpoint("GET", base_url, params, risks, ["QUERY"])
-
-        # JS Files
-        for script in soup.find_all("script", src=True):
-            js_url = urljoin(base_url, script["src"])
-            if self.in_scope(js_url):
-                with self.lock:
-                    if js_url not in self.intel["js_files"]:
-                        self.intel["js_files"].append(js_url)
-                self.queue.append((js_url, depth + 1))
+        # Inline JS
+        for script in soup.find_all("script"):
+            if script.string:
+                self.analyze_js(script.string)
 
     # =================================================
-    # Endpoint Handling
+    # GET Parameter Extraction
     # =================================================
 
-    def add_endpoint(self, method, url, params, risks, tags):
+    def extract_get_params(self, url):
+        parsed = urlparse(url)
+        if not parsed.query:
+            return
+
+        params = [{"name": k, "type": "query"} for k in parse_qs(parsed.query)]
+        risks = self.classify_risks(params)
+
         endpoint = {
-            "method": method,
+            "method": "GET",
             "url": url,
             "params": params,
             "risks": risks,
-            "tags": tags
+            "tags": ["GET_PARAM"]
         }
 
         with self.lock:
             if endpoint not in self.intel["endpoints"]:
                 self.intel["endpoints"].append(endpoint)
-                if method == "GET":
-                    self.intel["stats"]["get"] += 1
-                else:
-                    self.intel["stats"]["post"] += 1
+                self.intel["stats"]["get"] += 1
                 self.intel["stats"]["total"] += 1
+
+    # =================================================
+    # Form Handling
+    # =================================================
 
     def process_form(self, form, base_url):
         action = form.get("action")
@@ -202,38 +239,58 @@ class SpiderEngine:
         risks = self.classify_risks(params)
 
         if any(p["name"].lower() == "password" for p in params):
-            with self.lock:
-                self.intel["auth_surfaces"].append(full_url)
-                self.intel["signals"].append("AUTH_SURFACE_DETECTED")
+            self.intel["auth_surfaces"].append(full_url)
+            self.intel["signals"].append("AUTH_SURFACE_DETECTED")
 
-        self.add_endpoint(method, full_url, params, risks, ["FORM"])
+        endpoint = {
+            "method": method,
+            "url": full_url,
+            "params": params,
+            "risks": risks,
+            "tags": ["FORM"]
+        }
+
+        with self.lock:
+            if endpoint not in self.intel["endpoints"]:
+                self.intel["endpoints"].append(endpoint)
+                if method == "GET":
+                    self.intel["stats"]["get"] += 1
+                else:
+                    self.intel["stats"]["post"] += 1
+                self.intel["stats"]["total"] += 1
 
     # =================================================
     # JS Analysis
     # =================================================
 
-    def analyze_js(self, content, source_url):
+    def analyze_js(self, content):
 
         # API discovery
-        api_matches = re.findall(r"/api/[A-Za-z0-9/_\-]+", content)
-        for api in api_matches:
-            with self.lock:
-                if api not in self.intel["api_endpoints"]:
-                    self.intel["api_endpoints"].append(api)
+        api_matches = re.findall(r"(\/api\/[A-Za-z0-9\/_\-]+)", content)
+        versioned = re.findall(r"(\/v[0-9]+\/[A-Za-z0-9\/_\-]+)", content)
+
+        for match in api_matches + versioned:
+            if match not in self.intel["api_endpoints"]:
+                self.intel["api_endpoints"].append(match)
+
+        # Fetch / axios detection
+        fetch_calls = re.findall(r"(fetch|axios)\(['\"]([^'\"]+)", content)
+        for _, endpoint in fetch_calls:
+            if endpoint.startswith("/"):
+                self.intel["api_endpoints"].append(endpoint)
 
         # JWT detection
         if re.search(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.", content):
             self.intel["signals"].append("JWT_DETECTED")
-
-        # API key leakage detection
-        if re.search(r"(?i)(api[_-]?key|secret[_-]?key)\s*[:=]\s*['\"][A-Za-z0-9]{20,}", content):
-            self.intel["signals"].append("POTENTIAL_API_KEY_LEAK")
 
     # =================================================
     # Headers & Tech
     # =================================================
 
     def analyze_headers(self, response):
+        headers = response.headers
+        self.intel["security_headers"] = dict(headers)
+
         important = [
             "Content-Security-Policy",
             "Strict-Transport-Security",
@@ -241,14 +298,11 @@ class SpiderEngine:
             "X-Content-Type-Options"
         ]
 
-        headers = response.headers
-
-        with self.lock:
-            self.intel["security_headers"] = dict(headers)
-
-            for h in important:
-                if h not in headers:
-                    self.intel["signals"].append(f"MISSING_{h.upper().replace('-', '_')}")
+        for h in important:
+            if h not in headers:
+                self.intel["signals"].append(
+                    f"MISSING_{h.upper().replace('-', '_')}"
+                )
 
     def detect_tech(self, response):
         server = response.headers.get("Server", "").lower()
@@ -265,32 +319,18 @@ class SpiderEngine:
         if "nginx" in server:
             tech.append("Nginx")
 
-        with self.lock:
-            self.intel["tech_stack"].extend(tech)
-
-    # =================================================
-    # Sensitive Paths
-    # =================================================
-
-    def probe_sensitive(self):
-        for path in SENSITIVE_PATHS:
-            url = self.base_url + path
-            try:
-                r = self.session.get(url, timeout=3)
-                if r.status_code == 200:
-                    self.intel["sensitive_paths"].append(url)
-                    self.intel["signals"].append("SENSITIVE_PATH_EXPOSED")
-            except:
-                continue
+        self.intel["tech_stack"].extend(tech)
 
     # =================================================
     # Run
     # =================================================
 
     def run(self):
-        self.emit.info(f"Spider initialized ({self.max_threads} threads)")
 
-        self.probe_sensitive()
+        if self.auth_enabled:
+            self.attempt_login(self.base_url)
+
+        self.emit.info(f"Spider initialized ({self.max_threads} threads)")
 
         threads = []
         for _ in range(self.max_threads):
@@ -310,6 +350,12 @@ class SpiderEngine:
         for t in threads:
             t.join()
 
+        # Login wall detection
+        if self.login_detected and not self.auth_enabled and self.intel["stats"]["links"] < 3:
+            self.intel["signals"].append("LOGIN_WALL_DETECTED")
+            self.emit.warn("Authentication wall detected.")
+            self.emit.warn("Re-run with: strike spider --auth")
+
         self.intel["signals"] = list(set(self.intel["signals"]))
         self.intel["tech_stack"] = list(set(self.intel["tech_stack"]))
 
@@ -327,7 +373,7 @@ class SpiderEngine:
 
 
 # =================================================
-# Framework Entry Point
+# Framework Entry
 # =================================================
 
 def run(target, emit, options=None):
@@ -336,14 +382,17 @@ def run(target, emit, options=None):
 
     depth = 3
     threads = 8
+    auth = False
 
     if options:
         if options.get("mode") == "deep":
             depth = 5
         if options.get("threads"):
             threads = int(options.get("threads"))
+        if options.get("auth"):
+            auth = True
 
-    engine = SpiderEngine(target, emit, depth=depth, threads=threads)
+    engine = SpiderEngine(target, emit, depth=depth, threads=threads, auth=auth)
     result = engine.run()
 
     emit.success("Spider crawl complete.")
