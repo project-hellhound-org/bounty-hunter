@@ -579,17 +579,19 @@ Type 'help' to view available commands.
     # ============================
 
     def do_howl(self, arg):
-        """howl → Suggest next actions"""
+        """howl → Correlated intelligent attack suggestions"""
 
-        if "nmap" not in self.results:
-            print("[!] Run nmap first")
+        if not self.results:
+            print("[!] No intelligence collected yet.")
             return
 
-        suggestions = suggest_actions(self.results["nmap"])
+        suggestions = suggest_actions(self.results)
 
-        print("\n[ Howl — recommended actions ]")
+        print("\n[ Howl — Intelligence Correlation Engine ]\n")
+
         for s in suggestions:
             print(f"  → {s}")
+
         print()
 
     # ============================
