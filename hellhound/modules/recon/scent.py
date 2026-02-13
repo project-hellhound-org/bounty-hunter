@@ -1,11 +1,12 @@
 import subprocess
 import shutil
 import re
+import requests
+import socket
 
 NAME = "scent"
 CATEGORY = "recon"
-DESCRIPTION = "Full-scope reconnaissance (ASN, IP, Hosting, Cloud, CDN, DNS Records, Zone Transfer)"
-
+DESCRIPTION = "Actionable passive recon (Subdomains, NetRange, Email Stack, WAF/Tech ID, Leak & Takeover Detection)"
 
 # -------------------------------------------------
 # Helpers
@@ -15,240 +16,276 @@ def tool_exists(tool):
     return shutil.which(tool) is not None
 
 
-def run_cmd(cmd):
+def run_dig(target, record_type="A"):
+    if not tool_exists("dig"):
+        return ""
     try:
+        cmd = ["dig", "+short", target, record_type]
         result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            timeout=60
+            timeout=10
         )
         return result.stdout.strip()
     except Exception:
         return ""
 
 
+def fetch_json(url):
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
 def initialize_data(target):
-    """
-    Initializes a data structure holding both Asset and DNS information
-    """
     return {
         "target": target,
-        # Asset Intelligence
-        "ips": [],
-        "asn": [],
-        "org": [],
-        "cdn": [],
-        "cloud": [],
-        "whois": {},
-        # DNS Intelligence
-        "records": {
-            "A": [],
-            "AAAA": [],
-            "NS": [],
-            "MX": [],
-            "TXT": [],
-            "PTR": []
-        },
-        "zone_transfer": False,
-        # Signals
+        "subdomains": [],
+        "netrange": [],
+        "netname": "",
+        "asn": "",
+        "email_provider": [],
+        "mx_records": [],
+        "server": "",
+        "waf": "",
+        "tech": [],
+        "leak_indicators": [],
+        "takeover_candidates": [],
         "signals": []
     }
 
+# -------------------------------------------------
+# Stage 1: Passive Subdomain Enumeration
+# -------------------------------------------------
+
+def get_subdomains(target, data, emit):
+    emit.info("[scent] Harvesting subdomains via Certificate Transparency...")
+
+    clean_target = target.replace("http://", "").replace("https://", "").split("/")[0]
+    url = f"https://crt.sh/?q=%.{clean_target}&output=json"
+    response = fetch_json(url)
+
+    if not response:
+        emit.info("[scent] No CT data returned.")
+        return
+
+    subs = set()
+    for entry in response:
+        name_value = entry.get('name_value', '')
+        for name in name_value.split('\n'):
+            name = name.strip()
+            if name.startswith("*."):
+                name = name[2:]
+            if clean_target in name:
+                subs.add(name)
+
+    data["subdomains"] = sorted(subs)
+
+    if len(subs) > 15:
+        data["signals"].append("LARGE_ATTACK_SURFACE")
+
+    emit.info(f"[scent] Found {len(subs)} subdomains.")
 
 # -------------------------------------------------
-# Asset Recon Stages
+# Stage 2: NetRange & ASN
 # -------------------------------------------------
 
-def resolve_ips(target, data, emit):
-    """Stage 1: Resolve direct IP addresses"""
-    emit.info("[asset_recon] Resolving IP addresses")
+def get_netrange(target, data, emit):
+    emit.info("[scent] Extracting NetRange & ASN...")
 
-    if tool_exists("dig"):
-        out = run_cmd(["dig", "+short", target])
-        for line in out.splitlines():
-            if re.match(r"\d+\.\d+\.\d+\.\d+", line):
-                data["ips"].append(line)
+    ips = run_dig(target, "A").splitlines()
+    if not ips:
+        return
 
-    data["ips"] = sorted(set(data["ips"]))
-
-
-def run_whois(target, data, emit):
-    """Stage 2: Collect WHOIS and Organization data"""
-    emit.info("[asset_recon] Collecting WHOIS data")
+    main_ip = ips[0]
 
     if not tool_exists("whois"):
-        emit.warn("[asset_recon] whois not available")
+        emit.info("[scent] whois not installed. Skipping NetRange.")
         return
 
-    out = run_cmd(["whois", target])
-    data["whois"]["raw"] = out
+    try:
+        result = subprocess.run(
+            ["whois", main_ip],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15
+        )
 
-    for line in out.splitlines():
-        if line.lower().startswith("org"):
-            data["org"].append(line.split(":", 1)[-1].strip())
-        if "asn" in line.lower():
-            data["asn"].append(line.strip())
+        whois_text = result.stdout
 
+        cidr_matches = re.findall(r'(NetRange|inetnum|CIDR):\s*([^\n]+)', whois_text)
+        for match in cidr_matches:
+            data["netrange"].append(match[1].strip())
 
-def detect_cdn_cloud(data, emit):
-    """Stage 3: Analyze WHOIS to detect CDN and Cloud providers"""
-    emit.info("[asset_recon] Detecting CDN / Cloud providers")
+        org_match = re.search(r'(NetName|OrgName|owner):\s*([^\n]+)', whois_text)
+        if org_match:
+            data["netname"] = org_match.group(2).strip()
 
-    CDN_KEYWORDS = {
-        "cloudflare": "Cloudflare",
-        "akamai": "Akamai",
-        "fastly": "Fastly",
-        "incapsula": "Imperva"
+        asn_match = re.search(r'(Origin|OriginAS):\s*([A-Z0-9]+)', whois_text)
+        if asn_match:
+            data["asn"] = asn_match.group(2).strip()
+            data["signals"].append("ASN_IDENTIFIED")
+
+    except Exception:
+        pass
+
+# -------------------------------------------------
+# Stage 3: Email Infrastructure
+# -------------------------------------------------
+
+def analyze_email_stack(target, data, emit):
+    emit.info("[scent] Analyzing Email Infrastructure...")
+
+    mx_out = run_dig(target, "MX")
+    mx_hosts = [line.split(" ")[-1] for line in mx_out.splitlines() if line]
+    data["mx_records"] = mx_hosts
+
+    txt_out = run_dig(target, "TXT")
+
+    providers_found = set()
+
+    for line in txt_out.splitlines():
+        if "v=spf1" in line:
+            includes = re.findall(r'include:([^\s]+)', line)
+            for inc in includes:
+                if "google" in inc:
+                    providers_found.add("Google Workspace")
+                elif "outlook" in inc:
+                    providers_found.add("Microsoft O365")
+                elif "zoho" in inc:
+                    providers_found.add("Zoho")
+
+    if providers_found:
+        data["email_provider"] = list(providers_found)
+        data["signals"].append("EMAIL_PROVIDER_IDENTIFIED")
+
+# -------------------------------------------------
+# Stage 4: Tech & WAF Fingerprinting
+# -------------------------------------------------
+
+def fingerprint_tech(target, data, emit):
+    emit.info("[scent] Fingerprinting Tech & WAF...")
+
+    if not target.startswith("http"):
+        target = "http://" + target
+
+    try:
+        r = requests.get(target, timeout=8)
+        headers = r.headers
+
+        server = headers.get("Server", "")
+        data["server"] = server
+
+        if "cloudflare" in server.lower():
+            data["waf"] = "Cloudflare"
+            data["signals"].append("WAF_DETECTED")
+
+        powered = headers.get("X-Powered-By", "")
+        tech = []
+
+        if "php" in powered.lower():
+            tech.append("PHP")
+        if "nginx" in server.lower():
+            tech.append("Nginx")
+        if "apache" in server.lower():
+            tech.append("Apache")
+
+        data["tech"] = list(set(tech))
+
+    except Exception:
+        pass
+
+# -------------------------------------------------
+# Stage 5: Leak Detection
+# -------------------------------------------------
+
+def detect_leaks(target, data, emit):
+    emit.info("[scent] Checking for common exposed leaks...")
+
+    if not target.startswith("http"):
+        target = "http://" + target
+
+    leak_paths = ["/.env", "/.git/config", "/backup.zip", "/database.sql"]
+
+    for path in leak_paths:
+        try:
+            r = requests.get(target + path, timeout=5)
+            if r.status_code == 200 and len(r.text) > 10:
+                data["leak_indicators"].append(target + path)
+                data["signals"].append("POTENTIAL_LEAK_EXPOSED")
+        except:
+            continue
+
+# -------------------------------------------------
+# Stage 6: Subdomain Takeover Detection
+# -------------------------------------------------
+
+def detect_takeover(data, emit):
+    emit.info("[scent] Checking subdomain takeover possibilities...")
+
+    vulnerable_patterns = {
+        "github.io": "GitHub Pages",
+        "herokuapp.com": "Heroku",
+        "amazonaws.com": "AWS S3",
+        "azurewebsites.net": "Azure"
     }
 
-    CLOUD_KEYWORDS = {
-        "amazon": "AWS",
-        "aws": "AWS",
-        "google": "GCP",
-        "microsoft": "Azure",
-        "azure": "Azure",
-        "digitalocean": "DigitalOcean"
-    }
+    error_signatures = [
+        "NoSuchBucket",
+        "There isn't a GitHub Pages site here",
+        "No such app",
+        "The specified bucket does not exist"
+    ]
 
-    text_blob = " ".join(data["org"]) + " " + data["whois"].get("raw", "").lower()
+    for sub in data["subdomains"]:
+        cname = run_dig(sub, "CNAME")
+        if not cname:
+            continue
 
-    for key, name in CDN_KEYWORDS.items():
-        if key in text_blob:
-            data["cdn"].append(name)
-            data["signals"].append("CDN_DETECTED")
-
-    for key, name in CLOUD_KEYWORDS.items():
-        if key in text_blob:
-            data["cloud"].append(name)
-            data["signals"].append("CLOUD_HOSTED")
-
-    data["cdn"] = sorted(set(data["cdn"]))
-    data["cloud"] = sorted(set(data["cloud"]))
-
-
-# -------------------------------------------------
-# DNS Recon Stages
-# -------------------------------------------------
-
-def resolve_dns_records(target, data, emit):
-    """Stage 4: Gather standard DNS records"""
-    emit.info("[asset_recon] Resolving DNS records (A, AAAA, NS, MX, TXT)")
-
-    if not tool_exists("dig"):
-        emit.warn("[asset_recon] dig not found")
-        return
-
-    record_types = ["A", "AAAA", "NS", "MX", "TXT"]
-
-    for rtype in record_types:
-        out = run_cmd(["dig", "+short", target, rtype])
-        for line in out.splitlines():
-            data["records"][rtype].append(line.strip())
-
-    # Deduplicate
-    for rtype in data["records"]:
-        data["records"][rtype] = sorted(set(data["records"][rtype]))
-
-
-def reverse_dns_lookup(data, emit):
-    """Stage 5: Perform reverse DNS on found IPs"""
-    emit.info("[asset_recon] Performing reverse DNS lookup")
-
-    if not tool_exists("dig"):
-        return
-
-    for ip in data["records"]["A"]:
-        if re.match(r"\d+\.\d+\.\d+\.\d+", ip):
-            out = run_cmd(["dig", "+short", "-x", ip])
-            for line in out.splitlines():
-                data["records"]["PTR"].append(line.strip())
-
-    data["records"]["PTR"] = sorted(set(data["records"]["PTR"]))
-
-
-def check_zone_transfer(target, data, emit):
-    """Stage 6: Attempt DNS Zone Transfer"""
-    emit.info("[asset_recon] Checking for DNS zone transfer")
-
-    if not tool_exists("dig"):
-        return
-
-    for ns in data["records"]["NS"]:
-        out = run_cmd(["dig", "AXFR", target, "@"+ns])
-        if out and "Transfer failed" not in out:
-            data["zone_transfer"] = True
-            data["signals"].append("ZONE_TRANSFER_POSSIBLE")
-            emit.warn("[asset_recon] ZONE TRANSFER POSSIBLE!")
-            break
-
-
-# -------------------------------------------------
-# Final Signal Generation
-# -------------------------------------------------
-
-def generate_signals(data, emit):
-    """Stage 7: Compile findings into actionable signals"""
-    emit.info("[asset_recon] Generating tactical signals")
-
-    # Asset Signals
-    if len(data["ips"]) > 1:
-        data["signals"].append("MULTIPLE_IPS")
-
-    if any(org for org in data["org"]):
-        data["signals"].append("ORG_LARGE")
-
-    # DNS Signals
-    if len(data["records"]["NS"]) > 1:
-        data["signals"].append("MULTIPLE_NS")
-
-    if data["records"]["MX"]:
-        data["signals"].append("MX_PRESENT")
-
-    for txt in data["records"]["TXT"]:
-        if txt.lower().startswith("v=spf"):
-            data["signals"].append("SPF_PRESENT")
-        if txt.lower().startswith("v=dmarc"):
-            data["signals"].append("DMARC_PRESENT")
-
-    if data["records"]["PTR"]:
-        data["signals"].append("REVERSE_DNS_FOUND")
-
-    data["signals"] = sorted(set(data["signals"]))
-
+        for pattern, provider in vulnerable_patterns.items():
+            if pattern in cname:
+                try:
+                    r = requests.get("http://" + sub, timeout=5)
+                    for sig in error_signatures:
+                        if sig.lower() in r.text.lower():
+                            data["takeover_candidates"].append({
+                                "subdomain": sub,
+                                "provider": provider
+                            })
+                            data["signals"].append("SUBDOMAIN_TAKEOVER_POSSIBLE")
+                except:
+                    continue
 
 # -------------------------------------------------
 # Entry Point
 # -------------------------------------------------
 
 def run(target, emit, options=None):
-    emit.info(f"[asset_recon] Starting full-scope reconnaissance for: {target}")
+
+    emit.info(f"[*] Scent: Deep Intelligence for {target}")
 
     data = initialize_data(target)
 
-    # Run Asset Stages
-    resolve_ips(target, data, emit)
-    run_whois(target, data, emit)
-    detect_cdn_cloud(data, emit)
+    get_subdomains(target, data, emit)
+    get_netrange(target, data, emit)
+    analyze_email_stack(target, data, emit)
+    fingerprint_tech(target, data, emit)
+    detect_leaks(target, data, emit)
+    detect_takeover(data, emit)
 
-    # Run DNS Stages
-    resolve_dns_records(target, data, emit)
-    reverse_dns_lookup(data, emit)
-    check_zone_transfer(target, data, emit)
+    emit.success("[+] Scent Recon Complete")
 
-    # Final Analysis
-    generate_signals(data, emit)
-
-    emit.success("[asset_recon] Full reconnaissance complete")
-
-    # -------- Summary String --------
     summary = (
-        f"IPs: {len(data['ips'])} | "
-        f"NS: {len(data['records']['NS'])} | "
-        f"MX: {len(data['records']['MX'])} | "
-        f"CDN: {len(data['cdn'])} | "
-        f"Cloud: {len(data['cloud'])}"
+        f"Subs: {len(data['subdomains'])} | "
+        f"Leaks: {len(data['leak_indicators'])} | "
+        f"Takeover: {len(data['takeover_candidates'])}"
     )
 
     return {
