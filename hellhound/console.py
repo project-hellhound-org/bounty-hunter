@@ -423,15 +423,42 @@ Type 'help' to view available commands.
                         for s in signals:
                             print(f"    - {s}")
                         print()
+                        
+                if "summary" in intel:
+                    summary = intel.get("summary", {})
+                    print(Fore.GREEN + "  Summary:")
+                    print(f"    Total Vulnerabilities : {summary.get('total_vulnerabilities', 0)}")
+                    print(f"    Affected Parameters   : {', '.join(summary.get('affected_parameters', []))}")
+                    print()
 
                 # --- VULNERABILITIES ---
                 if "vulnerabilities" in intel:
                     vulns = intel.get("vulnerabilities", [])
+
                     if vulns:
-                        print(Fore.RED + "  ⚠ Vulnerabilities Detected:")
-                        for v in vulns:
-                            print(f"    - Port {v.get('port')} | {v.get('description')}")
-                        print()
+                        print(Fore.RED + "  ⚠ Vulnerabilities Detected:\n")
+
+                        for idx, v in enumerate(vulns, 1):
+
+                            vtype = v.get("type", "UNKNOWN")
+                            url = v.get("url", "")
+                            param = v.get("parameter", "")
+                            os_type = v.get("os", "")
+                            detection = v.get("detection", "")
+                            confidence = v.get("confidence", "Medium")
+
+                            print(Fore.YELLOW + f"  [{idx}] {vtype}")
+                            print(f"       Target     : {Fore.CYAN}{url}")
+                            print(f"       Parameter  : {Fore.WHITE}{param}")
+                            print(f"       OS         : {Fore.WHITE}{os_type}")
+                            print(f"       Detection  : {Fore.WHITE}{detection}")
+                            print(f"       Confidence : {Fore.WHITE}{confidence}")
+
+                            if v.get("proof"):
+                                print(Fore.MAGENTA + f"       Proof      : {v.get('proof')}")
+
+                            print()
+
 
             # -----------------------------------------
             # 2️⃣ Raw Text Fallback
@@ -448,9 +475,6 @@ Type 'help' to view available commands.
                 print()
 
         print(Fore.CYAN + "================================\n")
-
-
-
 
     # ============================
     # RECON

@@ -93,7 +93,6 @@ class HellhoundEngine:
 
         try:
             result = module.run(target, self.emit, options=options)
-            self.emit.success(f"{module_name} finished.")
             return result
         except Exception as e:
             self.emit.warn(f"Module '{module_name}' crashed: {e}")
