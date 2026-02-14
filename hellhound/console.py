@@ -423,7 +423,25 @@ Type 'help' to view available commands.
                         for s in signals:
                             print(f"    - {s}")
                         print()
-                        
+
+                # --- ROBOTS.TXT ---
+                if "robots_disallowed" in intel:
+                    robots = intel.get("robots_disallowed", [])
+                    if robots:
+                        print(Fore.GREEN + "  Robots.txt Disallowed:")
+                        for entry in robots:
+                            print(f"    - {entry}")
+                        print()
+                
+                # --- ROBOTS.TXT RAW CONTENT (ADDED) ---
+                if "robots_raw" in intel:
+                    raw_content = intel.get("robots_raw", "").strip()
+                    if raw_content:
+                        print(Fore.GREEN + "  Robots.txt Content:")
+                        for line in raw_content.split('\n'):
+                            print(Fore.WHITE + f"    {line}")
+                        print()
+
                 if "summary" in intel:
                     summary = intel.get("summary", {})
                     print(Fore.GREEN + "  Summary:")

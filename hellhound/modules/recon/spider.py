@@ -82,6 +82,8 @@ class SpiderEngine:
             "security_headers": {},
             "tech_stack": [],
             "signals": [],
+            "robots_disallowed": [],
+            "robots_raw": "",  # ADDED: To store full text
             "stats": {
                 "get": 0,
                 "post": 0,
@@ -132,6 +134,44 @@ class SpiderEngine:
         if "IDOR_POTENTIAL" in risks:
             score += 2
         return score
+
+    # =================================================
+    # Robots.txt Check
+    # =================================================
+    
+    def check_robots_txt(self):
+        robots_url = urljoin(self.base_url, "/robots.txt")
+        try:
+            self.emit.info(f"Checking for robots.txt at {robots_url}")
+            r = self.session.get(robots_url, timeout=5)
+            
+            if r.status_code == 200:
+                # ADDED: Save the raw content immediately
+                with self.lock:
+                    self.intel["robots_raw"] = r.text
+
+                disallows = []
+                # Basic parsing of robots.txt
+                for line in r.text.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("disallow:"):
+                        # Extract the path part after "Disallow:"
+                        path = line.split(":", 1)[1].strip()
+                        if path:
+                            disallows.append(path)
+                
+                if disallows:
+                    with self.lock:
+                        self.intel["robots_disallowed"] = disallows
+                    self.emit.success(f"Found {len(disallows)} disallowed entries in robots.txt")
+                    for entry in disallows:
+                        self.emit.notify(f"  Disallow: {entry}")
+                else:
+                    self.emit.info("robots.txt found but no disallow rules present.")
+            else:
+                self.emit.info("robots.txt not found (Status: {0})".format(r.status_code))
+        except Exception as e:
+            pass
 
     # =================================================
     # Authentication
@@ -374,6 +414,9 @@ class SpiderEngine:
             self.attempt_login(self.base_url)
 
         self.emit.info(f"Spider initialized ({self.max_threads} threads)")
+
+        # Check robots.txt before starting threads
+        self.check_robots_txt()
 
         threads = []
         for _ in range(self.max_threads):
