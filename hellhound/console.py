@@ -428,6 +428,7 @@ class HellhoundConsole(cmd.Cmd):
                     except Exception as e:
                         print(Fore.RED + f"[x] {module_name} failed: {str(e)}")
 
+    
     def do_loot(self, arg):
         """loot → View gathered results"""
 
@@ -441,30 +442,26 @@ class HellhoundConsole(cmd.Cmd):
 
             print(Fore.YELLOW + f"[{mod.upper()}]")
 
-            # -----------------------------------------
-            # 1️⃣ Structured Modules (Preferred Design)
-            # -----------------------------------------
             if isinstance(output, dict) and "intel" in output:
 
                 intel = output.get("intel", {})
 
-                # --- NMAP STYLE ---
-                if "services" in intel:
-                    services = intel.get("services", {})
-                    if services:
-                        print(Fore.GREEN + "  Open Services:")
-                        for port_proto, data in services.items():
-                            service = data.get("service", "unknown")
-                            product = data.get("product", "")
-                            version = data.get("version", "")
-                            print(
-                                f"    {Fore.CYAN}{port_proto:<8} "
-                                f"{Fore.WHITE}{service:<12} "
-                                f"{Fore.YELLOW}{product} {version}"
-                            )
-                    print()
+                # --- COMMENTS (Prioritized) ---
+                if "comments" in intel:
+                    comments = intel.get("comments", [])
+                    if comments:
+                        print(Fore.GREEN + "  Developer Notes / Source Comments:")
+                        for c in comments:
+                            display_text = (c[:75] + "...") if len(c) > 75 else c
+                            color = Fore.YELLOW
+                            if "flag" in c.lower(): color = Fore.RED
+                            elif "[JS]" in c: color = Fore.CYAN
+                            elif "[HTML]" in c: color = Fore.WHITE
+                            
+                            print(f"    - {color}{display_text}")
+                        print()
 
-                # --- ENDPOINT STYLE (sniff, stalk, etc.) ---
+                # --- ENDPOINTS / FORMS ---
                 if "endpoints" in intel:
                     endpoints = intel.get("endpoints", [])
                     stats = intel.get("stats", {})
@@ -474,40 +471,74 @@ class HellhoundConsole(cmd.Cmd):
                         print(f"    GET  : {stats.get('get', 0)}")
                         print(f"    POST : {stats.get('post', 0)}")
                         print(f"    TOTAL: {stats.get('total', 0)}")
+                        print(f"    LINKS: {stats.get('links', 0)}")
                         print()
 
                     for idx, ep in enumerate(endpoints, 1):
                         method = ep.get("method", "GET")
                         url = ep.get("url", "")
-
                         method_color = Fore.BLUE if method == "GET" else Fore.MAGENTA
                         print(method_color + f"  [{idx}] {method}  {url}")
 
-                        # Parameters
                         for p in ep.get("params", []):
                             pname = p.get("name", "")
                             ptype = p.get("type", "")
-
-                            risk_color = (
-                                Fore.RED if pname.lower() in ["id", "token", "password", "uid"]
-                                else Fore.WHITE
-                            )
-
+                            risk_color = (Fore.RED if pname.lower() in ["id", "token", "password", "uid"] else Fore.WHITE)
                             print(f"       - {risk_color}{pname} {Fore.YELLOW}({ptype})")
-
-                        # Tags
-                        if ep.get("tags"):
-                            print(Fore.RED + f"       Tags: {', '.join(ep['tags'])}")
-
+                        
+                        if ep.get("tags"): print(Fore.RED + f"       Tags: {', '.join(ep['tags'])}")
                         print()
 
                 # --- JS FILES ---
                 if "js_files" in intel:
                     js_files = intel.get("js_files", [])
                     if js_files:
-                        print(Fore.GREEN + "  JavaScript Files:")
+                        print(Fore.GREEN + "  JavaScript Files Found:")
                         for js in js_files:
-                            print(f"    - {js}")
+                            print(f"    - {Fore.CYAN}{js}")
+                        print()
+
+                # --- JS ENDPOINTS ---
+                if "js_endpoints" in intel:
+                    js_eps = intel.get("js_endpoints", [])
+                    if js_eps:
+                        print(Fore.GREEN + "  Endpoints Discovered in JavaScript:")
+                        for ep in js_eps:
+                            print(f"    - {Fore.YELLOW}{ep}")
+                        print()
+
+                # --- POTENTIAL KEYS ---
+                if "potential_keys" in intel:
+                    keys = intel.get("potential_keys", [])
+                    if keys:
+                        print(Fore.RED + "  ⚠ Potential Secrets/Keys Found:")
+                        for k in keys:
+                            print(f"    - {k}")
+                        print()
+
+                # --- ROBOTS.TXT ---
+                if "robots_disallowed" in intel:
+                    robots = intel.get("robots_disallowed", [])
+                    if robots:
+                        print(Fore.GREEN + "  Robots.txt Disallowed (Crawled):")
+                        for entry in robots:
+                            print(f"    - {Fore.RED}{entry}")
+                        print()
+                
+                if "robots_raw" in intel:
+                    raw_content = intel.get("robots_raw", "").strip()
+                    if raw_content:
+                        print(Fore.GREEN + "  Robots.txt Content:")
+                        for line in raw_content.split('\n'):
+                            print(Fore.WHITE + f"    {line}")
+                        print()
+
+                # --- TECH STACK ---
+                if "tech_stack" in intel:
+                    tech = intel.get("tech_stack", [])
+                    if tech:
+                        print(Fore.GREEN + "  Technology Stack:")
+                        print(f"    - {Fore.WHITE}{', '.join(tech)}")
                         print()
 
                 # --- SIGNALS ---
@@ -519,70 +550,26 @@ class HellhoundConsole(cmd.Cmd):
                             print(f"    - {s}")
                         print()
 
-                # --- ROBOTS.TXT ---
-                if "robots_disallowed" in intel:
-                    robots = intel.get("robots_disallowed", [])
-                    if robots:
-                        print(Fore.GREEN + "  Robots.txt Disallowed:")
-                        for entry in robots:
-                            print(f"    - {entry}")
-                        print()
-                
-                # --- ROBOTS.TXT RAW CONTENT (ADDED) ---
-                if "robots_raw" in intel:
-                    raw_content = intel.get("robots_raw", "").strip()
-                    if raw_content:
-                        print(Fore.GREEN + "  Robots.txt Content:")
-                        for line in raw_content.split('\n'):
-                            print(Fore.WHITE + f"    {line}")
-                        print()
-
-                if "summary" in intel:
-                    summary = intel.get("summary", {})
-                    print(Fore.GREEN + "  Summary:")
-                    print(f"    Total Vulnerabilities : {summary.get('total_vulnerabilities', 0)}")
-                    print(f"    Affected Parameters   : {', '.join(summary.get('affected_parameters', []))}")
-                    print()
-
                 # --- VULNERABILITIES ---
                 if "vulnerabilities" in intel:
                     vulns = intel.get("vulnerabilities", [])
-
                     if vulns:
                         print(Fore.RED + "  ⚠ Vulnerabilities Detected:\n")
-
                         for idx, v in enumerate(vulns, 1):
-
                             vtype = v.get("type", "UNKNOWN")
                             url = v.get("url", "")
                             param = v.get("parameter", "")
-                            os_type = v.get("os", "")
-                            detection = v.get("detection", "")
-                            confidence = v.get("confidence", "Medium")
-
+                            payload = v.get("payload_used")
                             print(Fore.YELLOW + f"  [{idx}] {vtype}")
                             print(f"       Target     : {Fore.CYAN}{url}")
                             print(f"       Parameter  : {Fore.WHITE}{param}")
-                            print(f"       OS         : {Fore.WHITE}{os_type}")
-                            print(f"       Detection  : {Fore.WHITE}{detection}")
-                            print(f"       Confidence : {Fore.WHITE}{confidence}")
-
-                            if v.get("proof"):
-                                print(Fore.MAGENTA + f"       Proof      : {v.get('proof')}")
-
+                            if payload: print(f"       Payload    : {Fore.GREEN}{payload}")
+                            if v.get("proof"): print(Fore.MAGENTA + f"       Proof      : {v.get('proof')}")
                             print()
 
-
-            # -----------------------------------------
-            # 2️⃣ Raw Text Fallback
-            # -----------------------------------------
             elif isinstance(output, str):
                 print(Fore.WHITE + output.strip()[:1000])
                 print()
-
-            # -----------------------------------------
-            # 3️⃣ Unknown Format Fallback
-            # -----------------------------------------
             else:
                 print(Fore.WHITE + str(output))
                 print()
