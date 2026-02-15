@@ -15,7 +15,6 @@ from hellhound.core.suggest import suggest_actions
 # ----------------------------
 # NEW ANIMATION HELPERS
 # ----------------------------
-
 def run_exploit_script():
     """
     Simulates running a shell script to initialize the framework.
@@ -34,96 +33,73 @@ def run_exploit_script():
     for cmd_input, response in commands:
         sys.stdout.write(f"{prompt} {cmd_input}")
         sys.stdout.flush()
-        time.sleep(0.4)
+        time.sleep(0.2)
         print(f"\n{Fore.LIGHTBLACK_EX}[+] {response}")
-        time.sleep(0.6)
+        time.sleep(0.3)
         
     print(f"\n{prompt} {Fore.GREEN}System Ready.\n")
-    time.sleep(1.0)
+    time.sleep(0.3)
 
-def realistic_signal_glitch(text):
+def simple_static_glitch(text):
     """
-    Realistic 'Signal Tearing' and 'Static' effect.
-    Simulates a bad video connection / corrupted terminal.
+    Simple, shape-preserving static glitch.
+    Uses cursor anchoring to prevent the banner from jumping/moving.
     """
+    # Split lines, but remove the very last empty line if it exists (prevents drift)
     lines = text.split('\n')
+    if lines and lines[-1] == '':
+        lines.pop()
     
-    # 1. Start with a dim, unstable signal (Grey)
-    sys.stdout.write(f"{Back.BLACK}{Fore.LIGHTBLACK_EX}{Style.DIM}")
-    for line in lines:
-        sys.stdout.write(line + "\n")
+    height = len(lines)
+    
+    # 1. Print the logo normally first
+    # We use sys.stdout.write to ensure no extra flushes happen yet
+    sys.stdout.write(f"{Fore.LIGHTBLACK_EX}{Style.DIM}{text}\n")
     sys.stdout.flush()
-    
-    time.sleep(0.4)
-    
-    # 2. The Chaos Loop (Simulate tearing and static)
-    # We iterate about 25 times rapidly
-    for _ in range(25): 
-        frame = []
+    time.sleep(0.3)
+
+    # 2. Move cursor UP to the start of the logo immediately (The Anchor)
+    # This ensures we are exactly at the top of the logo before we start animating
+    sys.stdout.write(f"\033[{height}F")
+
+    # 3. The Static Loop
+    for _ in range(10): 
+        # We are currently at the TOP of the logo.
         
-        for original_line in lines:
-            chance = random.random()
-            
-            # Case A: Horizontal Tear (Line shifts left/right)
-            if chance < 0.15:
-                shift = random.randint(2, 5)
-                if random.random() > 0.5:
-                    # Shift Left (Cut off start, add space at end)
-                    frame.append(original_line[shift:] + " " * shift)
+        # Iterate and draw the glitched frame
+        for line in lines:
+            glitch_line = ""
+            for char in line:
+                if char == ' ':
+                    glitch_line += " "
                 else:
-                    # Shift Right (Add space at start, cut off end)
-                    frame.append(" " * shift + original_line[:-shift])
-            
-            # Case B: Block Corruption (Line turns into static)
-            elif chance < 0.25:
-                noise = "▓█░" * (len(original_line) // 3)
-                frame.append(noise[:len(original_line)])
-            
-            # Case C: Color Flicker (Print in White or Cyan then revert)
-            elif chance < 0.40:
-                # We handle color in the print statement below, 
-                # here we just mark it for color change logic
-                frame.append(("COLOR_FLICKER", original_line))
-                
-            # Case D: Normal (but maybe corrupted chars)
-            else:
-                glitch_line = ""
-                for char in original_line:
-                    if char == ' ':
-                        glitch_line += " "
-                    elif random.random() < 0.1: # 10% chance of char error
-                        glitch_line += random.choice("!@#$%&*")
+                    # 15% chance to swap character
+                    if random.random() < 0.15:
+                        glitch_line += random.choice("@%#*+")
                     else:
                         glitch_line += char
-                frame.append(glitch_line)
+            
+            # Random color flicker
+            color = Fore.RED
+            if random.random() < 0.15: color = Fore.WHITE
+            
+            # Write the line + newline
+            sys.stdout.write(f"{color}{glitch_line}\n")
 
-        # RENDER THE FRAME
-        # Move cursor back up to the top of the logo
-        sys.stdout.write(f"\033[{len(lines)}F")
-        
-        for item in frame:
-            if isinstance(item, tuple) and item[0] == "COLOR_FLICKER":
-                # Flash random glitch colors
-                color = random.choice([Fore.WHITE, Fore.CYAN, Fore.YELLOW])
-                sys.stdout.write(f"{color}{Style.BRIGHT}{item[1]}\n")
-            else:
-                # Standard dim grey with glitches
-                sys.stdout.write(f"{Fore.LIGHTBLACK_EX}{Style.DIM}{item}\n")
-        
+        # Flush the frame to screen
         sys.stdout.flush()
-        # Randomize the sleep time to make it feel organic/jittery
-        time.sleep(random.uniform(0.02, 0.06))
+        
+        # CRITICAL FIX: Snap cursor back UP to the top of the logo
+        # This prevents it from drifting down.
+        sys.stdout.write(f"\033[{height}F")
+        
+        time.sleep(0.04)
 
-    # 3. The "Monitor Reboot" Flash
-    # Screen flashes white briefly, then goes to final state
+    # 4. Final Clean Render
+    # We are currently at the TOP of the logo.
+    # We print the final clean version. 
+    # Because we do NOT move the cursor up after this, the cursor naturally ends up at the bottom.
     os.system('cls' if os.name == 'nt' else 'clear')
-    sys.stdout.write(Back.WHITE + Fore.WHITE)
-    print(" " * 80) # Flash the screen
-    sys.stdout.flush()
-    time.sleep(0.08)
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-    # 4. Lock In (Final Stable State)
     print(f"{Back.BLACK}{Fore.RED}{Style.BRIGHT}{text}")
     print(Style.RESET_ALL, end="")
 
@@ -237,37 +213,57 @@ class HellhoundConsole(cmd.Cmd):
     # Hackeristic Boot Sequence (UPGRADED)
     # ----------------------------
     def preloop(self):
-        # 1. Clear Screen
         os.system('cls' if os.name == 'nt' else 'clear')
-
-        # 2. Run the Script Animation
         run_exploit_script()
         
-        # 3. Clear Screen for the Glitch Transition
-        os.system('cls' if os.name == 'nt' else 'clear')
-        
-        # 4. Define the Logo
+        # Using the exact logo provided
         logo = r"""
-        ███░ ███▓█████ ██▓▒    ██▓▒    ███░ ██▓  █████   ██  ░██  ███▄    ██ ▓█████▄
-        ░██░ ██ ▓█▓  ▀ ▓██▒    ▓██▒    ░██░ ██  ██░  ██▒ ██  ▓██▒ ██ ▀█   ██ ███▀  █▌
-        ░██████░▒███   ▒██░    ▒██░    ░██████░▒██░  ██▒▓██  ▒██░▓██  ▀█  ██▒███   █▌
-        ░██▀▀██░▒███   ▒██░    ▒██░    ░██ ░██░▒██░  ██▒▓██  ▒██░▓██   ▀█ ██▒███   █▌
-        ░▓█ ░██ ▒▓█  ▄ ▒██░    ▒██░    ░██ ░██ ▒██░  ██░ ▓█  ░██░▓██▒   ▐▌██▒███▄  █▌
-        ▓██ ░██▓░▒████▒░██████▒░██████▒▓██ ░██▓ ▓████▓░ ░▒█████▓ ▒██▒    ▓██░██████▓▌
-        ▒ ▒  ▒░▒░░ ▒░ ▒ ▒░▒ ▒░▒ ▒░▓ ░ ▒  ▒░▒░▒░▒▒░▒ ▒░░ ░▒  ▒ ▒ ▒ ▒ ▒▒   ▒ ▓ ▓ ▒▒   ▒
-        ░  ░ ▒  ░ ░ ░ ░ ░  ░  ░ ▒  ░  ░  ▒ ░  ░ ▒ ▒  ░  ░░  ░ ░ ▒   ▒░  ░▒ ░ ▒ ▒    ▒
-        ░    ░  ░   ░ ░ ░  ░    ░  ░ ░   ░   ░░ ░ ░  ░░  ░  ░   ░░  ▒░  ░  ░   ░    ░
-          ░   ░ ░  ░  ░  ░    ░ ░  ░░ ░  ░ ░  ░ ░    ░ ░ ░  ░    ░   ░  ░      ░   ░
-                      Hellhound Pentest Framework v1.0
-                        Modular Red-Team Assistant 
-                        Developed by Team Hellhound
 
+
+            .:@@@-..                             ...                                                
+            .#@@@@@@..                        ..+%.                                                 
+           ..@@@@@@@@@%:.                  .-%@:                                                    
+           .#@@@@@@@@@@@@@=.   .::.                             .:.                                 
+           .@@@@@@@@@@@@@@@@@@@@@@@@@@@@#=:...         ....+@@@@@+.                                 
+           .%**=@@@@@@@@@@@@@@@@**@@@@@@@@@#+:......:+@@@@@+..+@#.                                  
+           .%@@%@%:=@@@@@@@@=@@*%@=:#@@@@@@@@@@@@@@@@@@%=*#:%@@@..                                  
+           .#@:%@@@@@:-@@@@@@.#@@@@*-+%@@@@@@@@@@@@@@@@@@@@@@@@:.                                   
+           .=.   -%@@@@%+@@@@@#*@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@:.                                    
+                  .=@@@@@@@@@@@@@@@@@@@@@@@@@@=%%@@@@@@@@@@*.                                      
+                     .:@@@@@@@@@@@@@@@@@@@@@@@@+%@%-#@@@@#.....     ....                           
+            .           .=@*@@@@@@@@@@@@@@@@@@@@@#*@@@@@:..  :@@#-.. ..:-.                          
+           ==   ....  ..%@@-@@.+@@@@@@@@@@@@@@@@@@@=@@@@@@%.. .@@@@@:%:..                           
+          .@%..:@:%@+#@@*-#@@@.+.+@-@@@%@@@:@@@@#-@@*@@@@%:#@+..*@@@@@@*:.                  
+          :%@@@%+--..+@@@@@@@@%:@+. :@@.@@%:.+@@@:.#@@@@@@@@#.-#-:@@@@@@@@@*.                   
+          %@@@@@@@@@@@@@@@-+@@@-@@%.+=:.:@.%@-.#@+::-@@@@@@=@@@@:..:@=+@@=#@@:.                     
+          .*@@@@@@@@@@@@@@@@@@@@@@@+.%@=...@@@%.=#.@=.#@@@@*+@@@@@@@@+:=-@@%:-%#..                  
+            .=@::....::..=@@@@@@@@@@.+@@@:*@@@@@+#.*@#.@@@@%.+@@@@@@@@@@@@@@@@=..+=.                
+                         .@@@@@@@@@#.%@@@@@@@@@@@+.*@@%@@@@#. -@@@@@@@@@@@@@@@@@:       .:          
+                         .@#@@@@@*@:=@@@@@@@@@@@*.-@@@@@@@@=....%@@@#*@@@@@=%%@@@@.. .*@=.          
+                         .%-@@@@@+.-@@@@@@@@-@@-.=@@@@@@@@@...#-.-@@@@@:.#@@@@@*-@@-.*-.            
+                          .+@@@@-.+@@@@@@@@-**.:@@@@@@@@@@:...#@#..*@@@@@#..#@@@@@@@:.              
+                          .#=@@@.%@@@@@@@@-..+@@@@@@@@@@@+@-..%@@@:..@@@@@@@-.-=@@@@@..             
+                          .:.@@@@@@@@@@@@-.%@@@@@@@@@@@@@:.%..@@@@@#..:@@@@@@@=..@@@@:.             
+                            .@@@@@@@@@@@=@@@@@@@@@@@@%:..%@#.:@@@@@@@. .@@@@+:@# .%@@-.             
+                            .@@@@@@@@@@%@@@@@@#@#+-...*@@@@..*@@@@@@@% .@@@+ .=-..@@:.             
+                            .@*@@@+@@@@@@@@@-=*...:@@@@@@@:..@@@@@@@@@. .*@@:     .#@.              
+                            .--@@+:@@@@@@@=.+..=@@@@%%@@@...*@@@@@@@@@. .*@+      .*=.              
+                              -@=.+@@@@@%...=@@@*:..=@@+.. -@@-%@@@@@:...@-.     ..*.               
+                              --. *@@@@=..+@@+.. ..#@%.   -@=.-@@@@@.. .=.        ..                
+                              .. .#@@@:.:@@..   .-@#..   ++...%@@@%..                               
+                                 .@@@:.:@:.   ..%=..  ..#.. .#@@@..                                 
+                                 .@@. .#.    .-.           .%@%..                                     
+                                .#*.  ..                 .+@=..                                     
+                                +.                    ..=+..                                        
+                 ██╗  ██╗███████╗██╗     ██╗     ██╗  ██╗ ██████╗ ██╗   ██╗███╗   ██╗██████╗ 
+                 ██║  ██║██╔════╝██║     ██║     ██║  ██║██╔═══██╗██║   ██║████╗  ██║██╔══██╗
+                 ███████║█████╗  ██║     ██║     ███████║██║   ██║██║   ██║██╔██╗ ██║██║  ██║
+                 ██╔══██║██╔══╝  ██║     ██║     ██╔══██║██║   ██║██║   ██║██║╚██╗██║██║  ██║
+                 ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
+                 ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝                                      
 """
                 
-        # 5. Run the Realistic Glitch Animation
-        realistic_signal_glitch(logo)
-        
-        # 6. Final prompt hint
+        simple_static_glitch(logo)
         print(f"\n{Fore.WHITE}Type '{Fore.YELLOW}help{Fore.WHITE}' to view available commands.\n")
 
     # ============================
