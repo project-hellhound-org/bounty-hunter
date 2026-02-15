@@ -200,6 +200,37 @@ class CmdInjectionEngine:
         }
 
         self.vulnerabilities.append(vuln)
+    
+
+    # -------------------------------------------------
+    # Spider Auto Mode
+    # -------------------------------------------------
+
+    def auto_from_spider(self, spider_results):
+
+        intel = spider_results.get("intel", {})
+        endpoints = intel.get("endpoints", [])
+
+        for ep in endpoints:
+            method = ep.get("method")
+            url = ep.get("url")
+            params = ep.get("params", [])
+            risks = ep.get("risks", [])
+
+            if not params:
+                continue
+
+            # Only attack high risk surfaces
+            if not any(r in ["COMMAND_INJECTION", "SYSTEM_INTERACTION"] for r in risks):
+                continue
+
+            for p in params:
+                name = p.get("name")
+
+                if method == "POST":
+                    self.inject_post_param(url, name)
+                else:
+                    self.inject_get_param(url, name)
 
     # -------------------------------------------------
     # Manual Mode
@@ -217,6 +248,7 @@ class CmdInjectionEngine:
         for param in params:
             self.inject_post_param(self.target, param)
             self.inject_get_param(self.target, param)
+
 
     # -------------------------------------------------
     # Run
