@@ -35,6 +35,9 @@ class Emit:
     def success(self, msg):
         self._send(f"[✓] {msg}")
 
+    def error(self, msg):
+        self._send(f"[✗] {msg}")
+
     def _send(self, msg):
         print(msg)
         if self.socketio:
@@ -59,15 +62,16 @@ class HellhoundEngine:
             }
         }
 
-        # 🔥 Single source of truth for categories
+        # 🔥 SINGLE SOURCE OF TRUTH FOR MODULE CATEGORIES
+        # MUST MATCH your folder structure exactly
         self.module_categories = [
             "network",
             "web",
-            "enum",
             "recon",
-            "vuln",      # ✅ ADDED
-            "post",      # future-proof
-            "exploit"    # future-proof
+            "vuln",
+            "intel",
+            "enum",
+            "exploit"
         ]
 
     # =================================================
@@ -134,7 +138,7 @@ class HellhoundEngine:
         return output
 
     # =================================================
-    # Module Loader (FIXED + FUTURE PROOF)
+    # Module Loader (CLEAN + FUTURE PROOF)
     # =================================================
 
     def load_module(self, name):

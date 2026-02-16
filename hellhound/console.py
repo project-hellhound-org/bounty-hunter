@@ -124,7 +124,6 @@ def load_modules():
             module_name = file[:-3]
 
             try:
-                # Dynamically import module
                 module = __import__(
                     f"hellhound.modules.{category}.{module_name}",
                     fromlist=["*"]
@@ -143,8 +142,6 @@ def load_modules():
             }
 
     return modules
-
-
 
 class HellhoundConsole(cmd.Cmd):
 
@@ -190,8 +187,8 @@ class HellhoundConsole(cmd.Cmd):
             "nuclei": {
                 "--critical": {"severity": "critical"}
             },
-            "cmdinj": {
-                "--auto": {"auto": True}
+            "stalk": {
+                "--deep": {"mode": "deep"}
             }
 
         }
@@ -341,9 +338,6 @@ class HellhoundConsole(cmd.Cmd):
 
         print()
 
-
-
-
     def do_hunt(self, arg):
             """
             hunt → Intelligent, automated attack chain.
@@ -442,115 +436,193 @@ class HellhoundConsole(cmd.Cmd):
 
             print(Fore.YELLOW + f"[{mod.upper()}]")
 
+            # -------------------------------------------------
+            # Structured Modules (Preferred Design with "intel" key)
+            # -------------------------------------------------
             if isinstance(output, dict) and "intel" in output:
 
                 intel = output.get("intel", {})
+                summary = intel.get("summary", {})
 
-                # --- COMMENTS (Prioritized) ---
-                if "comments" in intel:
-                    comments = intel.get("comments", [])
-                    if comments:
-                        print(Fore.GREEN + "  Developer Notes / Source Comments:")
-                        for c in comments:
-                            display_text = (c[:75] + "...") if len(c) > 75 else c
-                            color = Fore.YELLOW
-                            if "flag" in c.lower(): color = Fore.RED
-                            elif "[JS]" in c: color = Fore.CYAN
-                            elif "[HTML]" in c: color = Fore.WHITE
-                            
-                            print(f"    - {color}{display_text}")
+                # =================================================
+                # 1️⃣ GENERIC SUMMARY BLOCK
+                # =================================================
+                if summary:
+                    print(Fore.GREEN + "  Summary:")
+                    for k, v in summary.items():
+                        print(f"    {k.replace('_',' ').title()} : {v}")
+                    print()
+
+                # =================================================
+                # 2️⃣ INFRASTRUCTURE (Stalk Phase 1)
+                # =================================================
+                if "infrastructure" in intel:
+                    infra = intel.get("infrastructure", {})
+                    print(Fore.GREEN + "  Infrastructure:")
+
+                    if infra.get("subdomains"):
+                        subs = infra["subdomains"]
+                        print(f"    Subdomains: {len(subs)} found")
+                        for s in subs[:10]:
+                            print(f"      - {Fore.CYAN}{s}")
+                        if len(subs) > 10:
+                            print(f"      ... +{len(subs)-10} more")
                         print()
 
-                # --- ENDPOINTS / FORMS ---
+                    if infra.get("netrange"):
+                        print("    NetRange:")
+                        for n in infra["netrange"]:
+                            print(f"      - {n}")
+                        print()
+
+                    if infra.get("asn"):
+                        print(f"    ASN: {Fore.YELLOW}{infra['asn']}")
+                        print()
+
+                    if infra.get("mx_records"):
+                        print("    MX Records:")
+                        for mx in infra["mx_records"]:
+                            print(f"      - {mx}")
+                        print()
+                    
+                    if infra.get("email_provider"):
+                        print(f"    Email Provider: {Fore.CYAN}{', '.join(infra['email_provider'])}")
+                        print()
+
+                    if infra.get("waf"):
+                        print(f"    WAF: {Fore.RED}{infra['waf']}")
+                        print()
+
+                # =================================================
+                # 2.5️⃣ EXPOSURE (Stalk Phase 3)
+                # =================================================
+                if "exposure" in intel:
+                    exp = intel.get("exposure", {})
+                    
+                    if exp.get("leaks"):
+                        print(Fore.RED + "  ⚠ Potential Leaks:")
+                        for l in exp["leaks"]:
+                            print(f"    - {Fore.YELLOW}{l}")
+                        print()
+
+                    if exp.get("takeover_candidates"):
+                        print(Fore.RED + "  ⚠ Takeover Candidates:")
+                        for t in exp["takeover_candidates"]:
+                            print(f"    - {Fore.CYAN}{t}")
+                        print()
+
+                # =================================================
+                # 3️⃣ WEB SURFACE (Stalk / Spider)
+                # =================================================
+                if "web" in intel:
+                    web = intel.get("web", {})
+
+                    if web.get("http_services"):
+                        print(Fore.GREEN + "  HTTP Services:")
+                        for h in web["http_services"]:
+                            print(f"      - {Fore.CYAN}{h}")
+                        print()
+
+                    if web.get("technologies"):
+                        print(Fore.GREEN + "  Technologies:")
+                        for t in web["technologies"]:
+                            print(f"      - {t}")
+                        print()
+
+                    if web.get("urls"):
+                        print(f"    URLs Discovered: {len(web['urls'])}")
+                        print()
+                    
+                    if web.get("js_files"):
+                        print(Fore.GREEN + "  JavaScript Files:")
+                        for js in web["js_files"]:
+                            print(f"      - {Fore.CYAN}{js}")
+                        print()
+
+                # =================================================
+                # 4️⃣ SERVICE MAP (Surfacemap Style)
+                # =================================================
+                if "map" in intel:
+                    surface = intel.get("map", {})
+                    for ip, ports in surface.items():
+                        print(Fore.GREEN + f"  Surface Map → {ip}")
+                        for port_proto, data in ports.items():
+                            service = data.get("service", "")
+                            product = data.get("product", "")
+                            version = data.get("version", "")
+                            print(
+                                f"    {Fore.CYAN}{port_proto:<8} "
+                                f"{Fore.WHITE}{service:<10} "
+                                f"{Fore.YELLOW}{product} {version}"
+                            )
+                        print()
+
+                # =================================================
+                # 5️⃣ ENDPOINTS (Spider / Stalk)
+                # =================================================
                 if "endpoints" in intel:
                     endpoints = intel.get("endpoints", [])
                     stats = intel.get("stats", {})
 
                     if stats:
                         print(Fore.GREEN + "  Attack Surface Summary:")
-                        print(f"    GET  : {stats.get('get', 0)}")
-                        print(f"    POST : {stats.get('post', 0)}")
-                        print(f"    TOTAL: {stats.get('total', 0)}")
-                        print(f"    LINKS: {stats.get('links', 0)}")
+                        for key, val in stats.items():
+                            print(f"    {key.upper():<6}: {val}")
                         print()
 
                     for idx, ep in enumerate(endpoints, 1):
                         method = ep.get("method", "GET")
                         url = ep.get("url", "")
-                        method_color = Fore.BLUE if method == "GET" else Fore.MAGENTA
-                        print(method_color + f"  [{idx}] {method}  {url}")
+                        color = Fore.BLUE if method == "GET" else Fore.MAGENTA
+                        print(color + f"  [{idx}] {method}  {url}")
 
                         for p in ep.get("params", []):
                             pname = p.get("name", "")
                             ptype = p.get("type", "")
-                            risk_color = (Fore.RED if pname.lower() in ["id", "token", "password", "uid"] else Fore.WHITE)
-                            print(f"       - {risk_color}{pname} {Fore.YELLOW}({ptype})")
-                        
-                        if ep.get("tags"): print(Fore.RED + f"       Tags: {', '.join(ep['tags'])}")
+                            print(f"       - {Fore.WHITE}{pname} {Fore.YELLOW}({ptype})")
+
+                        if ep.get("tags"):
+                            print(Fore.RED + f"       Tags: {', '.join(ep['tags'])}")
+
                         print()
 
-                # --- JS FILES ---
-                if "js_files" in intel:
-                    js_files = intel.get("js_files", [])
-                    if js_files:
-                        print(Fore.GREEN + "  JavaScript Files Found:")
-                        for js in js_files:
-                            print(f"    - {Fore.CYAN}{js}")
-                        print()
+                # =================================================
+                # 6️⃣ EMAILS / CREDLEAK / PHISHING
+                # =================================================
+                if "emails" in intel and intel["emails"]:
+                    print(Fore.GREEN + "  Emails Found:")
+                    for email in intel["emails"]:
+                        print(f"    - {Fore.CYAN}{email}")
+                    print()
 
-                # --- JS ENDPOINTS ---
-                if "js_endpoints" in intel:
-                    js_eps = intel.get("js_endpoints", [])
-                    if js_eps:
-                        print(Fore.GREEN + "  Endpoints Discovered in JavaScript:")
-                        for ep in js_eps:
-                            print(f"    - {Fore.YELLOW}{ep}")
-                        print()
+                if "paste_hits" in intel and intel["paste_hits"]:
+                    print(Fore.GREEN + "  Paste References:")
+                    for link in intel["paste_hits"]:
+                        print(f"    - {Fore.YELLOW}{link}")
+                    print()
 
-                # --- POTENTIAL KEYS ---
-                if "potential_keys" in intel:
-                    keys = intel.get("potential_keys", [])
-                    if keys:
-                        print(Fore.RED + "  ⚠ Potential Secrets/Keys Found:")
-                        for k in keys:
-                            print(f"    - {k}")
-                        print()
+                if "exposed_keys" in intel and intel["exposed_keys"]:
+                    print(Fore.RED + "  ⚠ Exposed Keys Detected:")
+                    for key in intel["exposed_keys"]:
+                        print(f"    - {key}")
+                    print()
 
-                # --- ROBOTS.TXT ---
-                if "robots_disallowed" in intel:
-                    robots = intel.get("robots_disallowed", [])
-                    if robots:
-                        print(Fore.GREEN + "  Robots.txt Disallowed (Crawled):")
-                        for entry in robots:
-                            print(f"    - {Fore.RED}{entry}")
-                        print()
-                
-                if "robots_raw" in intel:
-                    raw_content = intel.get("robots_raw", "").strip()
-                    if raw_content:
-                        print(Fore.GREEN + "  Robots.txt Content:")
-                        for line in raw_content.split('\n'):
-                            print(Fore.WHITE + f"    {line}")
-                        print()
+                if "security_policy" in intel:
+                    pol = intel["security_policy"]
+                    print(Fore.GREEN + "  Phishing Intel:")
+                    if intel.get("phishing_domain"):
+                        print(f"    Suggested Domain : {Fore.CYAN}{intel['phishing_domain']}")
+                    if pol.get("spf"):
+                        print(f"    SPF Status      : {Fore.YELLOW}{pol.get('spf_type')}")
+                    if pol.get("dmarc"):
+                        print(f"    DMARC Policy    : {Fore.YELLOW}{pol.get('dmarc_policy')}")
+                    if intel.get("target_emails"):
+                        print(f"    Target Emails   : {len(intel['target_emails'])}")
+                    print()
 
-                # --- TECH STACK ---
-                if "tech_stack" in intel:
-                    tech = intel.get("tech_stack", [])
-                    if tech:
-                        print(Fore.GREEN + "  Technology Stack:")
-                        print(f"    - {Fore.WHITE}{', '.join(tech)}")
-                        print()
-
-                # --- SIGNALS ---
-                if "signals" in intel:
-                    signals = intel.get("signals", [])
-                    if signals:
-                        print(Fore.GREEN + "  Signals:")
-                        for s in signals:
-                            print(f"    - {s}")
-                        print()
-
-                # --- VULNERABILITIES ---
+                # =================================================
+                # 7️⃣ VULNERABILITIES (Universal)
+                # =================================================
                 if "vulnerabilities" in intel:
                     vulns = intel.get("vulnerabilities", [])
                     if vulns:
@@ -560,21 +632,65 @@ class HellhoundConsole(cmd.Cmd):
                             url = v.get("url", "")
                             param = v.get("parameter", "")
                             payload = v.get("payload_used")
+                            confidence = v.get("confidence", "")
                             print(Fore.YELLOW + f"  [{idx}] {vtype}")
                             print(f"       Target     : {Fore.CYAN}{url}")
-                            print(f"       Parameter  : {Fore.WHITE}{param}")
-                            if payload: print(f"       Payload    : {Fore.GREEN}{payload}")
-                            if v.get("proof"): print(Fore.MAGENTA + f"       Proof      : {v.get('proof')}")
+                            if param:
+                                print(f"       Parameter  : {Fore.WHITE}{param}")
+                            if payload:
+                                print(f"       Payload    : {Fore.GREEN}{payload}")
+                            if confidence:
+                                print(f"       Confidence : {confidence}")
+                            if v.get("proof"):
+                                print(Fore.MAGENTA + f"       Proof      : {v.get('proof')}")
                             print()
 
+                # =================================================
+                # 8️⃣ SIGNALS
+                # =================================================
+                if "signals" in intel:
+                    signals = intel.get("signals", [])
+                    if signals:
+                        print(Fore.GREEN + "  Signals:")
+                        for s in signals:
+                            print(f"    - {s}")
+                        print()
+
+            # -------------------------------------------------
+            # RAW FALLBACK (Handles dicts without 'intel', strings, or lists)
+            # -------------------------------------------------
+            elif isinstance(output, dict):
+                # Handle modules returning {'raw': ..., 'signals': ...}
+                if "raw" in output:
+                    print(Fore.WHITE + output["raw"])
+                
+                if "signals" in output and output["signals"]:
+                    print(Fore.GREEN + "  Signals:")
+                    for s in output['signals']:
+                        print(f"    - {s}")
+                    print()
+                elif "summary" in output:
+                    print(Fore.WHITE + str(output["summary"]))
+                else:
+                    # Fallback for unknown dicts
+                    print(Fore.WHITE + str(output))
+
+            elif isinstance(output, list):
+                # Handle modules returning lists (e.g. simple lists of strings)
+                for item in output:
+                    print(Fore.WHITE + f"    - {item}")
+            
             elif isinstance(output, str):
                 print(Fore.WHITE + output.strip()[:1000])
                 print()
+
             else:
                 print(Fore.WHITE + str(output))
                 print()
 
         print(Fore.CYAN + "================================\n")
+
+
 
     # ============================
     # RECON
@@ -685,16 +801,42 @@ class HellhoundConsole(cmd.Cmd):
                 return
             options.update(module_flags[flag])
 
-        # Auto-inject spider intel into cmdinj
+        # ==========================================================
+        # AUTO-INTEGRATION LOGIC
+        # ==========================================================
+
+        # 1. Spider -> Cmdinj (Existing)
         if module == "cmdinj":
             if "spider" in self.results:
                 options["spider_results"] = self.results["spider"]
-                options.setdefault("auto", True)
+                
+        # 2. Stalk -> Surfacemap (New Integration)
+        if module == "surfacemap":
+            if "stalk" in self.results:
+                stalk_data = self.results["stalk"]
+                
+                # Check if Stalk data has the expected structure
+                if isinstance(stalk_data, dict) and "intel" in stalk_data:
+                    intel = stalk_data["intel"]
+                    
+                    # Extract HTTP Services
+                    http_services = intel.get("web", {}).get("http_services", [])
+                    if http_services:
+                        options["http_services"] = http_services
+                        print(Fore.CYAN + f"[*] Auto-fed {len(http_services)} HTTP targets from Stalk")
+
+                    # Extract Subdomains
+                    subdomains = intel.get("infrastructure", {}).get("subdomains", [])
+                    if subdomains:
+                        options["subdomains"] = subdomains
+                        print(Fore.CYAN + f"[*] Auto-fed {len(subdomains)} Subdomains from Stalk")
+
+        # ==========================================================
 
         print(Fore.YELLOW + f"[*] Executing {module}...")
 
         try:
-            output = self.engine.run_single(module, self.target, options=options if options else None)
+            output = self.engine.run_single(module, self.target, options=options)
             self.results[module] = output
             print(Fore.GREEN + f"[✓] {module} finished.")
         except Exception as e:
