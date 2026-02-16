@@ -4,7 +4,6 @@ import re
 import os
 import zipfile
 from datetime import datetime
-from hellhound.core.exploit_mapper import ExploitMapper
 
 NAME = "ftp"
 CATEGORY = "network"
