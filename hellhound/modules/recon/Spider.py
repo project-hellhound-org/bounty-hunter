@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from colorama import Fore
+import hashlib
 
 NAME = "spider"
 CATEGORY = "recon"
@@ -70,6 +71,8 @@ class SpiderEngine:
         self.max_depth = depth
         self.max_threads = threads
         self.auth_enabled = auth
+        self.content_hashes = set()
+
 
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
@@ -212,7 +215,7 @@ class SpiderEngine:
             try:
                 url, depth = self.queue.popleft()
             except IndexError:
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
 
             url = self.normalize(url)
@@ -223,9 +226,24 @@ class SpiderEngine:
 
             try:
                 r = self.session.get(url, timeout=8)
+
+                # Ignore obvious failures
+                if r.status_code >= 400:
+                    continue
+
+                if "not found" in r.text.lower() and r.status_code == 200:
+                    continue
+
             except: continue
 
             content_type = r.headers.get("Content-Type", "").lower()
+            content_hash = hashlib.md5(r.text.encode()).hexdigest()
+
+            with self.lock:
+                if content_hash in self.content_hashes:
+                    return
+                self.content_hashes.add(content_hash)
+
 
             if "text/html" in content_type:
                 self.analyze_headers(r)
@@ -373,7 +391,8 @@ class SpiderEngine:
         params = [{"name": k, "type": "query"} for k in parse_qs(parsed.query)]
         risks = self.classify_risks(params)
         priority = self.calculate_priority(risks)
-        endpoint = {"method": "GET", "url": url, "params": params, "risks": risks, "priority": priority, "tags": ["GET_PARAM"]}
+        normalized_url = parsed.scheme + "://" + parsed.netloc + parsed.path
+        endpoint = {"method": "GET", "url": normalized_url, "params": params, "risks": risks, "priority": priority, "tags": ["GET_PARAM"]}
         with self.lock:
             if endpoint not in self.intel["endpoints"]:
                 self.intel["endpoints"].append(endpoint)
@@ -458,6 +477,19 @@ class SpiderEngine:
         raw_summary = (f"GET: {self.intel['stats']['get']} | POST: {self.intel['stats']['post']} | "
                        f"TOTAL: {self.intel['stats']['total']} | LINKS: {self.intel['stats']['links']} | "
                        f"JS_FILES: {self.intel['stats']['js_files']}")
+        risk_score = 0
+
+        if "AUTH_SURFACE_DETECTED" in self.intel["signals"]:
+            risk_score += 2
+
+        if "HIGH_RISK_PARAMETERS_DETECTED" in self.intel["signals"]:
+            risk_score += 3
+
+        if "LOGIN_WALL_DETECTED" in self.intel["signals"]:
+            risk_score += 1
+
+        self.intel["risk_score"] = risk_score
+
         return {"raw": raw_summary, "intel": self.intel}
 
 
