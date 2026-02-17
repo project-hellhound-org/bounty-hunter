@@ -1,4 +1,0 @@
-Target: http://10.247.166.2:5000
-Modules Run: 4
-Risk Score: 8
-Vulnerabilities Identified: 1
