@@ -5,6 +5,9 @@ import os
 import time
 import sys
 import random
+from datetime import datetime
+import json
+
 
 from colorama import Fore, Back, Style, init
 init(autoreset=True)
@@ -181,16 +184,9 @@ class HellhoundConsole(cmd.Cmd):
                 "--enum": {"mode": "enum"},
                 "--brute": {"mode": "bruteforce"},
             },
-            "dirsearch": {
-                "--deep": {"mode": "deep"}
-            },
-            "nuclei": {
-                "--critical": {"severity": "critical"}
-            },
             "stalk": {
                 "--deep": {"mode": "deep"}
             }
-
         }
 
         self.aliases = {
@@ -262,6 +258,34 @@ class HellhoundConsole(cmd.Cmd):
                 
         simple_static_glitch(logo)
         print(f"\n{Fore.WHITE}Type '{Fore.YELLOW}help{Fore.WHITE}' to view available commands.\n")
+    
+    # ============================
+    # TAB COMPLETION
+    # ============================
+
+    def complete_strike(self, text, line, begidx, endidx):
+        """
+        TAB completion for: strike <module>
+        """
+        return self._module_autocomplete(text)
+
+    def complete_equip(self, text, line, begidx, endidx):
+        """
+        TAB completion for: equip <module>
+        """
+        return self._module_autocomplete(text)
+
+    def _module_autocomplete(self, text):
+        """
+        Returns matching modules based on typed text.
+        Case-insensitive.
+        """
+        modules = list(self.modules.keys())
+
+        if not text:
+            return modules
+
+        return [m for m in modules if m.lower().startswith(text.lower())]
 
     # ============================
     # CORE COMMANDS
@@ -422,19 +446,130 @@ class HellhoundConsole(cmd.Cmd):
                     except Exception as e:
                         print(Fore.RED + f"[x] {module_name} failed: {str(e)}")
 
-    
     def do_loot(self, arg):
         """loot → View gathered results"""
+        import json
+        import os
+        from datetime import datetime
 
         if not self.results:
             print(Fore.RED + "[!] No loot collected yet")
             return
 
+        parts = arg.split()
+
+        # ======================================================
+        # 1. LOOT --JSON (Raw Data Dump)
+        # ======================================================
+        if "--json" in parts:
+            print(json.dumps(self.results, indent=4, default=str))
+            return
+
+        # ======================================================
+        # 2. LOOT --SUMMARY (Executive View)
+        # ======================================================
+        if "--summary" in parts:
+
+            print(Fore.CYAN + "\n========== [ SUMMARY ] ==========\n")
+
+            # Calculate Risk & Vulnerability Stats
+            total_risk = 0
+            total_vulns = 0
+
+            for mod, output in self.results.items():
+                if isinstance(output, dict) and "intel" in output:
+                    intel = output["intel"]
+                    # Aggregate risk (default 0 if not present)
+                    total_risk += intel.get("risk_score", 0)
+                    # Aggregate vulnerabilities
+                    total_vulns += len(intel.get("vulnerabilities", []))
+
+            # Determine Risk Level
+            if total_risk <= 2:
+                level = "LOW"
+                level_color = Fore.GREEN
+            elif total_risk <= 6:
+                level = "MEDIUM"
+                level_color = Fore.YELLOW
+            elif total_risk <= 10:
+                level = "HIGH"
+                level_color = Fore.RED
+            else:
+                level = "CRITICAL"
+                level_color = Fore.MAGENTA
+
+            print(f"Target       : {self.target}")
+            print(f"Modules Run  : {len(self.results)}")
+            print(f"Risk Score   : {total_risk} ({level_color}{level}{Style.RESET_ALL})")
+            print(f"Vulnerabilities Identified : {total_vulns}")
+            print("\n================================\n")
+            return
+
+        # ======================================================
+        # 3. LOOT --EXPORT (File Export)
+        # ======================================================
+        if "--export" in parts:
+
+            from datetime import datetime
+            import json
+
+            base_path = os.path.join("storage", "reports", self.target)
+            os.makedirs(base_path, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+            json_path = os.path.join(base_path, f"{timestamp}.json")
+            summary_path = os.path.join(base_path, f"{timestamp}_summary.txt")
+
+            # Save JSON safely
+            with open(json_path, "w") as f:
+                json.dump(self.results, f, indent=4, default=str)
+
+            # Build summary
+            total_risk = 0
+            total_vulns = 0
+
+            for mod, output in self.results.items():
+                if isinstance(output, dict) and "intel" in output:
+                    intel = output["intel"]
+                    total_risk += intel.get("risk_score", 0)
+                    total_vulns += len(intel.get("vulnerabilities", []))
+
+            summary_content = (
+                f"Target: {self.target}\n"
+                f"Modules Run: {len(self.results)}\n"
+                f"Risk Score: {total_risk}\n"
+                f"Vulnerabilities Identified: {total_vulns}\n"
+            )
+
+            with open(summary_path, "w") as f:
+                f.write(summary_content)
+
+            print(Fore.GREEN + f"[✓] Report exported successfully.")
+            print(Fore.GREEN + f"    JSON: {json_path}")
+            print(Fore.GREEN + f"    Summary: {summary_path}")
+            return
+
+        # ======================================================
+        # 4. LOOT (Default - Detailed View)
+        # ======================================================
         print("\n" + Fore.CYAN + "========== [ LOOT ] ==========\n")
+        
+        # Track keys we have already printed to avoid duplicates
+        printed_keys = set()
 
         for mod, output in self.results.items():
+            
+            # 1. Normalize module name to lowercase for consistency
+            mod_clean = mod.lower()
+            
+            # 2. Skip if we already printed this module
+            if mod_clean in printed_keys:
+                continue
+            
+            printed_keys.add(mod_clean)
 
-            print(Fore.YELLOW + f"[{mod.upper()}]")
+            print(Fore.YELLOW + f"[{mod_clean.upper()}]")
 
             # -------------------------------------------------
             # Structured Modules (Preferred Design with "intel" key)
@@ -570,30 +705,38 @@ class HellhoundConsole(cmd.Cmd):
                             print(f"    {key.upper():<6}: {val}")
                         print()
 
-                    for idx, ep in enumerate(endpoints, 1):
-                        method = ep.get("method", "GET")
-                        url = ep.get("url", "")
+                    for idx, el in enumerate(endpoints, 1):
+                        method = el.get("method", "GET")
+                        url = el.get("url", "")
                         color = Fore.BLUE if method == "GET" else Fore.MAGENTA
                         print(color + f"  [{idx}] {method}  {url}")
 
-                        for p in ep.get("params", []):
+                        for p in el.get("params", []):
                             pname = p.get("name", "")
                             ptype = p.get("type", "")
                             print(f"       - {Fore.WHITE}{pname} {Fore.YELLOW}({ptype})")
 
-                        if ep.get("tags"):
-                            print(Fore.RED + f"       Tags: {', '.join(ep['tags'])}")
+                        if el.get("tags"):
+                            print(Fore.RED + f"       Tags: {', '.join(el['tags'])}")
 
                         print()
 
                 # =================================================
-                # 6️⃣ EMAILS / CREDLEAK / PHISHING
+                # 5.5️⃣ CREDLEAK / CLOUD (Upgraded)
                 # =================================================
-                if "emails" in intel and intel["emails"]:
-                    print(Fore.GREEN + "  Emails Found:")
-                    for email in intel["emails"]:
-                        print(f"    - {Fore.CYAN}{email}")
+                if "s3_buckets" in intel:
+                    print(Fore.GREEN + "  Cloud Assets (S3):")
+                    for bucket in intel["s3_buckets"]:
+                        print(f"    - {Fore.CYAN}http://{bucket}.s3.amazonaws.com")
                     print()
+
+                if "hardcoded_creds" in intel:
+                    creds = intel["hardcoded_creds"]
+                    if creds:
+                        print(Fore.RED + "  ⚠ Hardcoded Credentials Extracted:")
+                        for cred in creds:
+                            print(f"    - {Fore.YELLOW}{cred}")
+                        print()
 
                 if "paste_hits" in intel and intel["paste_hits"]:
                     print(Fore.GREEN + "  Paste References:")
@@ -602,11 +745,25 @@ class HellhoundConsole(cmd.Cmd):
                     print()
 
                 if "exposed_keys" in intel and intel["exposed_keys"]:
-                    print(Fore.RED + "  ⚠ Exposed Keys Detected:")
-                    for key in intel["exposed_keys"]:
-                        print(f"    - {key}")
+                    keys = intel["exposed_keys"]
+                    if keys:
+                        print(Fore.RED + "  ⚠ Exposed Keys Detected:")
+                        for key in keys:
+                            print(f"    - {key}")
+                        print()
+
+                # =================================================
+                # 6️⃣ EMAILS / PHISHING
+                # =================================================
+                if "emails" in intel and intel["emails"]:
+                    print(Fore.GREEN + "  Emails Found:")
+                    for email in intel["emails"]:
+                        print(f"    - {Fore.CYAN}{email}")
                     print()
 
+                # =================================================
+                # 6.5️⃣ PHISHING INTEL (Consolidated)
+                # =================================================
                 if "security_policy" in intel:
                     pol = intel["security_policy"]
                     print(Fore.GREEN + "  Phishing Intel:")
@@ -616,8 +773,32 @@ class HellhoundConsole(cmd.Cmd):
                         print(f"    SPF Status      : {Fore.YELLOW}{pol.get('spf_type')}")
                     if pol.get("dmarc"):
                         print(f"    DMARC Policy    : {Fore.YELLOW}{pol.get('dmarc_policy')}")
+                    
+                    # UPDATED: Show ONLY Top 10 emails + Indicate Source
                     if intel.get("target_emails"):
-                        print(f"    Target Emails   : {len(intel['target_emails'])}")
+                        emails = intel["target_emails"]
+                        signals = intel.get("signals", [])
+                        
+                        # Detect source of emails
+                        if "SCRAPED_EMAILS_FOUND" in signals:
+                            source_color = Fore.GREEN
+                            source_text = "Real (Scraped from HTML)"
+                        elif "SMART_PATTERN_DEDUCTION" in signals:
+                            source_color = Fore.MAGENTA
+                            source_text = "Derived (Pattern Matching)"
+                        else:
+                            source_color = Fore.LIGHTBLACK_EX
+                            source_text = "Predicted (Based on Usernames)"
+
+                        print(f"    Target Emails   : {len(emails)} found ({source_color}{source_text}{Style.RESET_ALL})")
+                        
+                        # ONLY SHOW TOP 10
+                        for e in emails[:10]:
+                            print(f"      - {Fore.CYAN}{e}")
+                        
+                        # Hide the rest
+                        if len(emails) > 10:
+                            print(f"      ... +{len(emails)-10} more (Hidden to reduce noise)")
                     print()
 
                 # =================================================
@@ -758,27 +939,39 @@ class HellhoundConsole(cmd.Cmd):
         """
 
         if not self.target or not self.target_type:
-            print("[!] No prey set")
+            print(Fore.RED + "[!] No prey set")
             return
 
         parts = arg.split()
 
-        # Determine module
-        module = self.active_module
-        if parts and not parts[0].startswith("--"):
-            module = parts[0]
-            parts = parts[1:]
+        # -----------------------------------------
+        # Determine module (case-insensitive)
+        # -----------------------------------------
+        module_input = self.active_module
 
-        if not module:
+        if parts and not parts[0].startswith("--"):
+            module_input = parts[0]
+            parts = parts[1:]
+            
+        if not module_input:
             print("Usage: strike <module> [--flags]")
             print("       strike (if tool equipped)")
             return
 
-        if module not in self.modules:
-            print(Fore.RED + f"[!] Unknown module: {module}")
+        # Resolve module name ignoring case
+        module = None
+        for m in self.modules:
+            if m.lower() == module_input.lower():
+                module = m
+                break
+
+        if not module:
+            print(Fore.RED + f"[!] Unknown module: {module_input}")
             return
 
-        # Scope enforcement
+        # -----------------------------------------
+        # Scope Enforcement
+        # -----------------------------------------
         category = self.modules[module]["category"]
         ALLOWED_FOR_WEB = {"web", "recon", "network", "vuln"}
 
@@ -786,13 +979,18 @@ class HellhoundConsole(cmd.Cmd):
             print(Fore.RED + f"[!] '{module}' not suitable for WEB targets")
             return
 
-        # Handle help
+        # -----------------------------------------
+        # Handle Help
+        # -----------------------------------------
         if "--help" in parts:
             self._show_module_help(module)
             return
 
-        # Validate flags
-        module_flags = self.MODULE_FLAGS.get(module, {})
+        # -----------------------------------------
+        # Validate Flags
+        # -----------------------------------------
+        module_key = module.lower() # Always use lowercase for keys/flags
+        module_flags = self.MODULE_FLAGS.get(module_key, {})
         options = {}
 
         for flag in parts:
@@ -802,34 +1000,34 @@ class HellhoundConsole(cmd.Cmd):
             options.update(module_flags[flag])
 
         # ==========================================================
-        # AUTO-INTEGRATION LOGIC
+        # 🔥 AUTO-INTEGRATION LOGIC (Case-Insensitive)
         # ==========================================================
 
-        # 1. Spider -> Cmdinj (Existing)
-        if module == "cmdinj":
-            if "spider" in self.results:
-                options["spider_results"] = self.results["spider"]
-                
-        # 2. Stalk -> Surfacemap (New Integration)
-        if module == "surfacemap":
-            if "stalk" in self.results:
-                stalk_data = self.results["stalk"]
-                
-                # Check if Stalk data has the expected structure
-                if isinstance(stalk_data, dict) and "intel" in stalk_data:
-                    intel = stalk_data["intel"]
-                    
-                    # Extract HTTP Services
-                    http_services = intel.get("web", {}).get("http_services", [])
-                    if http_services:
-                        options["http_services"] = http_services
-                        print(Fore.CYAN + f"[*] Auto-fed {len(http_services)} HTTP targets from Stalk")
+        # Spider → CmdInj
+        if module_key == "cmdinj":
+            # Check both 'spider' and 'Spider' to be safe
+            spider_data = self.results.get("spider") or self.results.get("Spider")
+            if spider_data:
+                options["spider_results"] = spider_data
+                print(Fore.CYAN + "[*] Auto-fed Spider results into CMDinj")
 
-                    # Extract Subdomains
-                    subdomains = intel.get("infrastructure", {}).get("subdomains", [])
-                    if subdomains:
-                        options["subdomains"] = subdomains
-                        print(Fore.CYAN + f"[*] Auto-fed {len(subdomains)} Subdomains from Stalk")
+        # Stalk → Surfacemap
+        if module_key == "surfacemap":
+            # Check both 'stalk' and 'Stalk'
+            stalk_data = self.results.get("stalk") or self.results.get("Stalk")
+
+            if stalk_data and isinstance(stalk_data, dict) and "intel" in stalk_data:
+                intel = stalk_data["intel"]
+
+                http_services = intel.get("web", {}).get("http_services", [])
+                if http_services:
+                    options["http_services"] = http_services
+                    print(Fore.CYAN + f"[*] Auto-fed {len(http_services)} HTTP targets from Stalk")
+
+                subdomains = intel.get("infrastructure", {}).get("subdomains", [])
+                if subdomains:
+                    options["subdomains"] = subdomains
+                    print(Fore.CYAN + f"[*] Auto-fed {len(subdomains)} subdomains from Stalk")
 
         # ==========================================================
 
@@ -837,16 +1035,20 @@ class HellhoundConsole(cmd.Cmd):
 
         try:
             output = self.engine.run_single(module, self.target, options=options)
-            self.results[module] = output
+            
+            # FIX: Store using module_key (lowercase) to prevent duplicates
+            self.results[module_key] = output
+            
             print(Fore.GREEN + f"[✓] {module} finished.")
         except Exception as e:
             print(Fore.RED + f"[x] {module} failed: {str(e)}")
 
 
+
     def _show_module_help(self, module):
         print(f"\n[ Help — {module} ]")
 
-        flags = self.MODULE_FLAGS.get(module, {})
+        flags = self.MODULE_FLAGS.get(module.lower(), {})
         if not flags:
             print("  No flags available.")
             return
@@ -855,6 +1057,7 @@ class HellhoundConsole(cmd.Cmd):
             print(f"  {flag}")
 
         print()
+
 
 
     # ============================
@@ -931,6 +1134,7 @@ auto      → Intelligent attack chain
 clear     → Clear the console screen
 status    → Show framework status
 sessions  → List previous hunts
+report    → Export full intelligence report to storage
 
 Aliases:
 =====================
