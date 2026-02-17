@@ -186,6 +186,9 @@ class HellhoundConsole(cmd.Cmd):
             },
             "stalk": {
                 "--deep": {"mode": "deep"}
+            },
+            "fuzzhunter": { 
+                "--deep": {"mode": "deep"}
             }
         }
 
@@ -611,7 +614,7 @@ class HellhoundConsole(cmd.Cmd):
                         print()
 
                     if infra.get("asn"):
-                        print(f"    ASN: {Fore.YELLOW}{infra['asn']}")
+                        print(f"    ASN: {Fore.YELLOW}{intel['asn']}")
                         print()
 
                     if infra.get("mx_records"):
@@ -625,7 +628,7 @@ class HellhoundConsole(cmd.Cmd):
                         print()
 
                     if infra.get("waf"):
-                        print(f"    WAF: {Fore.RED}{infra['waf']}")
+                        print(f"    WAF: {Fore.RED}{intel['waf']}")
                         print()
 
                 # =================================================
@@ -647,7 +650,7 @@ class HellhoundConsole(cmd.Cmd):
                         print()
 
                 # =================================================
-                # 3️⃣ WEB SURFACE (Stalk / Spider)
+                # 3️⃣ WEB SURFACE (Stalk / Spider) - UPDATED
                 # =================================================
                 if "web" in intel:
                     web = intel.get("web", {})
@@ -664,14 +667,76 @@ class HellhoundConsole(cmd.Cmd):
                             print(f"      - {t}")
                         print()
 
+                    # --- URLs: List them, don't just count ---
                     if web.get("urls"):
-                        print(f"    URLs Discovered: {len(web['urls'])}")
+                        urls = web["urls"]
+                        print(f"    URLs Discovered: {len(urls)}")
+                        for u in urls[:10]: # Show first 10
+                            print(f"      - {Fore.CYAN}{u}")
+                        if len(urls) > 10:
+                            print(f"      ... +{len(urls)-10} more")
                         print()
                     
                     if web.get("js_files"):
                         print(Fore.GREEN + "  JavaScript Files:")
                         for js in web["js_files"]:
                             print(f"      - {Fore.CYAN}{js}")
+                        print()
+
+                    # --- Parameters: List them ---
+                    if web.get("parameters"):
+                        params = web["parameters"]
+                        print(f"    Parameters Found: {len(params)}")
+                        for p in params[:15]: # Show first 15
+                            print(f"      - {Fore.MAGENTA}{p}")
+                        if len(params) > 15:
+                            print(f"      ... +{len(params)-15} more")
+                        print()
+
+                # =================================================
+                # 3.25️⃣ DEVELOPER COMMENTS (New - Spider)
+                # =================================================
+                if "comments" in intel:
+                    comments = intel["comments"]
+                    if comments:
+                        print(Fore.GREEN + "  Developer Comments:")
+                        for c in comments:
+                            print(f"    - {Fore.YELLOW}{c}")
+                        print()
+
+                # =================================================
+                # 3.3️⃣ SECURITY HEADERS (New - Spider)
+                # =================================================
+                if "security_headers" in intel:
+                    headers = intel["security_headers"]
+                    if headers:
+                        print(Fore.GREEN + "  Security Headers:")
+                        for k, v in headers.items():
+                            print(f"    {Fore.CYAN}{k}: {Fore.WHITE}{v}")
+                        print()
+
+                # =================================================
+                # 3.5️⃣ ROBOTS.TXT & SENSITIVE FILES (UPDATED)
+                # =================================================
+                # Check for disallowed paths found in robots.txt
+                disallowed = intel.get("disallowed_entries") or intel.get("robots_entries") or intel.get("robots_txt") or intel.get("robots_disallowed")
+                if disallowed:
+                    print(Fore.GREEN + "  Robots.txt Intelligence:")
+                    if isinstance(disallowed, list):
+                        print(f"    Disallowed Entries: {len(disallowed)}")
+                        for entry in disallowed:
+                            print(f"      - {Fore.YELLOW}{entry}")
+                    elif isinstance(disallowed, str):
+                        print(f"    Content Preview:\n      {Fore.WHITE}{disallowed[:200]}...")
+                    print()
+
+                # Check for other sensitive files
+                if "sensitive_files" in intel:
+                    files = intel.get("sensitive_files")
+                    if files:
+                        print(Fore.RED + "  ⚠ Sensitive Files Detected:")
+                        for f in files:
+                            print(f"    - {Fore.CYAN}{f}")
                         print()
 
                 # =================================================
@@ -693,7 +758,7 @@ class HellhoundConsole(cmd.Cmd):
                         print()
 
                 # =================================================
-                # 5️⃣ ENDPOINTS (Spider / Stalk)
+                # 5️⃣ ENDPOINTS (Universal: Spider, Fuzzhunter, Parax)
                 # =================================================
                 if "endpoints" in intel:
                     endpoints = intel.get("endpoints", [])
@@ -706,18 +771,46 @@ class HellhoundConsole(cmd.Cmd):
                         print()
 
                     for idx, el in enumerate(endpoints, 1):
-                        method = el.get("method", "GET")
+                        
+                        # FIX: Convert to string before calling .upper() to handle integer status codes
+                        raw_method_or_status = el.get("method", el.get("status", "UNK"))
+                        method = str(raw_method_or_status).upper()
+                        
                         url = el.get("url", "")
-                        color = Fore.BLUE if method == "GET" else Fore.MAGENTA
-                        print(color + f"  [{idx}] {method}  {url}")
+                        path = el.get("path", "")
+                        
+                        # Fallback for URL construction if only path exists
+                        if not url and path:
+                            url = f"/{path}"
 
-                        for p in el.get("params", []):
-                            pname = p.get("name", "")
-                            ptype = p.get("type", "")
-                            print(f"       - {Fore.WHITE}{pname} {Fore.YELLOW}({ptype})")
+                        # Color Logic
+                        color = Fore.BLUE if method == "GET" else Fore.MAGENTA
+                        if method.isdigit(): color = Fore.CYAN # Handle status codes as method for Fuzzhunter style
+                        
+                        # Display Logic: If it's a number, show it as Status, otherwise Method
+                        display_method = f"Status {method}" if method.isdigit() else method
+
+                        print(color + f"  [{idx}] {display_method}  {url}")
+
+                        # Show Params (Spider)
+                        if el.get("params"):
+                            for p in el.get("params"):
+                                pname = p.get("name", "")
+                                ptype = p.get("type", "")
+                                print(f"       - {Fore.WHITE}{pname} {Fore.YELLOW}({ptype})")
+                        
+                        # Show Size/Details (Fuzzhunter)
+                        if el.get("size"):
+                            print(f"       - Size: {el.get('size')} bytes")
+
+                        # Show Risks/Priority (Spider/Parax)
+                        if el.get("risks"):
+                            print(f"       - {Fore.RED}Risks: {', '.join(el['risks'])}")
+                        if el.get("priority"):
+                            print(f"       - Priority: {el.get('priority')}")
 
                         if el.get("tags"):
-                            print(Fore.RED + f"       Tags: {', '.join(el['tags'])}")
+                            print(Fore.CYAN + f"       Tags: {', '.join(el['tags'])}")
 
                         print()
 
@@ -765,7 +858,7 @@ class HellhoundConsole(cmd.Cmd):
                 # 6.5️⃣ PHISHING INTEL (Consolidated)
                 # =================================================
                 if "security_policy" in intel:
-                    pol = intel["security_policy"]
+                    pol = intel.get("security_policy")
                     print(Fore.GREEN + "  Phishing Intel:")
                     if intel.get("phishing_domain"):
                         print(f"    Suggested Domain : {Fore.CYAN}{intel['phishing_domain']}")
@@ -870,8 +963,6 @@ class HellhoundConsole(cmd.Cmd):
                 print()
 
         print(Fore.CYAN + "================================\n")
-
-
 
     # ============================
     # RECON
@@ -1010,6 +1101,14 @@ class HellhoundConsole(cmd.Cmd):
             if spider_data:
                 options["spider_results"] = spider_data
                 print(Fore.CYAN + "[*] Auto-fed Spider results into CMDinj")
+        
+        # Spider -> Parax Auto Feed
+        if module.lower() == "parax":
+            if "spider" in self.results:
+                spider_data = self.results["spider"]
+                if isinstance(spider_data, dict) and "intel" in spider_data:
+                    options["spider_intel"] = spider_data["intel"]
+                    print(Fore.CYAN + "[*] Auto-fed Spider results into Parax")
 
         # Stalk → Surfacemap
         if module_key == "surfacemap":
