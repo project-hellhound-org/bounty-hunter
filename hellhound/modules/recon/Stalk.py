@@ -52,7 +52,6 @@ class StalkEngine:
         self.target = target
         self.emit = emit
         self.options = options or {}
-
         self.mode = "deep" if self.options.get("mode") == "deep" else "quick"
 
         parsed = urlparse(target)
@@ -134,6 +133,7 @@ class StalkEngine:
             self.data["infrastructure"]["asn"] = asn_match.group(2)
             self.data["signals"].append("ASN_IDENTIFIED")
 
+
     def analyze_email_stack(self):
         if not tool_exists("dig"):
             return
@@ -166,21 +166,104 @@ class StalkEngine:
         self.emit.info("Phase 2: Web Surface Mapping")
 
         if tool_exists("httpx"):
-            out = run_cmd(["httpx", "-silent", "-u", self.domain])
-            self.data["web"]["http_services"] = out.splitlines()
+            ports = "80,443,8080,8443,8000,8888"
+            out = run_cmd(["httpx", "-silent", "-u", self.domain, "-ports", ports])
+            services = list(set(out.splitlines()))
+            self.data["web"]["http_services"] = services
+
+            if len(services) > 1:
+                self.data["signals"].append("MULTIPLE_WEB_SERVICES")
 
     def fingerprint_tech(self):
-        if not tool_exists("whatweb"):
-            return
+        self.emit.info("Phase 2: Technology Fingerprinting")
+
+        detected_tech = set()
+        waf_detected = None
 
         for url in self.data["web"]["http_services"]:
-            result = run_cmd(["whatweb", "-q", url])
-            if result:
-                self.data["web"]["technologies"].append(result)
 
-            if "cloudflare" in result.lower():
-                self.data["infrastructure"]["waf"] = "Cloudflare"
+            # ---------------------------------------------
+            # 1️⃣ WHATWEB (if installed)
+            # ---------------------------------------------
+            if tool_exists("whatweb"):
+                result = run_cmd(["whatweb", "-q", url])
+                if result:
+                    detected_tech.add(result)
+
+                    if "cloudflare" in result.lower():
+                        waf_detected = "Cloudflare"
+                    if "akamai" in result.lower():
+                        waf_detected = "Akamai"
+                    if "sucuri" in result.lower():
+                        waf_detected = "Sucuri"
+                    if "imperva" in result.lower():
+                        waf_detected = "Imperva"
+
+            # ---------------------------------------------
+            # 2️⃣ HEADER ANALYSIS (More Reliable)
+            # ---------------------------------------------
+            try:
+                r = requests.get(url, timeout=6)
+
+                headers = r.headers
+
+                server = headers.get("Server", "")
+                powered = headers.get("X-Powered-By", "")
+                via = headers.get("Via", "")
+                cf_ray = headers.get("CF-Ray", "")
+                x_akamai = headers.get("X-Akamai-Transformed", "")
+                x_sucuri = headers.get("X-Sucuri-ID", "")
+
+                # --- Server Header ---
+                if server:
+                    detected_tech.add(f"Server: {server}")
+
+                    if "nginx" in server.lower():
+                        detected_tech.add("Nginx")
+                    if "apache" in server.lower():
+                        detected_tech.add("Apache")
+                    if "iis" in server.lower():
+                        detected_tech.add("Microsoft IIS")
+
+                # --- X-Powered-By ---
+                if powered:
+                    detected_tech.add(f"Powered: {powered}")
+
+                    if "php" in powered.lower():
+                        detected_tech.add("PHP")
+                    if "asp" in powered.lower():
+                        detected_tech.add("ASP.NET")
+
+                # --- CDN / WAF Detection ---
+                if cf_ray or "cloudflare" in server.lower():
+                    waf_detected = "Cloudflare"
+
+                if x_akamai:
+                    waf_detected = "Akamai"
+
+                if x_sucuri:
+                    waf_detected = "Sucuri"
+
+                if via:
+                    detected_tech.add(f"Proxy: {via}")
+
+            except:
+                continue
+
+        # ---------------------------------------------
+        # Store Results
+        # ---------------------------------------------
+        self.data["web"]["technologies"] = list(detected_tech)
+
+        if waf_detected:
+            self.data["infrastructure"]["waf"] = waf_detected
+            if "WAF_DETECTED" not in self.data["signals"]:
                 self.data["signals"].append("WAF_DETECTED")
+
+        # Strategic Signals
+        if len(detected_tech) > 5:
+            self.data["signals"].append("COMPLEX_TECH_STACK")
+
 
     def harvest_urls(self):
         if self.mode != "deep":
@@ -204,7 +287,43 @@ class StalkEngine:
                 for pair in params.split("&"):
                     key = pair.split("=")[0]
                     if key:
+                        risky_keywords = ["id", "user", "uid", "account", "file", "path", "cmd", "token"]
+                        if key.lower() in risky_keywords:
+                            self.data["signals"].append("HIGH_RISK_PARAMETER")
+                            
                         self.data["web"]["parameters"].append(key)
+
+    # ======================================================
+    # Phase 2 — JavaScript Secret Analysis
+    # ======================================================
+
+    def scan_js_for_secrets(self):
+        self.emit.info("Phase 2: JavaScript Secret Analysis")
+
+        secret_patterns = [
+            r"AKIA[0-9A-Z]{16}",
+            r"AIza[0-9A-Za-z-_]{35}",
+            r"sk_live_[0-9a-zA-Z]{24}",
+            r"(?i)api[_-]?key\s*=\s*['\"]?[A-Za-z0-9_\-]{16,}"
+        ]
+
+        for js_url in self.data["web"]["js_files"]:
+            try:
+                r = requests.get(js_url, timeout=5)
+                if r.status_code != 200:
+                    continue
+
+                content = r.text
+
+                for pattern in secret_patterns:
+                    if re.search(pattern, content):
+                        self.data["exposure"]["leaks"].append(js_url)
+                        self.data["signals"].append("JS_SECRET_EXPOSED")
+                        break
+
+            except:
+                continue
+
 
     # ======================================================
     # Phase 3 — Exposure Detection
@@ -214,19 +333,78 @@ class StalkEngine:
         self.emit.info("Phase 3: Exposure Analysis")
 
         base = f"http://{self.domain}"
-        leak_paths = ["/.env", "/.git/config", "/backup.zip"]
+        leak_paths = {
+            "/.env": ["DB_PASSWORD=", "APP_KEY=", "AWS_SECRET", "DATABASE_URL="],
+            "/.git/config": ["repositoryformatversion", "[core]", "remote \"origin\""],
+            "/backup.zip": ["PK\x03\x04"]
+        }
 
-        for path in leak_paths:
+        for path, fingerprints in leak_paths.items():
             try:
-                r = requests.get(base + path, timeout=5)
-                if r.status_code == 200 and len(r.text) > 10:
-                    self.data["exposure"]["leaks"].append(base + path)
-                    self.data["signals"].append("POTENTIAL_LEAK_EXPOSED")
-            except:
+                r = requests.get(base + path, timeout=5, allow_redirects=False)
+
+                # Only consider direct 200 responses
+                if r.status_code != 200:
+                    continue
+
+                # ZIP validation
+                if path.endswith(".zip"):
+                    if "zip" in r.headers.get("Content-Type", "").lower():
+                        if r.content.startswith(b"PK"):
+                            self.data["exposure"]["leaks"].append(base + path)
+                            self.data["signals"].append("CONFIRMED_ZIP_EXPOSED")
+                    continue
+
+                # Text-based validation (.env / .git)
+                content = r.text[:5000]  # limit parsing
+
+                for pattern in fingerprints:
+                    if pattern in content:
+                        self.data["exposure"]["leaks"].append(base + path)
+                        self.data["signals"].append("CONFIRMED_FILE_EXPOSED")
+                        break
+
+            except Exception:
                 continue
 
+
     # ======================================================
-    # Run
+    # Phase 4 — IP Reputation
+    # ======================================================
+
+    def check_ip_reputation(self):
+        try:
+            ip = socket.gethostbyname(self.domain)
+            if ip.startswith("127."):
+                self.data["signals"].append("LOCAL_TARGET")
+        except:
+            pass
+
+
+    # ======================================================
+    # Risk Scoring
+    # ======================================================
+
+    def calculate_risk(self):
+
+        risk_score = 0
+
+        if "WAF_DETECTED" in self.data["signals"]:
+            risk_score += 1
+
+        if "JS_SECRET_EXPOSED" in self.data["signals"]:
+            risk_score += 3
+
+        if "HIGH_RISK_PARAMETER" in self.data["signals"]:
+            risk_score += 2
+
+        if "CONFIRMED_FILE_EXPOSED" in self.data["signals"]:
+            risk_score += 4
+
+        self.data["risk_score"] = risk_score
+
+    # ======================================================
+    # RUN
     # ======================================================
 
     def run(self):
@@ -241,20 +419,26 @@ class StalkEngine:
         self.fingerprint_tech()
         self.harvest_urls()
 
+        if self.mode == "deep":
+            self.scan_js_for_secrets()
+
         # Phase 3
         self.detect_leaks()
+
+        # Risk Score
+        self.calculate_risk()
 
         summary = (
             f"Subs: {len(self.data['infrastructure']['subdomains'])} | "
             f"URLs: {len(self.data['web']['urls'])} | "
-            f"Leaks: {len(self.data['exposure']['leaks'])}"
+            f"Leaks: {len(self.data['exposure']['leaks'])} | "
+            f"Risk Score: {self.data.get('risk_score', 0)}"
         )
 
         return {
             "raw": summary,
             "intel": self.data
         }
-
 
 # ==========================================================
 # Framework Entry
