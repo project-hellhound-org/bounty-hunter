@@ -1,100 +1,67 @@
 #  Hellhound – Modular Red Team Framework
 
-Hellhound Banner
+Hellhound is a correlation-based offensive security platform designed to streamline the Red Team kill chain. It moves beyond simple scanning by providing an intelligent, context-aware engine that orchestrates reconnaissance, vulnerability assessment, and exploitation workflows through a unified command interface. 
 
-Hellhound is a modular red team framework designed to orchestrate reconnaissance, enumeration, and controlled attack workflows through an interactive CLI console and an optional dashboard interface.
-
-It is built for operators who value structure, intelligence, and extensibility over blind automation.
+Built for operators who require structure, visibility, and actionable intelligence, Hellhound transforms raw data into correlated attack paths. 
 
 ![Hellhound Banner](Images/hellhound.png)
 
 ---
 
-##  Overview
+## Overview 
 
-Hellhound provides a structured environment for:
+Modern red teaming and penetration testing often involve managing a fragmented toolset—Nmap for discovery, web scanners for fuzzing, and manual scripts for exploitation. Hellhound solves this fragmentation by acting as an Orchestration Layer. 
 
-  - Target classification (Host vs Web)
-  - Service-aware reconnaissance
-  - Module-driven execution
-  - Evidence-based decision support
-  - Extensible attack chaining
+It provides: 
+   - Unified Intelligence Correlation: Aggregating data across reconnaissance, enumeration, and exploitation phases into a single "Loot" database.
+   - Context-Aware Execution: Dynamically adapting available modules based on target classification (Host vs. Web Application).
+   -  Risk-Based Scoring: Automatically quantifying threat severity based on confirmed exploitation and heuristic analysis.
+   -  Extensible Modularity: A plugin architecture that allows for rapid development and integration of custom capabilities.
 
-The framework emphasizes control, visibility, and modularity.
+## Design Philosophy 
 
----
+Hellhound is built on the principle of Human-in-the-Loop Automation. Unlike fully automated scanners that generate noise, Hellhound empowers the operator to guide the engagement while automating the tedious aspects of data correlation and evidence collection. 
+Core Architecture 
+     The Engine: A Python-based core that manages state, session persistence, and inter-module communication.
+     The Arsenal: A modular repository of capabilities categorized by operational phase (Recon, Web, Vuln, Exploit, Intel).
+     The Loot: A structured JSON-based intelligence store that correlates findings across modules to build a comprehensive attack narrative.
+     
 
-## What Hellhound Is
+## Operational Workflow 
 
-  - A modular orchestration framework
-  - A Metasploit-style interactive console
-  - A service-aware reconnaissance engine
-  - A structured hunting environment
-  - A platform for extending custom red team modules
+Hellhound structures engagements into a logical progression: 
 
----
-## Architecture Principles
+  - Discovery: Identifying the attack surface (Infrastructure & Web). 
+  - Enumeration: Gathering deep intelligence on services and parameters. 
+  - Assessment: Identifying vulnerabilities and logical flaws. 
+  - Exploitation: Validating risks and gaining access. 
+  - Reporting: Aggregating proof and risk scores for final delivery. 
 
-  - Human-in-the-loop operation
-  - Strict module separation (Network, Web, Recon, Enum)
-  - Service-aware intelligence engine
-  - Structured output and session management
-  - Clean CLI abstraction layer
-  - Replaceable and extensible components
+## Capabilities 
+### 1. Target-Aware Reconnaissance 
 
-##  Core Capabilities
-### Interactive Console
+Hellhound classifies targets to optimize the attack path. 
 
-  - Metasploit-style CLI
-  - Target locking (prey)
-  - Context-aware module listing (arsenal)
-  - Controlled execution (equip → strike)
-  - Structured results storage (loot)
-  - Ranked recommendations (howl)
-  - Alias system for operator efficiency
-  - Session management
+  - Host Mode: Engages network-layer reconnaissance, service enumeration, and vulnerability mapping.
+  - Web Mode: Prioritizes HTTP surface mapping, parameter discovery, and application logic analysis.
+     
 
-### Intelligence Engine
+### 2. Automated Intelligence Correlation 
 
-  - Nmap XML parsing
-  - Service detection and version extraction
-  - NSE script analysis
-  - Vulnerability hint detection
-  - Suggestion engine based on detected services
-  - Planned rule-based autonomous hunt mode
+Unlike standard scanners that output linear lists, Hellhound's loot command synthesizes data. 
 
----
-## Prerequisites
+  - Cross-Module Linking: Findings from the Spider (e.g., a comment mentioning SQLi) are automatically flagged for analysis by the Parax module.
+  - Risk Aggregation: The framework calculates a dynamic "Risk Score" based on the severity of confirmed exploits (e.g., RCE) versus potential risks (e.g., IDOR).
+     
 
-Hellhound does not bundle heavy tools.
-You must install and manage external tools yourself.
+### 3. Unified Command & Control (C2) 
 
-### Recommended Web Recon Tools
+The interactive console provides a Metasploit-inspired interface designed for operational efficiency. 
 
-- httpx
-
-- ffuf
-
-- dirsearch
-
-- feroxbuster
-
-- whatweb
-
-- waybackurls
-
-- gau
-
-### Optional (Advanced Recon)
-
-- subfinder
-
-- dnsx
-
-- nuclei
-
-Ensure all tools are available in your PATH.
----
+  - Session Management: Persistent storage of engagement data and results.
+  - Alias System: Rapid command execution for veteran operators.
+  - Suggestion Engine: "Howl" analyzes gathered intelligence to recommend the next logical step in the kill chain.
+     
 
 ##  Installation
 
