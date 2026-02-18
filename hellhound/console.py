@@ -558,6 +558,39 @@ class HellhoundConsole(cmd.Cmd):
         # ======================================================
         print("\n" + Fore.CYAN + "========== [ LOOT ] ==========\n")
         
+        # ----------------------------------
+        # GLOBAL RISK AGGREGATION
+        # ----------------------------------
+        total_risk = 0
+        breakdown = {}
+
+        for mod, output in self.results.items():
+            if isinstance(output, dict) and "intel" in output:
+                module_risk = output["intel"].get("risk_score", 0)
+                total_risk += module_risk
+                breakdown[mod] = module_risk
+
+        print(Fore.CYAN + "========== [ RISK BREAKDOWN ] ==========\n")
+
+        for mod, score in breakdown.items():
+            print(f"  {mod.upper():<12} : {score}")
+
+        print("----------------------------------------")
+        print(f"  TOTAL RISK SCORE : {total_risk}")
+
+        # Risk classification
+        if total_risk <= 3:
+            level = "LOW"
+        elif total_risk <= 8:
+            level = "MEDIUM"
+        elif total_risk <= 15:
+            level = "HIGH"
+        else:
+            level = "CRITICAL"
+
+        print(Fore.RED + f"  OVERALL SECURITY POSTURE : {level}")
+        print(Fore.CYAN + "========================================\n")
+
         # Track keys we have already printed to avoid duplicates
         printed_keys = set()
 

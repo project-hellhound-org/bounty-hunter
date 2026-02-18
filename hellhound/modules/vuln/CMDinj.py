@@ -453,14 +453,38 @@ class CmdInjectionEngine:
             "waf_detected": self.waf_detected
         }
 
+        # ==========================================================
+        # RISK SCORE CALCULATION
+        # ==========================================================
+        risk_score = 0
+
+        for v in self.vulnerabilities:
+            v_type = v.get("type", "")
+            conf = v.get("confidence", "Low")
+            
+            # Scoring Logic
+            if "COMMAND_INJECTION" in v_type:
+                if conf == "High":
+                    risk_score += 10  # Critical: Confirmed RCE
+                elif conf == "Medium":
+                    risk_score += 6
+                else:
+                    risk_score += 3
+            elif "BLIND" in v_type:
+                risk_score += 4
+            else:
+                # Baseline risk for other potential issues
+                risk_score += 2
+        # ==========================================================
+
         return {
             "raw": f"Vulns found: {len(self.vulnerabilities)}",
             "intel": {
                 "summary": summary,
-                "vulnerabilities": self.vulnerabilities
+                "vulnerabilities": self.vulnerabilities,
+                "risk_score": risk_score  # <--- Injecting the calculated score
             }
         }
-
 # =================================================
 # Framework Entry
 # =================================================
