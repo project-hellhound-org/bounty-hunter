@@ -189,7 +189,10 @@ class HellhoundConsole(cmd.Cmd):
             },
             "fuzzhunter": { 
                 "--deep": {"mode": "deep"}
-            }
+            },
+            "cmdinj": {
+                "--rev": {"mode": "reverse_shell"}
+            },
         }
 
         self.aliases = {

@@ -19,8 +19,12 @@ HEADERS = {
 RISK_KEYWORDS = {
     "cmd": "COMMAND_INJECTION", "exec": "COMMAND_INJECTION", "system": "COMMAND_INJECTION", 
     "shell": "COMMAND_INJECTION", "bash": "COMMAND_INJECTION",
-    "ip": "SYSTEM_INTERACTION", "host": "SYSTEM_INTERACTION", "target": "SYSTEM_INTERACTION", 
-    "ping": "SYSTEM_INTERACTION", "traceroute": "SYSTEM_INTERACTION",
+    # SPECIFIC FIX: Explicitly map host/ip/ping to Command Injection
+    "ip": "COMMAND_INJECTION", 
+    "host": "COMMAND_INJECTION", 
+    "target": "COMMAND_INJECTION", 
+    "ping": "COMMAND_INJECTION", 
+    "traceroute": "COMMAND_INJECTION",
     "file": "FILE_OPERATION", "path": "FILE_OPERATION", "page": "LFI_RFI_POTENTIAL", 
     "document": "LFI_RFI_POTENTIAL", "root": "LFI_RFI_POTENTIAL",
     "id": "IDOR_POTENTIAL", "user": "IDOR_POTENTIAL", "uid": "IDOR_POTENTIAL", 

@@ -165,12 +165,29 @@ class StalkEngine:
     def probe_http(self):
         self.emit.info("Phase 2: Web Surface Mapping")
 
+        services = []
+
+        # 1. Try httpx (Best for discovery)
         if tool_exists("httpx"):
             ports = "80,443,8080,8443,8000,8888"
             out = run_cmd(["httpx", "-silent", "-u", self.domain, "-ports", ports])
             services = list(set(out.splitlines()))
-            self.data["web"]["http_services"] = services
 
+        # 2. FALLBACK: Use Python Requests (Guaranteed to work)
+        # If httpx isn't installed, we manually check the target
+        if not services:
+            try:
+                # Check if target is an IP or Domain
+                url = self.target if self.target.startswith("http") else f"http://{self.target}"
+                r = requests.get(url, timeout=5)
+                if r.status_code == 200:
+                    services.append(url)
+                    self.emit.info(f"    [i] Fallback mode: Detected service at {url}")
+            except Exception as e:
+                self.emit.warn(f"    [!] Fallback mode failed: {e}")
+
+        if services:
+            self.data["web"]["http_services"] = services
             if len(services) > 1:
                 self.data["signals"].append("MULTIPLE_WEB_SERVICES")
 
@@ -180,36 +197,18 @@ class StalkEngine:
         detected_tech = set()
         waf_detected = None
 
+        # We iterate over services found in probe_http
         for url in self.data["web"]["http_services"]:
 
-            # ---------------------------------------------
-            # 1️⃣ WHATWEB (if installed)
-            # ---------------------------------------------
-            if tool_exists("whatweb"):
-                result = run_cmd(["whatweb", "-q", url])
-                if result:
-                    detected_tech.add(result)
-
-                    if "cloudflare" in result.lower():
-                        waf_detected = "Cloudflare"
-                    if "akamai" in result.lower():
-                        waf_detected = "Akamai"
-                    if "sucuri" in result.lower():
-                        waf_detected = "Sucuri"
-                    if "imperva" in result.lower():
-                        waf_detected = "Imperva"
-
-            # ---------------------------------------------
-            # 2️⃣ HEADER ANALYSIS (More Reliable)
-            # ---------------------------------------------
+            # --- Header Analysis (Python Native) ---
             try:
                 r = requests.get(url, timeout=6)
 
                 headers = r.headers
 
-                server = headers.get("Server", "")
-                powered = headers.get("X-Powered-By", "")
-                via = headers.get("Via", "")
+                server = headers.get("Server", "").lower()
+                powered = headers.get("X-Powered-By", "").lower()
+                via = headers.get("Via", "").lower()
                 cf_ray = headers.get("CF-Ray", "")
                 x_akamai = headers.get("X-Akamai-Transformed", "")
                 x_sucuri = headers.get("X-Sucuri-ID", "")
@@ -217,33 +216,25 @@ class StalkEngine:
                 # --- Server Header ---
                 if server:
                     detected_tech.add(f"Server: {server}")
-
-                    if "nginx" in server.lower():
-                        detected_tech.add("Nginx")
-                    if "apache" in server.lower():
-                        detected_tech.add("Apache")
-                    if "iis" in server.lower():
-                        detected_tech.add("Microsoft IIS")
+                    if "nginx" in server: detected_tech.add("Nginx")
+                    if "apache" in server: detected_tech.add("Apache")
+                    if "iis" in server: detected_tech.add("Microsoft IIS")
+                    if "werkzeug" in server: detected_tech.add("Werkzeug/Python")
 
                 # --- X-Powered-By ---
                 if powered:
                     detected_tech.add(f"Powered: {powered}")
-
-                    if "php" in powered.lower():
-                        detected_tech.add("PHP")
-                    if "asp" in powered.lower():
-                        detected_tech.add("ASP.NET")
+                    if "php" in powered: detected_tech.add("PHP")
+                    if "asp" in powered: detected_tech.add("ASP.NET")
+                    if "express" in powered: detected_tech.add("Node/Express")
 
                 # --- CDN / WAF Detection ---
-                if cf_ray or "cloudflare" in server.lower():
+                if cf_ray or "cloudflare" in server:
                     waf_detected = "Cloudflare"
-
                 if x_akamai:
                     waf_detected = "Akamai"
-
                 if x_sucuri:
                     waf_detected = "Sucuri"
-
                 if via:
                     detected_tech.add(f"Proxy: {via}")
 
@@ -260,15 +251,18 @@ class StalkEngine:
             if "WAF_DETECTED" not in self.data["signals"]:
                 self.data["signals"].append("WAF_DETECTED")
 
+        if detected_tech:
+             self.data["signals"].append("TECH_DETECTED")
+
         # Strategic Signals
         if len(detected_tech) > 5:
             self.data["signals"].append("COMPLEX_TECH_STACK")
-
 
     def harvest_urls(self):
         if self.mode != "deep":
             return
 
+        # Only use external tools if available
         if tool_exists("gau"):
             out = run_cmd(["gau", self.domain])
             self.data["web"]["urls"].extend(out.splitlines())
@@ -343,7 +337,6 @@ class StalkEngine:
             try:
                 r = requests.get(base + path, timeout=5, allow_redirects=False)
 
-                # Only consider direct 200 responses
                 if r.status_code != 200:
                     continue
 
@@ -389,6 +382,10 @@ class StalkEngine:
 
         risk_score = 0
 
+        # Base risk for finding a web service
+        if self.data["web"]["http_services"]:
+            risk_score += 2
+
         if "WAF_DETECTED" in self.data["signals"]:
             risk_score += 1
 
@@ -415,8 +412,8 @@ class StalkEngine:
         self.analyze_email_stack()
 
         # Phase 2
-        self.probe_http()
-        self.fingerprint_tech()
+        self.probe_http()             # NOW HAS FALLBACK
+        self.fingerprint_tech()        # NOW WORKS IF HTTP SERVICES FOUND
         self.harvest_urls()
 
         if self.mode == "deep":
