@@ -1,8 +1,7 @@
 # hellhound/core/engine.py
 
 import importlib
-import subprocess
-import shutil
+
 
 
 # =================================================
@@ -54,24 +53,13 @@ class HellhoundEngine:
         self.socketio = socketio
         self.emit = Emit(socketio)
 
-        # External binary-backed modules
-        self.external_modules = {
-            "reconcombo": {
-                "binary": "reconcomboGo",
-                "args": lambda target: ["--url", target]
-            }
-        }
-
         # 🔥 SINGLE SOURCE OF TRUTH FOR MODULE CATEGORIES
         # MUST MATCH your folder structure exactly
         self.module_categories = [
-            "network",
-            "web",
             "recon",
-            "vuln",
-            "intel",
-            "enum",
-            "exploit"
+            "analysis",
+            "exploit",
+            "intel"
         ]
 
     # =================================================
@@ -80,11 +68,6 @@ class HellhoundEngine:
 
     def run_single(self, module_name, target, options=None):
 
-        # 1️⃣ External module handling
-        if module_name in self.external_modules:
-            return self.run_external(module_name, target)
-
-        # 2️⃣ Python module handling
         try:
             module = self.load_module(module_name)
         except Exception as e:
@@ -96,8 +79,7 @@ class HellhoundEngine:
             return ""
 
         try:
-            result = module.run(target, self.emit, options=options)
-            return result
+            return module.run(target, self.emit, options=options)
         except Exception as e:
             self.emit.warn(f"Module '{module_name}' crashed: {e}")
             return ""
