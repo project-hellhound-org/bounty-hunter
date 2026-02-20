@@ -169,21 +169,6 @@ class HellhoundConsole(cmd.Cmd):
         # Module Flag Registry
         # ----------------------------
         self.MODULE_FLAGS = {
-            "nmap": {
-                "--fast": {"mode": "quick"},
-                "--full": {"mode": "full"},
-                "--udp": {"mode": "udp"},
-                "--vuln": {"mode": "vuln"},
-                "--stealth": {"mode": "stealth"},
-            },
-            "ftp": {
-                "--enum": {"mode": "enum"},
-                "--brute": {"mode": "bruteforce"},
-            },
-            "ssh": {
-                "--enum": {"mode": "enum"},
-                "--brute": {"mode": "bruteforce"},
-            },
             "stalk": {
                 "--deep": {"mode": "deep"}
             },
@@ -298,36 +283,18 @@ class HellhoundConsole(cmd.Cmd):
     # ============================
 
     def do_prey(self, arg):
-        """prey <ip|domain> → Lock onto a target"""
+        """prey <domain> → Lock onto web target"""
 
         if not arg.strip():
-            print("Usage: prey <ip | domain>")
+            print("Usage: prey <domain>")
             return
 
         self.target = arg.strip()
+        self.target_type = "web"
 
-        print("\nWhat kind of prey is this?")
-        print("  [1] Full machine / host (CTF, server, network)")
-        print("  [2] Web application / domain\n")
+        print(Fore.GREEN + f"[+] Web target acquired: {self.target}")
 
-        choice = input("Select type [1/2]: ").strip()
-
-        if choice == "1":
-            self.target_type = "host"
-            print(Fore.GREEN + f"[+] Prey locked as FULL MACHINE: {self.target}")
-
-        elif choice == "2":
-            self.target_type = "web"
-            print(Fore.GREEN + f"[+] Prey locked as WEB APPLICATION: {self.target}")
-
-        else:
-            print(Fore.RED + "[!] Invalid choice. Prey not set.")
-            self.target = None
-            self.target_type = None
-            return
-
-        print(Fore.GREEN + f"[+] Prey acquired: {self.target} ({self.target_type.upper()})")
-
+        
     def do_exit(self, arg):
         """exit → Leave console"""
         print(Fore.RED + "[+] Exiting Hellhound console")
@@ -338,119 +305,15 @@ class HellhoundConsole(cmd.Cmd):
     # ============================
 
     def do_arsenal(self, arg):
-        """arsenal → List available tools"""
+        """arsenal → List web modules"""
 
-        print()
-
-        # If no prey selected
-        if not self.target_type:
-            print("[ Arsenal — ALL MODULES ]\n")
-            for name, meta in sorted(self.modules.items()):
-                print(f"  {name:<12} - {meta['description']}")
-            print()
-            return
-
-        print(f"[ Arsenal — {self.target_type.upper()} ]\n")
+        print("\n[ Arsenal — WEB MODULES ]\n")
 
         for name, meta in sorted(self.modules.items()):
-            category = meta.get("category", "")
-
-            # WEB prey
-            if self.target_type == "web":
-                # Allow web + recon + network + nmap
-                if category in ["web", "recon", "network", "vuln"] or name == "nmap":
-                    print(f"  {name:<12} - {meta['description']}")
-
-            # HOST prey
-            elif self.target_type == "host":
-                # Host sees everything
-                print(f"  {name:<12} - {meta['description']}")
+            print(f"  {name:<12} - {meta['description']}")
 
         print()
 
-    def do_hunt(self, arg):
-            """
-            hunt → Intelligent, automated attack chain.
-            Runs Nmap, analyzes results, and strikes automatically.
-            """
-            if not self.target:
-                print("[!] No prey set. Use: prey <target>")
-                return
-
-            from hellhound.core.strategies import HUNT_RULES
-
-            print(Fore.YELLOW + "\n[!] HUNT MODE ENGAGED")
-            print(Fore.YELLOW + "[*] Phase 1: Reconnaissance (Nmap)")
-
-            # 1. Run Nmap (Fast + Version detection for speed)
-            nmap_result = self.engine.run_single("nmap", self.target, options={"mode": "default"})
-            self.results["nmap"] = nmap_result
-
-            # 2. Analyze Intel
-            intel = nmap_result.get("intel", {})
-            services = intel.get("services", {})
-            found_vulns = intel.get("vulnerabilities", [])
-
-            if not services:
-                print(Fore.RED + "[!] No services found. Hunt aborted.")
-                return
-
-            print(Fore.GREEN + f"[✓] Nmap found {len(services)} services.")
-
-            # 3. Check for immediate vulnerabilities found by Nmap scripts
-            if found_vulns:
-                print(Fore.RED + f"\n[!!!] CRITICAL VULNERABILITIES DETECTED:")
-                for v in found_vulns:
-                    print(f"    - {v['description']}")
-
-            # 4. Plan the Attack
-            print(Fore.YELLOW + "\n[*] Phase 2: Planning Attacks")
-            
-            attack_plan = []
-
-            for port_proto, data in services.items():
-                service_name = data.get("service", "").lower()
-                
-                # Find matching rule
-                for rule in HUNT_RULES:
-                    # Simple matching: if rule service is inside detected service
-                    if rule["service"] in service_name:
-                        attack_plan.append({
-                            "port": port_proto,
-                            "service": service_name,
-                            "modules": rule["modules"],
-                            "desc": rule["description"]
-                        })
-                        break # One rule per service is enough
-
-            if not attack_plan:
-                print("[*] No automatic attack rules match these services.")
-                return
-
-            print(f"[*] Generated Attack Plan:")
-            for idx, attack in enumerate(attack_plan):
-                print(f"    {idx+1}. {attack['port']} ({attack['service']}) -> {attack['desc']}")
-
-            # 5. Execute
-            print(Fore.YELLOW + "\n[*] Phase 3: The Strike")
-            
-            for attack in attack_plan:
-                for module_name in attack["modules"]:
-                    if module_name not in self.modules:
-                        continue
-                    
-                    print(Fore.CYAN + f"\n>> Hound is striking: {module_name} on {attack['port']}")
-                    
-                    # GET OPTIONS FROM STRATEGY
-                    module_opts = attack.get("options", {})
-                    
-                    try:
-                        # PASS OPTIONS TO ENGINE
-                        output = self.engine.run_single(module_name, self.target, options=module_opts)
-                        self.results[module_name] = output
-                        print(Fore.GREEN + f"[✓] {module_name} finished.")
-                    except Exception as e:
-                        print(Fore.RED + f"[x] {module_name} failed: {str(e)}")
 
     def do_loot(self, arg):
             """loot → View gathered results"""
@@ -754,7 +617,7 @@ class HellhoundConsole(cmd.Cmd):
                             print()
 
                     # =================================================
-                    # 3.25️⃣ DEVELOPER COMMENTS (New - Spider)
+                    #  DEVELOPER COMMENTS (New - Spider)
                     # =================================================
                     if "comments" in intel:
                         comments = intel["comments"]
@@ -765,7 +628,7 @@ class HellhoundConsole(cmd.Cmd):
                             print()
 
                     # =================================================
-                    # 3.3️⃣ SECURITY HEADERS (New - Spider)
+                    #  SECURITY HEADERS (New - Spider)
                     # =================================================
                     if "security_headers" in intel:
                         headers = intel["security_headers"]
@@ -776,7 +639,7 @@ class HellhoundConsole(cmd.Cmd):
                             print()
 
                     # =================================================
-                    # 3.5️⃣ ROBOTS.TXT & SENSITIVE FILES (UPDATED)
+                    # ROBOTS.TXT & SENSITIVE FILES (UPDATED)
                     # =================================================
                     # Check for disallowed paths found in robots.txt
                     disallowed = intel.get("disallowed_entries") or intel.get("robots_entries") or intel.get("robots_txt") or intel.get("robots_disallowed")
@@ -798,7 +661,70 @@ class HellhoundConsole(cmd.Cmd):
                             for f in files:
                                 print(f"    - {Fore.CYAN}{f}")
                             print()
+                   
+                    # JS ROUTES
+                    routes = intel.get("js_routes") or intel.get("js_endpoints")
+                    
+                    if routes:
+                        # Updated print to show total count
+                        print(Fore.GREEN + f"  JS Discovered Routes ({len(routes)} found):")
+                        
+                        # Iterate over the FULL list (removed [:20])
+                        for r in routes:
+                            print(f"    - {Fore.CYAN}{r}")
+                        
+                        print()
 
+                    # GRAPHQL
+                    if "graphql" in intel:
+                        gql = intel["graphql"]
+                        if gql:
+                            print(Fore.MAGENTA + "  GraphQL Endpoints:")
+                            for g in gql:
+                                print(f"    - {g}")
+                            print()
+
+                    # =================================================
+                    #  JS PARAMETERS (FIXED: Checks 'js_parameters')
+                    # =================================================
+                    # Spider saves it as 'js_parameters', loot was looking for 'parameters'
+                    # JS PARAMETERS (Show all)
+                    params = intel.get("js_parameters") or intel.get("parameters")
+                    
+                    if params:
+                        print(Fore.YELLOW + f"  JS Parameters ({len(params)} found):")
+                        for p in params:
+                            print(f"    - {p}")
+                        print()
+
+                    # =================================================
+                    #  POTENTIAL KEYS (FIXED: Filters out function names)
+                    # =================================================
+                    if "potential_keys" in intel:
+                        keys = intel["potential_keys"]
+                        if keys:
+                            print(Fore.RED + "  ⚠ Potential Secrets Found:")
+                            for k in keys:
+                                # Simple Heuristic Filter:
+                                # 1. Ignore if it starts with a lowercase letter followed by uppercase (CamelCase function name)
+                                # 2. Ignore if it contains common code words
+                                is_code_noise = False
+                                
+                                lower_k = k.lower()
+                                noise_indicators = ['handler', 'verify', 'show', 'displayed', 'difficulty', 'notification', 'repeat']
+                                
+                                if any(n in lower_k for n in noise_indicators):
+                                    is_code_noise = True
+                                
+                                # Allow if it looks like a hash/HEX or BTC address
+                                # (BTC addresses start with 1, 3, or bc1; Hashes are hex)
+                                if not is_code_noise:
+                                    print(f"    - {k}")
+                            print()
+
+                    # RISK SCORE
+                    if "risk_score" in intel:
+                        print(Fore.CYAN + f"  Risk Score: {intel['risk_score']}\n")
                     # =================================================
                     # 4️⃣ SERVICE MAP (Surfacemap Style)
                     # =================================================
@@ -1070,39 +996,6 @@ class HellhoundConsole(cmd.Cmd):
 
             print(Fore.CYAN + "================================\n")
 
-    # ============================
-    # RECON
-    # ============================
-
-    def do_nmap(self, arg):
-        """nmap → Run reconnaissance scan"""
-        
-        if not self.target:
-            print("[!] Set prey first")
-            return
-
-        # 1. Ask user for mode (This logic belongs in the UI, not the module)
-        print("\nSelect Scan Profile:")
-        print("  [1] Default (Version & Scripts)")
-        print("  [2] Quick (Top 100 ports)")
-        print("  [3] Full (All 65535 ports)")
-        print("  [4] Stealth (Syn Scan)")
-        
-        try:
-            choice = input("Choice [1]: ").strip() or "1"
-        except:
-            choice = "1"
-
-        modes = {"1": "default", "2": "quick", "3": "full", "4": "stealth"}
-        selected_mode = modes.get(choice, "default")
-
-        # 2. Call Module with options
-        print(Fore.YELLOW + f"[*] Running Nmap ({selected_mode} mode)...")
-        
-        # Pass the mode in the options dictionary
-        output = self.engine.run_single("nmap", self.target, options={"mode": selected_mode})
-        
-        self.results["nmap"] = output
 
     # ============================
     # MODULE CONTROL
@@ -1135,7 +1028,7 @@ class HellhoundConsole(cmd.Cmd):
         Executes selected module with validated flags.
         """
 
-        if not self.target or not self.target_type:
+        if not self.target:
             print(Fore.RED + "[!] No prey set")
             return
 
@@ -1166,15 +1059,6 @@ class HellhoundConsole(cmd.Cmd):
             print(Fore.RED + f"[!] Unknown module: {module_input}")
             return
 
-        # -----------------------------------------
-        # Scope Enforcement
-        # -----------------------------------------
-        category = self.modules[module]["category"]
-        ALLOWED_FOR_WEB = {"web", "recon", "network", "vuln"}
-
-        if self.target_type == "web" and category not in ALLOWED_FOR_WEB:
-            print(Fore.RED + f"[!] '{module}' not suitable for WEB targets")
-            return
 
         # -----------------------------------------
         # Handle Help

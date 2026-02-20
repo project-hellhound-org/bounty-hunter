@@ -29,42 +29,6 @@ def console():
     except Exception as e:
         click.echo(f"[!] Failed to start console: {e}")
 
-
-# -------------------------------------------------
-# Hunting Mode
-# -------------------------------------------------
-@cli.command()
-@click.argument("target")
-@click.option(
-    "--mode",
-    default="camouflage",
-    show_default=True,
-    type=click.Choice(["camouflage", "stealth", "brutal"]),
-    help="Hunting doctrine level"
-)
-def hunt(target, mode):
-    """
-    Launch automated hunting mode against a target.
-    """
-    try:
-        from hellhound.hunting_mode import HuntingMode
-        hunter = HuntingMode(target=target, mode=mode)
-        hunter.run()
-    except Exception as e:
-        click.echo(f"[!] Hunting mode failed: {e}")
-
-
-
-# -------------------------------------------------
-# Future Mode Placeholder (Optional Expansion)
-# -------------------------------------------------
-# Example:
-# @cli.command()
-# def dashboard():
-#     from hellhound.dashboard import start_dashboard
-#     start_dashboard()
-
-
 # -------------------------------------------------
 # Entry Point
 # -------------------------------------------------

@@ -7,10 +7,11 @@ import threading
 import time
 from colorama import Fore
 import hashlib
+from .utils.js_extractor import JSExtractor
 
 NAME = "spider"
 CATEGORY = "recon"
-DESCRIPTION = "Advanced intelligent crawler (Silent, High-fidelity Comment mining)"
+DESCRIPTION = "Advanced SPA-aware intelligent crawler"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Hellhound Spider v6.9)"
@@ -76,7 +77,8 @@ class SpiderEngine:
         self.max_threads = threads
         self.auth_enabled = auth
         self.content_hashes = set()
-
+        self.js_hashes = set()
+        self.extractor = JSExtractor()
 
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
@@ -101,6 +103,8 @@ class SpiderEngine:
             "robots_disallowed": [],
             "robots_raw": "",
             "signals": [],
+            "graphql": [],
+            "js_parameters": [],
             "stats": {
                 "get": 0, "post": 0, "total": 0, "links": 0, "js_files": 0
             }
@@ -259,12 +263,45 @@ class SpiderEngine:
                     self.intel["stats"]["js_files"] += 1
                     if url not in self.intel["js_files"]:
                         self.intel["js_files"].append(url)
-                
+
+                content_hash = hashlib.md5(r.text.encode()).hexdigest()
+
+                with self.lock:
+                    if content_hash in self.js_hashes:
+                        continue
+                    self.js_hashes.add(content_hash)
+
+                # === NEW SPA EXTRACTION LOGIC ===
+                extracted = self.extractor.extract(r.text)
+
+                with self.lock:
+                    for route in extracted["routes"]:
+                        if route not in self.intel["js_endpoints"]:
+                            self.intel["js_endpoints"].append(route)
+
+                    for gql in extracted["graphql"]:
+                        if gql not in self.intel.get("graphql", []):
+                            if "graphql" not in self.intel:
+                                self.intel["graphql"] = []
+                            self.intel["graphql"].append(gql)
+
+                    for param in extracted["parameters"]:
+                        if param not in self.intel.get("js_parameters", []):
+                            if "js_parameters" not in self.intel:
+                                self.intel["js_parameters"] = []
+                            self.intel["js_parameters"].append(param)
+
+                # Optional surface expansion
+                for route in extracted["routes"]:
+                    full = urljoin(self.base_url, route)
+                    if self.in_scope(full):
+                        self.queue.append((full, depth + 1))
+
+                # Keep your old JS analysis intact
                 if ".min.js" not in url:
                     self.parse_js_content(r.text, url)
                 else:
                     self.analyze_js(r.text)
-
     def parse_html(self, html, base_url, depth):
         soup = BeautifulSoup(html, "html.parser")
 
@@ -481,16 +518,49 @@ class SpiderEngine:
         raw_summary = (f"GET: {self.intel['stats']['get']} | POST: {self.intel['stats']['post']} | "
                        f"TOTAL: {self.intel['stats']['total']} | LINKS: {self.intel['stats']['links']} | "
                        f"JS_FILES: {self.intel['stats']['js_files']}")
+        
+        # ======================================================
+        # UPDATED RISK CALCULATION LOGIC
+        # ======================================================
         risk_score = 0
 
-        if "AUTH_SURFACE_DETECTED" in self.intel["signals"]:
-            risk_score += 2
+        # 1. Attack Surface Risk (Hidden Routes)
+        # We combine JS Endpoints, GraphQL endpoints, and Robots.txt disallowed paths.
+        # We add 1 point for every 3 hidden routes found.
+        hidden_routes_count = (
+            len(self.intel.get("js_endpoints", [])) +
+            len(self.intel.get("graphql", [])) +
+            len(self.intel.get("robots_disallowed", []))
+        )
+        risk_score += (hidden_routes_count // 3)
 
-        if "HIGH_RISK_PARAMETERS_DETECTED" in self.intel["signals"]:
-            risk_score += 3
+        # 2. Information Leakage Risk
+        # We add points for potential keys/flags and suspicious developer comments.
+        # 1 point for every 2 leaks found.
+        intel_leaks = (
+            len(self.intel.get("potential_keys", [])) +
+            len(self.intel.get("comments", []))
+        )
+        risk_score += (intel_leaks // 2)
 
-        if "LOGIN_WALL_DETECTED" in self.intel["signals"]:
-            risk_score += 1
+        # 3. Configuration & Vulnerability Risk (Signals)
+        # Parse the signals list for specific security issues.
+        for signal in self.intel["signals"]:
+            signal_upper = signal.upper()
+            
+            if "AUTH_SURFACE_DETECTED" in signal_upper:
+                risk_score += 2
+            elif "HIGH_RISK_PARAMETERS_DETECTED" in signal_upper:
+                risk_score += 3
+            elif "LOGIN_WALL_DETECTED" in signal_upper:
+                risk_score += 1
+            elif "MISSING_CONTENT_SECURITY_POLICY" in signal_upper:
+                risk_score += 2
+            elif "MISSING_STRICT_TRANSPORT_SECURITY" in signal_upper:
+                risk_score += 2
+            elif "MISSING_" in signal_upper:
+                # Any other missing security header (X-Frame-Options, etc.)
+                risk_score += 1
 
         self.intel["risk_score"] = risk_score
 
