@@ -272,6 +272,12 @@ The authors assume no liability for misuse.
 
 ---
 
+## Developed By
+
+Project Hellhound
+
+---
+
 ## License
 
 MIT License
