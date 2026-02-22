@@ -356,30 +356,43 @@ class HellhoundConsole(cmd.Cmd):
 
             for mod, output in self.results.items():
                 modules_active += 1
-                
-                # Check for top-level risk score (BAC style) or nested risk score
                 mod_risk = 0
-                if isinstance(output, dict):
-                    if "risk_score" in output:
-                        mod_risk = output.get("risk_score", 0)
-                    elif "intel" in output and isinstance(output["intel"], dict):
-                        mod_risk = output["intel"].get("risk_score", 0)
-                        total_vulns += len(output["intel"].get("vulnerabilities", []))
-                        
-                        # Count BAC findings
-                        if "bac" in output["intel"]:
-                             total_vulns += len(output["intel"]["bac"].get("findings", []))
-                             
+
+                if not isinstance(output, dict):
+                    continue
+
+                # 1️⃣ Direct risk_score (legacy modules)
+                if "risk_score" in output:
+                    mod_risk = output.get("risk_score", 0)
+
+                # 2️⃣ Nested intel risk
+                elif "intel" in output and isinstance(output["intel"], dict):
+                    intel = output["intel"]
+
+                    # Standard intel risk
+                    if "risk_score" in intel:
+                        mod_risk = intel.get("risk_score", 0)
+
+                    # BAC-style nested risk
+                    if "bac" in intel:
+                        bac_data = intel["bac"]
+                        mod_risk = bac_data.get("risk_score", 0)
+                        total_vulns += len(bac_data.get("findings", []))
+
+                    # Generic vulnerabilities array (for other modules)
+                    if "vulnerabilities" in intel:
+                        total_vulns += len(intel.get("vulnerabilities", []))
+
                 total_risk += mod_risk
 
             # Determine Risk Level
-            if total_risk <= 2:
+            if total_risk <= 20:
                 level = "LOW"
                 level_color = Fore.GREEN
-            elif total_risk <= 6:
+            elif total_risk <= 60:
                 level = "MEDIUM"
                 level_color = Fore.YELLOW
-            elif total_risk <= 10:
+            elif total_risk <= 120:
                 level = "HIGH"
                 level_color = Fore.RED
             else:
