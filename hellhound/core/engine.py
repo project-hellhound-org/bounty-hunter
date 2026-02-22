@@ -59,7 +59,8 @@ class HellhoundEngine:
             "recon",
             "analysis",
             "exploit",
-            "intel"
+            "intel",
+            "vuln"
         ]
 
     # =================================================

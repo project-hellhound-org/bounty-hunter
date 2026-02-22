@@ -316,685 +316,412 @@ class HellhoundConsole(cmd.Cmd):
 
 
     def do_loot(self, arg):
-            """loot → View gathered results"""
-            import json
-            import os
-            import re # Ensure regex is imported
-            from datetime import datetime
+        """loot → View gathered results (Web-Focused)"""
+        import json
+        import os
+        import re
+        from datetime import datetime
 
-            if not self.results:
-                print(Fore.RED + "[!] No loot collected yet")
-                return
+        if not self.results:
+            print(Fore.RED + "[!] No loot collected yet")
+            return
 
-            # ==============================================
-            # HELPER: Strip ANSI Color Codes
-            # ==============================================
-            def strip_ansi(text):
-                """Removes ANSI escape codes from strings"""
-                ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-                return ansi_escape.sub('', text)
+        # ==============================================
+        # HELPER: Strip ANSI Color Codes
+        # ==============================================
+        def strip_ansi(text):
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            return ansi_escape.sub('', text)
 
-            parts = arg.split()
+        parts = arg.split()
 
-            # ======================================================
-            # 1. LOOT --JSON (Raw Data Dump)
-            # ======================================================
-            if "--json" in parts:
-                print(json.dumps(self.results, indent=4, default=str))
-                return
+        # ======================================================
+        # 1. LOOT --JSON (Raw Data Dump)
+        # ======================================================
+        if "--json" in parts:
+            print(json.dumps(self.results, indent=4, default=str))
+            return
 
-            # ======================================================
-            # 2. LOOT --SUMMARY (Executive View)
-            # ======================================================
-            if "--summary" in parts:
+        # ======================================================
+        # 2. LOOT --SUMMARY (Executive View)
+        # ======================================================
+        if "--summary" in parts:
 
-                print(Fore.CYAN + "\n========== [ SUMMARY ] ==========\n")
+            print(Fore.CYAN + "\n========== [ WEB ASSESSMENT SUMMARY ] ==========\n")
 
-                # Calculate Risk & Vulnerability Stats
-                total_risk = 0
-                total_vulns = 0
-
-                for mod, output in self.results.items():
-                    if isinstance(output, dict) and "intel" in output:
-                        intel = output["intel"]
-                        # Aggregate risk (default 0 if not present)
-                        total_risk += intel.get("risk_score", 0)
-                        # Aggregate vulnerabilities
-                        total_vulns += len(intel.get("vulnerabilities", []))
-
-                # Determine Risk Level
-                if total_risk <= 2:
-                    level = "LOW"
-                    level_color = Fore.GREEN
-                elif total_risk <= 6:
-                    level = "MEDIUM"
-                    level_color = Fore.YELLOW
-                elif total_risk <= 10:
-                    level = "HIGH"
-                    level_color = Fore.RED
-                else:
-                    level = "CRITICAL"
-                    level_color = Fore.MAGENTA
-
-                print(f"Target       : {self.target}")
-                print(f"Modules Run  : {len(self.results)}")
-                print(f"Risk Score   : {total_risk} ({level_color}{level}{Style.RESET_ALL})")
-                print(f"Vulnerabilities Identified : {total_vulns}")
-                print("\n================================\n")
-                return
-
-            # ======================================================
-            # 3. LOOT --EXPORT (File Export)
-            # ======================================================
-            if "--export" in parts:
-
-                from datetime import datetime
-                import json
-
-                base_path = os.path.join("storage", "reports", self.target)
-                os.makedirs(base_path, exist_ok=True)
-
-                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-                json_path = os.path.join(base_path, f"{timestamp}.json")
-                summary_path = os.path.join(base_path, f"{timestamp}_summary.txt")
-
-                # Save JSON safely
-                with open(json_path, "w") as f:
-                    json.dump(self.results, f, indent=4, default=str)
-
-                # Build summary
-                total_risk = 0
-                total_vulns = 0
-
-                for mod, output in self.results.items():
-                    if isinstance(output, dict) and "intel" in output:
-                        intel = output["intel"]
-                        total_risk += intel.get("risk_score", 0)
-                        total_vulns += len(intel.get("vulnerabilities", []))
-
-                summary_content = (
-                    f"Target: {self.target}\n"
-                    f"Modules Run: {len(self.results)}\n"
-                    f"Risk Score: {total_risk}\n"
-                    f"Vulnerabilities Identified: {total_vulns}\n"
-                )
-
-                with open(summary_path, "w") as f:
-                    f.write(summary_content)
-
-                print(Fore.GREEN + f"[✓] Report exported successfully.")
-                print(Fore.GREEN + f"    JSON: {json_path}")
-                print(Fore.GREEN + f"    Summary: {summary_path}")
-                return
-
-            # ======================================================
-            # 4. LOOT (Default - Detailed View)
-            # ======================================================
-            print("\n" + Fore.CYAN + "========== [ LOOT ] ==========\n")
-            
-            # ----------------------------------
-            # GLOBAL RISK AGGREGATION
-            # ----------------------------------
+            # Calculate Risk & Vulnerability Stats
             total_risk = 0
-            breakdown = {}
+            total_vulns = 0
+            modules_active = 0
 
             for mod, output in self.results.items():
-                if isinstance(output, dict) and "intel" in output:
-                    module_risk = output["intel"].get("risk_score", 0)
-                    
-                    # DYNAMIC RISK CALCULATION FOR SEIGE
-                    # If module doesn't have a risk_score but has Nuclei findings, calculate it
-                    if module_risk == 0 and "nuclei_findings" in output["intel"]:
-                        vulns = output["intel"]["nuclei_findings"]
-                        for v in vulns:
-                            clean_v = strip_ansi(v) # Use clean version for checking
-                            if "[CRITICAL]" in clean_v: module_risk += 10
-                            elif "[HIGH]" in clean_v: module_risk += 7
-                            elif "[MEDIUM]" in clean_v: module_risk += 4
-                            elif "[LOW]" in clean_v: module_risk += 1
-                        # Add Nikto risk
-                        if "nikto_findings" in output["intel"]:
-                            module_risk += len(output["intel"]["nikto_findings"]) * 2
+                modules_active += 1
+                
+                # Check for top-level risk score (BAC style) or nested risk score
+                mod_risk = 0
+                if isinstance(output, dict):
+                    if "risk_score" in output:
+                        mod_risk = output.get("risk_score", 0)
+                    elif "intel" in output and isinstance(output["intel"], dict):
+                        mod_risk = output["intel"].get("risk_score", 0)
+                        total_vulns += len(output["intel"].get("vulnerabilities", []))
+                        
+                        # Count BAC findings
+                        if "bac" in output["intel"]:
+                             total_vulns += len(output["intel"]["bac"].get("findings", []))
+                             
+                total_risk += mod_risk
 
-                    total_risk += module_risk
-                    breakdown[mod] = module_risk
-
-            print(Fore.CYAN + "========== [ RISK BREAKDOWN ] ==========\n")
-
-            for mod, score in breakdown.items():
-                print(f"  {mod.upper():<12} : {score}")
-
-            print("----------------------------------------")
-            print(f"  TOTAL RISK SCORE : {total_risk}")
-
-            # Risk classification
-            if total_risk <= 3:
+            # Determine Risk Level
+            if total_risk <= 2:
                 level = "LOW"
-            elif total_risk <= 8:
+                level_color = Fore.GREEN
+            elif total_risk <= 6:
                 level = "MEDIUM"
-            elif total_risk <= 15:
+                level_color = Fore.YELLOW
+            elif total_risk <= 10:
                 level = "HIGH"
+                level_color = Fore.RED
             else:
                 level = "CRITICAL"
+                level_color = Fore.MAGENTA
 
-            print(Fore.RED + f"  OVERALL SECURITY POSTURE : {level}")
-            print(Fore.CYAN + "========================================\n")
+            print(f"Target             : {self.target}")
+            print(f"Modules Executed   : {modules_active}")
+            print(f"Total Risk Score   : {total_risk} ({level_color}{level}{Style.RESET_ALL})")
+            print(f"Issues Identified  : {total_vulns}")
+            print("\n==========================================\n")
+            return
 
-            # Track keys we have already printed to avoid duplicates
-            printed_keys = set()
+        # ======================================================
+        # 3. LOOT --EXPORT (File Export)
+        # ======================================================
+        if "--export" in parts:
+            base_path = os.path.join("storage", "reports", self.target)
+            os.makedirs(base_path, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            json_path = os.path.join(base_path, f"{timestamp}.json")
+            summary_path = os.path.join(base_path, f"{timestamp}_summary.txt")
 
+            with open(json_path, "w") as f:
+                json.dump(self.results, f, indent=4, default=str)
+
+            # Re-calc summary for file
+            total_risk = 0
+            total_vulns = 0
             for mod, output in self.results.items():
+                if isinstance(output, dict):
+                    if "risk_score" in output: total_risk += output["risk_score"]
+                    elif "intel" in output:
+                        total_risk += output["intel"].get("risk_score", 0)
+                        total_vulns += len(output["intel"].get("vulnerabilities", []))
+                        if "bac" in output["intel"]:
+                            total_vulns += len(output["intel"]["bac"].get("findings", []))
+
+            summary_content = (
+                f"Target: {self.target}\n"
+                f"Modules Run: {len(self.results)}\n"
+                f"Risk Score: {total_risk}\n"
+                f"Vulnerabilities Identified: {total_vulns}\n"
+            )
+
+            with open(summary_path, "w") as f:
+                f.write(summary_content)
+
+            print(Fore.GREEN + f"[✓] Report exported successfully.")
+            print(Fore.GREEN + f"    JSON: {json_path}")
+            print(Fore.GREEN + f"    Summary: {summary_path}")
+            return
+
+        # ======================================================
+        # 4. LOOT (Default - Detailed Web View)
+        # ======================================================
+        print("\n" + Fore.CYAN + "========== [ LOOT - WEB INTEL ] ==========\n")
+        
+        # ----------------------------------
+        # GLOBAL RISK AGGREGATION
+        # ----------------------------------
+        total_risk = 0
+        breakdown = {}
+
+        for mod, output in self.results.items():
+            if isinstance(output, dict):
+                # Handle BAC style (top level risk)
+                if "risk_score" in output:
+                    breakdown[mod] = output["risk_score"]
+                    total_risk += output["risk_score"]
+                # Handle Nuclei/Nikto style (nested risk)
+                elif "intel" in output and isinstance(output["intel"], dict):
+                    module_risk = output["intel"].get("risk_score", 0)
+                    
+                    # Dynamic Risk Calc for Siege (Nuclei/Nikto)
+                    if module_risk == 0:
+                        if "nuclei_findings" in output["intel"]:
+                            vulns = output["intel"]["nuclei_findings"]
+                            for v in vulns:
+                                clean_v = strip_ansi(v)
+                                if "[CRITICAL]" in clean_v: module_risk += 10
+                                elif "[HIGH]" in clean_v: module_risk += 7
+                                elif "[MEDIUM]" in clean_v: module_risk += 4
+                                elif "[LOW]" in clean_v: module_risk += 1
+                        if "nikto_findings" in output["intel"]:
+                            module_risk += len(output["intel"]["nikto_findings"]) * 2
+                    
+                    breakdown[mod] = module_risk
+                    total_risk += module_risk
+
+        print(Fore.CYAN + "========== [ RISK BREAKDOWN ] ==========\n")
+        for mod, score in breakdown.items():
+            print(f"  {mod.upper():<12} : {score}")
+        print("----------------------------------------")
+        print(f"  TOTAL RISK SCORE : {total_risk}")
+
+        if total_risk <= 3: level = "LOW"
+        elif total_risk <= 8: level = "MEDIUM"
+        elif total_risk <= 15: level = "HIGH"
+        else: level = "CRITICAL"
+
+        print(Fore.RED + f"  SECURITY POSTURE   : {level}")
+        print(Fore.CYAN + "========================================\n")
+
+        printed_keys = set()
+
+        for mod, output in self.results.items():
+            mod_clean = mod.lower()
+            if mod_clean in printed_keys: continue
+            printed_keys.add(mod_clean)
+
+            print(Fore.YELLOW + f"[{mod_clean.upper()}]")
+
+            if isinstance(output, dict) and "intel" in output:
+                intel = output.get("intel", {})
                 
-                # 1. Normalize module name to lowercase for consistency
-                mod_clean = mod.lower()
-                
-                # 2. Skip if we already printed this module
-                if mod_clean in printed_keys:
-                    continue
-                
-                printed_keys.add(mod_clean)
-
-                print(Fore.YELLOW + f"[{mod_clean.upper()}]")
-
-                # -------------------------------------------------
-                # Structured Modules (Preferred Design with "intel" key)
-                # -------------------------------------------------
-                if isinstance(output, dict) and "intel" in output:
-
-                    intel = output.get("intel", {})
-                    summary = intel.get("summary", {})
-
-                    # =================================================
-                    # 1️⃣ GENERIC SUMMARY BLOCK
-                    # =================================================
+                # =================================================
+                # 1️⃣ BAC MODULE (Access Control) - NEW
+                # =================================================
+                if "bac" in intel:
+                    bac_data = intel["bac"]
+                    findings = bac_data.get("findings", [])
+                    summary = bac_data.get("summary", {})
+                    
                     if summary:
-                        print(Fore.GREEN + "  Summary:")
+                        print(Fore.GREEN + "  Access Control Summary:")
                         for k, v in summary.items():
                             print(f"    {k.replace('_',' ').title()} : {v}")
-                        print()
-
-                    # =================================================
-                    # 2️⃣ INFRASTRUCTURE (Stalk Phase 1)
-                    # =================================================
-                    if "infrastructure" in intel:
-                        infra = intel.get("infrastructure", {})
-                        print(Fore.GREEN + "  Infrastructure:")
-
-                        if infra.get("subdomains"):
-                            subs = infra["subdomains"]
-                            print(f"    Subdomains: {len(subs)} found")
-                            for s in subs[:10]:
-                                print(f"      - {Fore.CYAN}{s}")
-                            if len(subs) > 10:
-                                print(f"      ... +{len(subs)-10} more")
-                            print()
-
-                        if infra.get("netrange"):
-                            print("    NetRange:")
-                            for n in infra["netrange"]:
-                                print(f"      - {n}")
-                            print()
-
-                        if infra.get("asn"):
-                            print(f"    ASN: {Fore.YELLOW}{intel['asn']}")
-                            print()
-
-                        if infra.get("mx_records"):
-                            print("    MX Records:")
-                            for mx in infra["mx_records"]:
-                                print(f"      - {mx}")
-                            print()
-                        
-                        if infra.get("email_provider"):
-                            print(f"    Email Provider: {Fore.CYAN}{', '.join(infra['email_provider'])}")
-                            print()
-
-                        if infra.get("waf"):
-                            print(f"    WAF: {Fore.RED}{intel['waf']}")
-                            print()
-
-                    # =================================================
-                    # 2.5️⃣ EXPOSURE (Stalk Phase 3)
-                    # =================================================
-                    if "exposure" in intel:
-                        exp = intel.get("exposure", {})
-                        
-                        if exp.get("leaks"):
-                            print(Fore.RED + "  ⚠ Potential Leaks:")
-                            for l in exp["leaks"]:
-                                print(f"    - {Fore.YELLOW}{l}")
-                            print()
-
-                        if exp.get("takeover_candidates"):
-                            print(Fore.RED + "  ⚠ Takeover Candidates:")
-                            for t in exp["takeover_candidates"]:
-                                print(f"    - {Fore.CYAN}{t}")
-                            print()
-
-                    # =================================================
-                    # 3️⃣ WEB SURFACE (Stalk / Spider) - UPDATED
-                    # =================================================
-                    if "web" in intel:
-                        web = intel.get("web", {})
-
-                        if web.get("http_services"):
-                            print(Fore.GREEN + "  HTTP Services:")
-                            for h in web["http_services"]:
-                                print(f"      - {Fore.CYAN}{h}")
-                            print()
-
-                        if web.get("technologies"):
-                            print(Fore.GREEN + "  Technologies:")
-                            for t in web["technologies"]:
-                                print(f"      - {t}")
-                            print()
-
-                        # --- URLs: List them, don't just count ---
-                        if web.get("urls"):
-                            urls = web["urls"]
-                            print(f"    URLs Discovered: {len(urls)}")
-                            for u in urls[:10]: # Show first 10
-                                print(f"      - {Fore.CYAN}{u}")
-                            if len(urls) > 10:
-                                print(f"      ... +{len(urls)-10} more")
-                            print()
-                        
-                        if web.get("js_files"):
-                            print(Fore.GREEN + "  JavaScript Files:")
-                            for js in web["js_files"]:
-                                print(f"      - {Fore.CYAN}{js}")
-                            print()
-
-                        # --- Parameters: List them ---
-                        if web.get("parameters"):
-                            params = web["parameters"]
-                            print(f"    Parameters Found: {len(params)}")
-                            for p in params[:15]: # Show first 15
-                                print(f"      - {Fore.MAGENTA}{p}")
-                            if len(params) > 15:
-                                print(f"      ... +{len(params)-15} more")
-                            print()
-
-                    # =================================================
-                    #  DEVELOPER COMMENTS (New - Spider)
-                    # =================================================
-                    if "comments" in intel:
-                        comments = intel["comments"]
-                        if comments:
-                            print(Fore.GREEN + "  Developer Comments:")
-                            for c in comments:
-                                print(f"    - {Fore.YELLOW}{c}")
-                            print()
-
-                    # =================================================
-                    #  SECURITY HEADERS (New - Spider)
-                    # =================================================
-                    if "security_headers" in intel:
-                        headers = intel["security_headers"]
-                        if headers:
-                            print(Fore.GREEN + "  Security Headers:")
-                            for k, v in headers.items():
-                                print(f"    {Fore.CYAN}{k}: {Fore.WHITE}{v}")
-                            print()
-
-                    # =================================================
-                    # ROBOTS.TXT & SENSITIVE FILES (UPDATED)
-                    # =================================================
-                    # Check for disallowed paths found in robots.txt
-                    disallowed = intel.get("disallowed_entries") or intel.get("robots_entries") or intel.get("robots_txt") or intel.get("robots_disallowed")
-                    if disallowed:
-                        print(Fore.GREEN + "  Robots.txt Intelligence:")
-                        if isinstance(disallowed, list):
-                            print(f"    Disallowed Entries: {len(disallowed)}")
-                            for entry in disallowed:
-                                print(f"      - {Fore.YELLOW}{entry}")
-                        elif isinstance(disallowed, str):
-                            print(f"    Content Preview:\n      {Fore.WHITE}{disallowed[:200]}...")
-                        print()
-
-                    # Check for other sensitive files
-                    if "sensitive_files" in intel:
-                        files = intel.get("sensitive_files")
-                        if files:
-                            print(Fore.RED + "  ⚠ Sensitive Files Detected:")
-                            for f in files:
-                                print(f"    - {Fore.CYAN}{f}")
-                            print()
-                   
-                    # JS ROUTES
-                    routes = intel.get("js_routes") or intel.get("js_endpoints")
                     
-                    if routes:
-                        # Updated print to show total count
-                        print(Fore.GREEN + f"  JS Discovered Routes ({len(routes)} found):")
-                        
-                        # Iterate over the FULL list (removed [:20])
-                        for r in routes:
-                            print(f"    - {Fore.CYAN}{r}")
-                        
-                        print()
-
-                    # GRAPHQL
-                    if "graphql" in intel:
-                        gql = intel["graphql"]
-                        if gql:
-                            print(Fore.MAGENTA + "  GraphQL Endpoints:")
-                            for g in gql:
-                                print(f"    - {g}")
+                    if findings:
+                        print(Fore.RED + "  ⚠ BAC Findings:")
+                        for f in findings:
+                            sev = f.get("severity", "Unknown")
+                            name = f.get("vulnerability", "Unknown")
+                            ep = f.get("endpoint", "")
+                            param = f.get("parameter", "")
+                            
+                            c_sev = Fore.RED if sev == "Critical" else (Fore.YELLOW if sev == "High" else Fore.WHITE)
+                            print(f"    [{c_sev}{sev}{Style.RESET_ALL}] {name}")
+                            if ep: print(f"       Endpoint: {Fore.CYAN}{ep}")
+                            if param: print(f"       Parameter: {param}")
                             print()
-
-                    # =================================================
-                    #  JS PARAMETERS (FIXED: Checks 'js_parameters')
-                    # =================================================
-                    # Spider saves it as 'js_parameters', loot was looking for 'parameters'
-                    # JS PARAMETERS (Show all)
-                    params = intel.get("js_parameters") or intel.get("parameters")
-                    
-                    if params:
-                        print(Fore.YELLOW + f"  JS Parameters ({len(params)} found):")
-                        for p in params:
-                            print(f"    - {p}")
-                        print()
-
-                    # =================================================
-                    #  POTENTIAL KEYS (FIXED: Filters out function names)
-                    # =================================================
-                    if "potential_keys" in intel:
-                        keys = intel["potential_keys"]
-                        if keys:
-                            print(Fore.RED + "  ⚠ Potential Secrets Found:")
-                            for k in keys:
-                                # Simple Heuristic Filter:
-                                # 1. Ignore if it starts with a lowercase letter followed by uppercase (CamelCase function name)
-                                # 2. Ignore if it contains common code words
-                                is_code_noise = False
-                                
-                                lower_k = k.lower()
-                                noise_indicators = ['handler', 'verify', 'show', 'displayed', 'difficulty', 'notification', 'repeat']
-                                
-                                if any(n in lower_k for n in noise_indicators):
-                                    is_code_noise = True
-                                
-                                # Allow if it looks like a hash/HEX or BTC address
-                                # (BTC addresses start with 1, 3, or bc1; Hashes are hex)
-                                if not is_code_noise:
-                                    print(f"    - {k}")
-                            print()
-
-                    # RISK SCORE
-                    if "risk_score" in intel:
-                        print(Fore.CYAN + f"  Risk Score: {intel['risk_score']}\n")
-                    # =================================================
-                    # 4️⃣ SERVICE MAP (Surfacemap Style)
-                    # =================================================
-                    if "map" in intel:
-                        surface = intel.get("map", {})
-                        for ip, ports in surface.items():
-                            print(Fore.GREEN + f"  Surface Map → {ip}")
-                            for port_proto, data in ports.items():
-                                service = data.get("service", "")
-                                product = data.get("product", "")
-                                version = data.get("version", "")
-                                print(
-                                    f"    {Fore.CYAN}{port_proto:<8} "
-                                    f"{Fore.WHITE}{service:<10} "
-                                    f"{Fore.YELLOW}{product} {version}"
-                                )
-                            print()
-
-                    # =================================================
-                    # 5️⃣ ENDPOINTS (Universal: Spider, Fuzzhunter, Parax)
-                    # =================================================
-                    if "endpoints" in intel:
-                        endpoints = intel.get("endpoints", [])
-                        stats = intel.get("stats", {})
-
-                        if stats:
-                            print(Fore.GREEN + "  Attack Surface Summary:")
-                            for key, val in stats.items():
-                                print(f"    {key.upper():<6}: {val}")
-                            print()
-
-                        for idx, el in enumerate(endpoints, 1):
-                            
-                            # FIX: Convert to string before calling .upper() to handle integer status codes
-                            raw_method_or_status = el.get("method", el.get("status", "UNK"))
-                            method = str(raw_method_or_status).upper()
-                            
-                            url = el.get("url", "")
-                            path = el.get("path", "")
-                            
-                            # Fallback for URL construction if only path exists
-                            if not url and path:
-                                url = f"/{path}"
-
-                            # Color Logic
-                            color = Fore.BLUE if method == "GET" else Fore.MAGENTA
-                            if method.isdigit(): color = Fore.CYAN # Handle status codes as method for Fuzzhunter style
-                            
-                            # Display Logic: If it's a number, show it as Status, otherwise Method
-                            display_method = f"Status {method}" if method.isdigit() else method
-
-                            print(color + f"  [{idx}] {display_method}  {url}")
-
-                            # Show Params (Spider)
-                            if el.get("params"):
-                                for p in el.get("params"):
-                                    pname = p.get("name", "")
-                                    ptype = p.get("type", "")
-                                    print(f"       - {Fore.WHITE}{pname} {Fore.YELLOW}({ptype})")
-                            
-                            # Show Size/Details (Fuzzhunter)
-                            if el.get("size"):
-                                print(f"       - Size: {el.get('size')} bytes")
-
-                            # Show Risks/Priority (Spider/Parax)
-                            if el.get("risks"):
-                                print(f"       - {Fore.RED}Risks: {', '.join(el['risks'])}")
-                            if el.get("priority"):
-                                print(f"       - Priority: {el.get('priority')}")
-
-                            if el.get("tags"):
-                                print(Fore.CYAN + f"       Tags: {', '.join(el['tags'])}")
-
-                            print()
-
-                    # =================================================
-                    # 5.5️⃣ CREDLEAK / CLOUD (Upgraded)
-                    # =================================================
-                    if "s3_buckets" in intel:
-                        print(Fore.GREEN + "  Cloud Assets (S3):")
-                        for bucket in intel["s3_buckets"]:
-                            print(f"    - {Fore.CYAN}http://{bucket}.s3.amazonaws.com")
-                        print()
-
-                    if "hardcoded_creds" in intel:
-                        creds = intel["hardcoded_creds"]
-                        if creds:
-                            print(Fore.RED + "  ⚠ Hardcoded Credentials Extracted:")
-                            for cred in creds:
-                                print(f"    - {Fore.YELLOW}{cred}")
-                            print()
-
-                    if "paste_hits" in intel and intel["paste_hits"]:
-                        print(Fore.GREEN + "  Paste References:")
-                        for link in intel["paste_hits"]:
-                            print(f"    - {Fore.YELLOW}{link}")
-                        print()
-
-                    if "exposed_keys" in intel and intel["exposed_keys"]:
-                        keys = intel["exposed_keys"]
-                        if keys:
-                            print(Fore.RED + "  ⚠ Exposed Keys Detected:")
-                            for key in keys:
-                                print(f"    - {key}")
-                            print()
-
-                    # =================================================
-                    # 6️⃣ EMAILS / PHISHING
-                    # =================================================
-                    if "emails" in intel and intel["emails"]:
-                        print(Fore.GREEN + "  Emails Found:")
-                        for email in intel["emails"]:
-                            print(f"    - {Fore.CYAN}{email}")
-                        print()
-
-                    # =================================================
-                    # 6.5️⃣ PHISHING INTEL (Consolidated)
-                    # =================================================
-                    if "security_policy" in intel:
-                        pol = intel.get("security_policy")
-                        print(Fore.GREEN + "  Phishing Intel:")
-                        if intel.get("phishing_domain"):
-                            print(f"    Suggested Domain : {Fore.CYAN}{intel['phishing_domain']}")
-                        if pol.get("spf"):
-                            print(f"    SPF Status      : {Fore.YELLOW}{pol.get('spf_type')}")
-                        if pol.get("dmarc"):
-                            print(f"    DMARC Policy    : {Fore.YELLOW}{pol.get('dmarc_policy')}")
-                        
-                        # UPDATED: Show ONLY Top 10 emails + Indicate Source
-                        if intel.get("target_emails"):
-                            emails = intel["target_emails"]
-                            signals = intel.get("signals", [])
-                            
-                            # Detect source of emails
-                            if "SCRAPED_EMAILS_FOUND" in signals:
-                                source_color = Fore.GREEN
-                                source_text = "Real (Scraped from HTML)"
-                            elif "SMART_PATTERN_DEDUCTION" in signals:
-                                source_color = Fore.MAGENTA
-                                source_text = "Derived (Pattern Matching)"
-                            else:
-                                source_color = Fore.LIGHTBLACK_EX
-                                source_text = "Predicted (Based on Usernames)"
-
-                            print(f"    Target Emails   : {len(emails)} found ({source_color}{source_text}{Style.RESET_ALL})")
-                            
-                            # ONLY SHOW TOP 10
-                            for e in emails[:10]:
-                                print(f"      - {Fore.CYAN}{e}")
-                            
-                            # Hide the rest
-                            if len(emails) > 10:
-                                print(f"      ... +{len(emails)-10} more (Hidden to reduce noise)")
-                        print()
-
-                    # =================================================
-                    # 7️⃣ VULNERABILITIES (Universal)
-                    # =================================================
-                    if "vulnerabilities" in intel:
-                        vulns = intel.get("vulnerabilities", [])
-                        if vulns:
-                            print(Fore.RED + "  ⚠ Vulnerabilities Detected:\n")
-                            for idx, v in enumerate(vulns, 1):
-                                vtype = v.get("type", "UNKNOWN")
-                                url = v.get("url", "")
-                                param = v.get("parameter", "")
-                                payload = v.get("payload_used")
-                                confidence = v.get("confidence", "")
-                                print(Fore.YELLOW + f"  [{idx}] {vtype}")
-                                print(f"       Target     : {Fore.CYAN}{url}")
-                                if param:
-                                    print(f"       Parameter  : {Fore.WHITE}{param}")
-                                if payload:
-                                    print(f"       Payload    : {Fore.GREEN}{payload}")
-                                if confidence:
-                                    print(f"       Confidence : {confidence}")
-                                if v.get("proof"):
-                                    print(Fore.MAGENTA + f"       Proof      : {v.get('proof')}")
-                                print()
-
-                    # =================================================
-                    # 7.5️⃣ VULNERABILITY SCANNER (Nikto/Nuclei) - SEIGE MODULE - FIXED
-                    # =================================================
-                    if "nikto_findings" in intel or "nuclei_findings" in intel:
-                        print(Fore.RED + "  ⚠️  Vulnerability Scan Results:\n")
-
-                        # --- NIKTO ---
-                        if intel.get("nikto_findings"):
-                            print(Fore.CYAN + "    [Nikto Issues]")
-                            for f in intel["nikto_findings"]:
-                                # Clean up the string slightly for display
-                                # Remove the leading '+' if present for cleaner look
-                                display_f = f.replace("+ ", "").strip()
-                                print(Fore.WHITE + f"      • {display_f}")
-                            print()
-
-                        # --- NUCLEI ---
-                        if intel.get("nuclei_findings"):
-                            print(Fore.CYAN + "    [Confirmed Vulnerabilities]")
-                            
-                            # Sort by severity (Critical/High first)
-                            vulns = intel["nuclei_findings"]
-                            
-                            # FIX: Use strip_ansi on findings before checking keywords
-                            critical = [v for v in vulns if "[CRITICAL]" in strip_ansi(v)]
-                            high = [v for v in vulns if "[HIGH]" in strip_ansi(v)]
-                            medium = [v for v in vulns if "[MEDIUM]" in strip_ansi(v)]
-                            low = [v for v in vulns if "[LOW]" in strip_ansi(v) or "[INFO]" in strip_ansi(v)]
-                            
-                            all_sorted = critical + high + medium + low
-                            
-                            for v in all_sorted:
-                                # Clean the string for display (removes Nuclei's native colors)
-                                clean_v = strip_ansi(v)
-                                
-                                # Color Coding based on CVSS/Severity (Hellhound Colors)
-                                if "[CRITICAL]" in clean_v:
-                                    print(Fore.RED + f"      🔴 {clean_v}")
-                                elif "[HIGH]" in clean_v:
-                                    print(Fore.LIGHTRED_EX + f"      🟠 {clean_v}")
-                                elif "[MEDIUM]" in clean_v:
-                                    print(Fore.YELLOW + f"      🟡 {clean_v}")
-                                else:
-                                    print(Fore.WHITE + f"      🟢 {clean_v}")
-                            print()
-
-                    # =================================================
-                    # 8️⃣ SIGNALS
-                    # =================================================
-                    if "signals" in intel:
-                        signals = intel.get("signals", [])
-                        if signals:
-                            print(Fore.GREEN + "  Signals:")
-                            for s in signals:
-                                print(f"    - {s}")
-                            print()
-
-                # -------------------------------------------------
-                # RAW FALLBACK (Handles dicts without 'intel', strings, or lists)
-                # -------------------------------------------------
-                elif isinstance(output, dict):
-                    # Handle modules returning {'raw': ..., 'signals': ...}
-                    if "raw" in output:
-                        print(Fore.WHITE + output["raw"])
-                    
-                    if "signals" in output and output["signals"]:
-                        print(Fore.GREEN + "  Signals:")
-                        for s in output['signals']:
-                            print(f"    - {s}")
-                        print()
-                    elif "summary" in output:
-                        print(Fore.WHITE + str(output["summary"]))
                     else:
-                        # Fallback for unknown dicts
-                        print(Fore.WHITE + str(output))
+                        print(Fore.GREEN + "  [+] No Access Control issues detected.\n")
 
-                elif isinstance(output, list):
-                    # Handle modules returning lists (e.g. simple lists of strings)
-                    for item in output:
-                        print(Fore.WHITE + f"    - {item}")
+                # =================================================
+                # 2️⃣ WEB SURFACE (Technologies, JS, Parameters)
+                # =================================================
+                if "web" in intel:
+                    web = intel.get("web", {})
+
+                    if web.get("technologies"):
+                        print(Fore.GREEN + "  Technologies:")
+                        for t in web["technologies"]:
+                            print(f"      - {t}")
+                        print()
+
+                    if web.get("urls"):
+                        urls = web["urls"]
+                        print(f"    URLs Discovered: {len(urls)}")
+                        for u in urls[:10]: 
+                            print(f"      - {Fore.CYAN}{u}")
+                        if len(urls) > 10: print(f"      ... +{len(urls)-10} more")
+                        print()
+                    
+                    if web.get("js_files"):
+                        print(Fore.GREEN + "  JavaScript Files:")
+                        for js in web["js_files"]:
+                            print(f"      - {Fore.CYAN}{js}")
+                        print()
+
+                    if web.get("parameters"):
+                        params = web["parameters"]
+                        print(f"    Parameters Found: {len(params)}")
+                        for p in params[:15]: 
+                            print(f"      - {Fore.MAGENTA}{p}")
+                        if len(params) > 15: print(f"      ... +{len(params)-15} more")
+                        print()
+
+                # =================================================
+                # 3️⃣ SPIDER INTEL (Routes, Comments, Headers)
+                # =================================================
+                if "comments" in intel and intel["comments"]:
+                    print(Fore.GREEN + "  Developer Comments:")
+                    for c in intel["comments"]:
+                        print(f"    - {Fore.YELLOW}{c}")
+                    print()
+
+                if "security_headers" in intel and intel["security_headers"]:
+                    print(Fore.GREEN + "  Security Headers:")
+                    for k, v in intel["security_headers"].items():
+                        print(f"    {Fore.CYAN}{k}: {Fore.WHITE}{v}")
+                    print()
+
+                # Robots / Sensitive Files
+                disallowed = intel.get("disallowed_entries") or intel.get("robots_entries") or intel.get("robots_txt")
+                if disallowed:
+                    print(Fore.GREEN + "  Robots.txt Intel:")
+                    if isinstance(disallowed, list):
+                        print(f"    Disallowed Entries: {len(disallowed)}")
+                        for entry in disallowed:
+                            print(f"      - {Fore.YELLOW}{entry}")
+                    elif isinstance(disallowed, str):
+                        print(f"    Content Preview:\n      {Fore.WHITE}{disallowed[:200]}...")
+                    print()
+
+                if "sensitive_files" in intel and intel["sensitive_files"]:
+                    print(Fore.RED + "  ⚠ Sensitive Files:")
+                    for f in intel["sensitive_files"]:
+                        print(f"    - {Fore.CYAN}{f}")
+                    print()
                 
-                elif isinstance(output, str):
-                    print(Fore.WHITE + output.strip()[:1000])
+                # JS Routes
+                routes = intel.get("js_routes") or intel.get("js_endpoints")
+                if routes:
+                    print(Fore.GREEN + f"  JS Discovered Routes ({len(routes)}):")
+                    for r in routes:
+                        print(f"    - {Fore.CYAN}{r}")
                     print()
 
-                else:
-                    print(Fore.WHITE + str(output))
+                # JS Parameters (Specific)
+                params = intel.get("js_parameters")
+                if params:
+                    print(Fore.YELLOW + f"  JS Parameters ({len(params)}):")
+                    for p in params:
+                        print(f"    - {p}")
                     print()
 
-            print(Fore.CYAN + "================================\n")
+                # Potential Keys / Secrets
+                if "potential_keys" in intel and intel["potential_keys"]:
+                    print(Fore.RED + "  ⚠ Potential Secrets:")
+                    for k in intel["potential_keys"]:
+                        is_code_noise = False
+                        lower_k = k.lower()
+                        noise = ['handler', 'verify', 'show', 'displayed', 'difficulty']
+                        if any(n in lower_k for n in noise): is_code_noise = True
+                        if not is_code_noise: print(f"    - {k}")
+                    print()
+
+                # =================================================
+                # 4️⃣ ENDPOINTS (Spider / Fuzzhunter)
+                # =================================================
+                if "endpoints" in intel:
+                    endpoints = intel.get("endpoints", [])
+                    stats = intel.get("stats", {})
+
+                    if stats:
+                        print(Fore.GREEN + "  Endpoint Stats:")
+                        for k, v in stats.items(): print(f"    {k.upper()}: {v}")
+                        print()
+
+                    for idx, el in enumerate(endpoints, 1):
+                        raw_method = el.get("method", el.get("status", "UNK"))
+                        method = str(raw_method).upper()
+                        url = el.get("url", el.get("path", ""))
+                        
+                        color = Fore.BLUE if method == "GET" else Fore.MAGENTA
+                        if method.isdigit(): color = Fore.CYAN 
+                        
+                        display_method = f"Status {method}" if method.isdigit() else method
+                        print(color + f"  [{idx}] {display_method}  {url}")
+
+                        if el.get("params"):
+                            for p in el.get("params"): print(f"       - {Fore.WHITE}{p.get('name')} {Fore.YELLOW}({p.get('type')})")
+                        if el.get("risks"): print(f"       - {Fore.RED}Risks: {', '.join(el['risks'])}")
+                        print()
+
+                # =================================================
+                # 5️⃣ VULNERABILITIES (General)
+                # =================================================
+                if "vulnerabilities" in intel:
+                    vulns = intel.get("vulnerabilities", [])
+                    if vulns:
+                        print(Fore.RED + "  ⚠ Vulnerabilities:\n")
+                        for idx, v in enumerate(vulns, 1):
+                            vtype = v.get("type", "UNKNOWN")
+                            url = v.get("url", "")
+                            print(Fore.YELLOW + f"  [{idx}] {vtype}")
+                            print(f"       Target  : {Fore.CYAN}{url}")
+                            if v.get("proof"): print(f"       Proof   : {Fore.MAGENTA}{v.get('proof')}")
+                            print()
+
+                # =================================================
+                # 6️⃣ SCANNERS (Nuclei / Nikto)
+                # =================================================
+                if "nikto_findings" in intel or "nuclei_findings" in intel:
+                    print(Fore.RED + "  ⚠️  Scanner Results:\n")
+
+                    if intel.get("nikto_findings"):
+                        print(Fore.CYAN + "    [Nikto]")
+                        for f in intel["nikto_findings"]:
+                            print(Fore.WHITE + f"      • {f.replace('+ ', '').strip()}")
+                        print()
+
+                    if intel.get("nuclei_findings"):
+                        print(Fore.CYAN + "    [Nuclei]")
+                        vulns = intel["nuclei_findings"]
+                        critical = [v for v in vulns if "[CRITICAL]" in strip_ansi(v)]
+                        high = [v for v in vulns if "[HIGH]" in strip_ansi(v)]
+                        medium = [v for v in vulns if "[MEDIUM]" in strip_ansi(v)]
+                        low = [v for v in vulns if "[LOW]" in strip_ansi(v)]
+                        
+                        for v in critical + high + medium + low:
+                            clean_v = strip_ansi(v)
+                            c = Fore.RED if "[CRITICAL]" in clean_v else (Fore.LIGHTRED_EX if "[HIGH]" in clean_v else (Fore.YELLOW if "[MEDIUM]" in clean_v else Fore.WHITE))
+                            print(c + f"      {clean_v}")
+                        print()
+
+                # =================================================
+                # 7️⃣ CREDENTIAL LEAKS (Web-based)
+                # =================================================
+                if "hardcoded_creds" in intel and intel["hardcoded_creds"]:
+                    print(Fore.RED + "  ⚠ Hardcoded Credentials:")
+                    for cred in intel["hardcoded_creds"]: print(f"    - {Fore.YELLOW}{cred}")
+                    print()
+
+                if "exposed_keys" in intel and intel["exposed_keys"]:
+                    print(Fore.RED + "  ⚠ Exposed Keys:")
+                    for key in intel["exposed_keys"]: print(f"    - {key}")
+                    print()
+
+                # =================================================
+                # 8️⃣ SIGNALS
+                # =================================================
+                if "signals" in intel and intel["signals"]:
+                    print(Fore.GREEN + "  Signals:")
+                    for s in intel["signals"]: print(f"    - {s}")
+                    print()
+
+            # -------------------------------------------------
+            # RAW FALLBACK
+            # -------------------------------------------------
+            elif isinstance(output, dict):
+                if "raw" in output: print(Fore.WHITE + output["raw"])
+                elif "summary" in output: print(Fore.WHITE + str(output["summary"]))
+                else: print(Fore.WHITE + str(output))
+            elif isinstance(output, list):
+                for item in output: print(Fore.WHITE + f"    - {item}")
+            elif isinstance(output, str):
+                print(Fore.WHITE + output.strip()[:1000])
+
+        print(Fore.CYAN + "================================\n")
 
 
     # ============================
