@@ -94,7 +94,8 @@ Each module:
 Example intelligence flow:
 
 ```
-Spider  → Discovers API routes & parameters
+Spider  → Discovers API routes & parameters in SPAs
+BACdetector → Advanced Access Control Scanner (IDOR, RBAC, Auth, Misconfig, Vuln Scan)
 Parax   → Analyzes parameters for risk patterns
 CMDinj  → Targets system-interaction endpoints
 Seige   → Performs vulnerability scanning on mapped routes

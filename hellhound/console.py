@@ -316,11 +316,6 @@ class HellhoundConsole(cmd.Cmd):
 
 
     def do_loot(self, arg):
-        """loot → View gathered results (Web-Focused)"""
-        import json
-        import os
-        import re
-        from datetime import datetime
 
         if not self.results:
             print(Fore.RED + "[!] No loot collected yet")
@@ -506,11 +501,23 @@ class HellhoundConsole(cmd.Cmd):
 
             print(Fore.YELLOW + f"[{mod_clean.upper()}]")
 
+            # ===============================================
+            # SPIDER SPECIFIC: INJECTION SUMMARY (Top Level)
+            # ===============================================
+            if mod_clean == "spider" and isinstance(output, dict):
+                inj_summary = output.get("injection_summary")
+                if inj_summary:
+                    print(Fore.MAGENTA + "  [API Surface Summary]")
+                    for k, v in inj_summary.items():
+                        k_clean = k.replace('_', ' ').title()
+                        print(f"    {k_clean:<25}: {Fore.WHITE}{v}")
+                    print()
+
             if isinstance(output, dict) and "intel" in output:
                 intel = output.get("intel", {})
                 
                 # =================================================
-                # 1️⃣ BAC MODULE (Access Control) - NEW
+                # 1️⃣ BAC MODULE (Access Control)
                 # =================================================
                 if "bac" in intel:
                     bac_data = intel["bac"]
@@ -539,8 +546,123 @@ class HellhoundConsole(cmd.Cmd):
                         print(Fore.GREEN + "  [+] No Access Control issues detected.\n")
 
                 # =================================================
-                # 2️⃣ WEB SURFACE (Technologies, JS, Parameters)
+                # 2️⃣ SPIDER: VALIDATED APIS (CRITICAL SECTION)
                 # =================================================
+                validated_apis = intel.get("validated_api", [])
+                if validated_apis:
+                    print(Fore.GREEN + f"  [Live Validated APIs] ({len(validated_apis)} endpoints)")
+                    
+                    for api in validated_apis:
+                        method = api.get("method", "GET").upper()
+                        path = api.get("path", api.get("url", ""))
+                        status = api.get("status_code", "???")
+                        auth_req = api.get("auth_required", False)
+                        content_type = api.get("content_type", "unknown")
+                        
+                        # Method Color
+                        m_color = Fore.BLUE if method == "GET" else (Fore.MAGENTA if method == "POST" else Fore.CYAN)
+                        
+                        # Line 1: Method | Status | Path
+                        auth_tag = f"{Fore.RED}[AUTH]{Style.RESET_ALL} " if auth_req else ""
+                        print(f"    {m_color}{method}{Style.RESET_ALL} | {Fore.GREEN}{status}{Style.RESET_ALL} | {auth_tag}{path}")
+                        
+                        # Line 2: Content Type & Size
+                        print(f"       Type: {content_type} ({api.get('response_size', 0)} bytes)")
+
+                        # Line 3: Discovered Fields (Highlight sensitive ones)
+                        fields = api.get("discovered_fields", [])
+                        if fields:
+                            sensitive_fields = [f for f in fields if any(x in f.lower() for x in ['pass', 'token', 'secret', 'key', 'auth', 'id'])]
+                            if sensitive_fields:
+                                print(f"       {Fore.RED}Fields: {', '.join(sensitive_fields)}")
+                            else:
+                                print(f"       {Fore.WHITE}Fields: {', '.join(fields[:5])}{'...' if len(fields) > 5 else ''}")
+
+                        # Line 4: ID Patterns (IDOR Potential)
+                        id_pats = api.get("id_patterns", [])
+                        if id_pats:
+                            for pat in id_pats:
+                                print(f"       {Fore.YELLOW}⚠ ID Pattern Detected: {pat.get('field')} (Test Candidates: {pat.get('test_candidates')})")
+                        print()
+                    
+                    # Global Aggregates for Validated APIs
+                    global_fields = intel.get("discovered_fields", [])
+                    if global_fields:
+                        print(Fore.CYAN + "  [Global Discovered Data Fields]")
+                        # Group sensitive vs normal
+                        sensitive = [f for f in global_fields if any(x in f.lower() for x in ['pass', 'token', 'secret', 'key', 'auth', 'totp', 'credit'])]
+                        normal = [f for f in global_fields if f not in sensitive]
+                        
+                        if sensitive:
+                            print(f"    {Fore.RED}Sensitive: {', '.join(sensitive)}")
+                        if normal:
+                            print(f"    {Fore.WHITE}Standard:  {', '.join(normal)}")
+                        print()
+                    
+                    global_id_pats = intel.get("id_patterns", [])
+                    if global_id_pats:
+                        print(Fore.YELLOW + "  [Global ID Patterns]")
+                        for pat in global_id_pats:
+                             print(f"    - Field '{pat.get('field')}' at {pat.get('endpoint')}")
+                        print()
+
+                # =================================================
+                # 3️⃣ SPIDER: RAW JS ROUTES (Unvalidated)
+                # =================================================
+                raw_js = intel.get("raw_js_routes", [])
+                if raw_js:
+                    print(Fore.GREEN + f"  [JS Detected Routes] ({len(raw_js)} unvalidated)")
+                    for route in raw_js[:15]: # Limit display
+                        path = route.get('path', '')
+                        method = route.get('method', 'GET')
+                        conf = route.get('confidence', 0)
+                        src = route.get('source', 'unknown')
+                        conf_color = Fore.GREEN if conf > 0.8 else (Fore.YELLOW if conf > 0.5 else Fore.RED)
+                        print(f"    {method:<6} {path} ({conf_color}conf: {conf}{Style.RESET_ALL}) [{src}]")
+                    if len(raw_js) > 15: print(f"    ... +{len(raw_js)-15} more")
+                    print()
+
+                # =================================================
+                # 4️⃣ SPIDER: API ENDPOINTS (Surface/HTML)
+                # =================================================
+                # These are usually the entry points, not the logic APIs
+                api_endpoints = intel.get("api_endpoints", [])
+                if api_endpoints:
+                    print(Fore.GREEN + f"  [Entry Points / Surface] ({len(api_endpoints)})")
+                    for ep in api_endpoints:
+                        url = ep.get("url", "")
+                        method = ep.get("method", "GET")
+                        cls = ep.get("classification", {})
+                        tags = ep.get("tags", [])
+                        
+                        # Determine type based on classification
+                        if cls.get("is_api"):
+                            type_str = "API"
+                        elif cls.get("is_spa_shell"):
+                            type_str = "SPA Shell"
+                        else:
+                            type_str = "HTML/Other"
+                            
+                        print(f"    [{Fore.MAGENTA}{type_str}{Style.RESET_ALL}] {method} {url}")
+                        if tags: print(f"       Tags: {', '.join(tags)}")
+                    print()
+
+                # =================================================
+                # 5️⃣ WEB SURFACE (Technologies, JS, Parameters)
+                # =================================================
+                
+                # --- JS Files ---
+                js_files = intel.get("js_files")
+                if not js_files and "web" in intel:
+                    js_files = intel["web"].get("js_files")
+
+                if js_files:
+                    print(Fore.GREEN + "  JavaScript Files:")
+                    for js in js_files:
+                        print(f"      - {Fore.CYAN}{js}")
+                    print()
+
+                # --- Standard Web Intel ---
                 if "web" in intel:
                     web = intel.get("web", {})
 
@@ -558,12 +680,6 @@ class HellhoundConsole(cmd.Cmd):
                         if len(urls) > 10: print(f"      ... +{len(urls)-10} more")
                         print()
                     
-                    if web.get("js_files"):
-                        print(Fore.GREEN + "  JavaScript Files:")
-                        for js in web["js_files"]:
-                            print(f"      - {Fore.CYAN}{js}")
-                        print()
-
                     if web.get("parameters"):
                         params = web["parameters"]
                         print(f"    Parameters Found: {len(params)}")
@@ -573,7 +689,7 @@ class HellhoundConsole(cmd.Cmd):
                         print()
 
                 # =================================================
-                # 3️⃣ SPIDER INTEL (Routes, Comments, Headers)
+                # 6️⃣ GENERAL INTEL (Comments, Headers, Robots)
                 # =================================================
                 if "comments" in intel and intel["comments"]:
                     print(Fore.GREEN + "  Developer Comments:")
@@ -588,7 +704,11 @@ class HellhoundConsole(cmd.Cmd):
                     print()
 
                 # Robots / Sensitive Files
-                disallowed = intel.get("disallowed_entries") or intel.get("robots_entries") or intel.get("robots_txt")
+                disallowed = (intel.get("disallowed_entries") or 
+                              intel.get("robots_entries") or 
+                              intel.get("robots_txt") or 
+                              intel.get("robots_disallowed"))
+                              
                 if disallowed:
                     print(Fore.GREEN + "  Robots.txt Intel:")
                     if isinstance(disallowed, list):
@@ -605,14 +725,6 @@ class HellhoundConsole(cmd.Cmd):
                         print(f"    - {Fore.CYAN}{f}")
                     print()
                 
-                # JS Routes
-                routes = intel.get("js_routes") or intel.get("js_endpoints")
-                if routes:
-                    print(Fore.GREEN + f"  JS Discovered Routes ({len(routes)}):")
-                    for r in routes:
-                        print(f"    - {Fore.CYAN}{r}")
-                    print()
-
                 # JS Parameters (Specific)
                 params = intel.get("js_parameters")
                 if params:
@@ -627,41 +739,13 @@ class HellhoundConsole(cmd.Cmd):
                     for k in intel["potential_keys"]:
                         is_code_noise = False
                         lower_k = k.lower()
-                        noise = ['handler', 'verify', 'show', 'displayed', 'difficulty']
+                        noise = ['handler', 'verify', 'show', 'displayed', 'difficulty', 'summary', 'banner']
                         if any(n in lower_k for n in noise): is_code_noise = True
                         if not is_code_noise: print(f"    - {k}")
                     print()
 
                 # =================================================
-                # 4️⃣ ENDPOINTS (Spider / Fuzzhunter)
-                # =================================================
-                if "endpoints" in intel:
-                    endpoints = intel.get("endpoints", [])
-                    stats = intel.get("stats", {})
-
-                    if stats:
-                        print(Fore.GREEN + "  Endpoint Stats:")
-                        for k, v in stats.items(): print(f"    {k.upper()}: {v}")
-                        print()
-
-                    for idx, el in enumerate(endpoints, 1):
-                        raw_method = el.get("method", el.get("status", "UNK"))
-                        method = str(raw_method).upper()
-                        url = el.get("url", el.get("path", ""))
-                        
-                        color = Fore.BLUE if method == "GET" else Fore.MAGENTA
-                        if method.isdigit(): color = Fore.CYAN 
-                        
-                        display_method = f"Status {method}" if method.isdigit() else method
-                        print(color + f"  [{idx}] {display_method}  {url}")
-
-                        if el.get("params"):
-                            for p in el.get("params"): print(f"       - {Fore.WHITE}{p.get('name')} {Fore.YELLOW}({p.get('type')})")
-                        if el.get("risks"): print(f"       - {Fore.RED}Risks: {', '.join(el['risks'])}")
-                        print()
-
-                # =================================================
-                # 5️⃣ VULNERABILITIES (General)
+                # 7️⃣ VULNERABILITIES (General)
                 # =================================================
                 if "vulnerabilities" in intel:
                     vulns = intel.get("vulnerabilities", [])
@@ -676,7 +760,7 @@ class HellhoundConsole(cmd.Cmd):
                             print()
 
                 # =================================================
-                # 6️⃣ SCANNERS (Nuclei / Nikto)
+                # 8️⃣ SCANNERS (Nuclei / Nikto)
                 # =================================================
                 if "nikto_findings" in intel or "nuclei_findings" in intel:
                     print(Fore.RED + "  ⚠️  Scanner Results:\n")
@@ -702,7 +786,7 @@ class HellhoundConsole(cmd.Cmd):
                         print()
 
                 # =================================================
-                # 7️⃣ CREDENTIAL LEAKS (Web-based)
+                # 9️⃣ CREDENTIAL LEAKS (Web-based)
                 # =================================================
                 if "hardcoded_creds" in intel and intel["hardcoded_creds"]:
                     print(Fore.RED + "  ⚠ Hardcoded Credentials:")
@@ -715,7 +799,7 @@ class HellhoundConsole(cmd.Cmd):
                     print()
 
                 # =================================================
-                # 8️⃣ SIGNALS
+                # 🔟 SIGNALS
                 # =================================================
                 if "signals" in intel and intel["signals"]:
                     print(Fore.GREEN + "  Signals:")
