@@ -453,30 +453,40 @@ class HellhoundConsole(cmd.Cmd):
         breakdown = {}
 
         for mod, output in self.results.items():
-            if isinstance(output, dict):
-                # Handle BAC style (top level risk)
-                if "risk_score" in output:
-                    breakdown[mod] = output["risk_score"]
-                    total_risk += output["risk_score"]
-                # Handle Nuclei/Nikto style (nested risk)
-                elif "intel" in output and isinstance(output["intel"], dict):
-                    module_risk = output["intel"].get("risk_score", 0)
-                    
-                    # Dynamic Risk Calc for Siege (Nuclei/Nikto)
-                    if module_risk == 0:
-                        if "nuclei_findings" in output["intel"]:
-                            vulns = output["intel"]["nuclei_findings"]
-                            for v in vulns:
-                                clean_v = strip_ansi(v)
-                                if "[CRITICAL]" in clean_v: module_risk += 10
-                                elif "[HIGH]" in clean_v: module_risk += 7
-                                elif "[MEDIUM]" in clean_v: module_risk += 4
-                                elif "[LOW]" in clean_v: module_risk += 1
-                        if "nikto_findings" in output["intel"]:
-                            module_risk += len(output["intel"]["nikto_findings"]) * 2
-                    
-                    breakdown[mod] = module_risk
-                    total_risk += module_risk
+            module_risk = 0
+
+            if not isinstance(output, dict):
+                continue
+
+            intel = output.get("intel", {})
+
+            # 1️⃣ Direct legacy risk
+            if "risk_score" in output:
+                module_risk += output.get("risk_score", 0)
+
+            # 2️⃣ Standard intel risk (Spider style)
+            if "risk_score" in intel:
+                module_risk += intel.get("risk_score", 0)
+
+            # 3️⃣ BAC nested risk (CRITICAL FIX)
+            if "bac" in intel and isinstance(intel["bac"], dict):
+                module_risk += intel["bac"].get("risk_score", 0)
+
+            # 4️⃣ Scanner dynamic fallback (Siege/Nuclei/Nikto)
+            if module_risk == 0:
+                if "nuclei_findings" in intel:
+                    for v in intel["nuclei_findings"]:
+                        clean_v = strip_ansi(v)
+                        if "[CRITICAL]" in clean_v: module_risk += 10
+                        elif "[HIGH]" in clean_v: module_risk += 7
+                        elif "[MEDIUM]" in clean_v: module_risk += 4
+                        elif "[LOW]" in clean_v: module_risk += 1
+
+                if "nikto_findings" in intel:
+                    module_risk += len(intel["nikto_findings"]) * 2
+
+            breakdown[mod] = module_risk
+            total_risk += module_risk
 
         print(Fore.CYAN + "========== [ RISK BREAKDOWN ] ==========\n")
         for mod, score in breakdown.items():
@@ -484,10 +494,14 @@ class HellhoundConsole(cmd.Cmd):
         print("----------------------------------------")
         print(f"  TOTAL RISK SCORE : {total_risk}")
 
-        if total_risk <= 3: level = "LOW"
-        elif total_risk <= 8: level = "MEDIUM"
-        elif total_risk <= 15: level = "HIGH"
-        else: level = "CRITICAL"
+        if total_risk < 50:
+            level = "LOW"
+        elif total_risk < 150:
+            level = "MEDIUM"
+        elif total_risk < 300:
+            level = "HIGH"
+        else:
+            level = "CRITICAL"
 
         print(Fore.RED + f"  SECURITY POSTURE   : {level}")
         print(Fore.CYAN + "========================================\n")
