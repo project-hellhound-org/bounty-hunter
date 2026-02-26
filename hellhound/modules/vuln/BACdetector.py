@@ -239,11 +239,32 @@ class Findings:
     def all(self):
         with self._lock: return list(self._list)
 
+
+# ==========================================================
+# UPDATED AUTO REGISTRAR (Robust Form Filling)
+# ==========================================================
+
 class AutoRegistrar:
-    def __init__(self, base, http, emit):
+    def __init__(self, base, http, emit, spider_intel=None):
         self.base = base
         self.http = http
         self.emit = emit
+        self.spider_intel = spider_intel or {}
+        self.dynamic_forms = self._extract_dynamic_forms()
+
+    def _extract_dynamic_forms(self):
+        """Parse Spider intel to find login/register forms and their fields."""
+        forms = []
+        raw_endpoints = self.spider_intel.get("endpoints", [])
+        
+        for ep in raw_endpoints:
+            if ep.get("tags") == ["FORM"]:
+                forms.append({
+                    "url": ep.get("url"),
+                    "method": ep.get("method", "POST"),
+                    "params": ep.get("params", [])
+                })
+        return forms
 
     def _extract_token(self, body):
         if not isinstance(body, dict): return None
@@ -255,7 +276,128 @@ class AutoRegistrar:
             if isinstance(v, str) and len(v) > 10: return v
         return None
 
+    def _try_spider_auth(self, sess, email, password, intent="register"):
+        """
+        Robust auth attempt that fills ALL text fields to pass validation.
+        Updated: Optimistic success detection (Checks for ABSENCE of errors).
+        """
+        if not self.dynamic_forms: return None
+
+        for form in self.dynamic_forms:
+            url = form["url"]
+            method = form["method"]
+            
+            # Heuristic: Guess intent based on URL keywords
+            url_lower = url.lower()
+            is_register = any(k in url_lower for k in ["register", "signup", "newuser", "create", "sign"])
+            is_login = any(k in url_lower for k in ["login", "signin", "auth"])
+            
+            if intent == "register" and not is_register: continue
+            if intent == "login" and not is_login: continue
+
+            payload = {}
+            has_password = False
+            username_part = email.split("@")[0] 
+
+            # Fill every field found in the form
+            for p in form["params"]:
+                name = p.get("name")
+                ptype = p.get("type", "text").lower()
+                if not name: continue
+                if name.lower() in ["submit", "button", "reset"]: continue
+
+                # 1. Password Fields
+                if ptype == "password" or "pass" in name.lower():
+                    payload[name] = password
+                    has_password = True
+                    continue
+                
+                # 2. Email Fields
+                if "mail" in name.lower():
+                    payload[name] = email
+                    continue
+
+                # 3. User/Name Fields
+                if "user" in name.lower() or "name" in name.lower():
+                    payload[name] = username_part
+                    continue
+                
+                # 4. Phone/Number Fields
+                if "phone" in name.lower() or "mobile" in name.lower() or "fax" in name.lower():
+                    payload[name] = "1234567890"
+                    continue
+                
+                # 5. Generic Text Fields (Fill with dummy text)
+                if ptype == "text":
+                    payload[name] = "TestUser123"
+                    continue
+                
+                # 6. Hidden Fields
+                if ptype == "hidden":
+                    payload[name] = p.get("value", "")
+
+            if not has_password: continue 
+
+            # CSRF Handling
+            if method == "POST" and BS4:
+                try:
+                    pre = sess.get(url, timeout=8)
+                    soup = BeautifulSoup(pre.text, "html.parser")
+                    for fname in ["user_token", "_token", "csrf_token", "authenticity_token", "csrfmiddlewaretoken"]:
+                        inp = soup.find("input", {"name": fname})
+                        if inp: 
+                            payload[fname] = inp.get("value", "")
+                except: pass
+
+            # Send Request
+            r = self.http.post(sess, url, form_data=payload)
+            
+            # Check Success (Optimized for TestPHP/Legacy)
+            
+            # 1. Explicit Failure Check
+            fail_kws = ["error", "fail", "incorrect", "mismatch", "invalid", "denied", "alert"]
+            if any(k in r.text.lower() for k in fail_kws):
+                return None
+
+            # 2. Success Checks
+            if r.status_code in (200, 201, 302):
+                # If Redirect, assume success (unless redirected to login again)
+                if r.status_code == 302:
+                    loc = r.headers.get("Location", "")
+                    if "login" not in loc.lower(): return "COOKIE"
+                
+                # If JSON
+                if is_json_ct(r):
+                    try:
+                        j = r.json()
+                        tok = self._extract_token(j)
+                        if tok: return tok
+                        # If no error keywords found earlier, assume OK
+                        return "COOKIE"
+                    except: pass
+                
+                # If HTML
+                if not is_json_ct(r):
+                    # Specific Success Keywords
+                    text_lower = r.text.lower()
+                    if intent == "register":
+                        if "success" in text_lower or "welcome" in text_lower or "registered" in text_lower or "created" in text_lower:
+                            return "COOKIE"
+                    elif intent == "login":
+                        if "logout" in text_lower or "dashboard" in text_lower or "welcome" in text_lower:
+                            return "COOKIE"
+                        if "userinfo" in text_lower or "index.php" in text_lower:
+                            return "COOKIE"
+                    
+                    # Fallback: If we didn't see "error" keywords and got 200, assume success
+                    # (Helps with generic forms that just refresh on success)
+                    if r.status_code == 200:
+                        return "COOKIE"
+
+        return None
+
     def _try_register(self, sess, ep, uf, pf, method, email, password):
+        # Existing Hardcoded Logic (Fallback)
         payloads = [
             {uf: email, pf: password},
             {uf: email, pf: password, "passwordRepeat": password},
@@ -273,6 +415,7 @@ class AutoRegistrar:
         return None, None
 
     def _try_login(self, sess, ep, uf, pf, method, email, password):
+        # Existing Hardcoded Logic (Fallback)
         extras = [{}, {"rememberMe": False}, {"Login": "Login"}]
         for extra in extras:
             pl = {uf: email, pf: password, **extra}
@@ -298,26 +441,47 @@ class AutoRegistrar:
         token = None
         login_cfg = None
 
-        # Parallel Register
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futs = {pool.submit(self._try_register, probe_sess, ep, uf, pf, m, email, password): (ep, uf, pf, m) for ep, uf, pf, m in REG_EPS}
-            for f in as_completed(futs):
-                status, tok = f.result()
-                if status in ("OK", "EXISTS", "TOKEN"):
-                    if tok: token = tok
-                    break
+        # 1. NEW: Try Spider Forms First (High Priority)
+        if self.dynamic_forms:
+            self.emit.info(f"Auth: Trying {role} via Spider Forms...")
+            
+            # Attempt Register
+            reg_status = self._try_spider_auth(probe_sess, email, password, intent="register")
+            if reg_status:
+                if reg_status == "COOKIE": token = "COOKIE"
+                else: token = reg_status # Actual Token
+                self.emit.info(f"Auth: {role} Registered via Spider Form")
+            
+            # If register failed or skipped, try Login
+            if not token:
+                login_status = self._try_spider_auth(probe_sess, email, password, intent="login")
+                if login_status:
+                    if login_status == "COOKIE": token = "COOKIE"
+                    else: token = login_status
+                    self.emit.info(f"Auth: {role} Logged in via Spider Form")
 
+        # 2. Fallback: Existing Hardcoded Logic
         if not token:
-            # Parallel Login
+            # Parallel Register (Original)
             with ThreadPoolExecutor(max_workers=5) as pool:
-                futs = {pool.submit(self._try_login, probe_sess, ep, uf, pf, m, email, password): (ep, uf, pf, m) for ep, uf, pf, m in LOGIN_EPS}
+                futs = {pool.submit(self._try_register, probe_sess, ep, uf, pf, m, email, password): (ep, uf, pf, m) for ep, uf, pf, m in REG_EPS}
                 for f in as_completed(futs):
-                    tok = f.result()
-                    if tok:
-                        token = tok
-                        ep, uf, pf, m = futs[f]
-                        login_cfg = {"endpoint": ep, "user_field": uf, "pass_field": pf, "method": m}
+                    status, tok = f.result()
+                    if status in ("OK", "EXISTS", "TOKEN"):
+                        if tok: token = tok
                         break
+
+            if not token:
+                # Parallel Login (Original)
+                with ThreadPoolExecutor(max_workers=5) as pool:
+                    futs = {pool.submit(self._try_login, probe_sess, ep, uf, pf, m, email, password): (ep, uf, pf, m) for ep, uf, pf, m in LOGIN_EPS}
+                    for f in as_completed(futs):
+                        tok = f.result()
+                        if tok:
+                            token = tok
+                            ep, uf, pf, m = futs[f]
+                            login_cfg = {"endpoint": ep, "user_field": uf, "pass_field": pf, "method": m}
+                            break
 
         engine_sess = make_session(pool_size=5)
         if token and token not in ("COOKIE", "OK"):
@@ -333,8 +497,10 @@ class AutoRegistrar:
 
     def register_users(self):
         self.emit.info("Auto-Registering Users...")
-        emailA, passA = f"hh_a{random.randint(100,999)}@test.local", f"Pass{random.randint(10,99)}!"
-        emailB, passB = f"hh_b{random.randint(100,999)}@test.local", f"Pass{random.randint(10,99)}!"
+        # Generate random creds
+        rand_str = lambda: "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
+        emailA, passA = f"hh_a{rand_str()}@test.local", f"Pass{rand_str()}!"
+        emailB, passB = f"hh_b{rand_str()}@test.local", f"Pass{rand_str()}!"
         
         with ThreadPoolExecutor(max_workers=2) as pool:
             fa = pool.submit(self._setup_user, "userA", emailA, passA)
@@ -344,7 +510,6 @@ class AutoRegistrar:
 
         guest = {"session": make_session(pool_size=5), "token": None, "authed": False}
         return {"userA": userA, "userB": userB, "guest": guest}
-
 class Discovery:
     def __init__(self, http, sess, emit, external_endpoints_file=None):
         self.http = http
@@ -447,7 +612,7 @@ class BaseEngine:
 class IDOREngine(BaseEngine):
     NAME = "IDOR"
     def run(self, endpoints):
-        self.F.emit.info("Engine 1/10: IDOR scanning...")
+        # REMOVED DUPLICATE LOG
         tasks = []
         seen_pairs = set()
         for ep in endpoints:
@@ -494,7 +659,7 @@ class IDOREngine(BaseEngine):
 class MissingAuthEngine(BaseEngine):
     NAME = "MissingAuth"
     def run(self, endpoints):
-        self.F.emit.info("Engine 2/10: Missing Auth scanning...")
+        # REMOVED DUPLICATE LOG
         targets = list(set(PROTECTED_EPS + [ep for ep in endpoints if any(ep.startswith(p) for p in PROTECTED_EPS)]))
         tasks = [(self._check, ep) for ep in targets]
         self._run_parallel(tasks)
@@ -515,7 +680,7 @@ class MissingAuthEngine(BaseEngine):
 class RBACEngine(BaseEngine):
     NAME = "RBAC"
     def run(self, endpoints):
-        self.F.emit.info("Engine 3/10: RBAC scanning...")
+        # REMOVED DUPLICATE LOG
         targets = list(set(ADMIN_EPS + [ep for ep in endpoints if any(a in ep for a in ["/admin", "/manage", "/dashboard", "/api/Users", "/api/Challenges"])]))
         tasks = [(self._check, ep) for ep in targets]
         self._run_parallel(tasks)
@@ -534,7 +699,7 @@ class ExcessivePrivEngine(BaseEngine):
     NAME = "ExcessivePriv"
     METHODS = ["PUT", "DELETE", "PATCH"]
     def run(self, endpoints):
-        self.F.emit.info("Engine 4/10: Excessive Privileges scanning...")
+        # REMOVED DUPLICATE LOG
         api_endpoints = []
         def check_api(ep):
             if real_api_response(self.http.get(self._sa, ep)): api_endpoints.append(ep)
@@ -561,7 +726,7 @@ class PathTraversalEngine(BaseEngine):
     FILE_PARAMS = {"file", "filename", "path", "page", "include", "doc", "document", "dir", "folder", "load", "read", "view", "f"}
     FTP_TARGETS = ["/ftp/package.json.bak", "/ftp/coupons_2013.md.bak", "/ftp/eastere.gg", "/ftp/suspicious_errors.yml"]
     def run(self, endpoints):
-        self.F.emit.info("Engine 5/10: Path Traversal scanning...")
+        # REMOVED DUPLICATE LOG
         tasks = []
         for ep in endpoints:
             parsed = urllib.parse.urlparse(ep)
@@ -593,7 +758,103 @@ class PathTraversalEngine(BaseEngine):
                 self.F.add("Sensitive File Accessible — FTP", "High", ftp_path, "Direct Access", evid(r), "Backup file exposed.", "Restrict FTP dir.", "High")
 
 # ==========================================================
-# ENGINE 6 — RATE LIMITING
+# ENGINE 6 — REFERRER BYPASS
+# ==========================================================
+class ReferrerEngine(BaseEngine):
+    NAME = "ReferrerBypass"
+    REFS = ["http://localhost/admin", "http://127.0.0.1/admin", "http://trusted.internal/"]
+    def run(self, endpoints):
+        # REMOVED DUPLICATE LOG
+        targets = [ep for ep in endpoints if any(ep.startswith(p) for p in PROTECTED_EPS)]
+        if not targets: targets = endpoints[:20]
+        tasks = [(self._check, ep, ref) for ep in targets for ref in self.REFS]
+        self._run_parallel(tasks)
+
+    def _check(self, ep, ref):
+        r = self.http.get(self._sg, ep, headers={"Referer": ref})
+        if is_spa(r): return
+        if r.status_code not in (200, 201, 204): return
+        if not real_api_response(r): return
+        self.F.add("Referrer Header Auth Bypass", "High", ep, f"Referer: {ref}", evid(r), "Bypassed auth via header.", "Validate session tokens.", "High")
+
+# ==========================================================
+# ENGINE 7 — HOST HEADER INJECTION
+# ==========================================================
+class HostHeaderEngine(BaseEngine):
+    NAME = "HostHeader"
+    HOSTS = ["evil.com", "attacker.com", "localhost", "127.0.0.1", "169.254.169.254"]
+    def run(self, endpoints):
+        # REMOVED DUPLICATE LOG
+        targets = endpoints[:8]
+        tasks = [(self._check, ep, hv) for ep in targets for hv in self.HOSTS]
+        self._run_parallel(tasks)
+
+    def _check(self, ep, hv):
+        r = self.http.get(self._sg, ep, headers={"Host": hv})
+        if is_spa(r): return
+        if hv in r.text:
+            self.F.add("Host Header Injection — Reflected", "Medium", ep, f"Host: {hv}", evid(r), "Host value reflected.", "Whitelist Host headers.", "High")
+        elif r.status_code in (200, 201) and is_json_ct(r):
+            self.F.add("Host Header — Arbitrary Accepted", "Low", ep, f"Host: {hv}", evid(r), "Arbitrary host accepted.", "Validate Host header.", "Medium")
+
+# ==========================================================
+# ENGINE 8 — SECURITY MISCONFIGURATION
+# ==========================================================
+class MisconfigEngine(BaseEngine):
+    NAME = "Misconfig"
+    INDICATORS = {
+        "/.env": ["DB_", "SECRET_KEY", "PASSWORD=", "API_KEY"], "/.git/config": ["[core]", "[remote"],
+        "/config.json": ["password", "secret", "database"], "/phpinfo.php": ["PHP Version", "phpinfo()"],
+        "/actuator/env": ["activeProfiles", "propertySources"], "/swagger.json": ['"swagger"', '"openapi"'],
+        "/metrics": ["jvm_", "# HELP"], "/ftp/": ["Index of /ftp", "Parent Directory"],
+    }
+    MISCONFIG_PATHS = list(set(list(INDICATORS.keys()) + ["/.htaccess", "/server-info", "/.well-known/security.txt", "/trace"]))
+
+    def run(self, endpoints):
+        # REMOVED DUPLICATE LOG
+        all_paths = list(set(self.MISCONFIG_PATHS + [ep for ep in endpoints if any(x in ep for x in [".env", ".git", "phpinfo", "actuator", "swagger", "ftp", "package.json"])]))
+        tasks = [(self._check, path) for path in all_paths]
+        self._run_parallel(tasks)
+
+    def _check(self, path):
+        for sess, sess_name in [(self._sg, "guest"), (self._sa, "user")]:
+            r = self.http.get(sess, path)
+            if r.status_code not in (200, 201): continue
+            if is_spa(r): continue
+            indicators = self.INDICATORS.get(path, [])
+            matched = [i for i in indicators if i.lower() in r.text.lower()]
+            generic = has_kw(r.text, SENS_KW)
+            if not matched and not generic: continue
+            sev = "Critical" if any(x in path for x in [".env", "phpinfo", "actuator"]) else "High"
+            self.F.add(f"Security Misconfiguration — {path}", sev, path, f"Accessible as: {sess_name}", evid(r), f"Sensitive path exposed. Matched: {matched[:3]}", "Restrict path.", "High" if matched else "Medium")
+            break
+
+# ==========================================================
+# ENGINE 9 — SENSITIVE DATA EXPOSURE
+# ==========================================================
+class SensitiveDataEngine(BaseEngine):
+    NAME = "SensitiveData"
+    HIGH_RISK = ["password", "passwordhash", "secret", "api_key", "ssn", "credit_card", "private_key"]
+    MED_RISK = ["isadmin", "is_admin", "role", "permissions", "accesstoken", "jwt", "salt"]
+    def run(self, endpoints):
+        # REMOVED DUPLICATE LOG
+        tasks = [(self._check, ep) for ep in endpoints]
+        self._run_parallel(tasks)
+
+    def _check(self, ep):
+        r = self.http.get(self._sa, ep)
+        if not real_api_response(r): return
+        lo = r.text.lower()
+        high = [f for f in self.HIGH_RISK if f in lo]
+        med = [f for f in self.MED_RISK if f in lo]
+        if high:
+            self.F.add("Sensitive Data Exposure — Critical Fields", "Critical", ep, f"Exposed: {high}", evid(r), "API returns sensitive fields.", "Whitelist safe fields.", "High")
+        elif med:
+            self.F.add("Sensitive Data Exposure — Privilege Fields", "High", ep, f"Exposed: {med}", evid(r), "API exposes roles/tokens.", "Exclude priv fields.", "Medium")
+
+
+# ==========================================================
+# ENGINE 10 — RATE LIMITING
 # ==========================================================
 class RateLimitEngine(BaseEngine):
     NAME = "RateLimit"
@@ -607,7 +868,7 @@ class RateLimitEngine(BaseEngine):
         return endpoints[0] if endpoints else "/"
 
     def run(self, endpoints):
-        self.F.emit.info("Engine 6/10: Rate Limit scanning...")
+        # REMOVED DUPLICATE LOG
         ep = self._pick_ep(endpoints)
         url = self.http.base + ep
         burst_sess = make_session(pool_size=40)
@@ -636,102 +897,6 @@ class RateLimitEngine(BaseEngine):
                 if hits >= 10:
                     hn = list(hdr.keys())[0]
                     self.F.add("Rate Limit Bypass — Spoofed IP", "High", ep, hn, f"{hits}/15 succeeded", "Bypassed via header.", "Rate-limit by ID.", "High")
-
-# ==========================================================
-# ENGINE 7 — REFERRER BYPASS
-# ==========================================================
-class ReferrerEngine(BaseEngine):
-    NAME = "ReferrerBypass"
-    REFS = ["http://localhost/admin", "http://127.0.0.1/admin", "http://trusted.internal/"]
-    def run(self, endpoints):
-        self.F.emit.info("Engine 7/10: Referrer Bypass scanning...")
-        targets = [ep for ep in endpoints if any(ep.startswith(p) for p in PROTECTED_EPS)]
-        if not targets: targets = endpoints[:20]
-        tasks = [(self._check, ep, ref) for ep in targets for ref in self.REFS]
-        self._run_parallel(tasks)
-
-    def _check(self, ep, ref):
-        r = self.http.get(self._sg, ep, headers={"Referer": ref})
-        if is_spa(r): return
-        if r.status_code not in (200, 201, 204): return
-        if not real_api_response(r): return
-        self.F.add("Referrer Header Auth Bypass", "High", ep, f"Referer: {ref}", evid(r), "Bypassed auth via header.", "Validate session tokens.", "High")
-
-# ==========================================================
-# ENGINE 8 — HOST HEADER INJECTION
-# ==========================================================
-class HostHeaderEngine(BaseEngine):
-    NAME = "HostHeader"
-    HOSTS = ["evil.com", "attacker.com", "localhost", "127.0.0.1", "169.254.169.254"]
-    def run(self, endpoints):
-        self.F.emit.info("Engine 8/10: Host Header scanning...")
-        targets = endpoints[:8]
-        tasks = [(self._check, ep, hv) for ep in targets for hv in self.HOSTS]
-        self._run_parallel(tasks)
-
-    def _check(self, ep, hv):
-        r = self.http.get(self._sg, ep, headers={"Host": hv})
-        if is_spa(r): return
-        if hv in r.text:
-            self.F.add("Host Header Injection — Reflected", "Medium", ep, f"Host: {hv}", evid(r), "Host value reflected.", "Whitelist Host headers.", "High")
-        elif r.status_code in (200, 201) and is_json_ct(r):
-            self.F.add("Host Header — Arbitrary Accepted", "Low", ep, f"Host: {hv}", evid(r), "Arbitrary host accepted.", "Validate Host header.", "Medium")
-
-# ==========================================================
-# ENGINE 9 — SECURITY MISCONFIGURATION
-# ==========================================================
-class MisconfigEngine(BaseEngine):
-    NAME = "Misconfig"
-    INDICATORS = {
-        "/.env": ["DB_", "SECRET_KEY", "PASSWORD=", "API_KEY"], "/.git/config": ["[core]", "[remote"],
-        "/config.json": ["password", "secret", "database"], "/phpinfo.php": ["PHP Version", "phpinfo()"],
-        "/actuator/env": ["activeProfiles", "propertySources"], "/swagger.json": ['"swagger"', '"openapi"'],
-        "/metrics": ["jvm_", "# HELP"], "/ftp/": ["Index of /ftp", "Parent Directory"],
-    }
-    MISCONFIG_PATHS = list(set(list(INDICATORS.keys()) + ["/.htaccess", "/server-info", "/.well-known/security.txt", "/trace"]))
-
-    def run(self, endpoints):
-        self.F.emit.info("Engine 9/10: Misconfiguration scanning...")
-        all_paths = list(set(self.MISCONFIG_PATHS + [ep for ep in endpoints if any(x in ep for x in [".env", ".git", "phpinfo", "actuator", "swagger", "ftp", "package.json"])]))
-        tasks = [(self._check, path) for path in all_paths]
-        self._run_parallel(tasks)
-
-    def _check(self, path):
-        for sess, sess_name in [(self._sg, "guest"), (self._sa, "user")]:
-            r = self.http.get(sess, path)
-            if r.status_code not in (200, 201): continue
-            if is_spa(r): continue
-            indicators = self.INDICATORS.get(path, [])
-            matched = [i for i in indicators if i.lower() in r.text.lower()]
-            generic = has_kw(r.text, SENS_KW)
-            if not matched and not generic: continue
-            sev = "Critical" if any(x in path for x in [".env", "phpinfo", "actuator"]) else "High"
-            self.F.add(f"Security Misconfiguration — {path}", sev, path, f"Accessible as: {sess_name}", evid(r), f"Sensitive path exposed. Matched: {matched[:3]}", "Restrict path.", "High" if matched else "Medium")
-            break
-
-# ==========================================================
-# ENGINE 10 — SENSITIVE DATA EXPOSURE
-# ==========================================================
-class SensitiveDataEngine(BaseEngine):
-    NAME = "SensitiveData"
-    HIGH_RISK = ["password", "passwordhash", "secret", "api_key", "ssn", "credit_card", "private_key"]
-    MED_RISK = ["isadmin", "is_admin", "role", "permissions", "accesstoken", "jwt", "salt"]
-    def run(self, endpoints):
-        self.F.emit.info("Engine 10/10: Sensitive Data Exposure scanning...")
-        tasks = [(self._check, ep) for ep in endpoints]
-        self._run_parallel(tasks)
-
-    def _check(self, ep):
-        r = self.http.get(self._sa, ep)
-        if not real_api_response(r): return
-        lo = r.text.lower()
-        high = [f for f in self.HIGH_RISK if f in lo]
-        med = [f for f in self.MED_RISK if f in lo]
-        if high:
-            self.F.add("Sensitive Data Exposure — Critical Fields", "Critical", ep, f"Exposed: {high}", evid(r), "API returns sensitive fields.", "Whitelist safe fields.", "High")
-        elif med:
-            self.F.add("Sensitive Data Exposure — Privilege Fields", "High", ep, f"Exposed: {med}", evid(r), "API exposes roles/tokens.", "Exclude priv fields.", "Medium")
-
 # ==========================================================
 # MODULE ENTRY POINT
 # ==========================================================
@@ -745,30 +910,34 @@ def run(target, emit, options=None, stop_check=None, pause_check=None):
     http = HTTP(base=target, timeout=10)
     findings_store = Findings(emit)
     
-    # 1. Auth
-    registrar = AutoRegistrar(target, http, emit)
-    users = registrar.register_users()
-    
-    # 2. Discovery
-    spider_file = options.get("spider_file")
+    # 1. Get Spider Intel early for AutoRegistrar
     spider_intel = options.get("spider_intel")
+    spider_file = options.get("spider_file")
     
-    # Load spider file if intel not provided directly
-    if spider_file and not spider_intel:
+    if not spider_intel and spider_file:
         try:
             with open(spider_file, 'r') as f:
                 j = json.load(f)
                 spider_intel = j.get("spider", {}).get("intel", j)
         except: pass
 
+    # 2. Auth
+    registrar = AutoRegistrar(target, http, emit, spider_intel=spider_intel)
+    users = registrar.register_users()
+    
+    # 3. Discovery
     disc_sess = make_session(10)
     if users["userA"].get("session"):
         for k,v in users["userA"]["session"].headers.items():
             if k.lower() == "authorization": disc_sess.headers[k] = v
             
     discovery = Discovery(http, disc_sess, emit, external_endpoints_file=None)
+    
     if spider_intel:
         raw_eps = spider_intel.get("js_endpoints", [])
+        # Also load surface endpoints (forms)
+        raw_eps.extend([ep['url'] for ep in spider_intel.get("endpoints", [])])
+        
         for ep in raw_eps:
             if ep.startswith("http"):
                 ep = urllib.parse.urlparse(ep).path
@@ -780,22 +949,23 @@ def run(target, emit, options=None, stop_check=None, pause_check=None):
     endpoints = discovery.endpoints()
     emit.info(f"Discovery: {len(endpoints)} live endpoints found")
 
-    # 3. Run Engines
+    # 4. Run Engines
     all_engines = [
         IDOREngine, MissingAuthEngine, RBACEngine, ExcessivePrivEngine,
         PathTraversalEngine, ReferrerEngine, HostHeaderEngine,
         MisconfigEngine, SensitiveDataEngine, RateLimitEngine
     ]
     
-    # Skip RateLimit if explicitly requested (optional flag)
     if options.get("skip_ratelimit"):
         all_engines = [e for e in all_engines if e != RateLimitEngine]
 
-    engine_args = (http, users, findings_store, 10) # 10 workers per engine
+    engine_args = (http, users, findings_store, 10) 
 
     for cls in all_engines:
         if stop_check and stop_check(): break
         try:
+            # CLEAN OUTPUT HANDLED HERE
+            emit.info(f"Engine: {cls.NAME} scanning...")
             cls(*engine_args).run(endpoints)
         except Exception as e:
             emit.warn(f"Engine {cls.NAME} error: {e}")
