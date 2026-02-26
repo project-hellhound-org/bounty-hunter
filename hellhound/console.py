@@ -178,6 +178,9 @@ class HellhoundConsole(cmd.Cmd):
             "cmdinj": {
                 "--rev": {"mode": "reverse_shell"}
             },
+            "spider": {
+                "--deep": {"mode": "deep"}
+            },
         }
 
         self.aliases = {
@@ -314,6 +317,39 @@ class HellhoundConsole(cmd.Cmd):
 
         print()
 
+    def _calculate_global_risk(self):
+        total_risk = 0
+        total_vulns = 0
+        breakdown = {}
+
+        for mod, output in self.results.items():
+            module_risk = 0
+
+            if not isinstance(output, dict):
+                continue
+
+            intel = output.get("intel", {})
+
+            # 1️⃣ Direct risk
+            module_risk += output.get("risk_score", 0)
+
+            # 2️⃣ Standard intel risk (Spider style)
+            module_risk += intel.get("risk_score", 0)
+
+            # 3️⃣ BAC nested risk
+            if "bac" in intel and isinstance(intel["bac"], dict):
+                bac_data = intel["bac"]
+                module_risk += bac_data.get("risk_score", 0)
+                total_vulns += len(bac_data.get("findings", []))
+
+            # 4️⃣ Generic vulnerabilities
+            if "vulnerabilities" in intel:
+                total_vulns += len(intel.get("vulnerabilities", []))
+
+            breakdown[mod] = module_risk
+            total_risk += module_risk
+
+        return total_risk, total_vulns, breakdown
 
     def do_loot(self, arg):
 
@@ -344,50 +380,18 @@ class HellhoundConsole(cmd.Cmd):
 
             print(Fore.CYAN + "\n========== [ WEB ASSESSMENT SUMMARY ] ==========\n")
 
-            # Calculate Risk & Vulnerability Stats
-            total_risk = 0
-            total_vulns = 0
-            modules_active = 0
+            total_risk, total_vulns, breakdown = self._calculate_global_risk()
 
-            for mod, output in self.results.items():
-                modules_active += 1
-                mod_risk = 0
+            modules_active = len(self.results)
 
-                if not isinstance(output, dict):
-                    continue
-
-                # 1️⃣ Direct risk_score (legacy modules)
-                if "risk_score" in output:
-                    mod_risk = output.get("risk_score", 0)
-
-                # 2️⃣ Nested intel risk
-                elif "intel" in output and isinstance(output["intel"], dict):
-                    intel = output["intel"]
-
-                    # Standard intel risk
-                    if "risk_score" in intel:
-                        mod_risk = intel.get("risk_score", 0)
-
-                    # BAC-style nested risk
-                    if "bac" in intel:
-                        bac_data = intel["bac"]
-                        mod_risk = bac_data.get("risk_score", 0)
-                        total_vulns += len(bac_data.get("findings", []))
-
-                    # Generic vulnerabilities array (for other modules)
-                    if "vulnerabilities" in intel:
-                        total_vulns += len(intel.get("vulnerabilities", []))
-
-                total_risk += mod_risk
-
-            # Determine Risk Level
-            if total_risk <= 20:
+            # Risk level thresholds
+            if total_risk < 50:
                 level = "LOW"
                 level_color = Fore.GREEN
-            elif total_risk <= 60:
+            elif total_risk < 150:
                 level = "MEDIUM"
                 level_color = Fore.YELLOW
-            elif total_risk <= 120:
+            elif total_risk < 300:
                 level = "HIGH"
                 level_color = Fore.RED
             else:
@@ -414,25 +418,13 @@ class HellhoundConsole(cmd.Cmd):
             with open(json_path, "w") as f:
                 json.dump(self.results, f, indent=4, default=str)
 
-            # Re-calc summary for file
-            total_risk = 0
-            total_vulns = 0
-            for mod, output in self.results.items():
-                if isinstance(output, dict):
-                    if "risk_score" in output: total_risk += output["risk_score"]
-                    elif "intel" in output:
-                        total_risk += output["intel"].get("risk_score", 0)
-                        total_vulns += len(output["intel"].get("vulnerabilities", []))
-                        if "bac" in output["intel"]:
-                            total_vulns += len(output["intel"]["bac"].get("findings", []))
-
+            total_risk, total_vulns, _ = self._calculate_global_risk()
             summary_content = (
                 f"Target: {self.target}\n"
                 f"Modules Run: {len(self.results)}\n"
                 f"Risk Score: {total_risk}\n"
                 f"Vulnerabilities Identified: {total_vulns}\n"
             )
-
             with open(summary_path, "w") as f:
                 f.write(summary_content)
 
@@ -446,47 +438,7 @@ class HellhoundConsole(cmd.Cmd):
         # ======================================================
         print("\n" + Fore.CYAN + "========== [ LOOT - WEB INTEL ] ==========\n")
         
-        # ----------------------------------
-        # GLOBAL RISK AGGREGATION
-        # ----------------------------------
-        total_risk = 0
-        breakdown = {}
-
-        for mod, output in self.results.items():
-            module_risk = 0
-
-            if not isinstance(output, dict):
-                continue
-
-            intel = output.get("intel", {})
-
-            # 1️⃣ Direct legacy risk
-            if "risk_score" in output:
-                module_risk += output.get("risk_score", 0)
-
-            # 2️⃣ Standard intel risk (Spider style)
-            if "risk_score" in intel:
-                module_risk += intel.get("risk_score", 0)
-
-            # 3️⃣ BAC nested risk (CRITICAL FIX)
-            if "bac" in intel and isinstance(intel["bac"], dict):
-                module_risk += intel["bac"].get("risk_score", 0)
-
-            # 4️⃣ Scanner dynamic fallback (Siege/Nuclei/Nikto)
-            if module_risk == 0:
-                if "nuclei_findings" in intel:
-                    for v in intel["nuclei_findings"]:
-                        clean_v = strip_ansi(v)
-                        if "[CRITICAL]" in clean_v: module_risk += 10
-                        elif "[HIGH]" in clean_v: module_risk += 7
-                        elif "[MEDIUM]" in clean_v: module_risk += 4
-                        elif "[LOW]" in clean_v: module_risk += 1
-
-                if "nikto_findings" in intel:
-                    module_risk += len(intel["nikto_findings"]) * 2
-
-            breakdown[mod] = module_risk
-            total_risk += module_risk
+        total_risk, total_vulns, breakdown = self._calculate_global_risk()
 
         print(Fore.CYAN + "========== [ RISK BREAKDOWN ] ==========\n")
         for mod, score in breakdown.items():
@@ -515,23 +467,175 @@ class HellhoundConsole(cmd.Cmd):
 
             print(Fore.YELLOW + f"[{mod_clean.upper()}]")
 
-            # ===============================================
-            # SPIDER SPECIFIC: INJECTION SUMMARY (Top Level)
-            # ===============================================
-            if mod_clean == "spider" and isinstance(output, dict):
-                inj_summary = output.get("injection_summary")
-                if inj_summary:
-                    print(Fore.MAGENTA + "  [API Surface Summary]")
-                    for k, v in inj_summary.items():
-                        k_clean = k.replace('_', ' ').title()
-                        print(f"    {k_clean:<25}: {Fore.WHITE}{v}")
-                    print()
+            # -------------------------------------------------
+            # RAW STATISTICS
+            # -------------------------------------------------
+            if isinstance(output, dict) and "raw" in output:
+                print(Fore.WHITE + f"  Raw Stats: {output['raw']}")
 
             if isinstance(output, dict) and "intel" in output:
                 intel = output.get("intel", {})
                 
                 # =================================================
-                # 1️⃣ BAC MODULE (Access Control)
+                # 1️⃣ SPIDER SPECIFIC INTEL
+                # =================================================
+                
+                # -- 1.1 Crawl Stats --
+                if "stats" in intel:
+                    stats = intel["stats"]
+                    print(Fore.CYAN + "  [Crawl Statistics]")
+                    print(f"    GET Requests : {stats.get('get', 0)}")
+                    print(f"    POST Requests: {stats.get('post', 0)}")
+                    print(f"    Total Links  : {stats.get('links', 0)}")
+                    print(f"    JS Files     : {stats.get('js_files', 0)}")
+                    print()
+
+                # -- 1.2 API Endpoints (Surface) -- CLEANED UP
+                endpoints = intel.get("endpoints", [])
+                if endpoints:
+                    # Sort by Priority Descending (High risk first)
+                    # This reduces noise by showing the important stuff first
+                    endpoints_sorted = sorted(endpoints, key=lambda x: x.get("priority", 0), reverse=True)
+                    
+                    print(Fore.GREEN + f"  [Surface Endpoints] ({len(endpoints)})")
+                    
+                    for ep in endpoints_sorted[:15]: 
+                        method = ep.get("method", "GET").upper()
+                        url = ep.get("url", "")
+                        params = ep.get("params", [])
+                        risks = ep.get("risks", [])
+                        
+                        # Format Risks as Color Badges
+                        risk_badges = ""
+                        if risks:
+                            for r in risks:
+                                if "SQLI" in r: risk_badges += f"{Fore.MAGENTA}[{r}] "
+                                elif "CMD" in r: risk_badges += f"{Fore.RED}[{r}] "
+                                elif "AUTH" in r: risk_badges += f"{Fore.RED}[{r}] "
+                                elif r == "LFI_RFI_POTENTIAL": risk_badges += f"{Fore.YELLOW}[LFI] "
+                                elif r == "IDOR_POTENTIAL": risk_badges += f"{Fore.YELLOW}[IDOR] "
+                        
+                        # Format Params (Summary)
+                        param_str = ""
+                        if params:
+                            param_names = [p['name'] for p in params if 'name' in p]
+                            if len(param_names) > 2:
+                                param_str = f" ({param_names[0]}, {param_names[1]}, ... +{len(param_names)-2})"
+                            else:
+                                param_str = f" ({', '.join(param_names)})"
+
+                        m_color = Fore.BLUE if method == "GET" else (Fore.MAGENTA if method == "POST" else Fore.CYAN)
+                        
+                        print(f"    {m_color}{method:<6}{Style.RESET_ALL} {url}{param_str} {risk_badges}")
+                    
+                    if len(endpoints) > 15: print(f"    ... +{len(endpoints)-15} more")
+                    print()
+
+                # -- 1.3 JS Endpoints --
+                js_endpoints = intel.get("js_endpoints", [])
+                if js_endpoints:
+                    print(Fore.GREEN + f"  [Discovered API Routes] ({len(js_endpoints)} found in JS)")
+                    
+                    for ep in js_endpoints[:25]: 
+                        if isinstance(ep, dict):
+                            path = ep.get("path", "Unknown")
+                            method = ep.get("method", "GET")
+                            conf = ep.get("confidence", 0)
+                            
+                            m_color = Fore.BLUE if method == "GET" else (Fore.MAGENTA if method == "POST" else Fore.CYAN)
+                            conf_color = Fore.GREEN if conf > 0.8 else (Fore.YELLOW if conf > 0.5 else Fore.RED)
+                            
+                            print(f"    {m_color}{method:<6}{Style.RESET_ALL} {path} ({conf_color}conf: {conf}{Style.RESET_ALL})")
+                        else:
+                            print(f"    {Fore.WHITE}{ep}")
+                    
+                    if len(js_endpoints) > 25: print(f"    ... +{len(js_endpoints)-25} more hidden")
+                    print()
+
+                # -- 1.4 JavaScript Files --
+                js_files = intel.get("js_files", [])
+                if js_files:
+                    print(Fore.GREEN + "  [JavaScript Files]")
+                    for js in js_files:
+                        print(f"    - {Fore.CYAN}{js}")
+                    print()
+
+                # -- 1.5 Auth Surfaces --
+                auth_surfaces = intel.get("auth_surfaces", [])
+                if auth_surfaces:
+                    print(Fore.YELLOW + "  [Authentication Surfaces]")
+                    for auth in auth_surfaces:
+                        print(f"    - {Fore.RED}{auth}")
+                    print()
+
+                # -- 1.6 Tech Stack --
+                tech_stack = intel.get("tech_stack", [])
+                if tech_stack:
+                    print(Fore.GREEN + "  [Technology Stack]")
+                    for tech in tech_stack:
+                        print(f"    - {Fore.CYAN}{tech}")
+                    print()
+
+                # -- 1.7 GraphQL --
+                graphql = intel.get("graphql", [])
+                if graphql:
+                    print(Fore.MAGENTA + "  [GraphQL Endpoints]")
+                    for g in graphql:
+                        print(f"    - {g}")
+                    print()
+
+                # -- 1.8 Comments --
+                comments = intel.get("comments", [])
+                if comments:
+                    print(Fore.GREEN + "  [Developer Comments]")
+                    for c in comments:
+                        print(f"    - {Fore.YELLOW}{c[:80]}{'...' if len(c) > 80 else ''}")
+                    print()
+
+                # -- 1.9 Security Headers --
+                sec_headers = intel.get("security_headers", {})
+                if sec_headers:
+                    print(Fore.GREEN + "  [Security Headers]")
+                    for k, v in sec_headers.items():
+                        print(f"    {Fore.CYAN}{k:<25}: {Fore.WHITE}{v}")
+                    print()
+
+                # -- 1.10 Signals --
+                signals = intel.get("signals", [])
+                if signals:
+                    print(Fore.RED + "  [Security Signals]")
+                    for s in signals:
+                        print(f"    - {s}")
+                    print()
+
+                # -- 1.11 Potential Keys --
+                pot_keys = intel.get("potential_keys", [])
+                if pot_keys:
+                    print(Fore.RED + "  [Potential Secrets/Keys]")
+                    for k in pot_keys:
+                        print(f"    - {k}")
+                    print()
+
+                # -- 1.12 JS Parameters --
+                params = intel.get("js_parameters", [])
+                if params:
+                    print(Fore.GREEN + f"  [JS Parameters] ({len(params)})")
+                    print(f"    {Fore.WHITE}{', '.join(params)}")
+                    print()
+
+                # -- 1.13 Robots.txt --
+                robots_disallowed = intel.get("robots_disallowed", [])
+                robots_raw = intel.get("robots_raw", "")
+                
+                if robots_disallowed:
+                    print(Fore.GREEN + "  [Robots.txt Intel]")
+                    print(f"    Disallowed: {', '.join(robots_disallowed)}")
+                    if robots_raw:
+                        print(f"    Raw Content:\n{Fore.LIGHTBLACK_EX}{robots_raw}")
+                    print()
+
+                # =================================================
+                # 2️⃣ BAC MODULE (Access Control)
                 # =================================================
                 if "bac" in intel:
                     bac_data = intel["bac"]
@@ -539,232 +643,49 @@ class HellhoundConsole(cmd.Cmd):
                     summary = bac_data.get("summary", {})
                     
                     if summary:
-                        print(Fore.GREEN + "  Access Control Summary:")
-                        for k, v in summary.items():
-                            print(f"    {k.replace('_',' ').title()} : {v}")
+                        print(Fore.GREEN + "  [Vulnerability Summary]")
+                        order = ["Critical", "High", "Medium", "Low", "Info"]
+                        for sev in order:
+                            if sev in summary:
+                                count = summary[sev]
+                                color = Fore.RED if sev in ["Critical", "High"] else (Fore.YELLOW if sev == "Medium" else Fore.WHITE)
+                                print(f"    {color}{sev:<8} : {count}")
+                        print()
                     
                     if findings:
-                        print(Fore.RED + "  ⚠ BAC Findings:")
-                        for f in findings:
-                            sev = f.get("severity", "Unknown")
+                        print(Fore.RED + "  [Detailed BAC Findings]")
+                        
+                        sev_weight = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
+                        sorted_findings = sorted(findings, key=lambda x: sev_weight.get(x.get("severity", "Info"), 99))
+
+                        for f in sorted_findings:
+                            sev = f.get("severity", "Unknown").upper()
                             name = f.get("vulnerability", "Unknown")
-                            ep = f.get("endpoint", "")
+                            ep = f.get("endpoint", "N/A")
                             param = f.get("parameter", "")
+                            evidence = f.get("evidence", "")
                             
-                            c_sev = Fore.RED if sev == "Critical" else (Fore.YELLOW if sev == "High" else Fore.WHITE)
-                            print(f"    [{c_sev}{sev}{Style.RESET_ALL}] {name}")
-                            if ep: print(f"       Endpoint: {Fore.CYAN}{ep}")
-                            if param: print(f"       Parameter: {param}")
+                            c_sev = Fore.MAGENTA if sev == "CRITICAL" else (Fore.RED if sev == "HIGH" else (Fore.YELLOW if sev == "MEDIUM" else Fore.WHITE))
+                            
+                            print(f"    {Style.BRIGHT}[{c_sev}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
+                            print(f"       Endpoint  : {Fore.CYAN}{ep}")
+                            if param: print(f"       Parameter : {Fore.LIGHTBLACK_EX}{param}")
+                            
+                            if evidence:
+                                clean_evi = evidence.replace('\n', ' ')[:120].strip()
+                                if len(evidence) > 120: clean_evi += "..."
+                                print(f"       Evidence   : {Fore.LIGHTBLACK_EX}{clean_evi}")
                             print()
                     else:
-                        print(Fore.GREEN + "  [+] No Access Control issues detected.\n")
+                        print(Fore.GREEN + "  [+] No access control issues detected.\n")
 
                 # =================================================
-                # 2️⃣ SPIDER: VALIDATED APIS (CRITICAL SECTION)
-                # =================================================
-                validated_apis = intel.get("validated_api", [])
-                if validated_apis:
-                    print(Fore.GREEN + f"  [Live Validated APIs] ({len(validated_apis)} endpoints)")
-                    
-                    for api in validated_apis:
-                        method = api.get("method", "GET").upper()
-                        path = api.get("path", api.get("url", ""))
-                        status = api.get("status_code", "???")
-                        auth_req = api.get("auth_required", False)
-                        content_type = api.get("content_type", "unknown")
-                        
-                        # Method Color
-                        m_color = Fore.BLUE if method == "GET" else (Fore.MAGENTA if method == "POST" else Fore.CYAN)
-                        
-                        # Line 1: Method | Status | Path
-                        auth_tag = f"{Fore.RED}[AUTH]{Style.RESET_ALL} " if auth_req else ""
-                        print(f"    {m_color}{method}{Style.RESET_ALL} | {Fore.GREEN}{status}{Style.RESET_ALL} | {auth_tag}{path}")
-                        
-                        # Line 2: Content Type & Size
-                        print(f"       Type: {content_type} ({api.get('response_size', 0)} bytes)")
-
-                        # Line 3: Discovered Fields (Highlight sensitive ones)
-                        fields = api.get("discovered_fields", [])
-                        if fields:
-                            sensitive_fields = [f for f in fields if any(x in f.lower() for x in ['pass', 'token', 'secret', 'key', 'auth', 'id'])]
-                            if sensitive_fields:
-                                print(f"       {Fore.RED}Fields: {', '.join(sensitive_fields)}")
-                            else:
-                                print(f"       {Fore.WHITE}Fields: {', '.join(fields[:5])}{'...' if len(fields) > 5 else ''}")
-
-                        # Line 4: ID Patterns (IDOR Potential)
-                        id_pats = api.get("id_patterns", [])
-                        if id_pats:
-                            for pat in id_pats:
-                                print(f"       {Fore.YELLOW}⚠ ID Pattern Detected: {pat.get('field')} (Test Candidates: {pat.get('test_candidates')})")
-                        print()
-                    
-                    # Global Aggregates for Validated APIs
-                    global_fields = intel.get("discovered_fields", [])
-                    if global_fields:
-                        print(Fore.CYAN + "  [Global Discovered Data Fields]")
-                        # Group sensitive vs normal
-                        sensitive = [f for f in global_fields if any(x in f.lower() for x in ['pass', 'token', 'secret', 'key', 'auth', 'totp', 'credit'])]
-                        normal = [f for f in global_fields if f not in sensitive]
-                        
-                        if sensitive:
-                            print(f"    {Fore.RED}Sensitive: {', '.join(sensitive)}")
-                        if normal:
-                            print(f"    {Fore.WHITE}Standard:  {', '.join(normal)}")
-                        print()
-                    
-                    global_id_pats = intel.get("id_patterns", [])
-                    if global_id_pats:
-                        print(Fore.YELLOW + "  [Global ID Patterns]")
-                        for pat in global_id_pats:
-                             print(f"    - Field '{pat.get('field')}' at {pat.get('endpoint')}")
-                        print()
-
-                # =================================================
-                # 3️⃣ SPIDER: RAW JS ROUTES (Unvalidated)
-                # =================================================
-                raw_js = intel.get("raw_js_routes", [])
-                if raw_js:
-                    print(Fore.GREEN + f"  [JS Detected Routes] ({len(raw_js)} unvalidated)")
-                    for route in raw_js[:15]: # Limit display
-                        path = route.get('path', '')
-                        method = route.get('method', 'GET')
-                        conf = route.get('confidence', 0)
-                        src = route.get('source', 'unknown')
-                        conf_color = Fore.GREEN if conf > 0.8 else (Fore.YELLOW if conf > 0.5 else Fore.RED)
-                        print(f"    {method:<6} {path} ({conf_color}conf: {conf}{Style.RESET_ALL}) [{src}]")
-                    if len(raw_js) > 15: print(f"    ... +{len(raw_js)-15} more")
-                    print()
-
-                # =================================================
-                # 4️⃣ SPIDER: API ENDPOINTS (Surface/HTML)
-                # =================================================
-                # These are usually the entry points, not the logic APIs
-                api_endpoints = intel.get("api_endpoints", [])
-                if api_endpoints:
-                    print(Fore.GREEN + f"  [Entry Points / Surface] ({len(api_endpoints)})")
-                    for ep in api_endpoints:
-                        url = ep.get("url", "")
-                        method = ep.get("method", "GET")
-                        cls = ep.get("classification", {})
-                        tags = ep.get("tags", [])
-                        
-                        # Determine type based on classification
-                        if cls.get("is_api"):
-                            type_str = "API"
-                        elif cls.get("is_spa_shell"):
-                            type_str = "SPA Shell"
-                        else:
-                            type_str = "HTML/Other"
-                            
-                        print(f"    [{Fore.MAGENTA}{type_str}{Style.RESET_ALL}] {method} {url}")
-                        if tags: print(f"       Tags: {', '.join(tags)}")
-                    print()
-
-                # =================================================
-                # 5️⃣ WEB SURFACE (Technologies, JS, Parameters)
-                # =================================================
-                
-                # --- JS Files ---
-                js_files = intel.get("js_files")
-                if not js_files and "web" in intel:
-                    js_files = intel["web"].get("js_files")
-
-                if js_files:
-                    print(Fore.GREEN + "  JavaScript Files:")
-                    for js in js_files:
-                        print(f"      - {Fore.CYAN}{js}")
-                    print()
-
-                # --- Standard Web Intel ---
-                if "web" in intel:
-                    web = intel.get("web", {})
-
-                    if web.get("technologies"):
-                        print(Fore.GREEN + "  Technologies:")
-                        for t in web["technologies"]:
-                            print(f"      - {t}")
-                        print()
-
-                    if web.get("urls"):
-                        urls = web["urls"]
-                        print(f"    URLs Discovered: {len(urls)}")
-                        for u in urls[:10]: 
-                            print(f"      - {Fore.CYAN}{u}")
-                        if len(urls) > 10: print(f"      ... +{len(urls)-10} more")
-                        print()
-                    
-                    if web.get("parameters"):
-                        params = web["parameters"]
-                        print(f"    Parameters Found: {len(params)}")
-                        for p in params[:15]: 
-                            print(f"      - {Fore.MAGENTA}{p}")
-                        if len(params) > 15: print(f"      ... +{len(params)-15} more")
-                        print()
-
-                # =================================================
-                # 6️⃣ GENERAL INTEL (Comments, Headers, Robots)
-                # =================================================
-                if "comments" in intel and intel["comments"]:
-                    print(Fore.GREEN + "  Developer Comments:")
-                    for c in intel["comments"]:
-                        print(f"    - {Fore.YELLOW}{c}")
-                    print()
-
-                if "security_headers" in intel and intel["security_headers"]:
-                    print(Fore.GREEN + "  Security Headers:")
-                    for k, v in intel["security_headers"].items():
-                        print(f"    {Fore.CYAN}{k}: {Fore.WHITE}{v}")
-                    print()
-
-                # Robots / Sensitive Files
-                disallowed = (intel.get("disallowed_entries") or 
-                              intel.get("robots_entries") or 
-                              intel.get("robots_txt") or 
-                              intel.get("robots_disallowed"))
-                              
-                if disallowed:
-                    print(Fore.GREEN + "  Robots.txt Intel:")
-                    if isinstance(disallowed, list):
-                        print(f"    Disallowed Entries: {len(disallowed)}")
-                        for entry in disallowed:
-                            print(f"      - {Fore.YELLOW}{entry}")
-                    elif isinstance(disallowed, str):
-                        print(f"    Content Preview:\n      {Fore.WHITE}{disallowed[:200]}...")
-                    print()
-
-                if "sensitive_files" in intel and intel["sensitive_files"]:
-                    print(Fore.RED + "  ⚠ Sensitive Files:")
-                    for f in intel["sensitive_files"]:
-                        print(f"    - {Fore.CYAN}{f}")
-                    print()
-                
-                # JS Parameters (Specific)
-                params = intel.get("js_parameters")
-                if params:
-                    print(Fore.YELLOW + f"  JS Parameters ({len(params)}):")
-                    for p in params:
-                        print(f"    - {p}")
-                    print()
-
-                # Potential Keys / Secrets
-                if "potential_keys" in intel and intel["potential_keys"]:
-                    print(Fore.RED + "  ⚠ Potential Secrets:")
-                    for k in intel["potential_keys"]:
-                        is_code_noise = False
-                        lower_k = k.lower()
-                        noise = ['handler', 'verify', 'show', 'displayed', 'difficulty', 'summary', 'banner']
-                        if any(n in lower_k for n in noise): is_code_noise = True
-                        if not is_code_noise: print(f"    - {k}")
-                    print()
-
-                # =================================================
-                # 7️⃣ VULNERABILITIES (General)
+                # 3️⃣ GENERAL VULNERABILITIES
                 # =================================================
                 if "vulnerabilities" in intel:
                     vulns = intel.get("vulnerabilities", [])
                     if vulns:
-                        print(Fore.RED + "  ⚠ Vulnerabilities:\n")
+                        print(Fore.RED + "  [General Vulnerabilities]\n")
                         for idx, v in enumerate(vulns, 1):
                             vtype = v.get("type", "UNKNOWN")
                             url = v.get("url", "")
@@ -774,10 +695,10 @@ class HellhoundConsole(cmd.Cmd):
                             print()
 
                 # =================================================
-                # 8️⃣ SCANNERS (Nuclei / Nikto)
+                # 4️⃣ EXTERNAL SCANNERS
                 # =================================================
                 if "nikto_findings" in intel or "nuclei_findings" in intel:
-                    print(Fore.RED + "  ⚠️  Scanner Results:\n")
+                    print(Fore.RED + "  [External Scanner Results]\n")
 
                     if intel.get("nikto_findings"):
                         print(Fore.CYAN + "    [Nikto]")
@@ -798,27 +719,6 @@ class HellhoundConsole(cmd.Cmd):
                             c = Fore.RED if "[CRITICAL]" in clean_v else (Fore.LIGHTRED_EX if "[HIGH]" in clean_v else (Fore.YELLOW if "[MEDIUM]" in clean_v else Fore.WHITE))
                             print(c + f"      {clean_v}")
                         print()
-
-                # =================================================
-                # 9️⃣ CREDENTIAL LEAKS (Web-based)
-                # =================================================
-                if "hardcoded_creds" in intel and intel["hardcoded_creds"]:
-                    print(Fore.RED + "  ⚠ Hardcoded Credentials:")
-                    for cred in intel["hardcoded_creds"]: print(f"    - {Fore.YELLOW}{cred}")
-                    print()
-
-                if "exposed_keys" in intel and intel["exposed_keys"]:
-                    print(Fore.RED + "  ⚠ Exposed Keys:")
-                    for key in intel["exposed_keys"]: print(f"    - {key}")
-                    print()
-
-                # =================================================
-                # 🔟 SIGNALS
-                # =================================================
-                if "signals" in intel and intel["signals"]:
-                    print(Fore.GREEN + "  Signals:")
-                    for s in intel["signals"]: print(f"    - {s}")
-                    print()
 
             # -------------------------------------------------
             # RAW FALLBACK
