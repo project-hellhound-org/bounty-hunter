@@ -7,7 +7,7 @@ import sys
 import random
 from datetime import datetime
 import json
-
+import re
 
 from colorama import Fore, Back, Style, init
 init(autoreset=True)
@@ -166,6 +166,15 @@ class HellhoundConsole(cmd.Cmd):
         self.modules = load_modules()
 
         # ----------------------------
+        # Target Session Context
+        # ----------------------------
+        self.target_context = {
+            "url": None,
+            "cookies": None,
+            "headers": {}
+        }
+
+        # ----------------------------
         # Module Flag Registry
         # ----------------------------
         self.MODULE_FLAGS = {
@@ -175,11 +184,8 @@ class HellhoundConsole(cmd.Cmd):
             "fuzzhunter": { 
                 "--deep": {"mode": "deep"}
             },
-            "cmdinj": {
-                "--rev": {"mode": "reverse_shell"}
-            },
             "spider": {
-                "--deep": {"mode": "deep"}
+                "--deep": {"verbrose": True}
             },
         }
 
@@ -286,16 +292,46 @@ class HellhoundConsole(cmd.Cmd):
     # ============================
 
     def do_prey(self, arg):
-        """prey <domain> → Lock onto web target"""
+        """
+        prey <domain> [--cookie "..."] [--header "Key: Value"]
+        """
 
-        if not arg.strip():
-            print("Usage: prey <domain>")
+        parts = arg.split()
+        if not parts:
+            print("Usage: prey <domain> [--cookie \"...\"] [--header \"Key: Value\"]")
             return
 
-        self.target = arg.strip()
+        domain = parts[0]
+        cookies = None
+        headers = {}
+
+        i = 1
+        while i < len(parts):
+            if parts[i] == "--cookie" and i + 1 < len(parts):
+                cookies = parts[i + 1]
+                i += 2
+            elif parts[i] == "--header" and i + 1 < len(parts):
+                header_input = parts[i + 1]
+                if ":" in header_input:
+                    k, v = header_input.split(":", 1)
+                    headers[k.strip()] = v.strip()
+                i += 2
+            else:
+                i += 1
+
+        self.target = domain
         self.target_type = "web"
 
-        print(Fore.GREEN + f"[+] Web target acquired: {self.target}")
+        self.target_context["url"] = domain
+        self.target_context["cookies"] = cookies
+        self.target_context["headers"] = headers
+
+        print(Fore.GREEN + f"[+] Web target acquired: {domain}")
+
+        if cookies:
+            print(Fore.CYAN + "[*] Session cookie loaded")
+        if headers:
+            print(Fore.CYAN + "[*] Custom headers loaded")
 
         
     def do_exit(self, arg):
@@ -329,6 +365,17 @@ class HellhoundConsole(cmd.Cmd):
                 continue
 
             intel = output.get("intel", {})
+            # Spider-derived risk signals
+            if mod == "spider":
+                secrets = len(intel.get("secrets", [])) if isinstance(intel.get("secrets"), list) else 0
+                cors = len(intel.get("cors_issues", [])) if isinstance(intel.get("cors_issues"), list) else 0
+                param_sensitive = intel.get("parameter_sensitive", 0) if isinstance(intel.get("parameter_sensitive"), int) else 0
+                auth_walled = intel.get("auth_required", 0) if isinstance(intel.get("auth_required"), int) else 0
+
+                module_risk += (secrets * 10)
+                module_risk += (cors * 4)
+                module_risk += (param_sensitive * 6)
+                module_risk += (auth_walled * 1)
 
             # 1️⃣ Direct risk
             module_risk += output.get("risk_score", 0)
@@ -490,149 +537,105 @@ class HellhoundConsole(cmd.Cmd):
                     print(f"    JS Files     : {stats.get('js_files', 0)}")
                     print()
 
-                # -- 1.2 API Endpoints (Surface) -- CLEANED UP
+                # =================================================
+                # 1.2 SPIDER INTELLIGENCE REPORT (UPGRADED)
+                # =================================================
+
                 endpoints = intel.get("endpoints", [])
-                if endpoints:
-                    # Sort by Priority Descending (High risk first)
-                    # This reduces noise by showing the important stuff first
-                    endpoints_sorted = sorted(endpoints, key=lambda x: x.get("priority", 0), reverse=True)
-                    
-                    print(Fore.GREEN + f"  [Surface Endpoints] ({len(endpoints)})")
-                    
-                    for ep in endpoints_sorted[:15]: 
-                        method = ep.get("method", "GET").upper()
-                        url = ep.get("url", "")
-                        params = ep.get("params", [])
-                        risks = ep.get("risks", [])
-                        
-                        # Format Risks as Color Badges
-                        risk_badges = ""
-                        if risks:
-                            for r in risks:
-                                if "SQLI" in r: risk_badges += f"{Fore.MAGENTA}[{r}] "
-                                elif "CMD" in r: risk_badges += f"{Fore.RED}[{r}] "
-                                elif "AUTH" in r: risk_badges += f"{Fore.RED}[{r}] "
-                                elif r == "LFI_RFI_POTENTIAL": risk_badges += f"{Fore.YELLOW}[LFI] "
-                                elif r == "IDOR_POTENTIAL": risk_badges += f"{Fore.YELLOW}[IDOR] "
-                        
-                        # Format Params (Summary)
-                        param_str = ""
-                        if params:
-                            param_names = [p['name'] for p in params if 'name' in p]
-                            if len(param_names) > 2:
-                                param_str = f" ({param_names[0]}, {param_names[1]}, ... +{len(param_names)-2})"
-                            else:
-                                param_str = f" ({', '.join(param_names)})"
+                secrets = intel.get("secrets", [])
+                cors = intel.get("cors_issues", [])
+                sourcemaps = intel.get("sourcemaps", [])
+                robots_entries = intel.get("robots_txt", []) or intel.get("robots_disallowed", [])
 
-                        m_color = Fore.BLUE if method == "GET" else (Fore.MAGENTA if method == "POST" else Fore.CYAN)
-                        
-                        print(f"    {m_color}{method:<6}{Style.RESET_ALL} {url}{param_str} {risk_badges}")
-                    
-                    if len(endpoints) > 15: print(f"    ... +{len(endpoints)-15} more")
-                    print()
+                # Deduplicate + merge methods per cluster
+                cluster_map = {}
 
-                # -- 1.3 JS Endpoints --
-                js_endpoints = intel.get("js_endpoints", [])
-                if js_endpoints:
-                    print(Fore.GREEN + f"  [Discovered API Routes] ({len(js_endpoints)} found in JS)")
-                    
-                    for ep in js_endpoints[:25]: 
-                        if isinstance(ep, dict):
-                            path = ep.get("path", "Unknown")
-                            method = ep.get("method", "GET")
-                            conf = ep.get("confidence", 0)
-                            
-                            m_color = Fore.BLUE if method == "GET" else (Fore.MAGENTA if method == "POST" else Fore.CYAN)
-                            conf_color = Fore.GREEN if conf > 0.8 else (Fore.YELLOW if conf > 0.5 else Fore.RED)
-                            
-                            print(f"    {m_color}{method:<6}{Style.RESET_ALL} {path} ({conf_color}conf: {conf}{Style.RESET_ALL})")
-                        else:
-                            print(f"    {Fore.WHITE}{ep}")
-                    
-                    if len(js_endpoints) > 25: print(f"    ... +{len(js_endpoints)-25} more hidden")
-                    print()
+                for ep in endpoints:
+                    cluster = ep.get("cluster", ep.get("url"))
+                    if cluster not in cluster_map:
+                        cluster_map[cluster] = {
+                            "url": ep.get("url"),
+                            "methods": set(ep.get("methods", [])),
+                            "confidence": ep.get("confidence_label"),
+                            "auth": ep.get("auth_required", False),
+                            "sensitive": ep.get("parameter_sensitive", False),
+                            "baseline": ep.get("baseline", {}),
+                        }
+                    else:
+                        cluster_map[cluster]["methods"].update(ep.get("methods", []))
 
-                # -- 1.4 JavaScript Files --
-                js_files = intel.get("js_files", [])
-                if js_files:
-                    print(Fore.GREEN + "  [JavaScript Files]")
-                    for js in js_files:
-                        print(f"    - {Fore.CYAN}{js}")
-                    print()
+                # ------------------------------
+                # CRITICAL SIGNALS
+                # ------------------------------
+                print(Fore.RED + "  [CRITICAL SIGNALS]")
 
-                # -- 1.5 Auth Surfaces --
-                auth_surfaces = intel.get("auth_surfaces", [])
-                if auth_surfaces:
-                    print(Fore.YELLOW + "  [Authentication Surfaces]")
-                    for auth in auth_surfaces:
-                        print(f"    - {Fore.RED}{auth}")
-                    print()
+                # Parameter Sensitive
+                sensitive_eps = [v for v in cluster_map.values() if v["sensitive"]]
+                if sensitive_eps:
+                    print(Fore.YELLOW + "    [Parameter-Sensitive]")
+                    for ep in sensitive_eps:
+                        status = ep["baseline"].get("status", "")
+                        print(f"      {Fore.CYAN}{ep['url']} {Fore.WHITE}(baseline: {status})")
 
-                # -- 1.6 Tech Stack --
-                tech_stack = intel.get("tech_stack", [])
-                if tech_stack:
-                    print(Fore.GREEN + "  [Technology Stack]")
-                    for tech in tech_stack:
-                        print(f"    - {Fore.CYAN}{tech}")
-                    print()
+                # Auth Walls
+                auth_eps = [v for v in cluster_map.values() if v["auth"]]
+                if auth_eps:
+                    print(Fore.YELLOW + "    [Auth Walls]")
+                    for ep in auth_eps:
+                        print(f"      {Fore.CYAN}{ep['url']}")
 
-                # -- 1.7 GraphQL --
-                graphql = intel.get("graphql", [])
-                if graphql:
-                    print(Fore.MAGENTA + "  [GraphQL Endpoints]")
-                    for g in graphql:
-                        print(f"    - {g}")
-                    print()
+                # CORS
+                if cors:
+                    print(Fore.YELLOW + f"    [CORS Misconfiguration] ({len(cors)} endpoints)")
+                    for c in cors[:5]:
+                        print(f"      {Fore.CYAN}{c['url']} ({c.get('severity')})")
+                    if len(cors) > 5:
+                        print(f"      ... +{len(cors)-5} more")
 
-                # -- 1.8 Comments --
-                comments = intel.get("comments", [])
-                if comments:
-                    print(Fore.GREEN + "  [Developer Comments]")
-                    for c in comments:
-                        print(f"    - {Fore.YELLOW}{c[:80]}{'...' if len(c) > 80 else ''}")
-                    print()
+                # Secrets
+                if secrets:
+                    print(Fore.YELLOW + "    [Secrets Found]")
+                    secret_types = {}
+                    for s in secrets:
+                        secret_types[s["type"]] = secret_types.get(s["type"], 0) + 1
+                    for stype, count in secret_types.items():
+                        print(f"      {Fore.MAGENTA}{stype}: {count}")
 
-                # -- 1.9 Security Headers --
-                sec_headers = intel.get("security_headers", {})
-                if sec_headers:
-                    print(Fore.GREEN + "  [Security Headers]")
-                    for k, v in sec_headers.items():
-                        print(f"    {Fore.CYAN}{k:<25}: {Fore.WHITE}{v}")
-                    print()
+                # SourceMaps
+                if sourcemaps:
+                    print(Fore.YELLOW + "    [Source Maps Exposed]")
+                    for sm in sourcemaps:
+                        print(f"      {Fore.CYAN}{sm['url']}")
 
-                # -- 1.10 Signals --
-                signals = intel.get("signals", [])
-                if signals:
-                    print(Fore.RED + "  [Security Signals]")
-                    for s in signals:
-                        print(f"    - {s}")
-                    print()
-
-                # -- 1.11 Potential Keys --
-                pot_keys = intel.get("potential_keys", [])
-                if pot_keys:
-                    print(Fore.RED + "  [Potential Secrets/Keys]")
-                    for k in pot_keys:
-                        print(f"    - {k}")
-                    print()
-
-                # -- 1.12 JS Parameters --
-                params = intel.get("js_parameters", [])
-                if params:
-                    print(Fore.GREEN + f"  [JS Parameters] ({len(params)})")
-                    print(f"    {Fore.WHITE}{', '.join(params)}")
-                    print()
-
-                # -- 1.13 Robots.txt --
-                robots_disallowed = intel.get("robots_disallowed", [])
-                robots_raw = intel.get("robots_raw", "")
-                
-                if robots_disallowed:
+                # ------------------------------
+                # ROBOTS.TXT INTEL
+                # ------------------------------
+                if robots_entries:
                     print(Fore.GREEN + "  [Robots.txt Intel]")
-                    print(f"    Disallowed: {', '.join(robots_disallowed)}")
-                    if robots_raw:
-                        print(f"    Raw Content:\n{Fore.LIGHTBLACK_EX}{robots_raw}")
+                    for r in robots_entries:
+                        print(f"    {Fore.CYAN}{r}")
                     print()
+                                # ------------------------------
+                # ATTACK SURFACE
+                # ------------------------------
+                print(Fore.GREEN + f"  [Attack Surface] ({len(cluster_map)})")
+
+                for ep in cluster_map.values():
+                    tags = []
+
+                    if ep["confidence"] in ("HIGH", "CONFIRMED"):
+                        tags.append(ep["confidence"])
+                    if ep["auth"]:
+                        tags.append("AUTH")
+                    if ep["sensitive"]:
+                        tags.append("SENSITIVE")
+
+                    tag_str = f"{Fore.RED}[{'|'.join(tags)}]{Style.RESET_ALL}" if tags else ""
+                    method_str = "|".join(sorted(ep["methods"]))
+
+                    print(f"    {Fore.BLUE}{method_str:<25}{Style.RESET_ALL} {ep['url']} {tag_str}")
+
+                print()
 
                 # =================================================
                 # 2️⃣ BAC MODULE (Access Control)
@@ -756,9 +759,15 @@ class HellhoundConsole(cmd.Cmd):
         print(Fore.GREEN + f"[+] {module} equipped")
 
     def do_release(self, arg):
-        """release → Exit tool mode"""
+        """release → Exit tool mode | release session → Clear auth session"""
+
         self.active_module = None
         self.prompt = Fore.RED + "hellhound > " + Style.RESET_ALL
+
+        if arg.strip().lower() == "session":
+            self.target_context["cookies"] = None
+            self.target_context["headers"] = {}
+            print(Fore.YELLOW + "[*] Session context cleared")
 
     def do_strike(self, arg):
         """
@@ -811,6 +820,15 @@ class HellhoundConsole(cmd.Cmd):
         module_key = module.lower() # Always use lowercase for keys/flags
         module_flags = self.MODULE_FLAGS.get(module_key, {})
         options = {}
+
+        # -----------------------------------------
+        # Inject prey session context into module
+        # -----------------------------------------
+        if self.target_context.get("cookies"):
+            options["cookie"] = self.target_context["cookies"]
+
+        if self.target_context.get("headers"):
+            options["headers"] = self.target_context["headers"]
 
         for flag in parts:
             if flag not in module_flags:
