@@ -6,13 +6,14 @@ setup(
     packages=find_packages(),
     include_package_data=True,
     package_data={
-        "hellhound": [
-            "config.yaml",
-            "scripts/*.sh",
-            "wordlists/*.txt",
-            "web/templates/*.html"
-        ]
-    },
+    "hellhound": [
+        "config.yaml",
+        "scripts/*.sh",
+        "wordlists/**/*.txt",
+        "web/templates/*.html",
+        "modules/**/*"
+    ]
+},
     install_requires=[
         "click",
         "flask",
