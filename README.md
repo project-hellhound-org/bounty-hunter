@@ -100,6 +100,12 @@ For authorized testing only. You are responsible for having explicit permission 
 
 ---
 
+## Author
+
+Built and maintained by **[l4zz3rj0d](https://github.com/l4zz3rj0d)**
+
+---
+
 ## License
 
 MIT
