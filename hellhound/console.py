@@ -843,7 +843,7 @@ class HellhoundConsole(cmd.Cmd):
         # Spider → CmdInj
         if module_key == "cmdinj":
             # Check both 'spider' and 'Spider' to be safe
-            spider_data = self.results.get("spider") or self.results.get("Spider")
+            spider_data = self.results.get("spider")
             if spider_data:
                 options["spider_results"] = spider_data
                 print(Fore.CYAN + "[*] Auto-fed Spider results into CMDinj")

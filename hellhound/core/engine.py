@@ -1,9 +1,11 @@
 # hellhound/core/engine.py
 
 import importlib
-
-
-
+import shutil
+import subprocess
+import traceback
+import pkgutil
+import hellhound.modules
 # =================================================
 # Emit Handler
 # =================================================
@@ -53,15 +55,9 @@ class HellhoundEngine:
         self.socketio = socketio
         self.emit = Emit(socketio)
 
-        # 🔥 SINGLE SOURCE OF TRUTH FOR MODULE CATEGORIES
-        # MUST MATCH your folder structure exactly
         self.module_categories = [
-            "recon",
-            "analysis",
-            "exploit",
-            "intel",
-            "vuln"
-        ]
+    name for _, name, _ in pkgutil.iter_modules(hellhound.modules.__path__)
+]
 
     # =================================================
     # Run Single Module
@@ -75,14 +71,14 @@ class HellhoundEngine:
             self.emit.warn(f"Failed to load module '{module_name}': {e}")
             return ""
 
-        if not hasattr(module, "run"):
-            self.emit.warn(f"Module '{module_name}' has no run() function")
+        if not callable(getattr(module, "run", None)):
+            self.emit.warn(f"Module '{module_name}' must define run(target, emit, options)")
             return ""
 
         try:
             return module.run(target, self.emit, options=options)
         except Exception as e:
-            self.emit.warn(f"Module '{module_name}' crashed: {e}")
+            self.emit.warn(f"Module '{module_name}' crashed:\n{traceback.format_exc()}")
             return ""
 
     # =================================================
