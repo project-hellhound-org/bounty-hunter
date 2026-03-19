@@ -2,7 +2,7 @@
   <img src="Images/hellhound.png" alt="Hellhound" width="600"/>
 </p>
 
-<h1 align="center">Hellhound</h1>
+<h1 align="center">Hellhound-Pentest(In-Dev)</h1>
 
 <p align="center">
   Modular red team framework for web recon, attack surface mapping, and guided exploitation workflows.
