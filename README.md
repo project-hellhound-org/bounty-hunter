@@ -48,8 +48,13 @@ Spider → BACdetector → Parax → CMDinj → Seige → Loot → Howl
 ---
 
 ## Install
+## Install
+
+It is recommended to use a virtual environment:
 
 ```bash
+python3 -m venv venv
+source venv/bin/activate
 git clone https://github.com/l4zz3rj0d/Hellhound-Pentest.git
 cd Hellhound-Pentest
 pip install -r requirements.txt
