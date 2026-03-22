@@ -48,7 +48,6 @@ Spider → BACdetector → Parax → CMDinj → Seige → Loot → Howl
 ---
 
 ## Install
-## Install
 
 It is recommended to use a virtual environment:
 
