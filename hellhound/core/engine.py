@@ -5,44 +5,9 @@ import shutil
 import subprocess
 import traceback
 import pkgutil
+
 import hellhound.modules
-# =================================================
-# Emit Handler
-# =================================================
-
-class Emit:
-    """
-    Unified emit handler.
-
-    Supports:
-      emit("message")
-      emit.info("message")
-      emit.warn("message")
-      emit.success("message")
-    """
-
-    def __init__(self, socketio=None):
-        self.socketio = socketio
-
-    def __call__(self, msg):
-        self._send(msg)
-
-    def info(self, msg):
-        self._send(f"[*] {msg}")
-
-    def warn(self, msg):
-        self._send(f"[!] {msg}")
-
-    def success(self, msg):
-        self._send(f"[✓] {msg}")
-
-    def error(self, msg):
-        self._send(f"[✗] {msg}")
-
-    def _send(self, msg):
-        print(msg)
-        if self.socketio:
-            self.socketio.emit("log", {"message": msg})
+from hellhound.core.emit import PlainEmit, ConsoleEmit
 
 
 # =================================================
@@ -51,34 +16,61 @@ class Emit:
 
 class HellhoundEngine:
 
-    def __init__(self, socketio=None):
+    def __init__(self, socketio=None, console=None):
+        """
+        socketio : optional SocketIO instance for web streaming
+        console  : optional HellhoundConsole instance
+                   When provided, module output is routed through the
+                   console's colored emit methods instead of plain stdout.
+        """
         self.socketio = socketio
-        self.emit = Emit(socketio)
+        self.console  = console
+
+        # Build the emit object once.
+        # If a console is attached, use ConsoleEmit (colored).
+        # Otherwise fall back to PlainEmit (headless / API safe).
+        if console is not None:
+            self.emit = ConsoleEmit(console, socketio=socketio)
+        else:
+            self.emit = PlainEmit(socketio=socketio)
 
         self.module_categories = [
-    name for _, name, _ in pkgutil.iter_modules(hellhound.modules.__path__)
-]
+            name for _, name, _ in pkgutil.iter_modules(hellhound.modules.__path__)
+        ]
+
+    def attach_console(self, console):
+        """
+        Called by HellhoundConsole after __init__ to wire itself in.
+        Upgrades emit from PlainEmit → ConsoleEmit so module output is colored.
+        """
+        self.console = console
+        self.emit    = ConsoleEmit(console, socketio=self.socketio)
 
     # =================================================
     # Run Single Module
     # =================================================
 
-    def run_single(self, module_name, target, options=None):
+    def run_single(self, module_name, target, options=None, emit=None):
+        """
+        emit parameter: caller can pass a custom emit object.
+        If None, uses self.emit (ConsoleEmit when console is attached).
+        """
+        active_emit = emit or self.emit
 
         try:
             module = self.load_module(module_name)
         except Exception as e:
-            self.emit.warn(f"Failed to load module '{module_name}': {e}")
+            active_emit.warn(f"Failed to load module '{module_name}': {e}")
             return ""
 
         if not callable(getattr(module, "run", None)):
-            self.emit.warn(f"Module '{module_name}' must define run(target, emit, options)")
+            active_emit.warn(f"Module '{module_name}' must define run(target, emit, options)")
             return ""
 
         try:
-            return module.run(target, self.emit, options=options)
+            return module.run(target, active_emit, options=options)
         except Exception as e:
-            self.emit.warn(f"Module '{module_name}' crashed:\n{traceback.format_exc()}")
+            active_emit.warn(f"Module '{module_name}' crashed:\n{traceback.format_exc()}")
             return ""
 
     # =================================================
@@ -86,7 +78,7 @@ class HellhoundEngine:
     # =================================================
 
     def run_external(self, name, target):
-        meta = self.external_modules[name]
+        meta   = self.external_modules[name]
         binary = meta["binary"]
 
         if not shutil.which(binary):
@@ -94,11 +86,11 @@ class HellhoundEngine:
             return ""
 
         args = meta["args"](target)
-        cmd = [binary] + args
+        cmd  = [binary] + args
 
         self.emit.info(f"Executing external tool: {' '.join(cmd)}")
 
-        output = ""
+        output  = ""
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -117,11 +109,10 @@ class HellhoundEngine:
         return output
 
     # =================================================
-    # Module Loader (CLEAN + FUTURE PROOF)
+    # Module Loader
     # =================================================
 
     def load_module(self, name):
-
         for category in self.module_categories:
             try:
                 return importlib.import_module(
@@ -129,5 +120,4 @@ class HellhoundEngine:
                 )
             except ModuleNotFoundError:
                 continue
-
         raise ImportError(f"Module '{name}' not found")

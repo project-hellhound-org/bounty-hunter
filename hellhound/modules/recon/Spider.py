@@ -1,31 +1,11 @@
 #!/usr/bin/env python3
 """
-SPIDER - Hellhound Recon Brain v10.1 (Enterprise Edition)
-Async Web Crawler + JS Analysis + Parameter Probing + Auth-Aware Session Management
+SPIDER - Hellhound Recon Brain v12.0 (Framework Module Edition)
+Full SPA + Non-SPA Crawler | robots.txt | sitemap.xml | JS Analysis
 
-Improvements over v9:
-  - Robust session cookie handling (string, dict, Netscape file, header injection)
-  - Auto re-auth detection on 401/403 mid-crawl
-  - URL normalization + path-parameter clustering (/users/123 -> /users/{id})
-  - Retry logic with exponential backoff (tenacity-style, no extra dep)
-  - Per-domain adaptive rate limiting (backs off on 429)
-  - Structured JSONL streaming output
-  - GraphQL introspection auto-probe
-  - OpenAPI / Swagger auto-discovery
-  - CORS misconfiguration detection
-  - CSP header parsing for endpoint hints
-  - Crawl-delay from robots.txt respected
-  - URL budget per depth level (prevents explosion)
-  - Confidence levels: LOW / MEDIUM / HIGH / CONFIRMED
-  - Config validation on startup
-  - Diff mode: compare two crawl JSON results
-  - Multiple export formats: JSON, JSONL, CSV, Burp XML
-  - Verbosity flag: verbose=False (clean mode) / verbose=True (debug mode)
-  - Fixed: continue inside async-with, self.emit refs, worker count math
-
-Verbosity:
-  Default (clean):  only scan start, critical findings (secrets/cors/graphql/openapi), summary
-  Verbose/debug:    all internal discovery logs (forms, JS APIs, params, comments, robots, etc.)
+Converted from v11.2 standalone to Hellhound module interface.
+All crawling logic, intelligence extraction, and probing are preserved exactly.
+CLI dependencies removed. Findings suppressed from output; stored in intel only.
 """
 
 import asyncio
@@ -40,12 +20,13 @@ import time
 import random
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from urllib.parse import urlparse, urljoin, parse_qs, urlencode, urlunparse
-from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from http.cookiejar import MozillaCookieJar
-from typing import Optional, Dict, List, Any
-from colorama import Fore, Style
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+from urllib.parse import urlparse, urljoin, parse_qs, urlencode, urlunparse
+
+from bs4 import BeautifulSoup, Comment
 
 try:
     from playwright.async_api import async_playwright
@@ -53,207 +34,246 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
-from bs4 import BeautifulSoup, Comment
-
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
 # METADATA
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
 
 NAME        = "spider"
 CATEGORY    = "recon"
-VERSION     = "10.1"
-DESCRIPTION = "Hellhound Recon Brain — Enterprise Async Crawler + Auth-Aware Session"
+VERSION     = "12.0"
+DESCRIPTION = "Advanced SPA-aware crawler with API discovery and intelligence extraction"
 
-# =================================================
-# CONFIDENCE LEVELS
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
+# OPTIONS  (replaces argparse flags — consumed by Hellhound console)
+# ══════════════════════════════════════════════════════════════════════
 
-class Confidence:
-    LOW       = 1   # Single indirect signal
-    MEDIUM    = 3   # Confirmed via HTML / JS reference
-    HIGH      = 6   # Form or direct JS fetch call
-    CONFIRMED = 10  # Dynamic browser traffic / OpenAPI definition
+OPTIONS = [
+    {"name": "max_depth",           "type": int,  "default": 4,     "help": "Maximum crawl depth"},
+    {"name": "concurrency",         "type": int,  "default": 12,    "help": "Concurrent workers"},
+    {"name": "timeout",             "type": int,  "default": 15,    "help": "Per-request timeout (seconds)"},
+    {"name": "max_retries",         "type": int,  "default": 3,     "help": "Max retries per request"},
+    {"name": "max_urls_per_depth",  "type": int,  "default": 500,   "help": "URL budget per depth level"},
+    {"name": "verbose",             "type": bool, "default": False, "help": "Show all discovery logs"},
+    {"name": "cookie",              "type": str,  "default": None,  "help": "Cookie string (format: key=value; key2=value2) OR path to cookie file"},
+    {"name": "auth",                "type": str,  "default": None,  "help": "Authorization header e.g. 'Bearer eyJ...'"},
+    {"name": "headers",             "type": dict, "default": {},    "help": "Extra headers dict"},
+    {"name": "output_format",       "type": str,  "default": "json","help": "Export format: json | jsonl | csv | burp"},
+    {"name": "output_file",         "type": str,  "default": None,  "help": "Path to save report file"},
+    {"name": "use_playwright",      "type": bool, "default": True,  "help": "Enable headless Chromium SPA scan"},
+    {"name": "enable_spa_interact", "type": bool, "default": False, "help": "Enable SPA form filling and button clicking"},
+    {"name": "enable_probing",      "type": bool, "default": True,  "help": "Enable intelligent probing phase"},
+    {"name": "enable_method_disc",  "type": bool, "default": True,  "help": "Discover HTTP methods per endpoint"},
+    {"name": "enable_graphql",      "type": bool, "default": True,  "help": "Probe for exposed GraphQL introspection"},
+    {"name": "enable_openapi",      "type": bool, "default": True,  "help": "Probe for exposed OpenAPI/Swagger specs"},
+    {"name": "enable_cors",         "type": bool, "default": True,  "help": "Check for CORS misconfigurations"},
+]
 
-# =================================================
-# CONFIG & VALIDATION
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
+# STRIP ANSI HELPER
+# ══════════════════════════════════════════════════════════════════════
 
-DEFAULT_CONFIG = {
-    "max_depth":            3,
-    "concurrency":          10,
-    "timeout":              12,
-    "max_retries":          3,
-    "retry_base_delay":     0.5,       # seconds; doubles each retry
-    "max_urls_per_depth":   200,       # budget per depth level
-    "user_agent":           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "extensions_to_ignore": [".png",".jpg",".jpeg",".gif",".ico",".svg",
-                              ".woff",".woff2",".ttf",".css",".mp4",".mp3",
-                              ".zip",".pdf",".exe",".dmg"],
-    "enable_probing":           True,
-    "enable_method_discovery":  True,
-    "enable_graphql_probe":     True,
-    "enable_openapi_probe":     True,
-    "enable_cors_check":        True,
-    "enable_playwright":        True,
-    "jitter_min":               0.05,
-    "jitter_max":               0.4,
-    "streaming_output":         False,  # emit JSONL lines as discovered
-    "stream_file":              None,   # path or None for stdout
-    "verbose":                  False,  # verbose=False: clean output / True: full debug logs
-}
+def _strip(s: str) -> str:
+    """Remove ANSI escape codes from any string."""
+    return re.sub(r'\033\[[^m]*m', '', s)
 
-REQUIRED_KEYS = ["max_depth", "concurrency", "timeout", "user_agent"]
+# ══════════════════════════════════════════════════════════════════════
+# MODULE EMIT WRAPPER
+# Only progress/lifecycle shown. Findings suppressed — intel only.
+# verbose=False : phase headers + summaries only
+# verbose=True  : all internal discovery progress logs
+# ══════════════════════════════════════════════════════════════════════
 
-def validate_config(cfg: dict) -> None:
-    for k in REQUIRED_KEYS:
-        if k not in cfg:
-            raise ValueError(f"[Config] Missing required key: {k}")
-    if cfg["max_depth"] < 0 or cfg["max_depth"] > 20:
-        raise ValueError("[Config] max_depth must be 0-20")
-    if cfg["concurrency"] < 1 or cfg["concurrency"] > 100:
-        raise ValueError("[Config] concurrency must be 1-100")
-
-# =================================================
-# VERBOSE EMIT WRAPPER
-# =================================================
-
-class VerboseEmit:
+class ModuleEmit:
     """
-    Wraps the caller's emit object and gates .info() / .success() calls
-    behind the verbose flag.
+    Adapts Hellhound's base emit object to the spider's internal emit API.
 
-    Logic:
-      verbose=False (clean mode)  — only .warn() and explicitly "always" calls pass through
-      verbose=True  (debug mode)  — everything passes through unchanged
-
-    Usage inside the spider:
-        self.emit.info(...)         # gated — only shown in verbose mode
-        self.emit.warn(...)         # always shown (critical findings)
-        self.emit.success(...)      # gated — only shown in verbose mode
-        self.emit.always_info(...)  # always shown regardless of verbose flag
-        self.emit.always_success(...) # always shown regardless of verbose flag
+    .info()           — gated behind verbose flag (noisy discovery detail)
+    .success()        — gated behind verbose flag (minor hits)
+    .warn()           — SUPPRESSED: findings go to intel, not output
+    .always_info()    — always shown (phase headers, auth, lifecycle)
+    .always_success() — always shown (phase completions, final summary)
+    .section()        — always shown as a phase divider
+    .row()            — gated behind verbose flag
+    .finding()        — SUPPRESSED: goes to intel only
+    .endpoint_row()   — SUPPRESSED: goes to intel only
+    .print_always()   — always shown
+    ._nc              — always True (no ANSI codes in module context)
     """
 
     def __init__(self, base_emit, verbose: bool):
-        self._emit   = base_emit
+        self._base    = base_emit
         self._verbose = verbose
 
     def info(self, msg: str):
         if self._verbose:
-            self._emit.info(msg)
+            self._base.info(msg)
 
     def success(self, msg: str):
         if self._verbose:
-            self._emit.success(msg)
+            self._base.success(_strip(msg))
 
     def warn(self, msg: str):
-        if "[SECRET" in msg:
-            msg = Fore.MAGENTA + msg + Style.RESET_ALL
-        elif "[Probe:Sensitive]" in msg:
-            msg = Fore.RED + msg + Style.RESET_ALL
-        elif "[CORS:HIGH]" in msg:
-            msg = Fore.RED + msg + Style.RESET_ALL
-        elif "[CORS:MEDIUM]" in msg:
-            msg = Fore.YELLOW + msg + Style.RESET_ALL
-        elif "[Auth-wall" in msg:
-            msg = Fore.YELLOW + msg + Style.RESET_ALL
-        elif "[SourceMap]" in msg:
-            msg = Fore.YELLOW + msg + Style.RESET_ALL
-        else:
-            msg = Fore.RED + msg + Style.RESET_ALL
-
-        self._emit.warn(msg)
+        # All findings go to intel via the store. No console output.
+        pass
 
     def always_info(self, msg: str):
-        msg = Fore.CYAN + msg + Style.RESET_ALL
-        self._emit.info(msg)
-        
+        self._base.info(_strip(msg))
+
     def always_success(self, msg: str):
-        msg = Fore.GREEN + msg + Style.RESET_ALL
-        self._emit.success(msg)
+        self._base.success(_strip(msg))
+
+    def section(self, title: str):
+        self._base.info(f"── {_strip(title)} ──")
+
+    def row(self, label: str, value, **kw):
+        if self._verbose:
+            self._base.info(f"{label}: {_strip(str(value))}")
+
+    def finding(self, *args):
+        # Findings suppressed — stored in intel via the store.
+        pass
+
+    def endpoint_row(self, ep: dict):
+        # Suppressed — endpoints returned in intel dict.
+        pass
+
+    def print_always(self, msg: str):
+        self._base.info(_strip(msg))
 
 
-# =================================================
-# SESSION COOKIE HANDLING
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
+# CONFIDENCE
+# ══════════════════════════════════════════════════════════════════════
 
-class SessionManager:
-    """
-    Handles every cookie format a pentester might throw at us:
-      1. Raw string:  "session=abc123; csrf=xyz"
-      2. Dict:        {"session": "abc123", "csrf": "xyz"}
-      3. Netscape / MozillaCookieJar file path
-      4. JSON file:   [{"name": "session", "value": "abc123", "domain": "..."}]
-      5. Header pair: {"Authorization": "Bearer <token>"}  (extra_headers option)
-    """
+class Conf:
+    LOW       = 1
+    MEDIUM    = 3
+    HIGH      = 6
+    CONFIRMED = 10
 
     @staticmethod
-    def parse(raw) -> Dict[str, str]:
-        """Returns a plain dict of name -> value cookies."""
+    def label(score: int) -> str:
+        if score >= Conf.CONFIRMED: return "CONFIRMED"
+        if score >= Conf.HIGH:      return "HIGH"
+        if score >= Conf.MEDIUM:    return "MEDIUM"
+        return "LOW"
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════
+
+class Config:
+    def __init__(self, **kw):
+        self.max_depth           = kw.get("max_depth",           4)
+        self.concurrency         = kw.get("concurrency",         12)
+        self.timeout             = kw.get("timeout",             15)
+        self.max_retries         = kw.get("max_retries",         3)
+        self.retry_base_delay    = kw.get("retry_base_delay",    0.5)
+        self.max_urls_per_depth  = kw.get("max_urls_per_depth",  500)
+        self.jitter_min          = kw.get("jitter_min",          0.05)
+        self.jitter_max          = kw.get("jitter_max",          0.35)
+        self.verbose             = kw.get("verbose",             False)
+        self.use_playwright      = kw.get("use_playwright",      True)
+        self.enable_spa_interact = kw.get("enable_spa_interact", False)
+        self.enable_probing      = kw.get("enable_probing",      True)
+        self.enable_method_disc  = kw.get("enable_method_disc",  True)
+        self.enable_graphql      = kw.get("enable_graphql",      True)
+        self.enable_openapi      = kw.get("enable_openapi",      True)
+        self.enable_cors         = kw.get("enable_cors",         True)
+        self.output_format       = kw.get("output_format",       "json")
+        self.output_file: Optional[str] = kw.get("output_file", None)
+        self.user_agent = kw.get(
+            "user_agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+        self.extensions_to_ignore: List[str] = kw.get("extensions_to_ignore", [
+            ".png",".jpg",".jpeg",".gif",".ico",".svg",".webp",
+            ".woff",".woff2",".ttf",".eot",".css",
+            ".mp4",".mp3",".avi",".mov",".webm",
+            ".zip",".gz",".tar",".rar",".pdf",".exe",".dmg",".apk",
+        ])
+
+    def validate(self):
+        if not (0 <= self.max_depth <= 20):
+            raise ValueError("max_depth must be 0-20")
+        if not (1 <= self.concurrency <= 100):
+            raise ValueError("concurrency must be 1-100")
+
+# ══════════════════════════════════════════════════════════════════════
+# SESSION / COOKIE MANAGER
+# ══════════════════════════════════════════════════════════════════════
+
+class SessionManager:
+    @staticmethod
+    def parse_cookies(raw) -> Dict[str, str]:
         if not raw:
             return {}
-
-        # Already a dict
         if isinstance(raw, dict):
-            # Could be header-style or cookie-style — split them
-            if any(k.lower() in ("authorization", "x-api-key") for k in raw):
-                return {}  # These go into headers, not cookies
+            if any(k.lower() in ("authorization","x-api-key","x-auth-token") for k in raw):
+                return {}
             return raw
-
         if isinstance(raw, str):
             raw = raw.strip()
-
-            # File path (Netscape or JSON)
-            p = Path(raw)
-            if p.exists() and p.is_file():
-                return SessionManager._load_file(p)
-
-            # Inline cookie string: "name=val; name2=val2"
-            cookies = {}
+            _looks_like_path = (
+                len(raw) <= 255
+                and " " not in raw
+                and ("/" in raw or raw.endswith((".txt", ".json")))
+            )
+            if _looks_like_path:
+                try:
+                    p = Path(raw)
+                    if p.exists() and p.is_file():
+                        return SessionManager._load_file(p)
+                except OSError:
+                    pass
+            out: Dict[str, str] = {}
             for part in raw.split(";"):
                 part = part.strip()
                 if "=" in part:
-                    name, _, val = part.partition("=")
-                    cookies[name.strip()] = val.strip()
-            return cookies
-
+                    k, _, v = part.partition("=")
+                    k = k.strip(); v = v.strip()
+                    if k:
+                        out[k] = v
+            return out
         return {}
 
     @staticmethod
     def _load_file(path: Path) -> Dict[str, str]:
-        # Try JSON array format first (exported from browser devtools / Burp)
         try:
             data = json.loads(path.read_text())
             if isinstance(data, list):
                 return {c["name"]: c["value"] for c in data if "name" in c and "value" in c}
-        except (json.JSONDecodeError, KeyError):
+        except Exception:
             pass
-
-        # Try Netscape cookie file
         try:
             jar = MozillaCookieJar(str(path))
             jar.load(ignore_discard=True, ignore_expires=True)
             return {c.name: c.value for c in jar}
         except Exception:
             pass
-
         return {}
 
     @staticmethod
-    def parse_extra_headers(raw) -> Dict[str, str]:
-        """Extract header-style auth values (Authorization, X-API-Key, etc.)"""
+    def parse_auth_header(raw) -> Dict[str, str]:
+        if not raw:
+            return {}
         if isinstance(raw, dict):
             return {k: v for k, v in raw.items()
-                    if k.lower() in ("authorization", "x-api-key", "x-auth-token",
-                                     "x-csrf-token", "x-access-token")}
+                    if k.lower() in ("authorization","x-api-key","x-auth-token",
+                                     "x-csrf-token","x-access-token")}
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if re.match(r'^(Bearer|Basic|Token)\s+\S+', raw, re.I):
+                return {"Authorization": raw}
         return {}
 
-# =================================================
-# RATE LIMITER (per-domain adaptive)
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
+# RATE LIMITER
+# ══════════════════════════════════════════════════════════════════════
 
 class DomainRateLimiter:
-    def __init__(self, base_delay: float = 0.1):
+    def __init__(self, base_delay: float = 0.05):
         self._delays: Dict[str, float] = defaultdict(lambda: base_delay)
         self._locks:  Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -262,1091 +282,1465 @@ class DomainRateLimiter:
             await asyncio.sleep(self._delays[domain])
 
     def backoff(self, domain: str):
-        """Called on 429 — doubles delay, capped at 10s."""
-        self._delays[domain] = min(self._delays[domain] * 2, 10.0)
+        self._delays[domain] = min(self._delays[domain] * 2.0, 10.0)
 
-    def reset(self, domain: str):
-        """Gradually recover delay after successful request."""
-        self._delays[domain] = max(self._delays[domain] * 0.9, 0.05)
+    def recover(self, domain: str):
+        self._delays[domain] = max(self._delays[domain] * 0.9, 0.03)
 
-# =================================================
-# RETRY HELPER
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
+# FETCH HELPER
+# ══════════════════════════════════════════════════════════════════════
 
-async def fetch_with_retry(session: aiohttp.ClientSession,
-                           method: str,
-                           url: str,
-                           rate_limiter: DomainRateLimiter,
-                           max_retries: int = 3,
-                           base_delay: float = 0.5,
-                           **kwargs):
-    """
-    Wraps aiohttp requests with exponential-backoff retry.
-    Returns (response_obj, text) or (None, None) on failure.
-    Caller must NOT use 'async with' — we return the consumed text.
-    """
+async def fetch(session, method, url, rl, max_retries=3, base_delay=0.5, **kw):
     domain = urlparse(url).netloc
-    await rate_limiter.wait(domain)
-
-    last_exc = None
+    await rl.wait(domain)
     for attempt in range(max_retries + 1):
         try:
-            async with session.request(method, url, **kwargs) as resp:
+            async with session.request(method, url, ssl=False, **kw) as resp:
                 if resp.status == 429:
-                    rate_limiter.backoff(domain)
-                    retry_after = int(resp.headers.get("Retry-After", base_delay * (2 ** attempt)))
-                    await asyncio.sleep(retry_after)
+                    rl.backoff(domain)
+                    await asyncio.sleep(float(resp.headers.get("Retry-After", base_delay * (2**attempt))))
                     continue
-                text = await resp.text(errors="replace")
-                rate_limiter.reset(domain)
-                return resp.status, dict(resp.headers), text
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            last_exc = e
+                body = await resp.text(errors="replace")
+                rl.recover(domain)
+                return resp.status, dict(resp.headers), body
+        except Exception:
             if attempt < max_retries:
-                await asyncio.sleep(base_delay * (2 ** attempt))
-
+                await asyncio.sleep(base_delay * (2**attempt))
     return None, None, None
 
-# =================================================
-# URL NORMALIZER + PATH PARAM CLUSTERING
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
+# URL UTILITIES
+# ══════════════════════════════════════════════════════════════════════
 
-_ID_SEGMENT = re.compile(r'^(\d+|[0-9a-fA-F\-]{8,}|[0-9a-fA-F]{24})$')
+_ID_RE = re.compile(
+    r'^(?:\d{1,20}'
+    r'|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    r'|[0-9a-fA-F]{24}'
+    r'|[0-9a-zA-Z]{20,}'
+    r')$',
+    re.I
+)
 
-def normalize_url(url: str) -> str:
-    """
-    1. Sort query params alphabetically.
-    2. Strip fragment.
-    3. Lowercase scheme + host.
-    """
-    p = urlparse(url)
-    qs = parse_qs(p.query, keep_blank_values=True)
-    sorted_qs = urlencode(sorted(qs.items()), doseq=True)
-    normalized = urlunparse((
-        p.scheme.lower(),
-        p.netloc.lower(),
-        p.path.rstrip("/") or "/",
-        p.params,
-        sorted_qs,
-        ""  # no fragment
-    ))
-    return normalized
+def normalize(url: str) -> str:
+    try:
+        p  = urlparse(url)
+        qs = urlencode(sorted(parse_qs(p.query, keep_blank_values=True).items()), doseq=True)
+        return urlunparse((p.scheme.lower(), p.netloc.lower(),
+                           p.path.rstrip("/") or "/", p.params, qs, ""))
+    except Exception:
+        return url
 
-def cluster_path(url: str) -> str:
-    """
-    Replace numeric / UUID path segments with {id} for deduplication.
-    /users/42/posts/abc123 -> /users/{id}/posts/{id}
-    """
-    p = urlparse(url)
-    segments = p.path.split("/")
-    clustered = ["{id}" if _ID_SEGMENT.match(s) else s for s in segments]
-    clustered_path = "/".join(clustered)
-    return urlunparse((p.scheme, p.netloc, clustered_path, "", "", ""))
+def cluster(url: str) -> str:
+    try:
+        p    = urlparse(url)
+        segs = ["{id}" if _ID_RE.match(s) else s for s in p.path.split("/")]
+        return urlunparse((p.scheme, p.netloc, "/".join(segs), "", "", ""))
+    except Exception:
+        return url
 
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
 # DATA STORE
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
 
-class InMemoryStore:
-    def __init__(self, stream_cb=None):
-        self.endpoints:      Dict[str, dict] = {}
-        self.comments:       List[dict]       = []
-        self.secrets:        List[dict]       = []
-        self.tech_stack:     set              = set()
-        self.robots_entries: List[str]        = []
-        self.sourcemaps:     List[dict]       = []
-        self.cors_issues:    List[dict]       = []
-        self.graphql_schemas:List[dict]       = []
-        self.openapi_specs:  List[dict]       = []
-        self._stream_cb = stream_cb  # callable(event_type, data)
+class Store:
+    def __init__(self):
+        self.endpoints:    Dict[str, dict] = {}
+        self.comments:     List[dict]       = []
+        self.secrets:      List[dict]       = []
+        self.tech_stack:   Set[str]         = set()
+        self.robots_paths: List[str]        = []
+        self.cors_issues:  List[dict]       = []
+        self.graphql:      List[dict]       = []
+        self.openapi:      List[dict]       = []
+        self.sourcemaps:   List[dict]       = []
 
-    # ---- internal ----
+    def _key(self, url, method):
+        return f"{method.upper()}:{cluster(normalize(url))}"
 
-    def _cluster_key(self, url: str, method: str) -> str:
-        return f"{method}:{cluster_path(normalize_url(url))}"
-
-    def _make_endpoint(self, url: str, method: str) -> dict:
+    def _new_ep(self, url, method):
         return {
-            "url":                 url,
-            "cluster":             cluster_path(normalize_url(url)),
-            "methods":             [method],
-            "params":              {"form": [], "js_static": [], "error_based": [],
-                                    "runtime": [], "openapi": []},
-            "source":              [],
-            "confidence":          0,
-            "confidence_label":    "LOW",
-            "sensitive_keywords":  [],
-            "baseline":            None,
-            "parameter_sensitive": False,
-            "observed_status":     [],
-            "auth_required":       False,
+            "url": url, "cluster": cluster(normalize(url)),
+            "methods": [method.upper()],
+            "params": {"query":[],"form":[],"js":[],"openapi":[],"runtime":[]},
+            "observed_values": {},
+            "headers": {},
+            "source": [], "confidence": 0, "confidence_label": "LOW",
+            "auth_required": False, "parameter_sensitive": False,
+            "observed_status": [], "baseline": None,
         }
 
-    def _label(self, score: int) -> str:
-        if score >= Confidence.CONFIRMED: return "CONFIRMED"
-        if score >= Confidence.HIGH:      return "HIGH"
-        if score >= Confidence.MEDIUM:    return "MEDIUM"
-        return "LOW"
-
-    def _stream(self, etype: str, data: dict):
-        if self._stream_cb:
-            self._stream_cb(etype, data)
-
-    # ---- public API ----
-
-    def add_endpoint(self, url: str, method: str = "GET",
-                     source: str = "Static",
-                     params: Optional[List[str]] = None,
-                     confidence_increment: int = Confidence.LOW,
-                     auth_required: bool = False) -> dict:
-        key = self._cluster_key(url, method)
+    def add_endpoint(self, url, method="GET", source="Static",
+                     params=None, score=Conf.LOW, auth_required=False):
+        key = self._key(url, method)
         if key not in self.endpoints:
-            self.endpoints[key] = self._make_endpoint(url, method)
-
+            self.endpoints[key] = self._new_ep(url, method)
         ep = self.endpoints[key]
-
         if source not in ep["source"]:
             ep["source"].append(source)
-        ep["confidence"] = min(ep["confidence"] + confidence_increment, Confidence.CONFIRMED)
-        ep["confidence_label"] = self._label(ep["confidence"])
-
-        if params:
-            if source == "Form":
-                ep["params"]["form"] = list(set(ep["params"]["form"] + params))
-            elif source == "OpenAPI":
-                ep["params"]["openapi"] = list(set(ep["params"]["openapi"] + params))
-
+        ep["confidence"]       = min(ep["confidence"] + score, Conf.CONFIRMED)
+        ep["confidence_label"] = Conf.label(ep["confidence"])
         if auth_required:
             ep["auth_required"] = True
-
-        self._stream("endpoint", ep)
+        if params:
+            if source == "OpenAPI":
+                bucket = "openapi"
+            elif source == "Form":
+                bucket = "form"
+            elif source.startswith("JS_") or source in ("SPA_XHR", "SPA_DOM"):
+                bucket = "js"
+            else:
+                bucket = "runtime"
+            for p in params:
+                if p and p not in ep["params"][bucket]:
+                    ep["params"][bucket].append(p)
         return ep
 
-    def add_params_from_js(self, url: str, params: List[str],
-                           source_type: str = "js_static") -> bool:
-        key = self._cluster_key(url, "GET")
-        if key not in self.endpoints:
-            self.endpoints[key] = self._make_endpoint(url, "GET")
-        ep = self.endpoints[key]
-        if source_type not in ep["params"]:
-            ep["params"][source_type] = []
-        new = [p for p in params if p not in ep["params"][source_type]]
-        ep["params"][source_type].extend(new)
-        if new:
-            ep["confidence"] = min(ep["confidence"] + 1, Confidence.CONFIRMED)
-            ep["confidence_label"] = self._label(ep["confidence"])
-            return True
-        return False
+    _HEADER_SKIP = frozenset({
+        "accept", "accept-encoding", "accept-language", "cache-control",
+        "connection", "host", "origin", "pragma", "referer",
+        "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+        "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+        "upgrade-insecure-requests", "user-agent",
+    })
 
-    def update_methods(self, url: str, methods: List[str]):
-        key = self._cluster_key(url, methods[0] if methods else "GET")
+    def merge_headers(self, url: str, method: str, headers: dict) -> bool:
+        if not headers:
+            return False
+        key = self._key(url, method)
         if key not in self.endpoints:
-            self.endpoints[key] = self._make_endpoint(url, methods[0] if methods else "GET")
+            return False
+        ep    = self.endpoints[key]
+        added = False
+        for k, v in headers.items():
+            lo = k.lower()
+            if lo in self._HEADER_SKIP:
+                continue
+            if lo not in ep["headers"]:
+                ep["headers"][lo] = v
+                added = True
+        return added
+
+    def add_js_params(self, url, params):
+        key = self._key(url, "GET")
+        if key not in self.endpoints:
+            self.endpoints[key] = self._new_ep(url, "GET")
+        ep  = self.endpoints[key]
+        new = [p for p in params if p not in ep["params"]["js"]]
+        ep["params"]["js"].extend(new)
+        if new:
+            ep["confidence"] = min(ep["confidence"] + 1, Conf.CONFIRMED)
+            ep["confidence_label"] = Conf.label(ep["confidence"])
+        return bool(new)
+
+    _RISK_PARAMS = frozenset({
+        "cmd","command","exec","run","shell","host","hostname","ip","addr","address",
+        "url","uri","target","dest","src","source","file","path","dir","query","q",
+        "search","input","arg","id","key","token","user","pass","passwd","password",
+    })
+    _PARAM_SUFFIXES = ("_raw","_sanitized","_input","_clean","_safe","_encoded","_value","_param")
+
+    def add_runtime_params(self, url: str, method: str, names: List[str]) -> bool:
+        key = self._key(url, method)
+        if key not in self.endpoints:
+            return False
+        ep = self.endpoints[key]
+        sanitization_seen = False
+        added = []
+        for raw_name in names:
+            if not raw_name:
+                continue
+            base = raw_name
+            is_suffixed = False
+            for suf in self._PARAM_SUFFIXES:
+                if raw_name.endswith(suf):
+                    base = raw_name[: -len(suf)]
+                    is_suffixed = True
+                    break
+            if is_suffixed:
+                sanitization_seen = True
+            if base and base not in ep["params"]["runtime"]:
+                ep["params"]["runtime"].append(base)
+                added.append(base)
+        if added:
+            ep["confidence"] = min(ep["confidence"] + 1, Conf.CONFIRMED)
+            ep["confidence_label"] = Conf.label(ep["confidence"])
+        if sanitization_seen:
+            ep["parameter_sensitive"] = True
+            ep["confidence"] = min(ep["confidence"] + 2, Conf.CONFIRMED)
+            ep["confidence_label"] = Conf.label(ep["confidence"])
+        return bool(added)
+
+    def add_query_params(self, url):
+        parsed = urlparse(url)
+        if not parsed.query:
+            return
+        key = self._key(url, "GET")
+        if key not in self.endpoints:
+            self.endpoints[key] = self._new_ep(url, "GET")
+        ep = self.endpoints[key]
+        for param, values in parse_qs(parsed.query).items():
+            if param not in ep["params"]["query"]:
+                ep["params"]["query"].append(param)
+            if values:
+                existing = ep["observed_values"].setdefault(param, [])
+                for v in values:
+                    if v and v not in existing:
+                        existing.append(v)
+
+    def update_methods(self, url, methods):
+        key = self._key(url, methods[0] if methods else "GET")
+        if key not in self.endpoints:
+            return
         ep = self.endpoints[key]
         for m in methods:
             if m not in ep["methods"]:
                 ep["methods"].append(m)
-        ep["confidence"] = min(ep["confidence"] + 1, Confidence.CONFIRMED)
-        ep["confidence_label"] = self._label(ep["confidence"])
+        ep["confidence"] = min(ep["confidence"] + 1, Conf.CONFIRMED)
+        ep["confidence_label"] = Conf.label(ep["confidence"])
 
-    def update_baseline(self, url: str, method: str,
-                        status: int, body_hash: str, length: int):
-        key = self._cluster_key(url, method)
+    def record_status(self, url, method, status):
+        key = self._key(url, method)
         if key in self.endpoints:
-            self.endpoints[key]["baseline"] = {
-                "status": status, "hash": body_hash, "length": length
-            }
+            ep = self.endpoints[key]
+            if status not in ep["observed_status"]:
+                ep["observed_status"].append(status)
             if status in (401, 403):
-                self.endpoints[key]["auth_required"] = True
+                ep["auth_required"] = True
 
-    def mark_sensitive(self, url: str, method: str):
-        key = self._cluster_key(url, method)
+    def mark_sensitive(self, url, method):
+        key = self._key(url, method)
         if key in self.endpoints:
-            self.endpoints[key]["parameter_sensitive"] = True
-            self.endpoints[key]["confidence"] = min(
-                self.endpoints[key]["confidence"] + 2, Confidence.CONFIRMED)
-            self.endpoints[key]["confidence_label"] = self._label(
-                self.endpoints[key]["confidence"])
+            ep = self.endpoints[key]
+            ep["parameter_sensitive"] = True
+            ep["confidence"] = min(ep["confidence"] + 2, Conf.CONFIRMED)
+            ep["confidence_label"] = Conf.label(ep["confidence"])
 
-    def record_status(self, url: str, method: str, status: int):
-        key = self._cluster_key(url, method)
-        if key in self.endpoints:
-            if status not in self.endpoints[key]["observed_status"]:
-                self.endpoints[key]["observed_status"].append(status)
-
-    def add_comment(self, content: str, source_url: str) -> bool:
+    def add_comment(self, content, source_url):
         content = content.strip()
-        if len(content) < 5 or content.startswith("["):
-            return False
-        if any(c["content"] == content for c in self.comments):
+        if len(content) < 4 or any(c["content"] == content for c in self.comments):
             return False
         self.comments.append({"content": content, "source": source_url})
-        self._stream("comment", self.comments[-1])
         return True
 
-    def add_secret(self, content: str, stype: str, source_url: str) -> bool:
-        if any(s["content"] == content for s in self.secrets):
+    def add_secret(self, val, stype, source_url):
+        if any(s["content"] == val for s in self.secrets):
             return False
-        self.secrets.append({"content": content, "type": stype, "source": source_url})
-        self._stream("secret", self.secrets[-1])
+        self.secrets.append({"content": val, "type": stype, "source": source_url})
         return True
 
-    def add_cors_issue(self, url: str, origin_sent: str, origin_reflected: str,
-                       allow_credentials: bool):
+    def add_cors(self, url, origin_sent, reflected, creds):
         self.cors_issues.append({
-            "url": url,
-            "origin_sent": origin_sent,
-            "origin_reflected": origin_reflected,
-            "allow_credentials": allow_credentials,
-            "severity": "HIGH" if allow_credentials else "MEDIUM"
+            "url": url, "origin_sent": origin_sent, "reflected": reflected,
+            "allow_credentials": creds, "severity": "HIGH" if creds else "MEDIUM"
         })
-        self._stream("cors", self.cors_issues[-1])
 
-    def add_tech(self, tech: str):        self.tech_stack.add(tech)
-    def add_robots_entry(self, path: str):
-        if path not in self.robots_entries: self.robots_entries.append(path)
-    def add_sourcemap(self, map_url: str, parent: str):
+    def add_sourcemap(self, map_url, parent):
         if not any(s["url"] == map_url for s in self.sourcemaps):
             self.sourcemaps.append({"url": map_url, "parent": parent})
 
-    def get_endpoints(self) -> List[dict]:
-        return list(self.endpoints.values())
+    def all_endpoints(self):
+        return [e for e in self.endpoints.values() if e["confidence"] >= Conf.LOW]
 
-    def export(self, target_url: str, fmt: str = "json") -> Any:
-        eps = [e for e in self.endpoints.values() if e["confidence"] >= Confidence.LOW]
+    def export(self, target, fmt="json"):
+        eps  = self.all_endpoints()
+        meta = {"tool": f"Hellhound Spider v{VERSION}", "target": target}
+        summary = {
+            "total_endpoints":     len(eps),
+            "confirmed":           sum(1 for e in eps if e["confidence_label"] == "CONFIRMED"),
+            "high":                sum(1 for e in eps if e["confidence_label"] == "HIGH"),
+            "auth_required":       sum(1 for e in eps if e["auth_required"]),
+            "parameter_sensitive": sum(1 for e in eps if e["parameter_sensitive"]),
+            "secrets":             len(self.secrets),
+            "cors_issues":         len(self.cors_issues),
+            "graphql_exposed":     len(self.graphql),
+            "openapi_exposed":     len(self.openapi),
+            "sourcemaps_exposed":  len(self.sourcemaps),
+            "tech_stack":          sorted(self.tech_stack),
+        }
         data = {
-            "meta": {
-                "tool":    f"Hellhound Spider v{VERSION}",
-                "target":  target_url,
-                "date":    datetime.utcnow().isoformat() + "Z",
-            },
-            "summary": {
-                "endpoints_count":          len(eps),
-                "confirmed_count":          len([e for e in eps if e["confidence_label"] == "CONFIRMED"]),
-                "high_confidence_count":    len([e for e in eps if e["confidence_label"] in ("HIGH","CONFIRMED")]),
-                "parameter_sensitive_count":len([e for e in eps if e["parameter_sensitive"]]),
-                "auth_required_count":      len([e for e in eps if e["auth_required"]]),
-                "cors_issues_count":        len(self.cors_issues),
-                "secrets_found":            len(self.secrets),
-                "tech_stack":               sorted(self.tech_stack),
-            },
-            "endpoints":    eps,
-            "comments":     self.comments,
-            "secrets":      self.secrets,
-            "cors_issues":  self.cors_issues,
-            "graphql":      self.graphql_schemas,
-            "openapi":      self.openapi_specs,
-            "tech_stack":   sorted(self.tech_stack),
-            "robots_txt":   self.robots_entries,
-            "sourcemaps":   self.sourcemaps,
+            "meta": meta, "summary": summary, "endpoints": eps,
+            "secrets": self.secrets, "cors_issues": self.cors_issues,
+            "graphql": self.graphql, "openapi": self.openapi,
+            "sourcemaps": self.sourcemaps, "comments": self.comments,
+            "robots_disallowed": self.robots_paths,
+            "tech_stack": sorted(self.tech_stack),
         }
 
         if fmt == "json":
             return json.dumps(data, indent=2)
 
         if fmt == "jsonl":
-            lines = [json.dumps({"type": "meta",     "data": data["meta"]}),
-                     json.dumps({"type": "summary",  "data": data["summary"]})]
+            lines = [json.dumps({"type":"meta","data":meta}),
+                     json.dumps({"type":"summary","data":summary})]
             for ep in eps:
-                lines.append(json.dumps({"type": "endpoint", "data": ep}))
+                lines.append(json.dumps({"type":"endpoint","data":ep}))
             return "\n".join(lines)
 
         if fmt == "csv":
             buf = io.StringIO()
-            w = csv.writer(buf)
-            w.writerow(["url","cluster","methods","confidence","confidence_label",
-                         "auth_required","parameter_sensitive","sources",
-                         "form_params","js_params","observed_status"])
+            w   = csv.writer(buf)
+            w.writerow(["url","cluster","methods","confidence","auth_required",
+                         "param_sensitive","sources","query_params","form_params",
+                         "js_params","openapi_params","status_codes","headers"])
             for ep in eps:
-                w.writerow([
-                    ep["url"], ep["cluster"],
-                    "|".join(ep["methods"]),
-                    ep["confidence"], ep["confidence_label"],
-                    ep["auth_required"], ep["parameter_sensitive"],
-                    "|".join(ep["source"]),
-                    "|".join(ep["params"].get("form",[])),
-                    "|".join(ep["params"].get("js_static",[])),
-                    "|".join(str(s) for s in ep.get("observed_status",[])),
-                ])
+                w.writerow([ep["url"], ep["cluster"], "|".join(ep["methods"]),
+                             ep["confidence_label"], ep["auth_required"],
+                             ep["parameter_sensitive"], "|".join(ep["source"]),
+                             "|".join(ep["params"].get("query",[])),
+                             "|".join(ep["params"].get("form",[])),
+                             "|".join(ep["params"].get("js",[])),
+                             "|".join(ep["params"].get("openapi",[])),
+                             "|".join(str(s) for s in ep.get("observed_status",[])),
+                             json.dumps(ep.get("headers", {}))])
             return buf.getvalue()
 
         if fmt == "burp":
-            root = ET.Element("items", burpVersion="2.0", exportTime=datetime.utcnow().isoformat())
+            root = ET.Element("items", burpVersion="2.0",
+                              exportTime=datetime.now(timezone.utc).isoformat())
             for ep in eps:
                 item = ET.SubElement(root, "item")
-                ET.SubElement(item, "url").text      = ep["url"]
-                ET.SubElement(item, "method").text   = ep["methods"][0]
-                ET.SubElement(item, "confidence").text = ep["confidence_label"]
+                ET.SubElement(item, "url").text          = ep["url"]
+                ET.SubElement(item, "method").text       = ep["methods"][0]
+                ET.SubElement(item, "confidence").text   = ep["confidence_label"]
                 ET.SubElement(item, "authRequired").text = str(ep["auth_required"])
-                ET.SubElement(item, "params").text   = str(ep["params"])
+                ET.SubElement(item, "params").text       = json.dumps(ep["params"])
+                ET.SubElement(item, "headers").text      = json.dumps(ep.get("headers", {}))
             return ET.tostring(root, encoding="unicode", xml_declaration=True)
 
         return json.dumps(data, indent=2)
 
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
 # DIFF ENGINE
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
 
 def diff_crawls(old_json: str, new_json: str) -> dict:
-    """
-    Compare two JSON crawl results (from export()).
-    Returns a dict with added / removed / changed endpoint clusters.
-    """
-    old = json.loads(old_json)
-    new = json.loads(new_json)
-
-    old_map = {e["cluster"]: e for e in old.get("endpoints", [])}
-    new_map = {e["cluster"]: e for e in new.get("endpoints", [])}
-
-    old_keys = set(old_map.keys())
-    new_keys = set(new_map.keys())
-
-    added   = [new_map[k] for k in (new_keys - old_keys)]
-    removed = [old_map[k] for k in (old_keys - new_keys)]
+    old = json.loads(old_json); new = json.loads(new_json)
+    om  = {e["cluster"]: e for e in old.get("endpoints",[])}
+    nm  = {e["cluster"]: e for e in new.get("endpoints",[])}
+    ok, nk = set(om), set(nm)
+    added   = [nm[k] for k in (nk - ok)]
+    removed = [om[k] for k in (ok - nk)]
     changed = []
-
-    for k in old_keys & new_keys:
-        o, n = old_map[k], new_map[k]
-        changes = {}
+    for k in ok & nk:
+        o, n = om[k], nm[k]; diff: dict = {}
         if set(o["methods"]) != set(n["methods"]):
-            changes["methods"] = {"old": o["methods"], "new": n["methods"]}
+            diff["methods"] = {"old": o["methods"], "new": n["methods"]}
         if o["confidence_label"] != n["confidence_label"]:
-            changes["confidence"] = {"old": o["confidence_label"], "new": n["confidence_label"]}
+            diff["confidence"] = {"old": o["confidence_label"], "new": n["confidence_label"]}
         if o["auth_required"] != n["auth_required"]:
-            changes["auth_required"] = {"old": o["auth_required"], "new": n["auth_required"]}
-        if changes:
-            changed.append({"cluster": k, "url": n["url"], "changes": changes})
+            diff["auth_required"] = {"old": o["auth_required"], "new": n["auth_required"]}
+        if diff: changed.append({"cluster": k, "url": n["url"], "changes": diff})
+    return {"old_target": old.get("meta",{}).get("target"),
+            "new_target": new.get("meta",{}).get("target"),
+            "added": added, "removed": removed, "changed": changed,
+            "summary": {"added": len(added), "removed": len(removed), "changed": len(changed)}}
 
-    return {
-        "old_target": old.get("meta", {}).get("target"),
-        "new_target": new.get("meta", {}).get("target"),
-        "added":   added,
-        "removed": removed,
-        "changed": changed,
-        "summary": {
-            "added_count":   len(added),
-            "removed_count": len(removed),
-            "changed_count": len(changed),
-        }
-    }
-
-# =================================================
-# EXTRACTOR
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
+# EXTRACTORS
+# ══════════════════════════════════════════════════════════════════════
 
 class Extractor:
-    JS_NOISE = {"console","window","document","return","function","const","let",
-                "var","this","class","import","export","default","null","undefined",
-                "true","false","new","async","await","try","catch","if","else"}
-
-    PARAM_PATTERNS = [
-        (r'body\s*:\s*JSON\.stringify\s*\(\s*\{([^}]{1,300})\}',    "json_body"),
-        (r'axios\.(?:post|put|patch)\([^,]{1,100},\s*\{([^}]{1,300})\}', "axios_obj"),
-        (r'data\s*:\s*\{([^}]{1,300})\}',                            "data_obj"),
-        (r'params\s*:\s*\{([^}]{1,300})\}',                          "params_obj"),
-        (r'new\s+URLSearchParams\s*\(\s*\{([^}]{1,300})\}',          "search_params"),
-        (r'let\s+\w+\s*=\s*\{([^}]{1,300})\}',                       "var_obj"),
+    _JS_NOISE = {
+        "console","window","document","return","function","const","let","var",
+        "this","class","import","export","default","null","undefined","true",
+        "false","new","async","await","try","catch","if","else","for","while",
+        "switch","case","break","continue","typeof","instanceof","void","delete",
+    }
+    _PARAM_RE = [
+        r'body\s*:\s*JSON\.stringify\s*\(\s*\{([^}]{1,400})\}',
+        r'axios\.(?:post|put|patch)\s*\([^,]{1,120},\s*\{([^}]{1,400})\}',
+        r'(?:data|payload|body)\s*:\s*\{([^}]{1,400})\}',
+        r'params\s*:\s*\{([^}]{1,400})\}',
+        r'new\s+URLSearchParams\s*\(\s*\{([^}]{1,400})\}',
+        r'FormData\s*\(\s*\)\s*;(?:[^}]{0,200}\.append\s*\(\s*["\']([^"\']+)["\'])',
+    ]
+    _SECRET_RE = [
+        (r'\b([13][a-km-zA-HJ-NP-Z1-9]{25,34})\b',                       "Bitcoin_Address"),
+        (r'\b(0x[a-fA-F0-9]{40})\b',                                      "Ethereum_Address"),
+        (r'(AIza[0-9A-Za-z\-_]{35})',                                     "Google_API_Key"),
+        (r'(AKIA[0-9A-Z]{16})',                                            "AWS_Access_Key"),
+        (r'Bearer\s+([a-zA-Z0-9\-._~+/]{20,}=*)',                         "Bearer_Token"),
+        (r'["\']sk-[a-zA-Z0-9]{20,}["\']',                                "Stripe_Key"),
+        (r'gh[pousr]_[A-Za-z0-9_]{36,}',                                  "GitHub_PAT"),
+        (r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',                      "Private_Key_PEM"),
+        (r'["\'](?:password|passwd|secret|api_?key|token)\s*["\']?\s*[:=]\s*["\']([^"\']{6,})["\']',
+                                                                           "Hardcoded_Credential"),
+        (r'["\']([0-9a-fA-F]{32})["\']',                                  "Possible_MD5"),
+    ]
+    _API_RE = [
+        r'["\']([/][a-zA-Z0-9_\-\.\/]*(?:api|v\d+|graphql|admin|auth|login|logout|rest|search|data|internal|upload|download)[a-zA-Z0-9_\-\.\/]*(?:\?[^"\'#\s]*)?)["\']',
+        r'(?:fetch|axios)\s*\(\s*["\']([^"\'#\s]{5,})["\']',
+        r'\.\s*(?:get|post|put|delete|patch)\s*\(\s*["\']([^"\'#\s]{5,})["\']',
+        r'`\$\{[^}]+\}(/[a-zA-Z0-9_\-\/]+(?:\?[^`#\s]*)?)`',
+        r'(?:fetch|axios|\.\s*(?:get|post|put|delete|patch))\s*\(\s*["\']([/][^"\'#\s]{3,})["\']',
     ]
 
-    SECRET_PATTERNS = [
-        (r'\b([13][a-km-zA-HJ-NP-Z1-9]{25,34})\b',                "Bitcoin_Address"),
-        (r'\b(0x[a-fA-F0-9]{40})\b',                               "Ethereum_Address"),
-        (r'(AIza[0-9A-Za-z\-_]{35})',                              "Google_API_Key"),
-        (r'(AKIA[0-9A-Z]{16})',                                     "AWS_Access_Key"),
-        (r'Bearer\s+([a-zA-Z0-9\-._~+/]{20,}=*)',                  "Bearer_Token"),
-        (r'["\']sk-[a-zA-Z0-9]{20,}["\']',                         "Stripe_Key"),
-        (r'gh[pousr]_[A-Za-z0-9_]{36,}',                           "GitHub_PAT"),
-        (r'["\']([0-9a-fA-F]{32})["\']',                           "Possible_MD5_Secret"),
-        (r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',               "Private_Key_PEM"),
-        (r'["\'](?:password|passwd|pwd|secret|api_?key)\s*["\']?\s*[:=]\s*["\']([^"\']{6,})["\']',
-                                                                    "Hardcoded_Credential"),
-    ]
-
-    API_PATTERNS = [
-        r'["\']([/][a-zA-Z0-9_\-\.\/]+'
-        r'(?:api|v\d|graphql|admin|auth|login|rest|search|data|internal)'
-        r'[a-zA-Z0-9_\-\.\/]*)["\']',
-        r'(?:axios|fetch)\s*\(\s*["\']([^"\'?\s]{5,})["\']',
-        r'\.\s*(?:get|post|put|delete|patch)\s*\(\s*["\']([^"\'?\s]{5,})["\']',
-    ]
-
-    @staticmethod
-    def _extract_keys(block: str) -> List[str]:
+    @classmethod
+    def _obj_keys(cls, block):
         keys = re.findall(r'["\']?([a-zA-Z_$][a-zA-Z0-9_$]*)["\']?\s*:', block)
-        return [k for k in keys if k not in Extractor.JS_NOISE and len(k) > 1]
+        return [k for k in keys if k not in cls._JS_NOISE and len(k) > 1]
 
-    @staticmethod
-    def extract_js_params(text: str, base_url: str, store: InMemoryStore, emit):
-        for pattern, ptype in Extractor.PARAM_PATTERNS:
-            for match in re.finditer(pattern, text):
-                block = match.group(1)
-                keys  = Extractor._extract_keys(block)
+    @classmethod
+    def _build_var_url_map(cls, text):
+        var_map = {}
+        for m in re.finditer(
+            r"""(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*["']([/][a-zA-Z0-9_\-\./?&=]+)["']""",
+            text
+        ):
+            var_map[m.group(1)] = m.group(2)
+        for m in re.finditer(
+            r"""(?:url|endpoint|action|path|href)\s*:\s*["']([/][a-zA-Z0-9_\-\./]+)["']""",
+            text
+        ):
+            var_map["__prop_%d" % m.start()] = m.group(1)
+        return var_map
+
+    @classmethod
+    def _find_url_for_params(cls, text, match_start, match_end, base_url, var_map):
+        url_lit = r"""["']([/][a-zA-Z0-9_\-\./]+(?:\?[^"'#\s]*)?)["']"""
+        pre_window = text[max(0, match_start - 600): match_start]
+        pre_matches = list(re.finditer(url_lit, pre_window))
+        if pre_matches:
+            return urljoin(base_url, pre_matches[-1].group(1).split("?")[0])
+        post_window = text[match_end: match_end + 500]
+        post_m = re.search(url_lit, post_window)
+        if post_m:
+            return urljoin(base_url, post_m.group(1).split("?")[0])
+        for varname, vpath in var_map.items():
+            if varname.startswith("__prop_"):
+                if abs(int(varname[7:]) - match_start) <= 800:
+                    return urljoin(base_url, vpath.split("?")[0])
+            else:
+                window = text[max(0, match_start - 800): match_end + 800]
+                if re.search(r"\b" + re.escape(varname) + r"\b", window):
+                    return urljoin(base_url, vpath.split("?")[0])
+        return base_url
+
+    @classmethod
+    def js_params(cls, text, base_url, store, emit):
+        var_map = cls._build_var_url_map(text)
+        for pat in cls._PARAM_RE:
+            for m in re.finditer(pat, text, re.S):
+                keys = cls._obj_keys(m.group(1) if m.lastindex else m.group(0))
                 if not keys:
                     continue
-                pre = text[max(0, match.start()-200):match.start()]
-                um  = re.search(r'["\']([/][a-zA-Z0-9_\-\.\/]+)["\']', pre)
-                if um:
-                    turl = urljoin(base_url, um.group(1))
-                    if store.add_params_from_js(turl, keys, "js_static"):
-                        emit.info(f"[JS Params] {keys} -> {turl}")
+                turl = cls._find_url_for_params(text, m.start(), m.end(), base_url, var_map)
+                if store.add_js_params(turl, keys):
+                    emit.info("[JS-Params] %s -> %s" % (keys, turl))
 
-    @staticmethod
-    def extract_secrets(text: str, url: str, store: InMemoryStore, emit):
-        for pattern, stype in Extractor.SECRET_PATTERNS:
-            for match in re.finditer(pattern, text):
-                val = match.group(1) if match.lastindex else match.group(0)
+    @classmethod
+    def secrets(cls, text, url, store, emit):
+        for pat, stype in cls._SECRET_RE:
+            for m in re.finditer(pat, text):
+                val = m.group(1) if m.lastindex else m.group(0)
                 if stype not in ("Bitcoin_Address","Ethereum_Address","Private_Key_PEM",
                                   "Hardcoded_Credential","GitHub_PAT") and len(val) < 20:
                     continue
-                if store.add_secret(val, stype, url):
-                    emit.warn(f"[SECRET:{stype}] {val[:60]}")
+                # Stored in intel only — no output
+                store.add_secret(val, stype, url)
 
-    @staticmethod
-    def extract_js_endpoints(text: str, url: str, store: InMemoryStore, emit):
-        for pattern in Extractor.API_PATTERNS:
-            for match in re.finditer(pattern, text):
-                path = match.group(1)
-                if not path.startswith("/") or len(path) < 4:
+    @classmethod
+    def js_endpoints(cls, text, base_url, store, emit):
+        _seen_paths: set = set()
+        for pat in cls._API_RE:
+            for m in re.finditer(pat, text):
+                raw = m.group(1)
+                if not raw or not raw.startswith("/") or len(raw) < 3:
                     continue
-                path     = path.split("?")[0]
-                full_url = urljoin(url, path)
-                store.add_endpoint(full_url, method="GET", source="JS_Analysis",
-                                   confidence_increment=Confidence.MEDIUM)
-                emit.info(f"[JS API] {full_url}")
+                _parsed    = urlparse(raw)
+                _qs_params = list(parse_qs(_parsed.query).keys())
+                clean_path = _parsed.path
+                if not clean_path or clean_path == "/":
+                    continue
+                full = urljoin(base_url, clean_path)
+                _dedup_key = (full, frozenset(_qs_params))
+                if _dedup_key in _seen_paths:
+                    continue
+                _seen_paths.add(_dedup_key)
+                store.add_endpoint(full, source="JS_Analysis", score=Conf.MEDIUM)
+                if _qs_params:
+                    store.add_js_params(full, _qs_params)
+                    emit.info(f"[JS-QS-Params] {_qs_params} <- {full}")
+                emit.info(f"[JS-API] {full}")
 
-    @staticmethod
-    def extract_comments(soup, url: str, store: InMemoryStore, emit):
-        kw = {'todo','fixme','bug','admin','hidden','secret','debug',
-              'config','key','password','cred','token','hack','temp','test'}
+    @classmethod
+    def html_comments(cls, soup, url, store, emit):
+        kw = {"todo","fixme","bug","admin","hidden","secret","debug","config",
+              "key","password","cred","token","hack","temp","test","internal",
+              "private","disabled","api","endpoint"}
         for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
             txt = c.strip()
-            if len(txt) < 3:
+            if len(txt) < 4:
                 continue
-            interesting = any(k in txt.lower() for k in kw) \
-                       or bool(re.match(r'^[/\.][a-z0-9_\-\.#]{3,}', txt))
-            if interesting and store.add_comment(txt, url):
-                emit.info(f"[Comment] {txt[:80]}")
+            if (any(k in txt.lower() for k in kw)
+                    or bool(re.match(r'^[/\.][a-z0-9_\-\.#]{3,}', txt))):
+                if store.add_comment(txt, url):
+                    emit.info(f"[Comment] {txt[:100]}")
 
-    @staticmethod
-    def parse_csp_endpoints(headers: dict, base_url: str,
-                            store: InMemoryStore, emit):
-        """Extract endpoint hints from Content-Security-Policy header."""
-        csp = headers.get("Content-Security-Policy", "") or \
-              headers.get("content-security-policy", "")
+    @classmethod
+    def csp_hints(cls, headers, base_url, store, emit):
+        csp = headers.get("Content-Security-Policy","") or headers.get("content-security-policy","")
         if not csp:
             return
-        parsed = urlparse(base_url)
-        for token in csp.split():
-            token = token.rstrip(";")
-            if token.startswith(("https://","http://")) \
-               and urlparse(token).netloc != parsed.netloc:
-                emit.info(f"[CSP] Third-party: {token}")
-            elif token.startswith("/") and len(token) > 2:
-                full = urljoin(base_url, token)
-                store.add_endpoint(full, source="CSP_Header",
-                                   confidence_increment=Confidence.LOW)
+        domain = urlparse(base_url).netloc
+        for tok in csp.split():
+            tok = tok.rstrip(";")
+            if tok.startswith("/") and len(tok) > 2:
+                store.add_endpoint(urljoin(base_url, tok), source="CSP", score=Conf.LOW)
+            elif tok.startswith(("https://","http://")) and urlparse(tok).netloc != domain:
+                emit.info(f"[CSP-3rd-party] {tok}")
 
-# =================================================
-# INTELLIGENT PROBER
-# =================================================
-
-class IntelligentProber:
-    METHODS_TO_TEST = ["OPTIONS","PUT","PATCH","DELETE","HEAD"]
-
-    def __init__(self, session, store: InMemoryStore, emit,
-                 rate_limiter: DomainRateLimiter, config: dict):
-        self.session      = session
-        self.store        = store
-        self.emit         = emit
-        self.rl           = rate_limiter
-        self.config       = config
-
-    async def run(self):
-        self.emit.info("Phase: Intelligent Probing (Baseline + Mutation + Methods)…")
-        endpoints = self.store.get_endpoints()
-        targets   = [
-            e for e in endpoints
-            if any(k in e["url"] for k in
-                   ("api","rest","admin","v1","v2","v3","data","login","auth","graphql"))
-        ][:40]
-
-        count_sens, count_methods = 0, 0
-
-        for ep in targets:
-            url    = ep["url"]
-            method = ep["methods"][0] if ep["methods"] else "GET"
-
-            status, hdrs, text = await fetch_with_retry(
-                self.session, method, url, self.rl,
-                max_retries=self.config["max_retries"],
-                base_delay=self.config["retry_base_delay"])
-
-            if status is None:
-                continue
-
-            bh = hashlib.md5(text.encode(errors="ignore")).hexdigest()
-            self.store.update_baseline(url, method, status, bh, len(text))
-            self.store.record_status(url, method, status)
-
-            if await self._test_mutation(url, method, status, bh, len(text)):
-                self.store.mark_sensitive(url, method)
-                self.emit.warn(f"[Probe:Sensitive] {url}")
-                count_sens += 1
-
-            if self.config["enable_method_discovery"]:
-                found = await self._discover_methods(url, hdrs or {})
-                if found:
-                    self.store.update_methods(url, found)
-                    self.emit.info(f"[Methods] {url} -> {', '.join(found)}")
-                    count_methods += 1
-
-            if self.config["enable_cors_check"]:
-                await self._check_cors(url)
-
-        if count_sens or count_methods:
-            self.emit.always_success(
-                f"Probing done. Sensitive: {count_sens}, New Methods: {count_methods}")
-
-    async def _test_mutation(self, url: str, method: str,
-                              base_status: int, base_hash: str,
-                              base_len: int) -> bool:
-        probe = url + ("&" if "?" in url else "?") + f"_hh={int(time.time())}"
-        s, _, t = await fetch_with_retry(self.session, method, probe, self.rl)
-        if s is None:
-            return False
-        h = hashlib.md5(t.encode(errors="ignore")).hexdigest()
-        return h != base_hash or abs(len(t) - base_len) > 50
-
-    async def _discover_methods(self, url: str, base_headers: dict) -> List[str]:
-        found = []
-        # First try OPTIONS
-        s, hdrs, _ = await fetch_with_retry(self.session, "OPTIONS", url, self.rl)
-        if hdrs:
-            allow = hdrs.get("Allow", "") or hdrs.get("allow", "")
-            if allow:
-                return [m for m in self.METHODS_TO_TEST if m in allow]
-        # Fallback: try each method
-        for m in self.METHODS_TO_TEST:
-            s, _, _ = await fetch_with_retry(self.session, m, url, self.rl,
-                                              data="{}", headers={"Content-Type":"application/json"})
-            if s is not None and s not in (405, 501, 400):
-                found.append(m)
-        return found
-
-    async def _check_cors(self, url: str):
-        evil = "https://evil.hellhound.local"
-        s, hdrs, _ = await fetch_with_retry(
-            self.session, "GET", url, self.rl,
-            headers={"Origin": evil})
-        if hdrs is None:
-            return
-        acao = hdrs.get("Access-Control-Allow-Origin","") or \
-               hdrs.get("access-control-allow-origin","")
-        acac = (hdrs.get("Access-Control-Allow-Credentials","") or
-                hdrs.get("access-control-allow-credentials","")).lower() == "true"
-        if acao and (acao == "*" or acao == evil):
-            self.store.add_cors_issue(url, evil, acao, acac)
-            sev = "HIGH" if acac else "MEDIUM"
-            self.emit.warn(f"[CORS:{sev}] {url} reflects origin={acao} creds={acac}")
-
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
 # GRAPHQL PROBER
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
 
-GRAPHQL_INTROSPECTION = '{"query":"{ __schema { types { name fields { name } } } }"}'
-GRAPHQL_PATHS = ["/graphql","/api/graphql","/gql","/query","/v1/graphql","/graphiql"]
+_GQL_PATHS = ["/graphql","/api/graphql","/gql","/query","/v1/graphql","/graphiql","/playground"]
+_GQL_QUERY = '{"query":"{ __schema { queryType { name } types { name fields { name args { name } } } } }"}'
 
-async def probe_graphql(session, base_url: str, store: InMemoryStore,
-                        emit, rate_limiter: DomainRateLimiter):
-    for path in GRAPHQL_PATHS:
-        url = urljoin(base_url, path)
-        s, hdrs, text = await fetch_with_retry(
-            session, "POST", url, rate_limiter,
-            data=GRAPHQL_INTROSPECTION,
-            headers={"Content-Type": "application/json"})
-        if s and s < 400 and '"__schema"' in (text or ""):
-            emit.warn(f"[GraphQL] Introspection OPEN at {url}")
-            store.add_endpoint(url, method="POST", source="GraphQL_Probe",
-                               confidence_increment=Confidence.CONFIRMED)
+async def probe_graphql(session, base, store, emit, rl):
+    emit.always_info("Phase: GraphQL introspection probe...")
+    for path in _GQL_PATHS:
+        url = urljoin(base, path)
+        s, _, text = await fetch(session, "POST", url, rl, data=_GQL_QUERY,
+                                  headers={"Content-Type": "application/json"})
+        if s and s < 400 and text and '"__schema"' in text:
+            store.add_endpoint(url, method="POST", source="GraphQL", score=Conf.CONFIRMED)
             try:
                 schema = json.loads(text)
-                store.graphql_schemas.append({"url": url, "schema": schema})
-                types = schema.get("data",{}).get("__schema",{}).get("types",[])
-                emit.warn(f"[GraphQL] {len(types)} types exposed — introspection should be disabled")
-            except json.JSONDecodeError:
+                types  = schema.get("data",{}).get("__schema",{}).get("types",[])
+                store.graphql.append({"url": url, "types_count": len(types), "schema": schema})
+                emit.always_info(f"GraphQL introspection found: {url} ({len(types)} types exposed)")
+            except Exception:
                 pass
-            break  # Found it, stop checking
+            return
 
-# =================================================
-# OPENAPI / SWAGGER PROBER
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
+# OPENAPI PROBER
+# ══════════════════════════════════════════════════════════════════════
 
-OPENAPI_PATHS = [
-    "/swagger.json","/swagger/v1/swagger.json",
-    "/api-docs","/api-docs.json",
+_OAS_PATHS = [
+    "/swagger.json","/swagger/v1/swagger.json","/swagger/v2/swagger.json",
+    "/api-docs","/api-docs.json","/api-docs/swagger.json",
     "/openapi.json","/openapi.yaml","/openapi/v3/api-docs",
     "/v1/swagger.json","/v2/swagger.json","/v3/api-docs",
-    "/.well-known/openapi",
+    "/.well-known/openapi","/api/swagger.json",
 ]
 
-async def probe_openapi(session, base_url: str, store: InMemoryStore,
-                        emit, rate_limiter: DomainRateLimiter):
-    for path in OPENAPI_PATHS:
-        url = urljoin(base_url, path)
-        s, _, text = await fetch_with_retry(session, "GET", url, rate_limiter)
+async def probe_openapi(session, base, store, emit, rl):
+    emit.always_info("Phase: OpenAPI/Swagger spec probe...")
+    for path in _OAS_PATHS:
+        url = urljoin(base, path)
+        s, _, text = await fetch(session, "GET", url, rl)
         if s != 200 or not text:
             continue
         try:
             spec = json.loads(text)
-        except json.JSONDecodeError:
+        except Exception:
             continue
-        if "paths" not in spec and "swagger" not in spec and "openapi" not in spec:
+        if not any(k in spec for k in ("paths","swagger","openapi")):
             continue
-
-        emit.warn(f"[OpenAPI] Spec exposed at {url} — full endpoint map available")
-        store.openapi_specs.append({"url": url})
-        server_base = ""
-        for server in spec.get("servers", []):
-            server_base = server.get("url","")
+        store.openapi.append({"url": url})
+        emit.always_info(f"OpenAPI spec found: {url}")
+        server_prefix = ""
+        for srv in spec.get("servers", []):
+            u = srv.get("url","")
+            if not u.startswith("http"):
+                server_prefix = u
             break
+        count = 0
+        for ep_path, methods_obj in spec.get("paths", {}).items():
+            for method, detail in methods_obj.items():
+                if method.lower() not in ("get","post","put","patch","delete","head","options"):
+                    continue
+                clean  = (server_prefix + ep_path).replace("{","").replace("}","")
+                full   = urljoin(base, clean)
+                params = [p.get("name","") for p in detail.get("parameters",[]) if p.get("name")]
+                bp: List[str] = []
+                for ct_data in detail.get("requestBody",{}).get("content",{}).values():
+                    bp += list(ct_data.get("schema",{}).get("properties",{}).keys())
+                store.add_endpoint(full, method=method.upper(), source="OpenAPI",
+                                   params=params+bp, score=Conf.CONFIRMED)
+                emit.info(f"[OpenAPI] {method.upper()} {full} ({len(params+bp)} params)")
+                count += 1
+        emit.always_success(f"OpenAPI: mapped {count} endpoints from spec")
+        return
 
-        for ep_path, methods in spec.get("paths", {}).items():
-            for method, details in methods.items():
-                if method.lower() in ("get","post","put","patch","delete","head"):
-                    full = urljoin(base_url, (server_base + ep_path).replace("{","").replace("}",""))
-                    params = [
-                        p.get("name","") for p in details.get("parameters",[])
-                        if p.get("name")
-                    ]
-                    body_params = []
-                    rb = details.get("requestBody",{}).get("content",{})
-                    for ct, ct_data in rb.items():
-                        schema = ct_data.get("schema",{})
-                        body_params += list(schema.get("properties",{}).keys())
+# ══════════════════════════════════════════════════════════════════════
+# INTELLIGENT PROBER
+# ══════════════════════════════════════════════════════════════════════
 
-                    store.add_endpoint(full, method=method.upper(), source="OpenAPI",
-                                       params=params + body_params,
-                                       confidence_increment=Confidence.CONFIRMED)
-                    emit.info(f"[OpenAPI] {method.upper()} {full} ({len(params+body_params)} params)")
-        break  # First spec found is enough
+class IntelligentProber:
+    _METHODS = ["OPTIONS","PUT","PATCH","DELETE","HEAD","TRACE"]
 
-# =================================================
-# CORE SPIDER
-# =================================================
+    def __init__(self, session, store, emit, rl, cfg):
+        self.session = session; self.store = store
+        self.emit = emit; self.rl = rl; self.cfg = cfg
 
-class AutonomousSpider:
-    def __init__(self, target_url: str, emit, options: dict = None):
-        self.target_url  = target_url
-        self.emit        = emit
-        self.options     = options or {}
-        self.base_domain = urlparse(target_url).netloc
-        self.store       = InMemoryStore()
-        self.visited     = set()
-        self.queue       = asyncio.Queue()
-        self.queue.put_nowait((target_url, 0, "Root"))
+    async def run(self):
+        self.emit.always_info("Phase: Intelligent Probing...")
 
-        # Build config
-        self.config = DEFAULT_CONFIG.copy()
-        for k in ("concurrency","timeout","max_retries","max_urls_per_depth","max_depth","verbose"):
-            if k in self.options:
-                self.config[k] = self.options[k]
-        validate_config(self.config)
+        _slug_re = re.compile(r'^[a-z][a-z0-9]{3,9}$')
 
-        # Wrap emit with verbosity control
-        # From this point, self.emit is always a VerboseEmit instance
-        self.emit = VerboseEmit(emit, verbose=self.config["verbose"])
+        def _is_slug_path(url: str) -> bool:
+            segs = urlparse(url).path.strip("/").split("/")
+            return any(
+                _slug_re.match(seg) and not seg.isalpha() and not seg.isdigit()
+                for seg in segs
+            )
 
-        self.sem          = asyncio.Semaphore(self.config["concurrency"])
-        self.rate_limiter = DomainRateLimiter(base_delay=0.05)
-        self._depth_counts: Dict[int, int] = defaultdict(int)
+        def _has_params(ep: dict) -> bool:
+            return any(ep.get("params",{}).get(b) for b in ("form","js","openapi","query","runtime"))
 
-        # --- Auth setup ---
-        raw_cookie  = self.options.get("cookie")
-        raw_auth    = self.options.get("auth")  # alias
-        cookie_src  = raw_cookie or raw_auth
-        self.cookies = SessionManager.parse(cookie_src)
-        self.extra_headers = SessionManager.parse_extra_headers(
-            self.options.get("headers", {}))
+        all_eps = self.store.all_endpoints()
+        targets = [
+            e for e in all_eps
+            if (
+                e.get("confidence", 0) >= Conf.MEDIUM
+                or _has_params(e)
+                or _is_slug_path(e.get("url",""))
+            )
+        ]
+        targets = sorted(targets, key=lambda e: e.get("confidence", 0), reverse=True)[:100]
 
-        if self.cookies:
-            self.emit.always_info(f"[Auth] Session cookies loaded: {list(self.cookies.keys())}")
-        elif "Authorization" in self.extra_headers:
-            self.emit.info("[Auth] Authorization header loaded")
-        else:
-            self.emit.info("[Auth] No credentials — unauthenticated crawl")
+        self.emit.always_info(f"Prober: {len(targets)} endpoints selected")
+        n_sens = n_meth = 0
+        for ep in targets:
+            url = ep["url"]; method = ep["methods"][0]
+            s, hdrs, body = await fetch(self.session, method, url, self.rl)
+            if s is None: continue
+            self.store.record_status(url, method, s)
+            bh = hashlib.md5(body.encode(errors="ignore")).hexdigest()
+            ep["baseline"] = {"status": s, "hash": bh, "length": len(body)}
+            probe = url + ("&" if "?" in url else "?") + f"_hh={int(time.time())}"
+            s2, _, b2 = await fetch(self.session, method, probe, self.rl)
+            if s2 and b2:
+                h2 = hashlib.md5(b2.encode(errors="ignore")).hexdigest()
+                if h2 != bh or abs(len(b2) - len(body)) > 50:
+                    self.store.mark_sensitive(url, method)
+                    # Stored in intel — no output
+                    n_sens += 1
+            if self.cfg.enable_method_disc:
+                found = await self._methods(url, hdrs or {})
+                if found:
+                    self.store.update_methods(url, found)
+                    self.emit.info(f"[Methods] {url} -> {', '.join(found)}")
+                    n_meth += 1
+            if self.cfg.enable_cors:
+                await self._cors(url)
+        self.emit.always_success(f"Probing done — sensitive: {n_sens}, new methods: {n_meth}")
 
-    # ---- helpers ----
+    async def _methods(self, url, base_hdrs):
+        found = []
+        _, hdrs, _ = await fetch(self.session, "OPTIONS", url, self.rl)
+        if hdrs:
+            allow = hdrs.get("Allow","") or hdrs.get("allow","")
+            if allow:
+                return [m for m in self._METHODS if m in allow]
+        for m in self._METHODS:
+            s, _, _ = await fetch(self.session, m, url, self.rl,
+                                   data="{}", headers={"Content-Type":"application/json"})
+            if s is not None and s not in (405, 501, 400, 404):
+                found.append(m)
+        return found
 
-    def is_valid(self, url: str) -> bool:
-        parsed = urlparse(url)
-        if parsed.netloc != self.base_domain:
-            return False
-        if any(url.lower().endswith(ext) for ext in self.config["extensions_to_ignore"]):
-            return False
-        return True
+    async def _cors(self, url):
+        evil = "https://evil.hellhound.test"
+        _, hdrs, _ = await fetch(self.session, "GET", url, self.rl, headers={"Origin": evil})
+        if not hdrs: return
+        acao = hdrs.get("Access-Control-Allow-Origin","") or hdrs.get("access-control-allow-origin","")
+        acac = (hdrs.get("Access-Control-Allow-Credentials","") or
+                hdrs.get("access-control-allow-credentials","")).lower() == "true"
+        if acao and (acao == "*" or acao == evil):
+            # Stored in intel — no output
+            self.store.add_cors(url, evil, acao, acac)
 
-    def _over_budget(self, depth: int) -> bool:
-        return self._depth_counts[depth] >= self.config["max_urls_per_depth"]
+# ══════════════════════════════════════════════════════════════════════
+# ROBOTS + SITEMAP PARSER
+# Disallowed paths are crawled as high-value targets, not skipped.
+# ══════════════════════════════════════════════════════════════════════
 
-    def detect_tech(self, headers: dict, url: str, body: str = ""):
-        tech = set()
-        s = (headers.get("Server","") or headers.get("server","")).lower()
-        x = (headers.get("X-Powered-By","") or headers.get("x-powered-by","")).lower()
-        ct = (headers.get("Content-Type","") or "").lower()
+class RobotsParser:
+    def __init__(self, session, base_url, store, queue, emit, rl, is_valid_fn):
+        self.session = session; self.base_url = base_url
+        self.store = store; self.queue = queue
+        self.emit = emit; self.rl = rl; self.is_valid = is_valid_fn
+        self.crawl_delay = 0.0
+        self._sitemap_seen: Set[str] = set()
 
-        if "php"          in x:                    tech.add("PHP")
-        if "express"      in x:                    tech.add("Node.js/Express")
-        if "asp.net"      in x:                    tech.add("ASP.NET")
-        if "django"       in (headers.get("X-Framework","") or "").lower(): tech.add("Django")
-        if "nginx"        in s:                    tech.add("Nginx")
-        if "apache"       in s:                    tech.add("Apache")
-        if "cloudflare"   in s:                    tech.add("Cloudflare")
-        if "socket.io"    in url.lower():           tech.add("Socket.IO")
-        if "__next"       in body or "_next" in body: tech.add("Next.js")
-        if "wp-content"   in body:                 tech.add("WordPress")
-        if "Drupal"       in body:                 tech.add("Drupal")
-        if "X-Shopify-Stage" in headers:           tech.add("Shopify")
-
-        for t in tech:
-            self.store.add_tech(t)
-        if tech:
-            self.emit.always_info(f"[Tech] {', '.join(sorted(tech))}")
-
-    async def check_sourcemap(self, session, js_url: str):
-        map_url = js_url + ".map"
-        s, _, _ = await fetch_with_retry(session, "GET", map_url, self.rate_limiter)
-        if s == 200:
-            self.emit.warn(f"[SourceMap] Exposed: {map_url}")
-            self.store.add_sourcemap(map_url, js_url)
-
-    async def parse_sitemap(self, session, sitemap_url: str):
-        if not self.is_valid(sitemap_url):
-            return
-        s, _, text = await fetch_with_retry(session, "GET", sitemap_url, self.rate_limiter)
+    async def run(self) -> float:
+        url = urljoin(self.base_url, "/robots.txt")
+        s, _, text = await fetch(self.session, "GET", url, self.rl)
         if s != 200 or not text:
-            return
+            return 0.0
+        self.emit.always_info(f"Robots: parsing {url}")
+        dis_count = sit_count = 0
+        for line in text.splitlines():
+            line = line.strip(); lower = line.lower()
+            if lower.startswith("crawl-delay:"):
+                try:
+                    self.crawl_delay = float(line.split(":",1)[1].strip())
+                    self.emit.always_info(f"Robots: crawl-delay {self.crawl_delay}s — honouring")
+                except ValueError:
+                    pass
+            elif lower.startswith("disallow:"):
+                path = line.split(":",1)[1].strip()
+                if not path or path == "/": continue
+                full = urljoin(self.base_url, path)
+                if self.is_valid(full):
+                    self.store.robots_paths.append(path)
+                    self.store.add_endpoint(full, source="Robots_Disallow", score=Conf.MEDIUM)
+                    self.queue.put_nowait((full, 1, "Robots_Disallow"))
+                    dis_count += 1
+                    self.emit.info(f"[Robots] Disallow queued: {path}")
+            elif lower.startswith("allow:"):
+                path = line.split(":",1)[1].strip()
+                if path and path != "/":
+                    full = urljoin(self.base_url, path)
+                    if self.is_valid(full):
+                        self.store.add_endpoint(full, source="Robots_Allow", score=Conf.LOW)
+                        self.queue.put_nowait((full, 1, "Robots_Allow"))
+                        self.emit.info(f"[Robots] Allow queued: {path}")
+            elif lower.startswith("sitemap:"):
+                sitemap_url = line.split(":",1)[1].strip()
+                if not sitemap_url.startswith("http"):
+                    sitemap_url = line.partition(":")[2].strip()
+                await self.parse_sitemap(sitemap_url)
+                sit_count += 1
+        self.emit.always_info(
+            f"Robots: done — {dis_count} disallow, {sit_count} sitemaps, "
+            f"crawl-delay={self.crawl_delay}s")
+        return self.crawl_delay
+
+    async def parse_sitemap(self, sitemap_url: str):
+        if sitemap_url in self._sitemap_seen: return
+        self._sitemap_seen.add(sitemap_url)
+        s, _, text = await fetch(self.session, "GET", sitemap_url, self.rl)
+        if s != 200 or not text: return
         try:
             root = ET.fromstring(text)
         except ET.ParseError:
             return
         ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-        for loc in root.findall("sm:sitemap/sm:loc", ns):
-            await self.parse_sitemap(session, loc.text)
+        for loc in (root.findall("sm:sitemap/sm:loc", ns) or root.findall("sitemap/loc")):
+            if loc.text: await self.parse_sitemap(loc.text.strip())
         count = 0
-        for loc in root.findall("sm:url/sm:loc", ns):
-            url = loc.text
-            if url and self.is_valid(url):
-                self.queue.put_nowait((url, 1, "Sitemap"))
-                self.store.add_endpoint(url, source="Sitemap",
-                                        confidence_increment=Confidence.LOW)
+        for loc in (root.findall("sm:url/sm:loc", ns) or root.findall("url/loc")):
+            u = (loc.text or "").strip()
+            if u and self.is_valid(u):
+                self.store.add_endpoint(u, source="Sitemap", score=Conf.LOW)
+                self.queue.put_nowait((u, 1, "Sitemap"))
                 count += 1
         if count:
-            self.emit.info(f"[Sitemap] Added {count} URLs")
+            self.emit.always_info(f"Sitemap: {sitemap_url} -> {count} URLs queued")
 
-    async def check_robots(self, session) -> float:
-        """Returns Crawl-delay (seconds) if found."""
-        robots_url  = urljoin(self.target_url, "/robots.txt")
-        crawl_delay = 0.0
-        s, _, text  = await fetch_with_retry(session, "GET", robots_url, self.rate_limiter)
-        if s != 200 or not text:
-            return crawl_delay
-        for line in text.splitlines():
-            line = line.strip()
-            lower = line.lower()
-            if lower.startswith("crawl-delay:"):
-                try:
-                    crawl_delay = float(line.split(":", 1)[1].strip())
-                    self.emit.always_info(f"[Robots] Crawl-delay: {crawl_delay}s — honouring")
-                except ValueError:
-                    pass
-            elif lower.startswith("disallow:"):
-                path = line.split(":", 1)[1].strip()
-                if path:
-                    full = urljoin(self.target_url, path)
-                    if self.is_valid(full):
-                        self.queue.put_nowait((full, 1, "Robots"))
-                        self.store.add_robots_entry(full)
-            elif lower.startswith("sitemap:"):
-                sitemap = line.split(":", 1)[1].strip()
-                await self.parse_sitemap(session, sitemap)
-        return crawl_delay
+# ══════════════════════════════════════════════════════════════════════
+# SPA SCANNER
+# ══════════════════════════════════════════════════════════════════════
 
-    async def playwright_scan(self):
-        if not PLAYWRIGHT_AVAILABLE or not self.config["enable_playwright"]:
+class SPAScanner:
+    def __init__(self, target_url, store, emit, cookies, extra_headers, queue, is_valid_fn, enable_spa_interact=False):
+        self.target_url = target_url; self.store = store; self.emit = emit
+        self.cookies = cookies; self.extra_headers = extra_headers
+        self.queue = queue; self.is_valid = is_valid_fn
+        self._enable_spa_interact = enable_spa_interact
+
+    async def run(self):
+        if not PLAYWRIGHT_AVAILABLE:
+            self.emit.info("[SPA] Playwright not installed — skipping")
             return
-        self.emit.info("[Playwright] Launching headless browser…")
+        self.emit.always_info("Phase: SPA headless Chromium scan...")
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                ctx_opts: dict = {}
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True, args=[
+                    "--no-sandbox","--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled"])
+                ctx_args: dict = {"ignore_https_errors": True}
                 if self.cookies:
-                    ctx_opts["extra_http_headers"] = {
-                        "Cookie": "; ".join(f"{k}={v}" for k, v in self.cookies.items())
-                    }
+                    parsed = urlparse(self.target_url)
+                    ctx_args["storage_state"] = {"cookies": [
+                        {"name":k,"value":v,"domain":parsed.netloc,"path":"/"}
+                        for k, v in self.cookies.items()]}
                 if self.extra_headers:
-                    ctx_opts.setdefault("extra_http_headers", {}).update(self.extra_headers)
+                    ctx_args["extra_http_headers"] = self.extra_headers
+                context = await browser.new_context(**ctx_args)
+                await context.route(
+                    re.compile(r'\.(png|jpg|jpeg|gif|svg|ico|woff2?|ttf|css|mp4|mp3)(\?.*)?$'),
+                    lambda route, _: asyncio.create_task(route.abort()))
+                page = await context.new_page()
 
-                context = await browser.new_context(**ctx_opts)
-                page    = await context.new_page()
+                async def on_request(req):
+                    url = req.url; rtype = req.resource_type; method = req.method or "GET"
+                    if rtype in ("fetch","xhr"):
+                        hdrs = dict(req.headers or {})
+                        auth = any(h.lower() in ("authorization","cookie","x-auth-token")
+                                   for h in hdrs)
+                        self.store.add_endpoint(url, method=method, source="SPA_XHR",
+                                                score=Conf.CONFIRMED, auth_required=auth)
+                        if self.store.merge_headers(url, method, hdrs):
+                            self.emit.info(f"[SPA-Headers] captured for {url}")
+                        if method == "POST":
+                            try:
+                                post_data = req.post_data
+                                if post_data:
+                                    try:
+                                        body_obj = json.loads(post_data)
+                                        if isinstance(body_obj, dict):
+                                            self.store.add_endpoint(
+                                                url, method="POST", source="SPA_XHR_POST",
+                                                params=list(body_obj.keys()),
+                                                score=Conf.CONFIRMED, auth_required=auth)
+                                    except Exception:
+                                        parsed_body = parse_qs(post_data)
+                                        if parsed_body:
+                                            self.store.add_endpoint(
+                                                url, method="POST", source="SPA_XHR_POST",
+                                                params=list(parsed_body.keys()),
+                                                score=Conf.CONFIRMED, auth_required=auth)
+                            except Exception:
+                                pass
+                        self.emit.success(f"[SPA-XHR] {method} {url}")
+                    elif rtype == "websocket":
+                        self.store.add_endpoint(url, method="WS", source="SPA_WebSocket",
+                                                score=Conf.CONFIRMED)
+                        # Stored in intel — no output
+                    elif rtype == "script" and self.is_valid(url):
+                        self.queue.put_nowait((url, 1, "SPA_Script"))
 
-                async def handle_request(req):
-                    url = req.url
-                    if req.resource_type in ("fetch","xhr","websocket"):
-                        auth = any(h in (req.headers or {})
-                                   for h in ("authorization","cookie","x-auth-token"))
-                        self.store.add_endpoint(
-                            url, method=req.method, source="Playwright_Dynamic",
-                            confidence_increment=Confidence.CONFIRMED,
-                            auth_required=auth)
-                        self.emit.success(f"[Dynamic] {req.method} {url}")
-                    elif req.resource_type == "script" and self.is_valid(url):
-                        self.queue.put_nowait((url, 1, "Playwright_Script"))
+                page.on("request", on_request)
 
-                page.on("request", handle_request)
-                await page.goto(self.target_url, wait_until="networkidle", timeout=15000)
+                async def on_response(resp):
+                    try:
+                        r_url    = resp.url
+                        r_method = resp.request.method or "GET"
+                        r_status = resp.status
+                        r_rtype  = resp.request.resource_type
+                        if r_rtype not in ("fetch", "xhr"): return
+                        if r_status not in range(200, 210): return
+                        ct = (resp.headers.get("content-type") or "").lower()
+                        if "json" not in ct: return
+                        body = await resp.text()
+                        if not body or len(body) > 512_000: return
+                        try:
+                            obj = json.loads(body)
+                        except Exception:
+                            return
+                        def _mine_resp(o, depth=0):
+                            if depth > 3 or not isinstance(o, dict): return
+                            for k, v in o.items():
+                                if re.match(
+                                    r'^(?:id|uid|user_?id|order_?id|basket_?id|'
+                                    r'item_?id|product_?id|address_?id|card_?id)$',
+                                    str(k), re.I
+                                ):
+                                    vstr = str(v) if v is not None else ""
+                                    if re.match(r'^\d{1,12}$', vstr):
+                                        r_key = self.store._key(r_url, r_method)
+                                        if r_key in self.store.endpoints:
+                                            ep  = self.store.endpoints[r_key]
+                                            obs = ep["observed_values"].setdefault(k, [])
+                                            if vstr not in obs:
+                                                obs.append(vstr)
+                                                self.emit.info(f"[SPA-ResponseID] {k}={vstr} <- {r_url}")
+                                if isinstance(v, (dict, list)):
+                                    _mine_resp(v, depth + 1)
+                        if isinstance(obj, list):
+                            for item in obj[:10]: _mine_resp(item)
+                        else:
+                            _mine_resp(obj)
+                    except Exception:
+                        pass
+
+                page.on("response", on_response)
+
+                try:
+                    await page.goto(self.target_url, wait_until="networkidle", timeout=20000)
+                except Exception as e:
+                    self.emit.info(f"[SPA] Goto warning: {e}")
                 try:
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(1)
-                    btn = page.locator("button").first
-                    if await btn.is_visible():
-                        await btn.click()
-                        await asyncio.sleep(1)
+                    await asyncio.sleep(1.5)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await asyncio.sleep(0.5)
                 except Exception:
                     pass
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                    await asyncio.sleep(1.0)
+                except Exception:
+                    pass
+                if self._enable_spa_interact:
+                    await self._interact(page)
+                await self._harvest_dom(page)
+                await self._harvest_hash(page)
                 await browser.close()
+                self.emit.always_info("SPA dynamic analysis complete")
         except Exception as e:
-            self.emit.warn(f"[Playwright] Error: {e}")
+            self.emit.info(f"[SPA] Error: {e}")
 
-    # ---- worker ----
+    async def _interact(self, page):
+        for sel in ["[role='menuitem']","[role='tab']",".nav-item","[data-toggle]","a[href]:not([href^='http'])"]:
+            try:
+                for el in (await page.query_selector_all(sel))[:8]:
+                    try:
+                        if await el.is_visible():
+                            await el.click(timeout=1500); await asyncio.sleep(0.4)
+                    except Exception: pass
+            except Exception: pass
+        try:
+            for form in (await page.query_selector_all("form"))[:5]:
+                try:
+                    if not await form.is_visible(): continue
+                    for inp in (await form.query_selector_all(
+                        "input[type='text'],input[type='email'],input[type='number'],input:not([type])"
+                    ))[:6]:
+                        try:
+                            itype = await inp.get_attribute("type") or "text"
+                            name  = (await inp.get_attribute("name") or "").lower()
+                            if "email" in name or itype == "email":
+                                await inp.fill("test@example.com", timeout=800)
+                            elif "quantity" in name or "qty" in name or itype == "number":
+                                await inp.fill("1", timeout=800)
+                            else:
+                                await inp.fill("test", timeout=800)
+                        except Exception: pass
+                    submit = await form.query_selector(
+                        "button[type='submit'],input[type='submit'],button:not([type])")
+                    if submit and await submit.is_visible():
+                        await submit.click(timeout=1500); await asyncio.sleep(0.5)
+                except Exception: pass
+        except Exception: pass
+        try:
+            for el in (await page.query_selector_all("button:not([disabled]):not([type='submit'])"))[:10]:
+                try:
+                    if await el.is_visible():
+                        await el.click(timeout=1500); await asyncio.sleep(0.3)
+                except Exception: pass
+        except Exception: pass
 
-    async def worker(self, session, worker_id: int, crawl_delay: float):
+    async def _harvest_dom(self, page):
+        try:
+            links = await page.evaluate("""
+                () => Array.from(document.querySelectorAll('[href],[src],[action]'))
+                    .map(e => e.href || e.src || e.action)
+                    .filter(u => u && u.startsWith('/'))
+            """)
+            for path in (links or []):
+                full = urljoin(self.target_url, path) if path.startswith("/") else path
+                if self.is_valid(full):
+                    self.store.add_endpoint(full, source="SPA_DOM", score=Conf.MEDIUM)
+                    self.queue.put_nowait((full, 1, "SPA_DOM"))
+        except Exception: pass
+
+    async def _harvest_hash(self, page):
+        try:
+            src = await page.content()
+            for r in re.findall(r'["\']#/([a-zA-Z0-9_\-/]+)["\']', src):
+                url = self.target_url.rstrip("/") + "/#/" + r
+                self.store.add_endpoint(url, source="SPA_HashRoute", score=Conf.MEDIUM)
+                self.emit.info(f"[SPA-Hash] {url}")
+        except Exception: pass
+
+# ══════════════════════════════════════════════════════════════════════
+# CORE SPIDER
+# ══════════════════════════════════════════════════════════════════════
+
+class Spider:
+    def __init__(self, target, cfg, emit, cookies, extra_headers):
+        self.target = target; self.cfg = cfg; self.emit = emit
+        self.cookies = cookies; self.extra_headers = extra_headers
+        self.base_domain = urlparse(target).netloc
+        self.store = Store()
+        self.visited: Set[str] = set()
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.sem = asyncio.Semaphore(cfg.concurrency)
+        self.rl = DomainRateLimiter()
+        self._depth_cnt: Dict[int,int] = defaultdict(int)
+        self.queue.put_nowait((target, 0, "Seed"))
+
+    def is_valid(self, url):
+        try:
+            p = urlparse(url)
+        except Exception:
+            return False
+        if p.netloc != self.base_domain: return False
+        low = url.lower()
+        if any(low.endswith(ext) or f"{ext}?" in low for ext in self.cfg.extensions_to_ignore):
+            return False
+        return bool(p.scheme in ("http","https"))
+
+    def _over_budget(self, depth):
+        return self._depth_cnt[depth] >= self.cfg.max_urls_per_depth
+
+    def _detect_tech(self, headers, body, url):
+        tech: Set[str] = set()
+        srv     = (headers.get("Server","")       or headers.get("server","")).lower()
+        xpb     = (headers.get("X-Powered-By","") or headers.get("x-powered-by","")).lower()
+        body_lo = body.lower()
+
+        if "nginx"      in srv: tech.add("Nginx")
+        if "apache"     in srv: tech.add("Apache")
+        if "cloudflare" in srv: tech.add("Cloudflare")
+        if "iis"        in srv: tech.add("IIS")
+        if "gunicorn"   in srv: tech.add("Python/Gunicorn")
+        if "werkzeug"   in srv: tech.add("Python/Werkzeug")
+        if "jetty"      in srv: tech.add("Java/Jetty")
+        if "tomcat"     in srv: tech.add("Java/Tomcat")
+        if "lighttpd"   in srv: tech.add("Lighttpd")
+        if "caddy"      in srv: tech.add("Caddy")
+        if "php"        in xpb: tech.add("PHP")
+        if "express"    in xpb: tech.add("Node.js/Express")
+        if "asp.net"    in xpb: tech.add("ASP.NET")
+        if "next.js"    in xpb: tech.add("Next.js")
+        if "servlet"    in xpb or "jsp" in xpb: tech.add("Java")
+        if headers.get("X-Shopify-Stage"): tech.add("Shopify")
+        if headers.get("x-drupal-cache") or headers.get("X-Drupal-Cache"): tech.add("Drupal")
+        if headers.get("x-pingback") or "xmlrpc.php" in body: tech.add("WordPress")
+        if headers.get("x-generator","").lower().startswith("drupal"): tech.add("Drupal")
+        if "laravel_session" in (headers.get("set-cookie","") or "").lower(): tech.add("Laravel")
+        if "django" in (headers.get("set-cookie","") or "").lower(): tech.add("Django")
+        if "_next/" in body or "__NEXT_DATA__" in body: tech.add("Next.js")
+        if "__nuxt" in body or "_nuxt/" in body: tech.add("Nuxt.js")
+        _is_angular = (
+            "<app-root" in body or "ng-version=" in body or
+            ("zone.js" in body_lo and "angular" in body_lo) or
+            "platformBrowserDynamic" in body or "BrowserModule" in body
+        )
+        if _is_angular: tech.add("Angular")
+        if re.search(r'<[^>]+\bng-app\b', body) or re.search(r'<[^>]+\bng-controller\b', body):
+            tech.add("AngularJS")
+        _is_react = (
+            "ReactDOM" in body or "react-dom" in body_lo or
+            "__reactFiber" in body or "__reactProps" in body or "data-reactroot" in body
+        )
+        if _is_react and "Angular" not in tech: tech.add("React")
+        if "__vue_app__" in body or "v-bind:" in body or "data-v-" in body: tech.add("Vue.js")
+        elif "vue" in body_lo and "v-app" in body: tech.add("Vue.js")
+        if "__svelte" in body or "svelte-" in body_lo: tech.add("Svelte")
+        if "wp-content" in body or "wp-json" in body or "wp-login" in body: tech.add("WordPress")
+        if "Drupal.settings" in body or "drupal.js" in body_lo: tech.add("Drupal")
+        if "csrfmiddlewaretoken" in body_lo or ("django" in body_lo and "__admin" in body_lo):
+            tech.add("Django")
+        if "laravel" in body_lo and ("csrf_token" in body_lo or "blade" in body_lo):
+            tech.add("Laravel")
+        if "rails-ujs" in body_lo or 'data-remote="true"' in body_lo: tech.add("Ruby on Rails")
+        if "jsf" in body_lo and "javax.faces" in body_lo: tech.add("Java/JSF")
+        if "socket.io" in body_lo: tech.add("Socket.IO")
+        if "graphql" in body_lo and ("__schema" in body or "introspection" in body_lo):
+            tech.add("GraphQL")
+        if re.search(r'class=["\'][^"\']*\b(?:navbar-brand|btn-primary|btn-secondary|col-md-|container-fluid)\b', body):
+            tech.add("Bootstrap")
+        if "jquery" in body_lo and ("$.ajax" in body or "$(document)" in body): tech.add("jQuery")
+        if "material-icons" in body_lo or "mat-" in body_lo: tech.add("Angular Material")
+
+        for t in tech: self.store.tech_stack.add(t)
+        if tech: self.emit.always_info(f"Tech detected: {', '.join(sorted(tech))}")
+
+    async def _check_sourcemap(self, session, js_url):
+        s, _, _ = await fetch(session, "GET", js_url + ".map", self.rl)
+        if s == 200:
+            # Stored in intel — no output
+            self.store.add_sourcemap(js_url + ".map", js_url)
+
+    def _queue_url(self, url, depth, source):
+        if not self.is_valid(url): return
+        norm = normalize(url)
+        if norm in self.visited: return
+        self.store.add_query_params(url)
+        self.queue.put_nowait((url, depth, source))
+
+    @staticmethod
+    def _collect_json_keys(obj) -> List[str]:
+        if isinstance(obj, dict):
+            return [k for k in obj.keys() if isinstance(k, str)]
+        if isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    return [k for k in item.keys() if isinstance(k, str)]
+        return []
+
+    @staticmethod
+    def _strip_param_suffix(name: str) -> str:
+        for suf in Store._PARAM_SUFFIXES:
+            if name.endswith(suf):
+                return name[: -len(suf)]
+        return name
+
+    def _extract_body_param_hints(self, url, body):
+        found = []
+        err_pats = [
+            r"""(?:missing|required|invalid|unknown|bad)\s+(?:field|param|parameter|key|argument)[:\s]+["']?([a-zA-Z_][a-zA-Z0-9_]{2,40})["']?""",
+            r"""["']([a-zA-Z_][a-zA-Z0-9_]{2,40})["']\s+(?:is required|is missing|not found|is invalid)""",
+            r"""(?:field|param|parameter)[:\s]+["']([a-zA-Z_][a-zA-Z0-9_]{2,40})["']""",
+        ]
+        for pat in err_pats:
+            for m in re.finditer(pat, body, re.I):
+                n = m.group(1).strip()
+                if n and n not in found: found.append(n)
+        for m in re.finditer(
+            r"""["'](?:required|fields|params|parameters|missing|expected)["']\s*:\s*\[([^\]]{1,400})\]""",
+            body, re.I
+        ):
+            for nm in re.finditer(r"""["']([a-zA-Z_][a-zA-Z0-9_]{2,40})["']""", m.group(1)):
+                n = nm.group(1)
+                if n not in found: found.append(n)
+        for m in re.finditer(r"""name=["']([a-zA-Z_][a-zA-Z0-9_]{2,40})["']""", body):
+            n = m.group(1)
+            if n not in found: found.append(n)
+        if found:
+            self.store.add_endpoint(url, source="Body_Hints", score=Conf.LOW)
+            changed = self.store.add_runtime_params(url, "GET", found)
+            if changed:
+                self.emit.info("[Body-Hints] %s <- %s" % (found, url))
+
+    def _process_html(self, url, text, depth, source):
+        soup = BeautifulSoup(text, "lxml")
+        Extractor.html_comments(soup, url, self.store, self.emit)
+        for tag in soup.find_all(["a","link","area"], href=True):
+            href = tag.get("href","").strip()
+            if href and not href.startswith(("javascript:","mailto:","tel:","#")):
+                self._queue_url(urljoin(url, href), depth+1, "HTML_Link")
+        for tag in soup.find_all("script", src=True):
+            src = tag.get("src","").strip()
+            if src:
+                full = urljoin(url, src)
+                if self.is_valid(full): self._queue_url(full, depth+1, "HTML_Script")
+        for tag in soup.find_all("script"):
+            if not tag.get("src") and tag.string:
+                Extractor.js_endpoints(tag.string, url, self.store, self.emit)
+                Extractor.js_params(tag.string, url, self.store, self.emit)
+                Extractor.secrets(tag.string, url, self.store, self.emit)
+        for form in soup.find_all("form"):
+            action = form.get("action") or url
+            full   = urljoin(url, action)
+            method = (form.get("method") or "POST").upper()
+            inputs = []
+            for el in form.find_all(["input","select","textarea","button","datalist"]):
+                nm = el.get("name","").strip()
+                if nm and nm not in inputs: inputs.append(nm)
+                for da in ("data-param","data-field","data-name","data-key","data-input"):
+                    dv = el.get(da,"").strip()
+                    if dv and dv not in inputs: inputs.append(dv)
+            for da in ("data-params","data-fields","data-inputs"):
+                dv = form.get(da,"").strip()
+                if dv:
+                    for part in re.split(r"[,;|\s]+", dv):
+                        p = part.strip()
+                        if p and p not in inputs: inputs.append(p)
+            if inputs: self.emit.info("[Form] %s %s <- [%s]" % (method, full, ", ".join(inputs)))
+            self.store.add_endpoint(full, method=method, source="Form", score=Conf.HIGH)
+            self.store.add_query_params(full)
+            _fkey = self.store._key(full, method)
+            if _fkey in self.store.endpoints:
+                _ep = self.store.endpoints[_fkey]
+                for _p in inputs:
+                    if _p and _p not in _ep["params"]["form"]: _ep["params"]["form"].append(_p)
+            self._queue_url(full, depth+1, "Form_Action")
+        for attr in ("data-src","data-href","data-url"):
+            for tag in soup.find_all(attrs={attr: True}):
+                self._queue_url(urljoin(url, tag[attr]), depth+1, "DataAttr")
+        for tag in soup.find_all("script", type="application/ld+json"):
+            if tag.string:
+                for m in re.finditer(r'"(?:url|@id|contentUrl|embedUrl)"\s*:\s*"([^"]+)"', tag.string):
+                    self._queue_url(m.group(1), depth+1, "JSONLD")
+
+    async def _process_js(self, url, text, session):
+        Extractor.secrets(text, url, self.store, self.emit)
+        Extractor.js_endpoints(text, url, self.store, self.emit)
+        Extractor.js_params(text, url, self.store, self.emit)
+        await self._check_sourcemap(session, url)
+        for m in re.finditer(r'import\s*\(\s*["\']([^"\']+)["\']', text):
+            full = urljoin(url, m.group(1))
+            if self.is_valid(full): self._queue_url(full, 1, "JS_DynImport")
+        for m in re.finditer(r'["\']\/(?:static|_next|assets)\/[a-zA-Z0-9._\-\/]+\.js["\']', text):
+            path = m.group(0).strip('"\'')
+            self._queue_url(urljoin(url, path), 1, "JS_Chunk")
+
+    async def _worker(self, session, worker_id, crawl_delay):
         while True:
-            item_acquired = False
+            acquired = False
             try:
                 async with self.sem:
                     try:
-                        url, depth, source = await asyncio.wait_for(
-                            self.queue.get(), timeout=3.0)
-                        item_acquired = True
+                        url, depth, source = await asyncio.wait_for(self.queue.get(), timeout=4.0)
+                        acquired = True
                     except asyncio.TimeoutError:
                         break
-
-                    norm = normalize_url(url)
-                    if norm in self.visited \
-                       or depth > self.config["max_depth"] \
-                       or self._over_budget(depth):
-                        pass  # skip — task_done called in finally
+                    norm = normalize(url)
+                    if norm in self.visited or depth > self.cfg.max_depth or self._over_budget(depth):
+                        pass
                     else:
                         self.visited.add(norm)
-                        self._depth_counts[depth] += 1
-
-                        status, headers, text = await fetch_with_retry(
-                            session, "GET", url, self.rate_limiter,
-                            max_retries=self.config["max_retries"],
-                            base_delay=self.config["retry_base_delay"])
-
-                        if status is None or text is None:
-                            pass  # network failure — skip
-                        else:
-                            self.store.record_status(url, "GET", status)
-
-                            # Auth-wall detection
-                            if status in (401, 403):
-                                self.store.add_endpoint(
-                                    url, source=source,
-                                    confidence_increment=Confidence.MEDIUM,
-                                    auth_required=True)
-                                self.emit.always_info(f"[Auth-wall:{status}] {url}")
-                            elif status == 200:
-                                if depth == 0 or source == "Root":
-                                    self.detect_tech(headers, url, text)
-                                    Extractor.parse_csp_endpoints(headers, url, self.store, self.emit)
-
-                                ct = (headers.get("Content-Type","") or
-                                      headers.get("content-type","")).lower()
-
+                        self._depth_cnt[depth] += 1
+                        s, hdrs, body = await fetch(session, "GET", url, self.rl,
+                                                    max_retries=self.cfg.max_retries,
+                                                    base_delay=self.cfg.retry_base_delay)
+                        if s is not None and body is not None:
+                            self.store.record_status(url, "GET", s)
+                            if s in (401, 403):
+                                self.store.add_endpoint(url, source=source,
+                                                        score=Conf.MEDIUM, auth_required=True)
+                                self.emit.info(f"[Auth-wall:{s}] {url}")
+                            elif s == 200:
+                                if depth <= 1:
+                                    self._detect_tech(hdrs, body, url)
+                                    Extractor.csp_hints(hdrs, url, self.store, self.emit)
+                                ct = (hdrs.get("Content-Type","") or hdrs.get("content-type","")).lower()
                                 if "text/html" in ct:
-                                    self.store.add_endpoint(
-                                        url, source=f"HTML({source})",
-                                        confidence_increment=Confidence.MEDIUM)
-                                    soup = BeautifulSoup(text, "html.parser")
-                                    Extractor.extract_comments(soup, url, self.store, self.emit)
-
-                                    for a in soup.find_all("a", href=True):
-                                        href = urljoin(url, a["href"])
-                                        if self.is_valid(href):
-                                            self.queue.put_nowait((href, depth+1, "Link"))
-
-                                    for form in soup.find_all("form"):
-                                        action = form.get("action") or url
-                                        full   = urljoin(url, action)
-                                        method = form.get("method","POST").upper()
-                                        inputs = [i.get("name") for i in
-                                                  form.find_all(["input","select","textarea"])
-                                                  if i.get("name")]
-                                        if inputs:
-                                            self.emit.info(
-                                                f"[Form] {method} {full} ({', '.join(inputs)})")
-                                        self.store.add_endpoint(
-                                            full, method=method, source="Form",
-                                            params=inputs or [],
-                                            confidence_increment=Confidence.HIGH)
-
-                                elif "javascript" in ct or url.endswith(".js"):
-                                    self.store.add_endpoint(
-                                        url, source="JS_File",
-                                        confidence_increment=Confidence.LOW)
-                                    Extractor.extract_secrets(text, url, self.store, self.emit)
-                                    Extractor.extract_js_endpoints(text, url, self.store, self.emit)
-                                    Extractor.extract_js_params(text, url, self.store, self.emit)
-                                    await self.check_sourcemap(session, url)
-
+                                    self.store.add_endpoint(url, source=f"HTML({source})", score=Conf.MEDIUM)
+                                    self._process_html(url, body, depth, source)
+                                    self._extract_body_param_hints(url, body)
+                                elif "javascript" in ct or url.split("?")[0].endswith(".js"):
+                                    self.store.add_endpoint(url, source="JS_File", score=Conf.LOW)
+                                    await self._process_js(url, body, session)
                                 elif "json" in ct:
-                                    self.store.add_endpoint(
-                                        url, source="JSON_Response",
-                                        confidence_increment=Confidence.MEDIUM)
-
+                                    self.store.add_endpoint(url, source="JSON_Response", score=Conf.MEDIUM)
+                                    for m in re.finditer(r'"([/][a-zA-Z0-9_\-\/]+)"', body):
+                                        path = m.group(1)
+                                        if len(path) > 3:
+                                            full = urljoin(url, path)
+                                            if self.is_valid(full):
+                                                self.store.add_endpoint(full, source="JSON_Path", score=Conf.LOW)
+                                                if not self._over_budget(depth + 1):
+                                                    self._queue_url(full, depth + 1, "JSON_Path")
+                                    self._extract_body_param_hints(url, body)
+                                    try:
+                                        _jdata = json.loads(body)
+                                        _top_keys = self._collect_json_keys(_jdata)
+                                        _risk = [
+                                            k for k in _top_keys
+                                            if self._strip_param_suffix(k) in Store._RISK_PARAMS
+                                        ]
+                                        if _risk:
+                                            changed = self.store.add_runtime_params(url, "GET", _risk)
+                                            if changed:
+                                                _bases = self.store.endpoints[
+                                                    self.store._key(url, "GET")
+                                                ]["params"]["runtime"]
+                                                self.emit.info(f"[JSON-Params] {_bases} <- {url}")
+                                    except Exception:
+                                        pass
+                                elif "xml" in ct:
+                                    try:
+                                        root = ET.fromstring(body)
+                                        ns = {"sm":"http://www.sitemaps.org/schemas/sitemap/0.9"}
+                                        for loc in root.findall("sm:url/sm:loc", ns):
+                                            if loc.text: self._queue_url(loc.text, depth+1, "XML_Sitemap")
+                                    except Exception:
+                                        pass
             except Exception:
                 pass
             finally:
-                if item_acquired:
+                if acquired:
                     self.queue.task_done()
-                if item_acquired and crawl_delay > 0:
-                    await asyncio.sleep(crawl_delay)
-                elif item_acquired:
-                    await asyncio.sleep(random.uniform(
-                        self.config["jitter_min"], self.config["jitter_max"]))
-
-    # ---- run ----
+                if acquired:
+                    delay = crawl_delay if crawl_delay > 0 else random.uniform(
+                        self.cfg.jitter_min, self.cfg.jitter_max)
+                    await asyncio.sleep(delay)
 
     async def run(self):
-        req_headers = {"User-Agent": self.config["user_agent"]}
+        req_headers = {
+            "User-Agent": self.cfg.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                      "application/json;q=0.8,*/*;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
         req_headers.update(self.extra_headers)
+        connector = aiohttp.TCPConnector(limit=self.cfg.concurrency, ttl_dns_cache=300, ssl=False)
+        timeout   = aiohttp.ClientTimeout(total=self.cfg.timeout)
+        async with aiohttp.ClientSession(headers=req_headers, cookies=self.cookies,
+                                          timeout=timeout, connector=connector) as session:
+            if self.cfg.enable_graphql:
+                await probe_graphql(session, self.target, self.store, self.emit, self.rl)
+            if self.cfg.enable_openapi:
+                await probe_openapi(session, self.target, self.store, self.emit, self.rl)
+            robots = RobotsParser(session, self.target, self.store, self.queue,
+                                  self.emit, self.rl, self.is_valid)
+            crawl_delay = await robots.run()
 
-        connector = aiohttp.TCPConnector(limit=self.config["concurrency"], ttl_dns_cache=300)
-        timeout   = aiohttp.ClientTimeout(total=self.config["timeout"])
+            # Unconditionally probe canonical sitemap paths
+            for _smap in ("/sitemap.xml", "/sitemap_index.xml", "/.well-known/sitemap.xml"):
+                _smap_url = urljoin(self.target, _smap)
+                if _smap_url not in robots._sitemap_seen:
+                    _s, _, _t = await fetch(session, "GET", _smap_url, self.rl)
+                    if _s == 200 and _t:
+                        await robots.parse_sitemap(_smap_url)
 
-        async with aiohttp.ClientSession(
-            headers=req_headers,
-            cookies=self.cookies,
-            timeout=timeout,
-            connector=connector
-        ) as session:
-            crawl_delay = await self.check_robots(session)
+            # Probe .well-known paths
+            for _wk in ("/.well-known/security.txt", "/.well-known/change-password"):
+                _wk_url = urljoin(self.target, _wk)
+                _s, _, _t = await fetch(session, "GET", _wk_url, self.rl)
+                if _s == 200 and _t:
+                    self.store.add_endpoint(_wk_url, source="WellKnown", score=Conf.LOW)
+                    self.emit.always_success(f".well-known found: {_wk_url}")
+                    for _m in re.finditer(r'(?:^|\s)((?:https?://[^\s]+|/[a-zA-Z0-9_\-/]+))', _t, re.M):
+                        _path = _m.group(1).strip()
+                        if _path.startswith("/"):
+                            _full = urljoin(self.target, _path)
+                            if self.is_valid(_full):
+                                self.store.add_endpoint(_full, source="WellKnown", score=Conf.LOW)
+                                self._queue_url(_full, 1, "WellKnown")
 
-            if self.config["enable_graphql_probe"]:
-                await probe_graphql(session, self.target_url, self.store,
-                                    self.emit, self.rate_limiter)
+            if self.cfg.use_playwright:
+                spa = SPAScanner(self.target, self.store, self.emit, self.cookies,
+                                 self.extra_headers, self.queue, self.is_valid,
+                                 enable_spa_interact=self.cfg.enable_spa_interact)
+                await spa.run()
 
-            if self.config["enable_openapi_probe"]:
-                await probe_openapi(session, self.target_url, self.store,
-                                    self.emit, self.rate_limiter)
+            self.emit.always_info(
+                f"Crawl started — depth={self.cfg.max_depth}, "
+                f"concurrency={self.cfg.concurrency}, "
+                f"auth={'yes' if self.cookies or self.extra_headers else 'no'}, "
+                f"seed={self.queue.qsize()} URLs")
 
-            await self.playwright_scan()
-
-            self.emit.always_info(f"[Spider] Crawling started (depth={self.config['max_depth']}, "
-                           f"concurrency={self.config['concurrency']}, "
-                           f"authenticated={'yes' if self.cookies or self.extra_headers else 'no'})…")
-
-            tasks = [asyncio.create_task(self.worker(session, i, crawl_delay))
-                     for i in range(self.config["concurrency"])]
+            workers = [asyncio.create_task(self._worker(session, i, crawl_delay))
+                       for i in range(self.cfg.concurrency)]
             await self.queue.join()
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            for w in workers: w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
-            if self.config["enable_probing"]:
-                prober = IntelligentProber(session, self.store, self.emit,
-                                           self.rate_limiter, self.config)
+            if self.cfg.enable_probing:
+                prober = IntelligentProber(session, self.store, self.emit, self.rl, self.cfg)
                 await prober.run()
 
-# =================================================
-# FRAMEWORK ENTRY POINT
-# =================================================
+# ══════════════════════════════════════════════════════════════════════
+# AUTO-SAVE
+# ══════════════════════════════════════════════════════════════════════
 
-def run(target: str, emit, options: dict = None, stop_check=None, pause_check=None):
-    """
-    options keys (all optional):
-      cookie         : str | dict | file_path  — session cookie(s)
-      auth           : alias for cookie
-      headers        : dict — extra headers (Authorization, X-API-Key, etc.)
-      concurrency    : int
-      timeout        : int
-      max_depth      : int
-      max_retries    : int
-      enable_probing : bool
-      verbose        : bool  — False (default): clean output, only critical findings + summary
-                               True: full debug logs for every discovery event
-      output_format  : "json" | "jsonl" | "csv" | "burp"
-      output_file    : str — path to save report
-    """
+def _auto_save(store: Store, target: str, out_path: Optional[str], fmt: str, emit) -> str:
+    domain    = re.sub(r'[^a-zA-Z0-9_\-]', '_', urlparse(target).netloc)
+    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+    json_path = out_path if (out_path and out_path.endswith(".json")) \
+                else f"hellhound_{domain}_{ts}.json"
+    try:
+        Path(json_path).write_text(store.export(target, fmt="json"))
+        emit.always_info(f"Report saved: {json_path}")
+    except Exception as e:
+        emit.info(f"Report save failed: {e}")
+        json_path = ""
+    if out_path and fmt != "json":
+        try:
+            Path(out_path).write_text(store.export(target, fmt=fmt))
+            emit.always_info(f"{fmt.upper()} saved: {out_path}")
+        except Exception as e:
+            emit.info(f"{fmt.upper()} save failed: {e}")
+    return json_path
+
+# ══════════════════════════════════════════════════════════════════════
+# SHARED RUN LOGIC
+# ══════════════════════════════════════════════════════════════════════
+
+def _do_run(target: str, cfg: Config, emit,
+            cookies: Dict[str, str], extra_headers: Dict[str, str]) -> dict:
     if not target.startswith("http"):
         target = "https://" + target
 
-    verbose = (options or {}).get("verbose", False)
-    mode_label = "verbose" if verbose else "clean"
-    if verbose:
-        emit.info(f"Hellhound Spider v{VERSION} — target: {target} — mode: verbose")
-    else:
-        emit.success(f"Hellhound Spider v{VERSION} — target locked")
-    start_time = time.time()
+    emit.always_info(f"Hellhound Spider v{VERSION} — {target}")
+    start = time.time()
 
-    spider: Optional[AutonomousSpider] = None
+    spider: Optional[Spider] = None
     try:
-        spider = AutonomousSpider(target, emit, options or {})
+        spider = Spider(target, cfg, emit, cookies, extra_headers)
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(spider.run())
     except KeyboardInterrupt:
-        emit.warn("Interrupted by user.")
+        emit.always_info("Scan interrupted — partial results follow")
     except ValueError as e:
-        emit.warn(f"Config error: {e}")
+        emit.always_info(f"Config error: {e}")
         return {"raw": str(e), "intel": {}}
     except Exception as e:
-        emit.warn(f"Spider error: {e}")
+        emit.always_info(f"Spider error: {e}")
 
     if spider is None:
         return {"raw": "Spider failed to initialize.", "intel": {}}
 
-    elapsed     = time.time() - start_time
-    fmt         = (options or {}).get("output_format","json")
-    report_data = spider.store.export(target, fmt=fmt)
-    report_dict = spider.store.export(target, fmt="json")  # always keep dict version
+    elapsed   = time.time() - start
+    json_path = _auto_save(spider.store, target, cfg.output_file, cfg.output_format, emit)
+    intel     = json.loads(spider.store.export(target, fmt="json"))
+    s         = intel.get("summary", {})
 
-    # Save to file if requested
-    output_file = (options or {}).get("output_file")
-    if output_file:
-        try:
-            Path(output_file).write_text(
-                report_data if isinstance(report_data, str) else json.dumps(report_data, indent=2))
-            emit.info(f"[Report] Saved to {output_file}")
-        except Exception as e:
-            emit.warn(f"[Report] Save failed: {e}")
-
-    try:
-        parsed_dict = json.loads(report_dict)
-        summary     = parsed_dict["summary"]
-    except Exception:
-        summary = {}
-
-    summary_str = (
+    raw_summary = (
         f"Target: {target} | "
         f"Time: {elapsed:.1f}s | "
-        f"Endpoints: {summary.get('endpoints_count','?')} | "
-        f"Confirmed: {summary.get('confirmed_count','?')} | "
-        f"High: {summary.get('high_confidence_count','?')} | "
-        f"Param-Sensitive: {summary.get('parameter_sensitive_count','?')} | "
-        f"Auth-Walled: {summary.get('auth_required_count','?')} | "
-        f"CORS Issues: {summary.get('cors_issues_count','?')} | "
-        f"Secrets: {summary.get('secrets_found','?')} | "
-        f"Tech: {', '.join(summary.get('tech_stack',[])) or 'unknown'}"
+        f"Endpoints: {s.get('total_endpoints','?')} | "
+        f"Confirmed: {s.get('confirmed','?')} | "
+        f"High: {s.get('high','?')} | "
+        f"Auth-Walled: {s.get('auth_required','?')} | "
+        f"Param-Sensitive: {s.get('parameter_sensitive','?')} | "
+        f"Secrets: {s.get('secrets','?')} | "
+        f"CORS: {s.get('cors_issues','?')} | "
+        f"GraphQL: {s.get('graphql_exposed','?')} | "
+        f"OpenAPI: {s.get('openapi_exposed','?')} | "
+        f"SourceMaps: {s.get('sourcemaps_exposed','?')} | "
+        f"Tech: {', '.join(s.get('tech_stack',[])) or 'unknown'}"
     )
 
-    # Always show final summary — use raw emit (not spider's VerboseEmit)
-    emit.success("Spider Scan Complete")
-    emit.success(summary_str)
+    emit.always_success("Spider scan complete")
+    emit.always_success(raw_summary)
 
-    return {
-        "raw":   summary_str,
-        "intel": json.loads(report_dict) if isinstance(report_dict, str) else report_dict
-    }
+    return {"raw": raw_summary, "intel": intel}
+
+# ══════════════════════════════════════════════════════════════════════
+# FRAMEWORK ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════
+
+def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_check=None):
+    """
+    Hellhound module entry point.
+
+    options keys (all optional — see OPTIONS list above):
+      cookie              : str | dict | file_path  — session cookie(s)
+      auth                : str — Authorization header e.g. "Bearer eyJ..."
+      headers             : dict — extra headers dict
+      max_depth           : int   (default 4)
+      concurrency         : int   (default 12)
+      timeout             : int   (default 15)
+      max_retries         : int   (default 3)
+      max_urls_per_depth  : int   (default 500)
+      verbose             : bool  — False: phase headers + summary only (default)
+                                    True:  all internal discovery logs
+      use_playwright      : bool  (default True)
+      enable_spa_interact : bool  (default False)
+      enable_probing      : bool  (default True)
+      enable_method_disc  : bool  (default True)
+      enable_graphql      : bool  (default True)
+      enable_openapi      : bool  (default True)
+      enable_cors         : bool  (default True)
+      output_format       : str   "json" | "jsonl" | "csv" | "burp"
+      output_file         : str   path to save report file
+
+    Returns:
+      {"raw": str, "intel": dict}
+    """
+    opts    = options or {}
+    raw_cookie = opts.get("cookie") or opts.get("auth")
+    cookies = SessionManager.parse_cookies(raw_cookie)
+    xhdrs   = SessionManager.parse_auth_header(opts.get("headers", {}))
+
+    # Fallback: if parse_cookies returned nothing but the raw value is a non-empty
+    # string with no "key=value" structure (e.g. a bare JWT or session token),
+    # store it under the key "token" so it is actually sent with requests.
+    if not cookies and isinstance(raw_cookie, str) and raw_cookie.strip():
+        raw_stripped = raw_cookie.strip()
+        if "=" not in raw_stripped or raw_stripped.startswith("eyJ"):
+            cookies = {"token": raw_stripped}
+
+    # Build Config — skip auth/header keys that don't belong in Config
+    _cfg_skip = {"cookie", "auth", "headers"}
+    cfg = Config(**{k: v for k, v in opts.items() if k not in _cfg_skip})
+    try:
+        cfg.validate()
+    except ValueError as e:
+        emit_obj.info(f"Config error: {e}")
+        return {"raw": str(e), "intel": {}}
+
+    if cookies:
+        emit_obj.info(f"Session cookies loaded: {list(cookies.keys())}")
+    elif xhdrs:
+        emit_obj.info(f"Auth header loaded: {list(xhdrs.keys())}")
+    else:
+        emit_obj.info("No credentials — unauthenticated scan")
+
+    emit = ModuleEmit(emit_obj, verbose=cfg.verbose)
+    return _do_run(target, cfg, emit, cookies, xhdrs)
