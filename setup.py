@@ -2,28 +2,24 @@ from setuptools import setup, find_packages
 
 setup(
     name="hellhound",
-    version="1.0",
+    version="12.0.0",
+    description="HELLHOUND — Modular Web Offensive Framework",
     packages=find_packages(),
     include_package_data=True,
-    package_data={
-    "hellhound": [
-        "config.yaml",
-        "scripts/*.sh",
-        "wordlists/**/*.txt",
-        "web/templates/*.html",
-        "modules/**/*"
-    ]
-},
     install_requires=[
-        "click",
-        "flask",
-        "flask-socketio",
+        "aiohttp",
+        "beautifulsoup4",
+        "colorama",
+        "playwright",
+        "pyyaml",
         "requests",
-        "pyyaml"
     ],
     entry_points={
         "console_scripts": [
-            "hellhound=hellhound.cli:main"
+            # This makes `hellhound` a real system command after install.
+            # Points to hellhound/cli.py → main()
+            "hellhound = hellhound.cli:main",
         ]
     },
+    python_requires=">=3.10",
 )
