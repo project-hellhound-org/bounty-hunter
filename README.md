@@ -1,9 +1,8 @@
 <p align="center">
   <img src="Images/hellhound.png" alt="Hellhound" width="600"/>
 </p>
-
 <h1 align="center">HELLHOUND</h1>
-
+<h1 align="center">Hellhound-Pentest(In-Dev)</h1>
 <p align="center">
   Modular web offensive framework for recon, attack surface mapping, and vulnerability detection.
 </p>
@@ -52,7 +51,11 @@ The framework has a strict separation of concerns: the console handles UI, the e
 
 ## Install
 
+It is recommended to use a virtual environment:
+
 ```bash
+python3 -m venv venv
+source venv/bin/activate
 git clone https://github.com/l4zz3rj0d/Hellhound-Pentest.git
 cd Hellhound-Pentest
 chmod +x install.sh
