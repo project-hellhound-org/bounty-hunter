@@ -924,28 +924,43 @@ def run(target, emit, options=None, stop_check=None, pause_check=None):
     # 2. Auth
     registrar = AutoRegistrar(target, http, emit, spider_intel=spider_intel)
     users = registrar.register_users()
-    
-    # 3. Discovery
+
+    # 3. Discovery — use Spider intel if available, otherwise fallback to internal probe
     disc_sess = make_session(10)
     if users["userA"].get("session"):
-        for k,v in users["userA"]["session"].headers.items():
+        for k, v in users["userA"]["session"].headers.items():
             if k.lower() == "authorization": disc_sess.headers[k] = v
-            
+
     discovery = Discovery(http, disc_sess, emit, external_endpoints_file=None)
-    
+
     if spider_intel:
-        raw_eps = spider_intel.get("js_endpoints", [])
-        # Also load surface endpoints (forms)
-        raw_eps.extend([ep['url'] for ep in spider_intel.get("endpoints", [])])
-        
+        # Spider brain already mapped the surface — feed it directly, skip re-crawl
+        raw_eps = list(spider_intel.get("js_endpoints", []))
+        raw_eps.extend([ep["url"] for ep in spider_intel.get("endpoints", [])
+                        if isinstance(ep, dict)])
+        fed = 0
+        skip_ext = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".css",
+                    ".woff", ".woff2", ".ttf", ".ico", ".map")
         for ep in raw_eps:
             if ep.startswith("http"):
                 ep = urllib.parse.urlparse(ep).path
             if not ep.startswith("/"):
                 ep = "/" + ep
+            if any(ep.lower().endswith(x) for x in skip_ext):
+                continue
             discovery.found.add(ep)
-        
-    discovery.probe(workers=20)
+            fed += 1
+        emit.info(f"Spider feed: {fed} endpoints loaded — skipping internal crawl")
+        # Still probe COMMON_PATHS not covered by Spider (admin panels, config files etc.)
+        spider_paths = set(discovery.found)
+        extra = [p for p in COMMON_PATHS if p not in spider_paths]
+        if extra:
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                list(pool.map(discovery._probe_one, extra))
+    else:
+        emit.info("No Spider intel — running internal discovery")
+        discovery.probe(workers=20)
+
     endpoints = discovery.endpoints()
     emit.info(f"Discovery: {len(endpoints)} live endpoints found")
 
