@@ -9,8 +9,9 @@ setup(
     install_requires=[
         "aiohttp",
         "beautifulsoup4",
+        "click",
         "colorama",
-        "playwright",
+        "playwright==1.56.0",
         "pyyaml",
         "requests",
     ],

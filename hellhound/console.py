@@ -45,11 +45,11 @@ def _boot_sequence():
         except Exception:
             pass
 
-    prompt  = Fore.LIGHTRED_EX + "hellhound" + Fore.LIGHTBLACK_EX + "@" + Fore.RED + "core" + Fore.LIGHTBLACK_EX + ":~# " + Style.RESET_ALL
+    prompt  = Fore.LIGHTRED_EX + "hellhound" + Fore.WHITE + "@" + Fore.RED + "core" + Fore.WHITE + ":~# " + Style.RESET_ALL
     boot_lines = [
-        ("hellhound --init",          Fore.LIGHTBLACK_EX + "  Initialising HELLHOUND framework v12.0"),
-        ("hellhound --load-modules",  Fore.LIGHTBLACK_EX + "  Modules loaded: recon, vuln, exploit, intel, analysis"),
-        ("hellhound --verify-chain",  Fore.LIGHTBLACK_EX + "  Engine ✓  Emit ✓  Session ✓  Loot ✓"),
+        ("hellhound --init",          Fore.WHITE + "  Initialising HELLHOUND framework v12.0"),
+        ("hellhound --load-modules",  Fore.WHITE + "  Modules loaded: recon, vuln, exploit, intel, analysis"),
+        ("hellhound --verify-chain",  Fore.WHITE + "  Engine ✓  Emit ✓  Session ✓  Loot ✓"),
         ("hellhound --arm",           Fore.RED           + "  All systems armed. Awaiting operator."),
     ]
 
@@ -96,7 +96,7 @@ def _scanline_logo(text):
         progress = i / max(len(lines) - 1, 1)
 
         if progress < 0.3:
-            color = Fore.RED + Style.DIM
+            color = Fore.RED
         elif progress < 0.7:
             color = Fore.RED
         else:
@@ -196,6 +196,20 @@ class HellhoundConsole(cmd.Cmd):
             "q": "exit",
             "cls": "clear",
         }
+
+        # ---- Command history via readline ----
+        try:
+            import readline
+            self._history_file = os.path.expanduser("~/.hellhound_history")
+            try:
+                readline.read_history_file(self._history_file)
+            except FileNotFoundError:
+                pass
+            readline.set_history_length(500)
+            import atexit
+            atexit.register(readline.write_history_file, self._history_file)
+        except ImportError:
+            pass
 
 
     # ----------------------------
@@ -339,17 +353,324 @@ class HellhoundConsole(cmd.Cmd):
     # ============================
 
     def do_arsenal(self, arg):
-        """arsenal → List web modules"""
+        """arsenal [category] → List available modules, optionally filtered by category"""
 
-        print("\n[ Arsenal — WEB MODULES ]\n")
+        filter_cat = arg.strip().lower() if arg.strip() else None
 
+        # Group by category
+        categorized = {}
         for name, meta in sorted(self.modules.items()):
-            print(f"  {name:<12} - {meta['description']}")
+            cat = meta.get("category", "unknown").lower()
+            if filter_cat and cat != filter_cat:
+                continue
+            categorized.setdefault(cat, []).append((name, meta["description"]))
+
+        if not categorized:
+            if filter_cat:
+                print(Fore.YELLOW + f"[!] No modules found for category '{filter_cat}'." + Style.RESET_ALL)
+            else:
+                print(Fore.YELLOW + "[!] No modules loaded." + Style.RESET_ALL)
+            return
+
+        cat_colors = {
+            "recon":    Fore.CYAN   + Style.BRIGHT,
+            "analysis": Fore.BLUE   + Style.BRIGHT,
+            "exploit":  Fore.RED    + Style.BRIGHT,
+            "intel":    Fore.MAGENTA + Style.BRIGHT,
+            "vuln":     Fore.YELLOW + Style.BRIGHT,
+        }
+
+        print(Fore.RED + Style.BRIGHT + "\n╔══════════════════════════════════════╗")
+        print(Fore.RED + Style.BRIGHT + "║           HELLHOUND — ARSENAL        ║")
+        print(Fore.RED + Style.BRIGHT + "╚══════════════════════════════════════╝" + Style.RESET_ALL)
+
+        for cat in ["recon", "analysis", "vuln", "exploit", "intel", "unknown"]:
+            if cat not in categorized:
+                continue
+            cc = cat_colors.get(cat, Fore.WHITE)
+            print(f"\n  {cc}{Style.BRIGHT}[ {cat.upper()} ]{Style.RESET_ALL}")
+            for name, desc in categorized[cat]:
+                active_marker = Style.BRIGHT + Fore.GREEN + " ◀ ACTIVE" + Style.RESET_ALL if name == self.active_module else ""
+                print(f"    {Fore.WHITE + Style.BRIGHT}{name:<16}{Style.RESET_ALL}{Fore.WHITE}{desc}{Style.RESET_ALL}{active_marker}")
 
         print()
 
+    # ============================
+    # MODULE SELECTION
+    # ============================
+
+    def do_equip(self, arg):
+        """equip <module> → Load a module and prepare it for execution"""
+        module_name = arg.strip()
+
+        if not module_name:
+            print(Fore.YELLOW + "[!] Usage: equip <module_name>" + Style.RESET_ALL)
+            return
+
+        # Case-insensitive match
+        match = None
+        for name in self.modules:
+            if name.lower() == module_name.lower():
+                match = name
+                break
+
+        if not match:
+            print(Fore.RED + f"[x] Module '{module_name}' not found. Use 'arsenal' to list available modules." + Style.RESET_ALL)
+            return
+
+        mod_obj = self._load_module(match)
+        if not mod_obj:
+            print(Fore.RED + f"[x] Failed to load module '{match}'." + Style.RESET_ALL)
+            return
+
+        self.active_module = match
+
+        # Load default options from module OPTIONS definition
+        options_def = getattr(mod_obj, "OPTIONS", [])
+        self.module_options = {opt["name"]: opt["default"] for opt in options_def}
+
+        category = self.modules[match].get("category", "unknown")
+        description = self.modules[match].get("description", "")
+
+        print(Style.BRIGHT + Fore.GREEN + f"\n[✔] Module equipped: {match}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.WHITE + f"    Category    " + Style.RESET_ALL + f": {Style.BRIGHT + Fore.CYAN}{category}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.WHITE + f"    Description " + Style.RESET_ALL + f": {Fore.WHITE}{description}" + Style.RESET_ALL)
+
+        if options_def:
+            print(Style.BRIGHT + Fore.YELLOW + f"\n    Options loaded. Use 'options' to view, 'set <option> <value>' to configure." + Style.RESET_ALL)
+
+        print()
+        # Update prompt to show active module
+        self.prompt = (Fore.RED + Style.BRIGHT + "hellhound" + Style.RESET_ALL + Fore.WHITE + " [" +
+                       Style.BRIGHT + Fore.CYAN + match + Style.RESET_ALL + Fore.WHITE + "] > " + Style.RESET_ALL)
+
+    def do_release(self, arg):
+        """release → Unload the current module"""
+        if not self.active_module:
+            print(Fore.YELLOW + "[!] No module currently equipped." + Style.RESET_ALL)
+            return
+        print(Fore.YELLOW + f"[*] Released module: {self.active_module}" + Style.RESET_ALL)
+        self.active_module = None
+        self.module_options = {}
+        self.prompt = Fore.RED + "hellhound > " + Style.RESET_ALL
+
+    # ============================
+    # OPTIONS & CONFIGURATION
+    # ============================
+
+    def do_options(self, arg):
+        """options → Show current module options"""
+        if not self.active_module:
+            print(Style.BRIGHT + Fore.YELLOW + "[•] No module equipped. Use 'equip <module>' first." + Style.RESET_ALL)
+            return
+
+        mod_obj = self._load_module(self.active_module)
+        if not mod_obj:
+            print(Style.BRIGHT + Fore.RED + "[✖] Could not reload module for options." + Style.RESET_ALL)
+            return
+
+        options_def = getattr(mod_obj, "OPTIONS", [])
+        if not options_def:
+            print(Style.BRIGHT + Fore.YELLOW + "[•] This module has no configurable options." + Style.RESET_ALL)
+            return
+
+        # Column widths
+        C_NAME = 22
+        C_VAL  = 20
+        C_REQ  = 10
+
+        # Header
+        cat = self.modules.get(self.active_module, {}).get("category", "module")
+        print(f"\n  Module options ({Fore.CYAN + Style.BRIGHT}{cat}/{self.active_module}{Style.RESET_ALL}):\n")
+
+        # Column labels
+        h_name = f"{'Name':<{C_NAME}}"
+        h_val  = f"{'Current Setting':<{C_VAL}}"
+        h_req  = f"{'Required':<{C_REQ}}"
+        h_desc = "Description"
+        print(f"   {Style.BRIGHT + Fore.WHITE}{h_name}{h_val}{h_req}{h_desc}{Style.RESET_ALL}")
+
+        # Separator — dashes under each header word only (Metasploit style)
+        sep_name = "-" * len("Name")
+        sep_val  = "-" * len("Current Setting")
+        sep_req  = "-" * len("Required")
+        sep_desc = "-" * len("Description")
+        print(f"   {Fore.WHITE}"
+              f"{sep_name:<{C_NAME}}{sep_val:<{C_VAL}}{sep_req:<{C_REQ}}{sep_desc}"
+              f"{Style.RESET_ALL}")
+
+        for opt in options_def:
+            name     = opt.get("name", "")
+            default  = opt.get("default")
+            helptext = opt.get("help", "")
+            required = opt.get("required", False)
+            current  = self.module_options.get(name, default)
+
+            # Current setting display
+            if name == "cookie" and isinstance(current, str) and current:
+                first_pair = current.split(";")[0].strip()
+                if "=" in first_pair:
+                    k, v = first_pair.split("=", 1)
+                    raw_display = f"{k}={v[:12]}..." if len(v) > 12 else f"{k}={v}"
+                else:
+                    raw_display = first_pair[:C_VAL]
+            elif current is None or current == "" or current == {}:
+                raw_display = ""
+            else:
+                raw_str = str(current)
+                raw_display = raw_str[:C_VAL] + "..." if len(raw_str) > C_VAL else raw_str
+
+            # Colors
+            val_color  = Fore.GREEN + Style.BRIGHT if raw_display else Fore.WHITE
+            req_str    = "yes" if required else "no"
+            req_color  = Fore.RED + Style.BRIGHT if required else Fore.WHITE
+
+            # Pad manually (ANSI codes inflate len so do it by hand)
+            pad_name = " " * max(0, C_NAME - len(name))
+            pad_val  = " " * max(0, C_VAL  - len(raw_display))
+            pad_req  = " " * max(0, C_REQ  - len(req_str))
+
+            print(f"   {Fore.CYAN + Style.BRIGHT}{name}{Style.RESET_ALL}{pad_name}"
+                  f"{val_color}{raw_display}{Style.RESET_ALL}{pad_val}"
+                  f"{req_color}{req_str}{Style.RESET_ALL}{pad_req}"
+                  f"{Fore.WHITE}{helptext}{Style.RESET_ALL}")
+
+        print()
+
+
+    def do_set(self, arg):
+        """set <option> <value> → Set a module option"""
+        if not self.active_module:
+            print(Fore.YELLOW + "[!] No module equipped. Use 'equip <module>' first." + Style.RESET_ALL)
+            return
+
+        parts = arg.split(None, 1)
+        if len(parts) < 2:
+            print(Fore.YELLOW + "[!] Usage: set <option> <value>" + Style.RESET_ALL)
+            return
+
+        key, raw_value = parts[0].strip(), parts[1].strip()
+
+        mod_obj = self._load_module(self.active_module)
+        options_def = getattr(mod_obj, "OPTIONS", []) if mod_obj else []
+
+        # Find the option definition to enforce correct type
+        opt_def = next((o for o in options_def if o["name"] == key), None)
+
+        if not opt_def:
+            # Warn but allow — future-proof for dynamic options
+            print(Fore.YELLOW + f"[!] '{key}' is not a declared option for {self.active_module}." + Style.RESET_ALL)
+            print(Fore.YELLOW + f"    Setting anyway. Use 'options' to see valid options." + Style.RESET_ALL)
+            self.module_options[key] = raw_value
+            return
+
+        # Type coercion with validation
+        typ = opt_def.get("type", str)
+        try:
+            if typ == bool:
+                if raw_value.lower() in ("true", "1", "yes"):
+                    coerced = True
+                elif raw_value.lower() in ("false", "0", "no"):
+                    coerced = False
+                else:
+                    raise ValueError(f"Expected bool (true/false), got '{raw_value}'")
+            elif typ == int:
+                coerced = int(raw_value)
+            elif typ == dict:
+                coerced = json.loads(raw_value)
+            else:
+                coerced = str(raw_value)
+        except (ValueError, json.JSONDecodeError) as e:
+            print(Fore.RED + f"[x] Type error for '{key}': {e}" + Style.RESET_ALL)
+            return
+
+        self.module_options[key] = coerced
+        print(Fore.GREEN + f"[✓] {key} => {coerced}" + Style.RESET_ALL)
+
+    def complete_set(self, text, line, begidx, endidx):
+        """TAB completion for: set <option>"""
+        if not self.active_module:
+            return []
+        mod_obj = self._load_module(self.active_module)
+        if not mod_obj:
+            return []
+        options_def = getattr(mod_obj, "OPTIONS", [])
+        names = [o["name"] for o in options_def]
+        return [n for n in names if n.lower().startswith(text.lower())]
+
+    # ============================
+    # EXECUTION
+    # ============================
+
+    def do_strike(self, arg):
+        """strike → Execute the equipped module against the target"""
+
+        # ── Guard: target ──────────────────────────────────────
+        if not self.target:
+            print(Fore.RED + "[x] No target set. Use 'prey <target>' first." + Style.RESET_ALL)
+            return
+
+        # ── Guard: module ──────────────────────────────────────
+        if not self.active_module:
+            print(Fore.RED + "[x] No module equipped. Use 'equip <module>' first." + Style.RESET_ALL)
+            return
+
+        # ── Validate required options ──────────────────────────
+        mod_obj = self._load_module(self.active_module)
+        if not mod_obj:
+            print(Fore.RED + f"[x] Failed to load module '{self.active_module}'." + Style.RESET_ALL)
+            return
+
+        options_def = getattr(mod_obj, "OPTIONS", [])
+        missing = []
+        for opt in options_def:
+            if opt.get("required") and self.module_options.get(opt["name"]) in (None, ""):
+                missing.append(opt["name"])
+
+        if missing:
+            print(Fore.RED + f"[x] Missing required options: {', '.join(missing)}" + Style.RESET_ALL)
+            print(Fore.YELLOW + "    Use 'set <option> <value>' to configure." + Style.RESET_ALL)
+            return
+
+        # ── Merge target context into options ──────────────────
+        runtime_options = dict(self.module_options)
+        if self.target_context.get("cookies") and "cookie" not in runtime_options:
+            runtime_options["cookie"] = self.target_context["cookies"]
+        if self.target_context.get("headers") and "headers" not in runtime_options:
+            runtime_options["headers"] = self.target_context["headers"]
+
+        # ── Cookie raw-token detection warning ────────────────
+        raw_cookie_val = self.target_context.get("cookies") or runtime_options.get("cookie")
+        if raw_cookie_val and isinstance(raw_cookie_val, str) and "=" not in raw_cookie_val:
+            print(Style.BRIGHT + Fore.YELLOW + "[•] Session token detected (auto-mapped)" + Style.RESET_ALL)
+
+        # ── Minimal strike header ──────────────────────────────
+        print(Style.BRIGHT + Fore.RED + "\n[ STRIKE ]" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.WHITE + "  Module" + Style.RESET_ALL +
+              " : " + Style.BRIGHT + Fore.CYAN + self.active_module.upper() + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.WHITE + "  Target" + Style.RESET_ALL +
+              " : " + Style.BRIGHT + Fore.CYAN + self.target + Style.RESET_ALL + "\n")
+
+        try:
+            result = self.engine.run_single(
+                module_name=self.active_module,
+                target=self.target,
+                emit=self,
+                options=runtime_options
+            )
+        except Exception as e:
+            print(Style.BRIGHT + Fore.RED + f"[✖] Strike failed: {e}" + Style.RESET_ALL)
+            return
+
+        if result:
+            self.results[self.active_module.lower()] = result
+            print(Style.BRIGHT + Fore.GREEN + f"\n[✔] Strike complete. Intel stored under '{self.active_module.lower()}'." + Style.RESET_ALL)
+            print(Fore.CYAN + "    Use 'loot' to view results or 'howl' for suggestions.\n" + Style.RESET_ALL)
+        else:
+            print(Style.BRIGHT + Fore.YELLOW + "[•] Module returned no results." + Style.RESET_ALL)
+
     def _load_module(self, module_name):
-        for category in ["recon", "analysis", "exploit", "intel"]:
+        for category in ["recon", "analysis", "exploit", "intel", "vuln"]:
             try:
                 module = __import__(
                     f"hellhound.modules.{category}.{module_name}",
@@ -485,10 +806,10 @@ class HellhoundConsole(cmd.Cmd):
             print(Fore.RED + Style.BRIGHT + "\n╔══════════════════════════════════════╗")
             print(Fore.RED + Style.BRIGHT + "║     HELLHOUND — ASSESSMENT SUMMARY   ║")
             print(Fore.RED + Style.BRIGHT + "╚══════════════════════════════════════╝" + Style.RESET_ALL)
-            print(f"  {Fore.LIGHTBLACK_EX}Target   {Style.RESET_ALL}: {Fore.WHITE}{self.target}")
-            print(f"  {Fore.LIGHTBLACK_EX}Modules  {Style.RESET_ALL}: {Fore.WHITE}{len(self.results)}")
-            print(f"  {Fore.LIGHTBLACK_EX}Risk     {Style.RESET_ALL}: {lc}{total_risk} — {level}{Style.RESET_ALL}")
-            print(f"  {Fore.LIGHTBLACK_EX}Issues   {Style.RESET_ALL}: {Fore.WHITE}{total_vulns}")
+            print(f"  {Fore.WHITE}Target   {Style.RESET_ALL}: {Fore.WHITE}{self.target}")
+            print(f"  {Fore.WHITE}Modules  {Style.RESET_ALL}: {Fore.WHITE}{len(self.results)}")
+            print(f"  {Fore.WHITE}Risk     {Style.RESET_ALL}: {lc}{total_risk} — {level}{Style.RESET_ALL}")
+            print(f"  {Fore.WHITE}Issues   {Style.RESET_ALL}: {Fore.WHITE}{total_vulns}")
             print()
             for mod, score in breakdown.items():
                 bar = "█" * min(int(score / 5), 30)
@@ -556,11 +877,11 @@ class HellhoundConsole(cmd.Cmd):
             # Module header
             print(Fore.RED + "  ┌─────────────────────────────────────")
             print(Fore.RED + f"  │ " + Fore.WHITE + Style.BRIGHT + f"{mod_clean.upper()}" +
-                  Style.RESET_ALL + Fore.LIGHTBLACK_EX + f"  risk={sc}{mod_score}{Style.RESET_ALL}")
+                  Style.RESET_ALL + Fore.WHITE + f"  risk={sc}{mod_score}{Style.RESET_ALL}")
             print(Fore.RED + "  └─────────────────────────────────────" + Style.RESET_ALL)
 
             if raw_stats:
-                print(Fore.LIGHTBLACK_EX + f"  {raw_stats}" + Style.RESET_ALL)
+                print(Fore.WHITE + f"  {raw_stats}" + Style.RESET_ALL)
             print()
 
             # ── Try module-declared renderer first ──────────────
@@ -597,8 +918,8 @@ class HellhoundConsole(cmd.Cmd):
                                     Fore.RED     if sev == "HIGH"     else
                                     Fore.YELLOW  if sev == "MEDIUM"   else Fore.WHITE)
                             print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
-                            if url:   print(f"       {Fore.LIGHTBLACK_EX}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
-                            if proof: print(f"       {Fore.LIGHTBLACK_EX}proof : {Fore.LIGHTBLACK_EX}{str(proof)[:120]}{Style.RESET_ALL}")
+                            if url:   print(f"       {Fore.WHITE}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
+                            if proof: print(f"       {Fore.WHITE}proof : {Fore.WHITE}{str(proof)[:120]}{Style.RESET_ALL}")
                             print()
 
                     elif renderer == "table":
@@ -647,8 +968,8 @@ class HellhoundConsole(cmd.Cmd):
                                     Fore.RED     if sev == "HIGH"     else
                                     Fore.YELLOW  if sev == "MEDIUM"   else Fore.WHITE)
                             print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
-                            if url:   print(f"       {Fore.LIGHTBLACK_EX}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
-                            if proof: print(f"       {Fore.LIGHTBLACK_EX}proof : {Fore.LIGHTBLACK_EX}{str(proof)[:120]}{Style.RESET_ALL}")
+                            if url:   print(f"       {Fore.WHITE}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
+                            if proof: print(f"       {Fore.WHITE}proof : {Fore.WHITE}{str(proof)[:120]}{Style.RESET_ALL}")
                             print()
                         else:
                             print(f"    {Fore.WHITE}• {f}")
@@ -678,7 +999,7 @@ class HellhoundConsole(cmd.Cmd):
                                     Fore.RED if sev=="HIGH" else
                                     Fore.YELLOW if sev=="MEDIUM" else Fore.WHITE)
                             print(f"    [{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
-                            if ep: print(f"       {Fore.LIGHTBLACK_EX}endpoint : {Fore.CYAN}{ep}{Style.RESET_ALL}")
+                            if ep: print(f"       {Fore.WHITE}endpoint : {Fore.CYAN}{ep}{Style.RESET_ALL}")
                             print()
 
                 # 3. endpoints (Spider / any recon module)
@@ -722,9 +1043,9 @@ class HellhoundConsole(cmd.Cmd):
                         if ep["sensitive"]: tags.append("SENS")
                         tag_str    = (Fore.RED + f"[{'|'.join(tags)}]" + Style.RESET_ALL) if tags else ""
                         method_str = "|".join(sorted(ep["methods"]))
-                        print(f"    {Fore.LIGHTBLACK_EX}{method_str:<10}{Style.RESET_ALL} {Fore.WHITE}{ep['url']} {tag_str}")
+                        print(f"    {Fore.WHITE}{method_str:<10}{Style.RESET_ALL} {Fore.WHITE}{ep['url']} {tag_str}")
                     if len(cluster_map) > 50:
-                        print(Fore.LIGHTBLACK_EX + f"    ... +{len(cluster_map)-50} more (use loot --json)" + Style.RESET_ALL)
+                        print(Fore.WHITE + f"    ... +{len(cluster_map)-50} more (use loot --json)" + Style.RESET_ALL)
                     print()
 
                 # 4. secrets
@@ -745,7 +1066,7 @@ class HellhoundConsole(cmd.Cmd):
                     for c in cors[:5]:
                         print(f"    {Fore.CYAN}{c.get('url','')} {Fore.YELLOW}({c.get('severity','')}){Style.RESET_ALL}")
                     if len(cors) > 5:
-                        print(Fore.LIGHTBLACK_EX + f"    ... +{len(cors)-5} more" + Style.RESET_ALL)
+                        print(Fore.WHITE + f"    ... +{len(cors)-5} more" + Style.RESET_ALL)
                     print()
 
                 # 6. sourcemaps
@@ -770,12 +1091,12 @@ class HellhoundConsole(cmd.Cmd):
                                 url = item.get("url", item.get("path", item.get("name", "")))
                                 extra = {k:v for k,v in item.items() if k not in ("url","path","name")}
                                 line = f"    {Fore.WHITE}• {url or json.dumps(item, default=str)[:80]}"
-                                if extra: line += Fore.LIGHTBLACK_EX + f"  {json.dumps(extra, default=str)[:60]}"
+                                if extra: line += Fore.WHITE + f"  {json.dumps(extra, default=str)[:60]}"
                                 print(line + Style.RESET_ALL)
                             else:
                                 print(f"    {Fore.WHITE}• {item}{Style.RESET_ALL}")
                         if len(val) > 20:
-                            print(Fore.LIGHTBLACK_EX + f"    ... +{len(val)-20} more" + Style.RESET_ALL)
+                            print(Fore.WHITE + f"    ... +{len(val)-20} more" + Style.RESET_ALL)
                         print()
                     elif isinstance(val, dict) and val:
                         print(Fore.MAGENTA + f"  [{key}]" + Style.RESET_ALL)
@@ -834,29 +1155,29 @@ class HellhoundConsole(cmd.Cmd):
     # ============================
 
     def info(self, msg):
-        print(Fore.LIGHTBLUE_EX + f"[*] {msg}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.CYAN + f"[•] {msg}" + Style.RESET_ALL)
 
     def success(self, msg):
-        print(Fore.GREEN + f"[✓] {msg}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.GREEN + f"[✔] {msg}" + Style.RESET_ALL)
 
     def warn(self, msg):
-        print(Fore.YELLOW + f"[!] {msg}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.YELLOW + f"[•] {msg}" + Style.RESET_ALL)
 
     def always_info(self, msg):
-        print(Fore.BLUE + msg + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.CYAN + f"[•] {msg}" + Style.RESET_ALL)
 
     def always_success(self, msg):
         if "Target:" in msg:
-            msg = msg.replace("High:", Fore.RED + "High:" + Style.RESET_ALL + Fore.GREEN)
-            msg = msg.replace("Secrets:", Fore.MAGENTA + "Secrets:" + Style.RESET_ALL + Fore.GREEN)
-            msg = msg.replace("Param-Sensitive:", Fore.YELLOW + "Param-Sensitive:" + Style.RESET_ALL + Fore.GREEN)
-        print(Fore.GREEN + f"[✓] {msg}" + Style.RESET_ALL)
+            msg = msg.replace("High:", Fore.RED + Style.BRIGHT + "High:" + Style.RESET_ALL + Fore.GREEN + Style.BRIGHT)
+            msg = msg.replace("Secrets:", Fore.MAGENTA + Style.BRIGHT + "Secrets:" + Style.RESET_ALL + Fore.GREEN + Style.BRIGHT)
+            msg = msg.replace("Param-Sensitive:", Fore.YELLOW + Style.BRIGHT + "Param-Sensitive:" + Style.RESET_ALL + Fore.GREEN + Style.BRIGHT)
+        print(Style.BRIGHT + Fore.GREEN + f"[✔] {msg}" + Style.RESET_ALL)
 
     def error(self, msg):
-        print(Fore.RED + f"[x] {msg}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.RED + f"[✖] {msg}" + Style.RESET_ALL)
 
     def section(self, title):
-        print(Fore.MAGENTA + f"\n  ── {title} ──" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.MAGENTA + f"\n  ── {title} ──" + Style.RESET_ALL)
 
     def row(self, key, value, **kwargs):
         print(f"{key}: {value}")
@@ -899,36 +1220,101 @@ class HellhoundConsole(cmd.Cmd):
     # ============================
 
     def do_help(self, arg):
-        """Show Hellhound command manual"""
-        print("""
-Documented commands:
-=====================
-prey      → Set target (lock onto a host)
-nmap      → Run reconnaissance scan
-arsenal   → List available tools
-equip     → Select a tool/module
-strike    → Execute selected tool
-howl      → Get suggested next actions
-loot      → View gathered results
-release   → Exit tool mode
-exit      → Exit console
-auto      → Intelligent attack chain
-clear     → Clear the console screen
-status    → Show framework status
-sessions  → List previous hunts
-report    → Export full intelligence report to storage
+        """help [command] → Show command reference or detailed help for a command"""
 
-Aliases:
-=====================
-hunt <ip>     → prey <ip>
-use <module>  → equip <module>
-run           → strike
-back          → release
-ls            → arsenal
-results       → loot
-quit / q      → exit
-cls           → clear
-""")
+        detailed = {
+            "prey":     "prey <url> [--cookie \"k=v\"] [--header \"Key: Value\"]\n"
+                        "    Lock onto a web target. Supports session cookies and custom headers.\n"
+                        "    Example: prey https://example.com --cookie \"session=abc123\"",
+            "equip":    "equip <module>\n"
+                        "    Load a module and prepare it for execution. Loads default options.\n"
+                        "    Example: equip Spider",
+            "options":  "options\n"
+                        "    Show all configurable options for the equipped module.\n"
+                        "    Displays name, type, current value, and description.",
+            "set":      "set <option> <value>\n"
+                        "    Set an option for the equipped module. Type is enforced.\n"
+                        "    Example: set timeout 20\n"
+                        "    Example: set cookie session=abc123",
+            "strike":   "strike\n"
+                        "    Execute the equipped module against the current target.\n"
+                        "    Validates required options before running.",
+            "loot":     "loot [--json | --summary | --export]\n"
+                        "    View gathered intelligence.\n"
+                        "    --json    : Raw JSON dump of all results\n"
+                        "    --summary : Executive risk overview\n"
+                        "    --export  : Save report to storage/",
+            "howl":     "howl\n"
+                        "    Correlated attack suggestions based on collected intel.",
+            "arsenal":  "arsenal [category]\n"
+                        "    List available modules grouped by category.\n"
+                        "    Filter: arsenal recon | arsenal vuln | arsenal exploit",
+            "release":  "release\n"
+                        "    Unload the current module and reset options.",
+            "status":   "status\n"
+                        "    Show current framework state: target, module, results count.",
+            "clear":    "clear\n"
+                        "    Clear the terminal screen.",
+            "sessions": "sessions\n"
+                        "    List previously saved session directories.",
+            "exit":     "exit\n"
+                        "    Exit the Hellhound console.",
+        }
+
+        if arg.strip() and arg.strip() in detailed:
+            print(Fore.CYAN + f"\n  {arg.strip()}" + Style.RESET_ALL)
+            print(Fore.WHITE + f"  {detailed[arg.strip()]}" + Style.RESET_ALL)
+            print()
+            return
+
+        print(Fore.RED + Style.BRIGHT + "\n╔══════════════════════════════════════╗")
+        print(Fore.RED + Style.BRIGHT + "║        HELLHOUND — COMMAND MANUAL    ║")
+        print(Fore.RED + Style.BRIGHT + "╚══════════════════════════════════════╝" + Style.RESET_ALL)
+
+        sections = [
+            ("TARGET", [
+                ("prey <url>",           "Set web target (supports --cookie, --header)"),
+            ]),
+            ("MODULE", [
+                ("arsenal [category]",   "List all modules, optionally filter by category"),
+                ("equip <module>",       "Load a module"),
+                ("options",              "Show module options"),
+                ("set <option> <value>", "Configure a module option"),
+                ("strike",               "Execute the equipped module"),
+                ("release",              "Unload the current module"),
+            ]),
+            ("INTELLIGENCE", [
+                ("loot",                 "View gathered results (--json / --summary / --export)"),
+                ("howl",                 "Get correlated attack suggestions"),
+            ]),
+            ("SYSTEM", [
+                ("status",               "Show framework state"),
+                ("sessions",             "List saved sessions"),
+                ("clear",                "Clear the screen"),
+                ("exit",                 "Exit console"),
+            ]),
+            ("ALIASES", [
+                ("hunt → prey",          ""),
+                ("use  → equip",         ""),
+                ("run  → strike",        ""),
+                ("back → release",       ""),
+                ("ls   → arsenal",       ""),
+                ("results → loot",       ""),
+                ("q / quit → exit",      ""),
+            ]),
+        ]
+
+        for section_name, commands in sections:
+            print(f"\n  {Fore.RED}{Style.BRIGHT}{section_name}{Style.RESET_ALL}")
+            for cmd_name, desc in commands:
+                if desc:
+                    print(f"    {Fore.CYAN + Style.BRIGHT}{cmd_name:<26}{Style.RESET_ALL}{Fore.WHITE}{desc}{Style.RESET_ALL}")
+                else:
+                    print(f"    {Fore.WHITE}{cmd_name}{Style.RESET_ALL}")
+
+        print(Fore.YELLOW + Style.BRIGHT + "\n  Tip: 'help <command>' for detailed usage.\n" + Style.RESET_ALL)
+
+
 
     def default(self, line):
         """

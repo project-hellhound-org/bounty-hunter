@@ -123,7 +123,7 @@ class ModuleEmit:
         self._base.success(_strip(msg))
 
     def section(self, title: str):
-        self._base.info(f"── {_strip(title)} ──")
+        self._base.section(_strip(title))
 
     def row(self, label: str, value, **kw):
         if self._verbose:
@@ -799,7 +799,7 @@ _GQL_PATHS = ["/graphql","/api/graphql","/gql","/query","/v1/graphql","/graphiql
 _GQL_QUERY = '{"query":"{ __schema { queryType { name } types { name fields { name args { name } } } } }"}'
 
 async def probe_graphql(session, base, store, emit, rl):
-    emit.always_info("Phase: GraphQL introspection probe...")
+    emit.section("GraphQL Introspection Probe")
     for path in _GQL_PATHS:
         url = urljoin(base, path)
         s, _, text = await fetch(session, "POST", url, rl, data=_GQL_QUERY,
@@ -810,7 +810,7 @@ async def probe_graphql(session, base, store, emit, rl):
                 schema = json.loads(text)
                 types  = schema.get("data",{}).get("__schema",{}).get("types",[])
                 store.graphql.append({"url": url, "types_count": len(types), "schema": schema})
-                emit.always_info(f"GraphQL introspection found: {url} ({len(types)} types exposed)")
+                emit.always_success(f"GraphQL introspection EXPOSED: {url} ({len(types)} types)")
             except Exception:
                 pass
             return
@@ -828,7 +828,7 @@ _OAS_PATHS = [
 ]
 
 async def probe_openapi(session, base, store, emit, rl):
-    emit.always_info("Phase: OpenAPI/Swagger spec probe...")
+    emit.section("OpenAPI / Swagger Probe")
     for path in _OAS_PATHS:
         url = urljoin(base, path)
         s, _, text = await fetch(session, "GET", url, rl)
@@ -841,7 +841,7 @@ async def probe_openapi(session, base, store, emit, rl):
         if not any(k in spec for k in ("paths","swagger","openapi")):
             continue
         store.openapi.append({"url": url})
-        emit.always_info(f"OpenAPI spec found: {url}")
+        emit.always_success(f"OpenAPI spec EXPOSED: {url}")
         server_prefix = ""
         for srv in spec.get("servers", []):
             u = srv.get("url","")
@@ -878,7 +878,7 @@ class IntelligentProber:
         self.emit = emit; self.rl = rl; self.cfg = cfg
 
     async def run(self):
-        self.emit.always_info("Phase: Intelligent Probing...")
+        self.emit.section("Intelligent Probing")
 
         _slug_re = re.compile(r'^[a-z][a-z0-9]{3,9}$')
 
@@ -973,6 +973,7 @@ class RobotsParser:
         s, _, text = await fetch(self.session, "GET", url, self.rl)
         if s != 200 or not text:
             return 0.0
+        self.emit.section("Robots.txt / Sitemap")
         self.emit.always_info(f"Robots: parsing {url}")
         dis_count = sit_count = 0
         for line in text.splitlines():
@@ -1049,12 +1050,23 @@ class SPAScanner:
         if not PLAYWRIGHT_AVAILABLE:
             self.emit.info("[SPA] Playwright not installed — skipping")
             return
-        self.emit.always_info("Phase: SPA headless Chromium scan...")
+        self.emit.section("SPA Headless Chromium Scan")
         try:
             async with async_playwright() as pw:
-                browser = await pw.chromium.launch(headless=True, args=[
-                    "--no-sandbox","--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled"])
+                try:
+                    browser = await pw.chromium.launch(headless=True, args=[
+                        "--no-sandbox","--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled"])
+                except Exception as launch_err:
+                    err_str = str(launch_err)
+                    if "Connection closed" in err_str or "cli.js" in err_str or "driver" in err_str.lower():
+                        self.emit.always_info(
+                            "[SPA] Playwright driver not found — skipping SPA scan. "
+                            "Fix: pip install playwright && playwright install chromium"
+                        )
+                    else:
+                        self.emit.always_info(f"[SPA] Browser launch failed: {launch_err}")
+                    return
                 ctx_args: dict = {"ignore_https_errors": True}
                 if self.cookies:
                     parsed = urlparse(self.target_url)
@@ -1154,7 +1166,10 @@ class SPAScanner:
                 page.on("response", on_response)
 
                 try:
-                    await page.goto(self.target_url, wait_until="networkidle", timeout=20000)
+                    await asyncio.wait_for(
+                        page.goto(self.target_url, wait_until="domcontentloaded", timeout=15000),
+                        timeout=20
+                    )
                 except Exception as e:
                     self.emit.info(f"[SPA] Goto warning: {e}")
                 try:
@@ -1334,7 +1349,7 @@ class Spider:
         if "material-icons" in body_lo or "mat-" in body_lo: tech.add("Angular Material")
 
         for t in tech: self.store.tech_stack.add(t)
-        if tech: self.emit.always_info(f"Tech detected: {', '.join(sorted(tech))}")
+        if tech: self.emit.always_success(f"Tech detected: {', '.join(sorted(tech))}")
 
     async def _check_sourcemap(self, session, js_url):
         s, _, _ = await fetch(session, "GET", js_url + ".map", self.rl)
@@ -1585,12 +1600,16 @@ class Spider:
                 spa = SPAScanner(self.target, self.store, self.emit, self.cookies,
                                  self.extra_headers, self.queue, self.is_valid,
                                  enable_spa_interact=self.cfg.enable_spa_interact)
-                await spa.run()
+                try:
+                    await asyncio.wait_for(spa.run(), timeout=90)
+                except asyncio.TimeoutError:
+                    self.emit.always_info("[SPA] Hard timeout (90s) — continuing with partial SPA data")
 
+            self.emit.section("Crawling")
             self.emit.always_info(
-                f"Crawl started — depth={self.cfg.max_depth}, "
-                f"concurrency={self.cfg.concurrency}, "
-                f"auth={'yes' if self.cookies or self.extra_headers else 'no'}, "
+                f"depth={self.cfg.max_depth} | "
+                f"concurrency={self.cfg.concurrency} | "
+                f"auth={'yes' if self.cookies or self.extra_headers else 'no'} | "
                 f"seed={self.queue.qsize()} URLs")
 
             workers = [asyncio.create_task(self._worker(session, i, crawl_delay))
@@ -1643,7 +1662,25 @@ def _do_run(target: str, cfg: Config, emit,
         spider = Spider(target, cfg, emit, cookies, extra_headers)
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        asyncio.run(spider.run())
+
+        # Suppress "Task exception was never retrieved" noise from playwright
+        # driver crashes — those are handled inside SPAScanner.run() already.
+        loop = asyncio.new_event_loop()
+        loop.set_exception_handler(lambda lp, ctx: None)
+        try:
+            loop.run_until_complete(spider.run())
+        finally:
+            # Cancel all pending tasks before closing to prevent
+            # "coroutine ignored GeneratorExit" on GC
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+            loop.close()
     except KeyboardInterrupt:
         emit.always_info("Scan interrupted — partial results follow")
     except ValueError as e:
@@ -1656,7 +1693,6 @@ def _do_run(target: str, cfg: Config, emit,
         return {"raw": "Spider failed to initialize.", "intel": {}}
 
     elapsed   = time.time() - start
-    json_path = _auto_save(spider.store, target, cfg.output_file, cfg.output_format, emit)
     intel     = json.loads(spider.store.export(target, fmt="json"))
     s         = intel.get("summary", {})
 
@@ -1676,8 +1712,23 @@ def _do_run(target: str, cfg: Config, emit,
         f"Tech: {', '.join(s.get('tech_stack',[])) or 'unknown'}"
     )
 
-    emit.always_success("Spider scan complete")
-    emit.always_success(raw_summary)
+    emit.section("Spider Summary")
+    emit.always_success(f"Scan complete — {elapsed:.1f}s")
+    emit.always_info(f"Target             : {target}")
+    emit.always_info(f"Endpoints          : {s.get('total_endpoints', '?')}")
+    emit.always_info(f"High Confidence    : {s.get('high', '?')}")
+    emit.always_info(f"Auth-Required      : {s.get('auth_required', '?')}")
+    emit.always_info(f"Param-Sensitive    : {s.get('parameter_sensitive', '?')}")
+    emit.always_info(f"Secrets Found      : {s.get('secrets', '?')}")
+    emit.always_info(f"CORS Issues        : {s.get('cors_issues', '?')}")
+    tech_str = ', '.join(s.get('tech_stack', [])) or 'unknown'
+    emit.always_info(f"Tech Stack         : {tech_str}")
+    gql = s.get('graphql_exposed', 0)
+    oas = s.get('openapi_exposed', 0)
+    if gql:
+        emit.always_success(f"GraphQL Exposed    : {gql} endpoint(s)")
+    if oas:
+        emit.always_success(f"OpenAPI Exposed    : {oas} spec(s)")
 
     return {"raw": raw_summary, "intel": intel}
 
