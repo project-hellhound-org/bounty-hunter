@@ -940,6 +940,12 @@ class HellhoundConsole(cmd.Cmd):
                             print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
                             if url:   print(f"       {Fore.WHITE}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
                             if proof: print(f"       {Fore.WHITE}proof : {Fore.WHITE}{str(proof)[:120]}{Style.RESET_ALL}")
+                            poc_curl = f.get("poc_curl", "")
+                            poc_browser = f.get("poc_browser", "")
+                            if poc_curl:
+                                print(f"       {Fore.WHITE}curl  : {Fore.YELLOW}{poc_curl}{Style.RESET_ALL}")
+                            if poc_browser:
+                                print(f"       {Fore.WHITE}open  : {Fore.CYAN}{poc_browser}{Style.RESET_ALL}")
                             print()
 
                     elif renderer == "table":
@@ -990,6 +996,12 @@ class HellhoundConsole(cmd.Cmd):
                             print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
                             if url:   print(f"       {Fore.WHITE}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
                             if proof: print(f"       {Fore.WHITE}proof : {Fore.WHITE}{str(proof)[:120]}{Style.RESET_ALL}")
+                            poc_curl = f.get("poc_curl", "")
+                            poc_browser = f.get("poc_browser", "")
+                            if poc_curl:
+                                print(f"       {Fore.WHITE}curl  : {Fore.YELLOW}{poc_curl}{Style.RESET_ALL}")
+                            if poc_browser:
+                                print(f"       {Fore.WHITE}open  : {Fore.CYAN}{poc_browser}{Style.RESET_ALL}")
                             print()
                         else:
                             print(f"    {Fore.WHITE}• {f}")

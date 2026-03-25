@@ -4512,11 +4512,10 @@ def _spider_intel_to_endpoints(intel, target):
         if not ep_url.startswith("http"):
             ep_url = urllib.parse.urljoin(base_url + "/", ep_url.lstrip("/"))
 
-        # Rebase if needed
-        ep_parsed  = urllib.parse.urlparse(ep_url)
-        file_origin = f"{ep_parsed.scheme}://{ep_parsed.netloc}"
-        cli_origin  = f"{cli_parsed.scheme}://{cli_parsed.netloc}"
-        if cli_origin != file_origin and cli_parsed.netloc:
+        # Extract only the path and query string for consistent mapping
+        # This fixes issues where the spider origin and console target differ slightly
+        ep_parsed = urllib.parse.urlparse(ep_url)
+        if cli_parsed.netloc:
             ep_url = urllib.parse.urlunparse((
                 cli_parsed.scheme, cli_parsed.netloc,
                 ep_parsed.path, ep_parsed.params, ep_parsed.query, ""))
@@ -4613,6 +4612,7 @@ def _spider_intel_to_endpoints(intel, target):
         has_path_id = bool(
             _PATH_NUMERIC_RE.search(urllib.parse.urlparse(ep_url).path) or
             _PATH_UUID_RE.search(urllib.parse.urlparse(ep_url).path))
+        ep_synthetic = False
         if is_auth_ep and not params and not has_path_id:
             last_segs = [s for s in urllib.parse.urlparse(ep_url).path.split("/") if s]
             if last_segs:
@@ -4626,12 +4626,14 @@ def _spider_intel_to_endpoints(intel, target):
                     synth = raw_seg + "_id"
                 params[synth] = "1"
                 priority_params.append(synth)
+                ep_synthetic = True
 
         endpoints.append({
             "url":              clean_url,
             "method":           method,
             "params":           params,
             "priority_params":  list(dict.fromkeys(priority_params)),
+            "synthetic_params": ep_synthetic,
             "_spider_id_hints": id_hints_ep,
             "source":           "spider_intel",
             "parameter_sensitive": bool(entry.get("parameter_sensitive")),
