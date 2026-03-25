@@ -1162,17 +1162,170 @@ class HellhoundConsole(cmd.Cmd):
         """howl → Correlated intelligent attack suggestions"""
 
         if not self.results:
-            print("[!] No intelligence collected yet.")
+            print(Fore.YELLOW + Style.BRIGHT + "[!] No intelligence collected yet — run Spider first." + Style.RESET_ALL)
             return
 
-        suggestions = suggest_actions(self.results)
+        # ── Import structured report ──────────────────────────
+        try:
+            from hellhound.core.suggest import suggest_report
+            report = suggest_report(self.results)
+        except ImportError:
+            # Legacy fallback: suggest_actions returns List[str]
+            from hellhound.core.suggest import suggest_actions
+            lines = suggest_actions(self.results)
+            print(Fore.RED + Style.BRIGHT + "\n[ Howl — Intelligence Correlation Engine ]\n" + Style.RESET_ALL)
+            for l in lines:
+                print(f"  {Fore.CYAN}{l}{Style.RESET_ALL}")
+            return
 
-        print("\n[ Howl — Intelligence Correlation Engine ]\n")
+        # ── Color constants ───────────────────────────────────
+        C_BORDER    = Fore.RED    + Style.BRIGHT
+        C_HEAD      = Fore.RED    + Style.BRIGHT
+        C_CRITICAL  = Fore.RED    + Style.BRIGHT
+        C_HIGH      = Fore.YELLOW + Style.BRIGHT
+        C_MEDIUM    = Fore.CYAN   + Style.BRIGHT
+        C_LOW       = Fore.WHITE
+        C_CHAIN     = Fore.MAGENTA + Style.BRIGHT
+        C_SKIP      = Fore.LIGHTBLACK_EX
+        C_LABEL     = Fore.WHITE  + Style.BRIGHT
+        C_DIM       = Fore.WHITE
+        C_EVIDENCE  = Fore.CYAN
+        C_ACCENT    = Fore.RED
+        C_CONF_BAR  = Fore.GREEN  + Style.BRIGHT
+        C_STEP      = Fore.RED    + Style.BRIGHT
+        R           = Style.RESET_ALL
 
-        for s in suggestions:
-            print(f"  → {s}")
+        CONF_COLORS = {
+            "confirmed": Fore.RED    + Style.BRIGHT,
+            "strong":    Fore.YELLOW + Style.BRIGHT,
+            "likely":    Fore.CYAN   + Style.BRIGHT,
+            "possible":  Fore.WHITE,
+        }
 
-        print("\n==========================================================\n")
+        W = 58  # inner content width
+
+        def _bar(text, fill="═"):
+            return C_BORDER + fill * W + R
+
+        def _section_head(title, color=None):
+            color = color or C_HEAD
+            side  = "─" * 3
+            pad   = W - len(title) - 8
+            print(f"\n  {C_BORDER}{side}{R} {color}{title}{R} {C_BORDER}{side + '─' * pad}{R}")
+
+        def _print_suggestion(s, index=None):
+            # Priority label color
+            plabel = s.priority_label
+            if plabel == "CRITICAL":
+                pc = C_CRITICAL
+            elif plabel == "HIGH":
+                pc = C_HIGH
+            elif plabel == "MEDIUM":
+                pc = C_MEDIUM
+            else:
+                pc = C_LOW
+
+            # Confidence bar
+            conf_c = CONF_COLORS.get(s.confidence, Fore.WHITE)
+            conf_bar = conf_c + s.confidence_bar + R
+
+            # Step number or bullet
+            if index is not None:
+                step = f"{C_STEP}[{index:02d}]{R}"
+            else:
+                step = f"{C_CHAIN}  +--{R}"
+
+            # Action line
+            print(f"  {step} {pc}{s.action}{R}")
+
+            # Why line
+            print(f"       {C_LABEL}why{R}        {C_DIM}{s.reason}{R}")
+
+            # Confidence
+            print(f"       {C_LABEL}confidence{R} {conf_bar} {conf_c}{s.confidence}{R}")
+
+            # Evidence lines
+            for ev in s.evidence:
+                if ev.strip():
+                    print(f"       {C_LABEL}evidence{R}   {C_EVIDENCE}{ev.strip()}{R}")
+
+            # Chain label
+            if s.chain:
+                print(f"       {C_LABEL}chain{R}      {C_CHAIN}{s.chain}{R}")
+
+        def _print_skip(s):
+            print(f"  {C_SKIP}  [-] {s.action:<28}  {s.reason}{R}")
+
+        # ── Header ────────────────────────────────────────────
+        print()
+        print(C_BORDER + "  " + "═" * W + R)
+        title_pad = (W - 34) // 2
+        print(C_BORDER + "  " + "║" + " " * title_pad
+              + Fore.WHITE + Style.BRIGHT + "HELLHOUND  —  HOWL  ENGINE"
+              + " " * (W - title_pad - 26) + C_BORDER + "║" + R)
+        print(C_BORDER + "  " + "═" * W + R)
+
+        # Modules ran summary
+        if report.ran_modules:
+            mods_str = "  ".join(m.upper() for m in sorted(report.ran_modules))
+            print(f"\n  {C_LABEL}Modules analysed:{R}  {C_EVIDENCE}{mods_str}{R}")
+
+        # ── Critical Path ─────────────────────────────────────
+        if report.critical_path:
+            _section_head("CRITICAL PATH", C_CRITICAL)
+            print(f"  {C_DIM}Run these. In this order. Do not skip.{R}\n")
+            for i, s in enumerate(report.critical_path, 1):
+                _print_suggestion(s, index=i)
+                print()
+        else:
+            _section_head("CRITICAL PATH", C_CRITICAL)
+            print(f"  {C_DIM}No critical-path findings yet.{R}")
+
+        # ── Attack Chains ─────────────────────────────────────
+        if report.chains:
+            _section_head("ATTACK CHAINS", C_CHAIN)
+            print(f"  {C_DIM}Cross-module correlations — multi-step exploitation paths.{R}\n")
+            for s in report.chains:
+                _print_suggestion(s)
+                print()
+
+        # ── Detected Complete Chains ──────────────────────────
+        if report.attack_chains:
+            _section_head("CONFIRMED CHAINS", Fore.MAGENTA + Style.BRIGHT)
+            for chain in report.attack_chains:
+                print(f"  {C_CHAIN}  [{'>'}]{R} {Fore.WHITE + Style.BRIGHT}{chain}{R}")
+            print()
+
+        # ── Optional Intel ────────────────────────────────────
+        if report.optional_intel:
+            _section_head("OPTIONAL INTEL", C_MEDIUM)
+            print(f"  {C_DIM}Useful context — pursue when critical path is done.{R}\n")
+            for s in report.optional_intel:
+                conf_c  = CONF_COLORS.get(s.confidence, Fore.WHITE)
+                print(f"  {C_MEDIUM}  [+]{R} {Fore.WHITE + Style.BRIGHT}{s.action}{R}")
+                print(f"       {C_DIM}{s.reason}{R}")
+                if s.evidence:
+                    for ev in s.evidence[:2]:
+                        if ev.strip():
+                            print(f"       {C_EVIDENCE}{ev.strip()}{R}")
+                print()
+
+        # ── Skip List ─────────────────────────────────────────
+        if report.skip_list:
+            _section_head("SKIP FOR NOW", C_SKIP)
+            print(f"  {C_DIM}Not recommended — reason given for each.{R}\n")
+            for s in report.skip_list:
+                _print_skip(s)
+            print()
+
+        # ── Footer ────────────────────────────────────────────
+        total_findings = len(report.critical_path) + len(report.chains)
+        print(C_BORDER + "\n  " + "─" * W + R)
+        print(f"  {C_DIM}Critical/High: {R}{C_CRITICAL}{len(report.critical_path)}{R}"
+              f"  {C_DIM}Chains: {R}{C_CHAIN}{len(report.chains)}{R}"
+              f"  {C_DIM}Optional: {R}{C_MEDIUM}{len(report.optional_intel)}{R}"
+              f"  {C_DIM}Skipped: {R}{C_SKIP}{len(report.skip_list)}{R}")
+        print(C_BORDER + "  " + "─" * W + R + "\n")
 
     # ============================
     # SYSTEM
