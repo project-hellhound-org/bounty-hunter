@@ -1179,21 +1179,21 @@ class HellhoundConsole(cmd.Cmd):
             return
 
         # ── Color constants ───────────────────────────────────
-        C_BORDER    = Fore.RED    + Style.BRIGHT
-        C_HEAD      = Fore.RED    + Style.BRIGHT
-        C_CRITICAL  = Fore.RED    + Style.BRIGHT
-        C_HIGH      = Fore.YELLOW + Style.BRIGHT
-        C_MEDIUM    = Fore.CYAN   + Style.BRIGHT
-        C_LOW       = Fore.WHITE
-        C_CHAIN     = Fore.MAGENTA + Style.BRIGHT
-        C_SKIP      = Fore.LIGHTBLACK_EX
-        C_LABEL     = Fore.WHITE  + Style.BRIGHT
-        C_DIM       = Fore.WHITE
-        C_EVIDENCE  = Fore.CYAN
-        C_ACCENT    = Fore.RED
-        C_CONF_BAR  = Fore.GREEN  + Style.BRIGHT
-        C_STEP      = Fore.RED    + Style.BRIGHT
-        R           = Style.RESET_ALL
+        C_BORDER   = Fore.RED     + Style.BRIGHT
+        C_HEAD     = Fore.RED     + Style.BRIGHT
+        C_CRITICAL = Fore.RED     + Style.BRIGHT
+        C_HIGH     = Fore.YELLOW  + Style.BRIGHT
+        C_MEDIUM   = Fore.CYAN    + Style.BRIGHT
+        C_LOW      = Fore.WHITE
+        C_CHAIN    = Fore.MAGENTA + Style.BRIGHT
+        C_SKIP     = Fore.LIGHTBLACK_EX
+        C_LABEL    = Fore.WHITE   + Style.BRIGHT
+        C_DIM      = Fore.WHITE
+        C_EVIDENCE = Fore.CYAN
+        C_STEP     = Fore.RED     + Style.BRIGHT
+        C_URL      = Fore.YELLOW
+        C_OK       = Fore.GREEN   + Style.BRIGHT
+        R          = Style.RESET_ALL
 
         CONF_COLORS = {
             "confirmed": Fore.RED    + Style.BRIGHT,
@@ -1202,73 +1202,117 @@ class HellhoundConsole(cmd.Cmd):
             "possible":  Fore.WHITE,
         }
 
-        W = 58  # inner content width
-
-        def _bar(text, fill="═"):
-            return C_BORDER + fill * W + R
+        W = 62  # inner content width
 
         def _section_head(title, color=None):
             color = color or C_HEAD
             side  = "─" * 3
-            pad   = W - len(title) - 8
+            pad   = max(0, W - len(title) - 8)
             print(f"\n  {C_BORDER}{side}{R} {color}{title}{R} {C_BORDER}{side + '─' * pad}{R}")
 
-        def _print_suggestion(s, index=None):
-            # Priority label color
+        def _priority_badge(s):
             plabel = s.priority_label
             if plabel == "CRITICAL":
-                pc = C_CRITICAL
+                return C_CRITICAL + "[CRIT]" + R
             elif plabel == "HIGH":
-                pc = C_HIGH
+                return C_HIGH + "[HIGH]" + R
             elif plabel == "MEDIUM":
-                pc = C_MEDIUM
+                return C_MEDIUM + "[MED] " + R
             else:
-                pc = C_LOW
+                return C_LOW + "[LOW] " + R
 
-            # Confidence bar
-            conf_c = CONF_COLORS.get(s.confidence, Fore.WHITE)
-            conf_bar = conf_c + s.confidence_bar + R
+        def _conf_inline(s):
+            """Short coloured confidence tag for inline display."""
+            cc = CONF_COLORS.get(s.confidence, Fore.WHITE)
+            bar = cc + s.confidence_bar + R
+            tag = cc + s.confidence + R
+            return f"{bar} {tag}"
 
-            # Step number or bullet
+        def _print_suggestion(s, index=None):
+            badge = _priority_badge(s)
+
+            # Step counter or chain bullet
             if index is not None:
-                step = f"{C_STEP}[{index:02d}]{R}"
+                prefix = f"{C_STEP}[{index:02d}]{R}"
             else:
-                step = f"{C_CHAIN}  +--{R}"
+                prefix = f"{C_CHAIN}  +--{R}"
 
-            # Action line
-            print(f"  {step} {pc}{s.action}{R}")
+            # ── Action line with inline badge ──────────────────
+            print(f"  {prefix} {badge}  {C_LABEL}{s.action}{R}")
 
-            # Why line
-            print(f"       {C_LABEL}why{R}        {C_DIM}{s.reason}{R}")
+            # ── Why ────────────────────────────────────────────
+            print(f"       {C_DIM}why        {R}{s.reason}")
 
-            # Confidence
-            print(f"       {C_LABEL}confidence{R} {conf_bar} {conf_c}{s.confidence}{R}")
+            # ── Confidence ─────────────────────────────────────
+            print(f"       {C_DIM}confidence {R}{_conf_inline(s)}")
 
-            # Evidence lines
+            # ── Evidence — URLs get URL colour, others get evidence colour ──
             for ev in s.evidence:
-                if ev.strip():
-                    print(f"       {C_LABEL}evidence{R}   {C_EVIDENCE}{ev.strip()}{R}")
+                ev = ev.strip()
+                if not ev:
+                    continue
+                if ev.startswith("http"):
+                    print(f"       {C_DIM}evidence   {R}{C_URL}{ev}{R}")
+                else:
+                    print(f"       {C_DIM}evidence   {R}{C_EVIDENCE}{ev}{R}")
 
-            # Chain label
+            # ── Chain label ────────────────────────────────────
             if s.chain:
-                print(f"       {C_LABEL}chain{R}      {C_CHAIN}{s.chain}{R}")
+                print(f"       {C_DIM}chain      {R}{C_CHAIN}{s.chain}{R}")
+
+        def _print_optional(s):
+            conf_c = CONF_COLORS.get(s.confidence, Fore.WHITE)
+            badge  = _priority_badge(s)
+            print(f"  {C_MEDIUM}  [+]{R} {badge}  {Fore.WHITE + Style.BRIGHT}{s.action}{R}")
+            print(f"       {C_DIM}why        {R}{s.reason}")
+            print(f"       {C_DIM}confidence {R}{_conf_inline(s)}")
+            for ev in s.evidence[:3]:
+                ev = ev.strip()
+                if not ev:
+                    continue
+                if ev.startswith("http"):
+                    print(f"       {C_DIM}evidence   {R}{C_URL}{ev}{R}")
+                else:
+                    print(f"       {C_DIM}evidence   {R}{C_EVIDENCE}{ev}{R}")
+            if s.chain:
+                print(f"       {C_DIM}chain      {R}{C_CHAIN}{s.chain}{R}")
 
         def _print_skip(s):
-            print(f"  {C_SKIP}  [-] {s.action:<28}  {s.reason}{R}")
+            print(f"  {C_SKIP}  [-] {s.action:<30}  {s.reason}{R}")
 
-        # ── Header ────────────────────────────────────────────
+        # ── Header banner ─────────────────────────────────────
         print()
         print(C_BORDER + "  " + "═" * W + R)
-        title_pad = (W - 34) // 2
-        print(C_BORDER + "  " + "║" + " " * title_pad
-              + Fore.WHITE + Style.BRIGHT + "HELLHOUND  —  HOWL  ENGINE"
-              + " " * (W - title_pad - 26) + C_BORDER + "║" + R)
+        inner = "HELLHOUND  —  HOWL  ENGINE"
+        title_pad = (W - len(inner)) // 2
+        print(C_BORDER + "  ║" + " " * title_pad
+              + Fore.WHITE + Style.BRIGHT + inner
+              + " " * (W - title_pad - len(inner) - 2) + C_BORDER + "║" + R)
         print(C_BORDER + "  " + "═" * W + R)
 
-        # Modules ran summary
+        # ── Session context block ─────────────────────────────
         if report.ran_modules:
             mods_str = "  ".join(m.upper() for m in sorted(report.ran_modules))
             print(f"\n  {C_LABEL}Modules analysed:{R}  {C_EVIDENCE}{mods_str}{R}")
+
+        # Quick risk tally line
+        n_crit  = sum(1 for s in report.critical_path if s.priority_label == "CRITICAL")
+        n_high  = sum(1 for s in report.critical_path if s.priority_label == "HIGH")
+        n_chain = len(report.chains)
+        print(
+            f"  {C_LABEL}Session risk:{R}  "
+            f"{C_CRITICAL}{n_crit} critical{R}  "
+            f"{C_HIGH}{n_high} high{R}  "
+            f"{C_CHAIN}{n_chain} chain(s){R}"
+        )
+
+        # ── Confirmed attack chains (top — operator sees them first) ──
+        if report.attack_chains:
+            _section_head("CONFIRMED CHAINS", C_CHAIN)
+            print(f"  {C_DIM}End-to-end exploitation paths proven this session.{R}\n")
+            for chain in report.attack_chains:
+                print(f"  {C_CHAIN}  [⚡]{R} {Fore.WHITE + Style.BRIGHT}{chain}{R}")
+            print()
 
         # ── Critical Path ─────────────────────────────────────
         if report.critical_path:
@@ -1289,25 +1333,12 @@ class HellhoundConsole(cmd.Cmd):
                 _print_suggestion(s)
                 print()
 
-        # ── Detected Complete Chains ──────────────────────────
-        if report.attack_chains:
-            _section_head("CONFIRMED CHAINS", Fore.MAGENTA + Style.BRIGHT)
-            for chain in report.attack_chains:
-                print(f"  {C_CHAIN}  [{'>'}]{R} {Fore.WHITE + Style.BRIGHT}{chain}{R}")
-            print()
-
         # ── Optional Intel ────────────────────────────────────
         if report.optional_intel:
             _section_head("OPTIONAL INTEL", C_MEDIUM)
             print(f"  {C_DIM}Useful context — pursue when critical path is done.{R}\n")
             for s in report.optional_intel:
-                conf_c  = CONF_COLORS.get(s.confidence, Fore.WHITE)
-                print(f"  {C_MEDIUM}  [+]{R} {Fore.WHITE + Style.BRIGHT}{s.action}{R}")
-                print(f"       {C_DIM}{s.reason}{R}")
-                if s.evidence:
-                    for ev in s.evidence[:2]:
-                        if ev.strip():
-                            print(f"       {C_EVIDENCE}{ev.strip()}{R}")
+                _print_optional(s)
                 print()
 
         # ── Skip List ─────────────────────────────────────────
@@ -1319,12 +1350,13 @@ class HellhoundConsole(cmd.Cmd):
             print()
 
         # ── Footer ────────────────────────────────────────────
-        total_findings = len(report.critical_path) + len(report.chains)
         print(C_BORDER + "\n  " + "─" * W + R)
-        print(f"  {C_DIM}Critical/High: {R}{C_CRITICAL}{len(report.critical_path)}{R}"
-              f"  {C_DIM}Chains: {R}{C_CHAIN}{len(report.chains)}{R}"
-              f"  {C_DIM}Optional: {R}{C_MEDIUM}{len(report.optional_intel)}{R}"
-              f"  {C_DIM}Skipped: {R}{C_SKIP}{len(report.skip_list)}{R}")
+        print(
+            f"  {C_DIM}Critical/High:{R} {C_CRITICAL}{len(report.critical_path)}{R}"
+            f"  {C_DIM}Chains:{R} {C_CHAIN}{len(report.chains)}{R}"
+            f"  {C_DIM}Optional:{R} {C_MEDIUM}{len(report.optional_intel)}{R}"
+            f"  {C_DIM}Skipped:{R} {C_SKIP}{len(report.skip_list)}{R}"
+        )
         print(C_BORDER + "  " + "─" * W + R + "\n")
 
     # ============================

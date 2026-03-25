@@ -5,6 +5,7 @@ Advanced rule-based suggestion engine (HOWL command).
 Reads self.results from console and returns structured, prioritised next-steps.
 
 Design principles:
+  - Web targets only. No host/IP/port/service logic.
   - Deterministic only. No AI, no guessing.
   - Cross-module correlation: chains findings across modules into attack paths.
   - Priority scoring: confirmed RCE outweighs param hints outweighs recon gaps.
@@ -21,6 +22,7 @@ Spider v12 intel shape:
 import re
 from dataclasses import dataclass, field
 from typing import List, Optional
+from urllib.parse import urlparse
 
 
 # ─────────────────────────────────────────────────────────────
@@ -30,17 +32,8 @@ from typing import List, Optional
 KNOWN_MODULES = {
     "spider", "bacdetector", "cmdinj", "parax",
     "seige", "fuzzhunter", "fingerprint", "credleak",
-    "stalk", "surfacemap", "wafbuster", "exmap",
+    "surfacemap", "wafbuster", "exmap",
     "idordetector", "emptracker", "phishprep",
-}
-
-SERVICE_MODULE_MAP = {
-    "http":         ["spider", "fuzzhunter", "wafbuster"],
-    "https":        ["spider", "fuzzhunter", "wafbuster"],
-    "ftp":          [],
-    "ssh":          [],
-    "mysql":        [],
-    "microsoft-ds": [],
 }
 
 # Priority tiers (lower = more urgent)
@@ -56,62 +49,38 @@ CONF_STRONG     = "strong"      # multiple corroborating signals
 CONF_LIKELY     = "likely"      # single signal, high-risk param/pattern
 CONF_POSSIBLE   = "possible"    # heuristic match, low specificity
 
-# Version → CVE map (extend as needed)
-VERSION_CVE_MAP = [
-    {
-        "match":   r"apache[/ ]*2\.4\.49",
-        "cve":     "CVE-2021-41773",
-        "title":   "Apache Path Traversal + RCE",
-        "cvss":    9.8,
-        "weaponized": True,
-    },
-    {
-        "match":   r"apache[/ ]*2\.4\.50",
-        "cve":     "CVE-2021-42013",
-        "title":   "Apache Path Traversal (bypass of 41773 patch)",
-        "cvss":    9.8,
-        "weaponized": True,
-    },
-    {
-        "match":   r"vsftpd[/ ]*2\.3\.4",
-        "cve":     "CVE-2011-2523",
-        "title":   "vsftpd Backdoor Command Execution",
-        "cvss":    10.0,
-        "weaponized": True,
-    },
-    {
-        "match":   r"openssh[/ ]*[67]\.\d",
-        "cve":     "CVE-2016-6210",
-        "title":   "OpenSSH Username Enumeration",
-        "cvss":    5.3,
-        "weaponized": False,
-    },
-    {
-        "match":   r"php[/ ]*[45]\.\d",
-        "cve":     "CVE-2012-1823",
-        "title":   "PHP CGI Argument Injection",
-        "cvss":    7.5,
-        "weaponized": True,
-    },
-    {
-        "match":   r"wordpress[/ ]*([0-3]\.\d|4\.[0-8])",
-        "cve":     "CVE-2019-8943",
-        "title":   "WordPress Path Traversal (old core)",
-        "cvss":    6.5,
-        "weaponized": False,
-    },
-]
+# Static asset extensions — never score params from these
+STATIC_ASSET_EXTENSIONS = {
+    ".js", ".mjs", ".css", ".map", ".png", ".jpg", ".jpeg",
+    ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot",
+    ".webp", ".mp4", ".mp3", ".pdf", ".zip",
+}
+
+# Param names that appear everywhere and carry zero injection signal on their own
+PARAM_NOISE_BLOCKLIST = {
+    # pagination / listing
+    "page", "limit", "offset", "size", "per_page", "cursor", "skip", "take",
+    # display / i18n
+    "format", "locale", "lang", "timezone", "currency",
+    # cache-busting / versioning
+    "v", "version", "cache", "ts", "t", "_", "cb", "bust",
+    # generic UI state
+    "tab", "view", "mode", "layout", "theme", "color",
+    # common but non-injectable type/format selectors
+    "type", "format",
+}
 
 # Param name sets for vuln class heuristics
 IDOR_PARAMS = {
     "id", "user_id", "uid", "account_id", "profile_id", "order_id",
     "invoice_id", "doc_id", "file_id", "record_id", "customer_id",
     "ticket_id", "item_id", "product_id", "post_id", "comment_id",
+    "message_id", "thread_id", "conversation_id", "asset_id",
 }
 SQLI_PARAMS = {
     "search", "query", "q", "keyword", "filter", "sort", "order",
-    "where", "name", "username", "email", "login", "category",
-    "tag", "type", "status", "page", "limit", "offset",
+    "where", "username", "email", "login", "category",
+    "tag", "status", "name",
 }
 CMDI_PARAMS = {
     "cmd", "exec", "command", "run", "ping", "host", "ip",
@@ -120,7 +89,7 @@ CMDI_PARAMS = {
 }
 LFI_PARAMS = {
     "file", "path", "page", "template", "include", "load",
-    "read", "doc", "document", "view", "lang", "locale",
+    "read", "doc", "document", "view", "lang",
     "module", "conf", "config",
 }
 REDIRECT_PARAMS = {
@@ -226,11 +195,20 @@ class SuggestReport:
 # HELPERS
 # ─────────────────────────────────────────────────────────────
 
+def _is_static_asset(url: str) -> bool:
+    """Return True if the URL points to a static file — never score params on these."""
+    try:
+        path = urlparse(url).path.lower().split("?")[0]
+        return any(path.endswith(ext) for ext in STATIC_ASSET_EXTENSIONS)
+    except Exception:
+        return False
+
+
 def _flat_params(ep) -> set:
     """
     Spider v12: params stored as dict of buckets.
     {"query": ["id", "user"], "form": ["email"], "js": [], ...}
-    Flatten to a set of param name strings.
+    Flatten to a set of param name strings, stripping noise tokens.
     """
     raw = ep.get("params", {})
     if isinstance(raw, dict):
@@ -238,17 +216,20 @@ def _flat_params(ep) -> set:
         for bucket in raw.values():
             if isinstance(bucket, list):
                 names.update(bucket)
-        return names
-    if isinstance(raw, list):
-        return {p["name"] for p in raw if isinstance(p, dict) and "name" in p}
-    return set()
+    elif isinstance(raw, list):
+        names = {p["name"] for p in raw if isinstance(p, dict) and "name" in p}
+    else:
+        names = set()
+
+    # Strip noise — generic params that produce FPs on every app
+    return names - PARAM_NOISE_BLOCKLIST
 
 
 def _param_risk_score(params: set) -> dict:
     """
-    Given a flat set of param names, return a dict of:
-      {"classes": [...vuln classes...], "score": int, "hits": {class: [matched_params]}}
-    Higher score = more diverse risk.
+    Given a flat set of cleaned param names, return:
+      {"classes": [...], "score": int, "hits": {class: [matched_params]}, "confidence": str}
+    Score ladders into confidence so high-diversity endpoints get CONF_STRONG.
     """
     hits = {}
     if params & CMDI_PARAMS:
@@ -263,7 +244,18 @@ def _param_risk_score(params: set) -> dict:
         hits["redirect"] = sorted(params & REDIRECT_PARAMS)
 
     score = sum(PARAM_CLASS_WEIGHT.get(cls, 0) for cls in hits)
-    return {"classes": list(hits.keys()), "score": score, "hits": hits}
+
+    # Confidence based on score diversity, not just count
+    if score >= 7:
+        confidence = CONF_STRONG
+    elif score >= 4:
+        confidence = CONF_LIKELY
+    elif score >= 1:
+        confidence = CONF_POSSIBLE
+    else:
+        confidence = CONF_POSSIBLE
+
+    return {"classes": list(hits.keys()), "score": score, "hits": hits, "confidence": confidence}
 
 
 def _severity_rank(sev: str) -> int:
@@ -293,6 +285,29 @@ def _sugg(priority, confidence, source, action, reason,
     )
 
 
+def _extract_bac_findings(results: dict) -> list:
+    """
+    Single source of truth for pulling BAC findings out of bacdetector intel.
+    Handles both intel shapes (bac.findings list and top-level vulnerabilities list).
+    """
+    intel = results.get("bacdetector", {}).get("intel", {})
+    bac   = intel.get("bac", {})
+    findings = (bac.get("findings", []) if isinstance(bac, dict) else [])
+    vulns    = intel.get("vulnerabilities", [])
+    return findings + vulns
+
+
+def _extract_idor_findings(results: dict) -> list:
+    """Single source of truth for IDORdetector confirmed findings."""
+    intel = results.get("idordetector", {}).get("intel", {})
+    # Support both shapes modules may return
+    confirmed = [
+        f for f in intel.get("findings", intel.get("vulnerabilities", []))
+        if f.get("confirmed", True)   # if key absent, treat finding as confirmed
+    ]
+    return confirmed
+
+
 # ─────────────────────────────────────────────────────────────
 # CROSS-MODULE CORRELATOR
 # ─────────────────────────────────────────────────────────────
@@ -301,30 +316,23 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
     """
     Detects multi-module attack chains and produces high-value suggestions
     that no single module's section would emit alone.
-
-    Examples of chains detected:
-      Spider(cmdi_params) + CMDinj(confirmed) → "RCE chain complete, escalate"
-      Spider(auth_endpoints) + BAC(bypass)    → "Auth bypass chain, pivot to IDOR"
-      Fingerprint(cms_version) + Exmap        → "Version fingerprint → CVE lookup chain"
-      BAC(bypass) + Spider(sensitive_ep)      → "Auth bypass on sensitive endpoint"
-      Stalk(subdomains) + Spider(endpoints)   → "Multi-surface coverage chain"
     """
     chains = []
 
     spider_intel  = results.get("spider",      {}).get("intel", {})
-    bac_intel     = results.get("bacdetector", {}).get("intel", {})
     cmdinj_intel  = results.get("cmdinj",      {}).get("intel", {})
     parax_intel   = results.get("parax",       {}).get("intel", {})
     fp_intel      = results.get("fingerprint", {}).get("intel", {})
-    stalk_intel   = results.get("stalk",       {}).get("intel", {})
 
-    endpoints     = spider_intel.get("endpoints",   [])
-    bac_findings  = (bac_intel.get("bac",   {}).get("findings", []) if isinstance(bac_intel.get("bac"), dict) else []) + bac_intel.get("vulnerabilities", [])
+    endpoints     = spider_intel.get("endpoints", [])
+    bac_findings  = _extract_bac_findings(results)
+    idor_findings = _extract_idor_findings(results)
     cmdi_vulns    = cmdinj_intel.get("vulnerabilities", [])
     parax_vulns   = parax_intel.get("vulnerabilities",  [])
 
     # ── Chain 1: CMDi params found by Spider + CMDinj confirmed RCE ──
-    cmdi_param_eps = [e for e in endpoints if _flat_params(e) & CMDI_PARAMS]
+    dynamic_eps    = [e for e in endpoints if not _is_static_asset(e.get("url", ""))]
+    cmdi_param_eps = [e for e in dynamic_eps if _flat_params(e) & CMDI_PARAMS]
     confirmed_rce  = [v for v in cmdi_vulns if v.get("confirmed")]
     if cmdi_param_eps and confirmed_rce:
         chains.append(_sugg(
@@ -339,7 +347,7 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
         ))
 
     # ── Chain 2: BAC bypass + sensitive endpoints = privilege escalation path ──
-    bac_bypasses = [f for f in bac_findings if f.get("severity","").lower() in ("critical","high")]
+    bac_bypasses  = [f for f in bac_findings if f.get("severity","").lower() in ("critical","high")]
     sensitive_eps = [e for e in endpoints if e.get("parameter_sensitive") or e.get("auth_required")]
     if bac_bypasses and sensitive_eps:
         chains.append(_sugg(
@@ -354,12 +362,12 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
         ))
 
     # ── Chain 3: IDOR params + BAC bypass = confirmed object access ──
-    idor_param_eps = [e for e in endpoints if _flat_params(e) & IDOR_PARAMS]
+    idor_param_eps = [e for e in dynamic_eps if _flat_params(e) & IDOR_PARAMS]
     if idor_param_eps and bac_bypasses and "idordetector" not in ran:
         chains.append(_sugg(
             P_HIGH, CONF_STRONG, "correlator",
             action  = "equip IDORdetector — BAC bypass + IDOR-risk params on same surface",
-            reason  = "Auth bypass is confirmed; IDOR params present; object-level access control likely broken",
+            reason  = "Auth bypass confirmed; IDOR-risk params present — object-level access control likely broken",
             evidence= [
                 f"Spider: {len(idor_param_eps)} endpoint(s) with IDOR-risk params",
                 f"BAC: bypass confirmed at high/critical severity",
@@ -367,9 +375,45 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
             chain   = "BACdetector → IDORdetector",
         ))
 
-    # ── Chain 4: Fingerprint version + no Exmap run ──
+    # ── Chain 4: Confirmed IDOR + BAC = full object takeover path ──
+    if idor_findings and bac_bypasses:
+        chains.append(_sugg(
+            P_CRITICAL, CONF_CONFIRMED, "correlator",
+            action  = "Full object takeover path confirmed — extract, pivot, escalate",
+            reason  = "IDORdetector confirmed unauthorised object access + BACdetector confirmed auth bypass; full horizontal/vertical escalation is proven",
+            evidence= [
+                f"IDOR: {len(idor_findings)} confirmed object access violation(s)",
+                f"BAC: {len(bac_bypasses)} high/critical bypass finding(s)",
+                f"Top IDOR: {idor_findings[0].get('url', idor_findings[0].get('endpoint', '?'))}",
+            ],
+            chain   = "BACdetector + IDORdetector → data exfiltration",
+        ))
+
+    # ── Chain 5: Confirmed IDOR + no Parax run → SQLi on same object endpoints ──
+    if idor_findings and "parax" not in ran:
+        idor_eps_urls = {f.get("url", f.get("endpoint", "")) for f in idor_findings}
+        sqli_overlap = [
+            e for e in dynamic_eps
+            if e.get("url", "") in idor_eps_urls and _flat_params(e) & SQLI_PARAMS
+        ]
+        if sqli_overlap:
+            chains.append(_sugg(
+                P_HIGH, CONF_STRONG, "correlator",
+                action  = "equip Parax — confirmed IDOR endpoints also carry SQLi-risk params",
+                reason  = "The same endpoints with confirmed IDOR have query params matching SQLi patterns; double-tap with Parax",
+                evidence= [
+                    f"IDOR-confirmed endpoints with SQLi params: {len(sqli_overlap)}",
+                    f"Example: {sqli_overlap[0].get('url','')}",
+                ],
+                chain   = "IDORdetector → Parax",
+            ))
+
+    # ── Chain 6: Fingerprint version + no Exmap run ──
     detected_tech  = fp_intel.get("detected", {}) or fp_intel.get("technologies", {})
-    versioned_tech = {k: v for k, v in (detected_tech.items() if isinstance(detected_tech, dict) else {}.items()) if v and str(v).strip()}
+    versioned_tech = {
+        k: v for k, v in (detected_tech.items() if isinstance(detected_tech, dict) else {}.items())
+        if v and str(v).strip()
+    }
     if versioned_tech and "exmap" not in ran:
         top = list(versioned_tech.items())[:3]
         chains.append(_sugg(
@@ -380,7 +424,7 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
             chain   = "Fingerprint → Exmap",
         ))
 
-    # ── Chain 5: Parax high-risk params + CMDinj not run ──
+    # ── Chain 7: Parax high-risk params + CMDinj not run ──
     high_parax = [v for v in parax_vulns if v.get("risk","").lower() in ("critical","high")]
     if high_parax and "cmdinj" not in ran:
         chains.append(_sugg(
@@ -391,18 +435,7 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
             chain   = "Parax → CMDinj",
         ))
 
-    # ── Chain 6: Stalk subdomains + Spider not yet run on all surfaces ──
-    subdomains = stalk_intel.get("infrastructure", {}).get("subdomains", [])
-    if subdomains and "spider" in ran:
-        chains.append(_sugg(
-            P_MEDIUM, CONF_LIKELY, "correlator",
-            action  = "re-equip Spider on discovered subdomains",
-            reason  = "Stalk found subdomains not in current Spider scope; each is an independent attack surface",
-            evidence= [f"Stalk: {len(subdomains)} subdomain(s): {', '.join(subdomains[:4])}{'...' if len(subdomains)>4 else ''}"],
-            chain   = "Stalk → Spider (multi-surface)",
-        ))
-
-    # ── Chain 7: Secrets found + CredLeak not run ──
+    # ── Chain 8: Secrets found + CredLeak not run ──
     secrets = spider_intel.get("secrets", [])
     if secrets and "credleak" not in ran:
         chains.append(_sugg(
@@ -419,51 +452,6 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
 # ─────────────────────────────────────────────────────────────
 # MODULE ANALYZERS
 # ─────────────────────────────────────────────────────────────
-
-def _analyze_nmap(results, ran) -> List[Suggestion]:
-    out = []
-    intel    = results["nmap"].get("intel", {})
-    services = intel.get("services", {})
-
-    if not services:
-        out.append(_sugg(P_MEDIUM, CONF_POSSIBLE, "nmap",
-            action="re-run nmap with -p- flag",
-            reason="No services parsed from current scan; default port range may have missed services",
-        ))
-        return out
-
-    for port_proto, data in services.items():
-        port    = port_proto.split("/")[0]
-        service = data.get("service", "").lower()
-        version = data.get("version", "")
-
-        # Service → module suggestions
-        for svc_key, modules in SERVICE_MODULE_MAP.items():
-            if svc_key in service:
-                for mod in modules:
-                    if mod not in ran:
-                        out.append(_sugg(P_HIGH, CONF_STRONG, "nmap",
-                            action  = f"equip {mod}",
-                            reason  = f"{service.upper()} on port {port} is a web surface — {mod} not yet run",
-                            evidence= [f"Port {port}: {service} {version}".strip()],
-                        ))
-
-        # Version CVE matching
-        for rule in VERSION_CVE_MAP:
-            if version and re.search(rule["match"], version, re.IGNORECASE):
-                weaponized_tag = " [WEAPONIZED EXPLOIT EXISTS]" if rule["weaponized"] else ""
-                out.append(_sugg(P_CRITICAL, CONF_CONFIRMED, "nmap",
-                    action  = f"equip Exmap + manual exploit — {rule['cve']}{weaponized_tag}",
-                    reason  = f"{rule['title']} (CVSS {rule['cvss']}) detected on port {port}",
-                    evidence= [
-                        f"Detected version: {version} on port {port}",
-                        f"CVE: {rule['cve']} | CVSS: {rule['cvss']}",
-                        f"Weaponized: {'YES' if rule['weaponized'] else 'NO'}",
-                    ],
-                ))
-
-    return out
-
 
 def _analyze_spider(results, ran) -> List[Suggestion]:
     out = []
@@ -482,13 +470,14 @@ def _analyze_spider(results, ran) -> List[Suggestion]:
         ))
         return out
 
-    # Surface summary (informational)
-    auth_walled = [e for e in endpoints if e.get("auth_required")]
-    sensitive   = [e for e in endpoints if e.get("parameter_sensitive")]
+    # Only score params on dynamic endpoints — skip static assets
+    dynamic_eps = [ep for ep in endpoints if not _is_static_asset(ep.get("url", ""))]
+    auth_walled = [e for e in dynamic_eps if e.get("auth_required")]
+    sensitive   = [e for e in dynamic_eps if e.get("parameter_sensitive")]
 
-    # Param-level risk scoring across all endpoints
+    # Param-level risk scoring across dynamic endpoints only
     ep_risks = []
-    for ep in endpoints:
+    for ep in dynamic_eps:
         params = _flat_params(ep)
         risk   = _param_risk_score(params)
         if risk["score"] > 0:
@@ -506,35 +495,33 @@ def _analyze_spider(results, ran) -> List[Suggestion]:
 
     if cmdi_eps and "cmdinj" not in ran:
         top_url, top_risk = cmdi_eps[0]
-        out.append(_sugg(P_HIGH, CONF_LIKELY, "spider",
+        # Use the laddered confidence from the score
+        conf = top_risk["confidence"]
+        top3 = [f"  {u}  →  params: {', '.join(r['hits'].get('cmdi', []))}" for u, r in cmdi_eps[:3]]
+        out.append(_sugg(P_HIGH, conf, "spider",
             action  = "equip CMDinj",
-            reason  = f"{len(cmdi_eps)} endpoint(s) carry CMDi-risk params — highest risk at {top_url}",
-            evidence= [
-                f"Matched params: {', '.join(top_risk['hits'].get('cmdi', []))}",
-                f"Total CMDi-risk endpoints: {len(cmdi_eps)}",
-            ],
+            reason  = f"{len(cmdi_eps)} endpoint(s) carry CMDi-risk params — highest risk: {top_url}",
+            evidence= [f"Matched params: {', '.join(top_risk['hits'].get('cmdi', []))}"] + top3,
         ))
 
     if sqli_eps and "parax" not in ran:
         top_url, top_risk = sqli_eps[0]
-        out.append(_sugg(P_HIGH, CONF_LIKELY, "spider",
+        conf = top_risk["confidence"]
+        top3 = [f"  {u}  →  params: {', '.join(r['hits'].get('sqli', []))}" for u, r in sqli_eps[:3]]
+        out.append(_sugg(P_HIGH, conf, "spider",
             action  = "equip Parax",
-            reason  = f"{len(sqli_eps)} endpoint(s) carry SQLi-risk params",
-            evidence= [
-                f"Matched params: {', '.join(top_risk['hits'].get('sqli', []))}",
-                f"Top endpoint: {top_url}",
-            ],
+            reason  = f"{len(sqli_eps)} dynamic endpoint(s) carry SQLi-risk params",
+            evidence= [f"Matched params: {', '.join(top_risk['hits'].get('sqli', []))}"] + top3,
         ))
 
     if lfi_eps and "parax" not in ran:
         top_url, top_risk = lfi_eps[0]
-        out.append(_sugg(P_HIGH, CONF_LIKELY, "spider",
+        conf = top_risk["confidence"]
+        top3 = [f"  {u}  →  params: {', '.join(r['hits'].get('lfi', []))}" for u, r in lfi_eps[:3]]
+        out.append(_sugg(P_HIGH, conf, "spider",
             action  = "equip Parax (LFI-risk params detected)",
             reason  = f"{len(lfi_eps)} endpoint(s) carry LFI-risk params — file inclusion risk",
-            evidence= [
-                f"Matched params: {', '.join(top_risk['hits'].get('lfi', []))}",
-                f"Top endpoint: {top_url}",
-            ],
+            evidence= [f"Matched params: {', '.join(top_risk['hits'].get('lfi', []))}"] + top3,
         ))
 
     if auth_walled and "bacdetector" not in ran:
@@ -546,13 +533,11 @@ def _analyze_spider(results, ran) -> List[Suggestion]:
 
     if idor_eps and "bacdetector" not in ran:
         top_url, top_risk = idor_eps[0]
+        top3 = [u for u, _ in idor_eps[:3]]
         out.append(_sugg(P_HIGH, CONF_LIKELY, "spider",
             action  = "equip BACdetector (IDOR-risk params)",
             reason  = f"{len(idor_eps)} endpoint(s) with object-reference params — IDOR likely",
-            evidence= [
-                f"Matched params: {', '.join(top_risk['hits'].get('idor', []))}",
-                f"Top endpoint: {top_url}",
-            ],
+            evidence= [f"Matched params: {', '.join(top_risk['hits'].get('idor', []))}"] + top3,
         ))
 
     # Secrets
@@ -595,7 +580,6 @@ def _analyze_fingerprint(results, ran) -> List[Suggestion]:
     detected   = intel.get("detected",     {}) or intel.get("technologies", {})
     waf        = intel.get("waf",          None)
     cms        = intel.get("cms",          None)
-    frameworks = intel.get("frameworks",   [])
     headers    = intel.get("headers",      {})
 
     if waf:
@@ -610,23 +594,7 @@ def _analyze_fingerprint(results, ran) -> List[Suggestion]:
         cms_version = cms.get("version", "") if isinstance(cms, dict) else ""
         version_tag = f" v{cms_version}" if cms_version else ""
 
-        # Check version against CVE map
-        matched_cves = []
-        for rule in VERSION_CVE_MAP:
-            if re.search(rule["match"], f"{cms_name}{version_tag}", re.IGNORECASE):
-                matched_cves.append(rule)
-
-        if matched_cves and "exmap" not in ran:
-            for rule in matched_cves:
-                out.append(_sugg(P_CRITICAL, CONF_CONFIRMED, "fingerprint",
-                    action  = f"equip Exmap + manual exploit — {rule['cve']} [{rule['title']}]",
-                    reason  = f"{cms_name}{version_tag} maps to known CVE (CVSS {rule['cvss']})",
-                    evidence= [
-                        f"CMS: {cms_name}{version_tag}",
-                        f"CVE: {rule['cve']} | Weaponized: {'YES' if rule['weaponized'] else 'NO'}",
-                    ],
-                ))
-        elif cms_version and "exmap" not in ran:
+        if cms_version and "exmap" not in ran:
             out.append(_sugg(P_HIGH, CONF_STRONG, "fingerprint",
                 action  = "equip Exmap",
                 reason  = f"{cms_name}{version_tag} detected with specific version — map to CVE database",
@@ -666,11 +634,7 @@ def _analyze_fingerprint(results, ran) -> List[Suggestion]:
 
 def _analyze_bacdetector(results, ran) -> List[Suggestion]:
     out = []
-    intel        = results["bacdetector"].get("intel", {})
-    bac          = intel.get("bac", {})
-    findings     = bac.get("findings", []) if isinstance(bac, dict) else []
-    vulns        = intel.get("vulnerabilities", [])
-    all_findings = findings + vulns
+    all_findings = _extract_bac_findings(results)
 
     if not all_findings:
         out.append(_sugg(P_LOW, CONF_POSSIBLE, "bacdetector",
@@ -682,21 +646,88 @@ def _analyze_bacdetector(results, ran) -> List[Suggestion]:
     high = [f for f in all_findings if f.get("severity","").lower() in ("critical","high")]
     top  = _top_severity(all_findings)
 
+    # Surface top finding URLs for immediate operator context
+    top_urls = list({f.get("url", f.get("endpoint", "")) for f in high if f.get("url") or f.get("endpoint")})[:3]
+
     out.append(_sugg(
         P_CRITICAL if top in ("critical","high") else P_HIGH,
         CONF_CONFIRMED, "bacdetector",
         action  = "review loot — BAC findings require manual verification + PoC",
         reason  = f"{len(all_findings)} access control issue(s), top severity: {top.upper()}",
-        evidence= [
-            f"Total: {len(all_findings)} | High/Critical: {len(high)}",
-        ] + [f.get("url","") for f in high[:2]],
+        evidence= [f"Total: {len(all_findings)} | High/Critical: {len(high)}"] + top_urls,
     ))
 
     if high and "cmdinj" not in ran:
         out.append(_sugg(P_HIGH, CONF_STRONG, "bacdetector",
             action  = "equip CMDinj — confirmed auth bypass enables direct injection testing",
             reason  = "Access control bypass on auth-required endpoints creates direct path to CMDi",
-            evidence= [f"BAC bypass at: {f.get('url','')} " for f in high[:2]],
+            evidence= [f"BAC bypass at: {f.get('url', f.get('endpoint',''))} " for f in high[:2]],
+        ))
+
+    if high and "idordetector" not in ran:
+        out.append(_sugg(P_HIGH, CONF_STRONG, "bacdetector",
+            action  = "equip IDORdetector — auth bypass on object endpoints indicates IDOR surface",
+            reason  = "High/critical BAC bypass found; object-level access control is the natural next test",
+            evidence= [f"BAC: {len(high)} high/critical finding(s)"],
+        ))
+
+    return out
+
+
+def _analyze_idordetector(results, ran) -> List[Suggestion]:
+    out = []
+    intel    = results["idordetector"].get("intel", {})
+    findings = _extract_idor_findings(results)
+
+    if not findings:
+        out.append(_sugg(P_LOW, CONF_POSSIBLE, "idordetector",
+            action="review IDORdetector config — no confirmed findings; verify ID pool coverage",
+            reason="Zero confirmed IDORs; may need wider ID range or authenticated session for harvest pass",
+        ))
+        return out
+
+    # Bucket by location (path vs param vs body)
+    by_location: dict = {}
+    sensitive_data_findings = []
+    for f in findings:
+        loc = f.get("location", f.get("param_location", "unknown"))
+        by_location[loc] = by_location.get(loc, 0) + 1
+        evidence = f.get("evidence", [])
+        if isinstance(evidence, list) and any("sensitive" in str(e).lower() for e in evidence):
+            sensitive_data_findings.append(f)
+        elif isinstance(evidence, str) and "sensitive" in evidence.lower():
+            sensitive_data_findings.append(f)
+
+    loc_summary = ", ".join(f"{loc}: {cnt}" for loc, cnt in by_location.items())
+    top_urls = list({
+        f.get("url", f.get("endpoint", ""))
+        for f in findings if f.get("url") or f.get("endpoint")
+    })[:3]
+
+    out.append(_sugg(
+        P_CRITICAL, CONF_CONFIRMED, "idordetector",
+        action  = "document IDOR PoC + assess data exposure scope",
+        reason  = f"{len(findings)} confirmed IDOR finding(s) — unauthorised object access proven ({loc_summary})",
+        evidence= [f"Confirmed IDORs: {len(findings)}  |  Locations: {loc_summary}"] + top_urls,
+    ))
+
+    # If sensitive data keys appeared in IDOR responses, escalate
+    if sensitive_data_findings:
+        out.append(_sugg(
+            P_CRITICAL, CONF_CONFIRMED, "idordetector",
+            action  = "escalate — IDOR responses contain sensitive data fields",
+            reason  = f"{len(sensitive_data_findings)} IDOR finding(s) leaked sensitive response fields (PII, tokens, credentials)",
+            evidence= [
+                f.get("url", f.get("endpoint", "?")) + "  →  " + str(f.get("evidence", ""))[:80]
+                for f in sensitive_data_findings[:3]
+            ],
+        ))
+
+    # Push toward Parax if not run
+    if "parax" not in ran:
+        out.append(_sugg(P_HIGH, CONF_LIKELY, "idordetector",
+            action  = "equip Parax — test IDOR-confirmed endpoints for SQLi/LFi",
+            reason  = "Endpoints confirmed for IDOR are high-value targets for injection; Parax will probe same surface",
         ))
 
     return out
@@ -751,16 +782,15 @@ def _analyze_cmdinj(results, ran) -> List[Suggestion]:
         ))
         return out
 
-    confirmed = [v for v in vulns if v.get("confirmed")]
+    confirmed   = [v for v in vulns if v.get("confirmed")]
     unconfirmed = [v for v in vulns if not v.get("confirmed")]
 
     if confirmed:
+        top_urls = [v.get("url", v.get("endpoint","")) for v in confirmed[:3]]
         out.append(_sugg(P_CRITICAL, CONF_CONFIRMED, "cmdinj",
             action  = "document PoC + escalate — confirmed RCE",
             reason  = f"{len(confirmed)} confirmed command injection(s) with PoC; this is the critical finding",
-            evidence= [
-                f"Confirmed: {len(confirmed)} | Unconfirmed: {len(unconfirmed)}",
-            ] + [v.get("url","") for v in confirmed[:2]],
+            evidence= [f"Confirmed: {len(confirmed)} | Unconfirmed: {len(unconfirmed)}"] + top_urls,
         ))
         if "exmap" not in ran:
             out.append(_sugg(P_HIGH, CONF_STRONG, "cmdinj",
@@ -771,7 +801,7 @@ def _analyze_cmdinj(results, ran) -> List[Suggestion]:
         out.append(_sugg(P_HIGH, CONF_LIKELY, "cmdinj",
             action  = "manual verification required — unconfirmed CMDi findings",
             reason  = f"{len(unconfirmed)} unconfirmed injection indicator(s); scanner saw evidence but could not verify blind",
-            evidence= [v.get("url","") for v in unconfirmed[:3]],
+            evidence= [v.get("url", v.get("endpoint","")) for v in unconfirmed[:3]],
         ))
 
     return out
@@ -830,29 +860,6 @@ def _analyze_credleak(results, ran) -> List[Suggestion]:
     return out
 
 
-def _analyze_stalk(results, ran) -> List[Suggestion]:
-    out = []
-    intel      = results["stalk"].get("intel", {})
-    subdomains = intel.get("infrastructure", {}).get("subdomains", [])
-    open_ports = intel.get("infrastructure", {}).get("open_ports",  [])
-    emails     = intel.get("exposure",       {}).get("emails",      [])
-
-    if subdomains and "surfacemap" not in ran:
-        out.append(_sugg(P_HIGH, CONF_STRONG, "stalk",
-            action  = "equip SurfaceMAP on discovered subdomains",
-            reason  = f"{len(subdomains)} subdomain(s) found — service enumeration not yet performed",
-            evidence= subdomains[:5],
-        ))
-
-    if emails and "credleak" not in ran:
-        out.append(_sugg(P_MEDIUM, CONF_LIKELY, "stalk",
-            action  = "equip CredLeak — emails harvested, check breach databases",
-            reason  = f"{len(emails)} email(s) found in OSINT — check for credential exposure",
-        ))
-
-    return out
-
-
 def _analyze_exmap(results, ran) -> List[Suggestion]:
     out = []
     intel    = results["exmap"].get("intel", {})
@@ -886,19 +893,18 @@ def _analyze_exmap(results, ran) -> List[Suggestion]:
 def _build_skip_list(results: dict, ran: set, active_actions: set) -> List[Suggestion]:
     """
     Build a reasoned skip list: modules not suggested, with WHY.
-    Only skip modules that are installed and would normally be considered.
+    Web-only — no host/port/service references.
     """
     skip = []
     spider_intel = results.get("spider", {}).get("intel", {})
     endpoints    = spider_intel.get("endpoints", [])
 
     # Phishprep — skip if no employee data collected
-    emp_ran   = "emptracker" in ran
-    stalk_ran = "stalk" in ran
+    emp_ran = "emptracker" in ran
     if "phishprep" not in ran and not emp_ran:
         skip.append(_sugg(P_SKIP, CONF_POSSIBLE, "skip",
             action="Phishprep",
-            reason="No employee data collected yet — run EMPtracker or Stalk first",
+            reason="No employee data collected yet — run EMPtracker first",
             skip=True,
         ))
 
@@ -911,21 +917,11 @@ def _build_skip_list(results: dict, ran: set, active_actions: set) -> List[Sugge
         ))
 
     # CredLeak — skip if no emails and spider found no secrets
-    secrets = spider_intel.get("secrets", [])
-    stalk_intel = results.get("stalk", {}).get("intel", {})
-    stalk_emails = stalk_intel.get("exposure", {}).get("emails", [])
-    if "credleak" not in ran and not secrets and not stalk_emails:
+    secrets      = spider_intel.get("secrets", [])
+    if "credleak" not in ran and not secrets:
         skip.append(_sugg(P_SKIP, CONF_POSSIBLE, "skip",
             action="CredLeak",
-            reason="No emails or secrets found yet — insufficient data to query leak databases",
-            skip=True,
-        ))
-
-    # Stalk — skip if recon already comprehensive
-    if "stalk" in ran:
-        skip.append(_sugg(P_SKIP, CONF_CONFIRMED, "skip",
-            action="Stalk (re-run)",
-            reason="OSINT recon already completed this session",
+            reason="No secrets or emails found yet — insufficient data to query leak databases",
             skip=True,
         ))
 
@@ -938,39 +934,38 @@ def _build_skip_list(results: dict, ran: set, active_actions: set) -> List[Sugge
 
 def _detected_attack_chains(results: dict) -> List[str]:
     """
-    Return human-readable labels for complete attack chains detected.
-    These are shown as highlights in the report — "what story do the findings tell".
+    Return human-readable labels for complete attack chains detected this session.
+    Uses the shared helper functions so BAC/IDOR extraction is consistent.
     """
     chains = []
     ran = set(results.keys())
 
-    cmdi_confirmed  = any(
+    cmdi_confirmed = any(
         v.get("confirmed")
         for v in results.get("cmdinj", {}).get("intel", {}).get("vulnerabilities", [])
     )
-    bac_bypass      = any(
-        f.get("severity","").lower() in ("critical","high")
-        for f in (
-            results.get("bacdetector",{}).get("intel",{}).get("bac",{}).get("findings",[])
-            + results.get("bacdetacker",{}).get("intel",{}).get("vulnerabilities",[])
-            if isinstance(results.get("bacdetector",{}).get("intel",{}).get("bac",{}), dict) else []
-        )
-    )
-    has_cves        = bool(results.get("exmap", {}).get("intel", {}).get("cves", []))
-    has_secrets     = bool(results.get("spider", {}).get("intel", {}).get("secrets", []))
-    has_subdomains  = bool(results.get("stalk",  {}).get("intel", {}).get("infrastructure", {}).get("subdomains", []))
+    bac_bypasses = [
+        f for f in _extract_bac_findings(results)
+        if f.get("severity","").lower() in ("critical","high")
+    ]
+    idor_confirmed = _extract_idor_findings(results)
+    has_cves       = bool(results.get("exmap", {}).get("intel", {}).get("cves", []))
+    has_secrets    = bool(results.get("spider", {}).get("intel", {}).get("secrets", []))
 
     if cmdi_confirmed and "exmap" in ran:
         chains.append("RCE-to-CVE chain: CMDinj confirmed → Exmap correlated → full exploit documented")
 
-    if bac_bypass and cmdi_confirmed:
+    if bac_bypasses and cmdi_confirmed:
         chains.append("Privilege escalation chain: BAC bypass → CMDinj on auth-protected endpoint → full compromise")
+
+    if idor_confirmed and bac_bypasses:
+        chains.append(
+            f"Full object takeover: BAC bypass ({len(bac_bypasses)} findings) + "
+            f"IDOR confirmed ({len(idor_confirmed)} objects) → horizontal escalation proven"
+        )
 
     if has_secrets and "credleak" in ran:
         chains.append("Credential exposure chain: Spider exposed secrets → CredLeak verified breach → active key found")
-
-    if has_subdomains and "surfacemap" in ran and "spider" in ran:
-        chains.append("Multi-surface chain: Stalk subdomains → SurfaceMAP enumerated → Spider crawled all surfaces")
 
     return chains
 
@@ -1009,16 +1004,15 @@ def suggest_report(results: dict) -> SuggestReport:
     all_suggestions: List[Suggestion] = []
 
     analyzer_map = {
-        "nmap":        _analyze_nmap,
-        "spider":      _analyze_spider,
-        "fingerprint": _analyze_fingerprint,
-        "bacdetector": _analyze_bacdetector,
-        "parax":       _analyze_parax,
-        "cmdinj":      _analyze_cmdinj,
-        "seige":       _analyze_seige,
-        "credleak":    _analyze_credleak,
-        "stalk":       _analyze_stalk,
-        "exmap":       _analyze_exmap,
+        "spider":        _analyze_spider,
+        "fingerprint":   _analyze_fingerprint,
+        "bacdetector":   _analyze_bacdetector,
+        "idordetector":  _analyze_idordetector,
+        "parax":         _analyze_parax,
+        "cmdinj":        _analyze_cmdinj,
+        "seige":         _analyze_seige,
+        "credleak":      _analyze_credleak,
+        "exmap":         _analyze_exmap,
     }
 
     for module, analyzer in analyzer_map.items():
