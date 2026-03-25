@@ -476,7 +476,7 @@ class HellhoundConsole(cmd.Cmd):
 
         # Column widths
         C_NAME = 22
-        C_VAL  = 20
+        C_VAL  = 24
         C_REQ  = 10
 
         # Header
@@ -506,32 +506,45 @@ class HellhoundConsole(cmd.Cmd):
             required = opt.get("required", False)
             current  = self.module_options.get(name, default)
 
-            # Current setting display
-            if name == "cookie" and isinstance(current, str) and current:
-                first_pair = current.split(";")[0].strip()
-                if "=" in first_pair:
-                    k, v = first_pair.split("=", 1)
-                    raw_display = f"{k}={v[:12]}..." if len(v) > 12 else f"{k}={v}"
-                else:
-                    raw_display = first_pair[:C_VAL]
-            elif current is None or current == "" or current == {}:
-                raw_display = ""
+            # ── Value display ──────────────────────────────────────
+            if current is None or current == "" or current == {}:
+                disp = ""
+            elif isinstance(current, str) and current.startswith("eyJ"):
+                # Raw JWT — show head...tail only
+                disp = f"{current[:8]}...{current[-4:]}"
+            elif isinstance(current, str) and current.lower().startswith("bearer "):
+                tok  = current[7:]
+                disp = f"Bearer {tok[:8]}...{tok[-4:]}"
+            elif isinstance(current, str) and "=" in current and len(current) > C_VAL:
+                # Cookie key=value style
+                first = current.split(";")[0].strip()
+                k, v  = first.split("=", 1)
+                max_v = max(4, C_VAL - len(k) - 4)
+                disp  = f"{k}={v[:max_v]}..." if len(v) > max_v else f"{k}={v}"
             else:
-                raw_str = str(current)
-                raw_display = raw_str[:C_VAL] + "..." if len(raw_str) > C_VAL else raw_str
+                raw = str(current)
+                disp = raw[:C_VAL - 3] + "..." if len(raw) > C_VAL else raw
 
             # Colors
-            val_color  = Fore.GREEN + Style.BRIGHT if raw_display else Fore.WHITE
-            req_str    = "yes" if required else "no"
-            req_color  = Fore.RED + Style.BRIGHT if required else Fore.WHITE
+            if disp:
+                val_color = Fore.GREEN + Style.BRIGHT
+            elif required:
+                val_color = Fore.RED
+                disp      = "not set"
+            else:
+                val_color = Fore.LIGHTBLACK_EX
+                disp      = ""
 
-            # Pad manually (ANSI codes inflate len so do it by hand)
+            req_str   = "yes" if required else "no"
+            req_color = Fore.RED + Style.BRIGHT if required else Fore.WHITE
+
+            # Padding uses only visible char counts — no ANSI in disp
             pad_name = " " * max(0, C_NAME - len(name))
-            pad_val  = " " * max(0, C_VAL  - len(raw_display))
+            pad_val  = " " * max(0, C_VAL  - len(disp))
             pad_req  = " " * max(0, C_REQ  - len(req_str))
 
             print(f"   {Fore.CYAN + Style.BRIGHT}{name}{Style.RESET_ALL}{pad_name}"
-                  f"{val_color}{raw_display}{Style.RESET_ALL}{pad_val}"
+                  f"{val_color}{disp}{Style.RESET_ALL}{pad_val}"
                   f"{req_color}{req_str}{Style.RESET_ALL}{pad_req}"
                   f"{Fore.WHITE}{helptext}{Style.RESET_ALL}")
 
@@ -638,6 +651,13 @@ class HellhoundConsole(cmd.Cmd):
             runtime_options["cookie"] = self.target_context["cookies"]
         if self.target_context.get("headers") and "headers" not in runtime_options:
             runtime_options["headers"] = self.target_context["headers"]
+
+        # ── Auto-feed Spider intel to any module that wants it ──
+        # Silently inject previously collected spider intel so modules
+        # can skip their internal crawlers and use the Spider brain instead.
+        spider_result = self.results.get("spider")
+        if spider_result and "spider_intel" not in runtime_options:
+            runtime_options["spider_intel"] = spider_result.get("intel", {})
 
         # ── Cookie raw-token detection warning ────────────────
         raw_cookie_val = self.target_context.get("cookies") or runtime_options.get("cookie")
