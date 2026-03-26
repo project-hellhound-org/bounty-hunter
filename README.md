@@ -1,3 +1,16 @@
+<p align="center">
+  <img src="Images/hellhound.png" alt="Hellhound" width="600"/>
+</p>
+<h1 align="center">HELLHOUND</h1>
+<h1 align="center">Hellhound-Pentest(In-Dev)</h1>
+<p align="center">
+  Modular web offensive framework for recon, attack surface mapping, and vulnerability detection.
+</p>
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white"/>
+  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square"/>
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey?style=flat-square"/>
+</p>
 # Hellhound
 
 ## Web Application Offensive Security Framework
