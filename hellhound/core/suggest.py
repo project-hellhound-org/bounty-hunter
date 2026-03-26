@@ -36,10 +36,10 @@ from urllib.parse import urlparse
 
 KNOWN_MODULES = {
     "spider", "bacdetector", "cmdinj", "parax",
-    "seige", "fuzzhunter", "fingerprint", "credleak",
-    "surfacemap", "wafbuster", "exmap",
-    "idordetector", "emptracker", "phishprep",
+    "graphql_hunter", "jwt_analyzer", "wafbuster", "exmap",
+    "idordetector",
 }
+
 
 P_CRITICAL = 0
 P_HIGH     = 1
@@ -424,15 +424,25 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
             chain   = "Parax → CMDinj",
         ))
 
-    # Chain 9: Secrets found + CredLeak not run
-    secrets = spider_intel.get("secrets", [])
-    if secrets and "credleak" not in ran:
+    # Chain 9: GraphQL endpoints found + hunter not run
+    graphql_eps = spider_intel.get("graphql", [])
+    if graphql_eps and "graphql_hunter" not in ran:
+        chains.append(_sugg(
+            P_HIGH, CONF_STRONG, "correlator",
+            action  = "equip GraphQL — Spider found exposed GraphQL endpoints",
+            reason  = "GraphQL endpoints are often misconfigured with introspection enabled; dedicated probe required",
+            evidence= [f"Spider: {len(graphql_eps)} endpoint(s) detected"],
+            chain   = "Spider → GraphQL",
+        ))
+
+    # Chain 10: Potential JWTs found + analyzer not run
+    jwt_found = any("id_token" in str(e).lower() or "bearer" in str(e).lower() for e in spider_intel.get("endpoints", []))
+    if jwt_found and "jwt_analyzer" not in ran:
         chains.append(_sugg(
             P_HIGH, CONF_LIKELY, "correlator",
-            action  = "equip CredLeak — Spider found exposed secrets, check paste/leak databases",
-            reason  = "Exposed API keys or emails in source may appear in breach databases; CredLeak will verify",
-            evidence= [f"Spider: {len(secrets)} secret(s) exposed in source/JS"],
-            chain   = "Spider secrets → CredLeak",
+            action  = "equip JWTanalyzer — Spider found potential tokens in endpoints",
+            reason  = "Authorization headers or token-like strings detected; verify for algorithm confusion/none vulnerabilities",
+            chain   = "Spider → JWTanalyzer",
         ))
 
     # Chain 10: Exmap found weaponized CVEs + no confirmed exploitation yet
@@ -799,32 +809,44 @@ def _analyze_cmdinj(results, ran) -> List[Suggestion]:
     return out
 
 
-def _analyze_seige(results, ran) -> List[Suggestion]:
+def _analyze_graphql_hunter(results, ran) -> List[Suggestion]:
     out   = []
-    intel = results["seige"].get("intel", {})
-    vulns = intel.get("vulnerabilities", [])
-    score = intel.get("risk_score", 0)
+    intel = results.get("graphql_hunter", {}).get("intel", {})
+    eps   = intel.get("graphql_endpoints", [])
+    
+    if eps:
+        vuln_eps = [e for e in eps if e.get("introspection_enabled") or e.get("suggestions_enabled")]
+        if vuln_eps:
+             out.append(_sugg(P_CRITICAL, CONF_CONFIRMED, "graphql_hunter",
+                action  = "exploit GraphQL — introspection/suggestions enabled",
+                reason  = f"{len(vuln_eps)} GraphQL endpoint(s) allow schema extraction or field suggestions",
+                evidence= [e.get("endpoint","") for e in vuln_eps[:3]],
+            ))
+        else:
+            out.append(_sugg(P_MEDIUM, CONF_CONFIRMED, "graphql_hunter",
+                action  = "review GraphQL loot — endpoints confirmed but locked down",
+                reason  = f"{len(eps)} GraphQL endpoint(s) analyzed; no immediate leaks found",
+            ))
+    return out
 
-    if not vulns:
-        return out
 
-    high = [v for v in vulns if v.get("severity","").lower() in ("critical","high")]
-    out.append(_sugg(
-        P_CRITICAL if high else P_HIGH,
-        CONF_CONFIRMED, "seige",
-        action  = "review Seige findings — Nikto/Nuclei flagged issues",
-        reason  = f"{len(vulns)} vulnerability finding(s) (risk score: {score}); {len(high)} high/critical",
-        evidence= [f"{v.get('title','')} [{v.get('severity','')}]" for v in high[:3]],
-    ))
-
-    waf_hints = [v for v in vulns if "waf" in v.get("title","").lower() or "firewall" in v.get("title","").lower()]
-    if waf_hints and "wafbuster" not in ran:
-        out.append(_sugg(P_HIGH, CONF_LIKELY, "seige",
-            action  = "equip WAFBuster — Seige detected WAF-like filtering behaviour",
-            reason  = "Nuclei/Nikto flagged responses consistent with a WAF; bypass needed before active exploitation",
-            evidence= [v.get("title","") for v in waf_hints[:2]],
+def _analyze_jwt_analyzer(results, ran) -> List[Suggestion]:
+    out   = []
+    intel = results.get("jwt_analyzer", {}).get("intel", {})
+    jwts  = intel.get("jwts", [])
+    
+    critical = [j for j in jwts if any("CRITICAL" in v for v in j.get("vulnerabilities", []))]
+    if critical:
+        out.append(_sugg(P_CRITICAL, CONF_CONFIRMED, "jwt_analyzer",
+            action  = "escalate JWT — critical vulnerability (e.g. none algorithm) confirmed",
+            reason  = f"{len(critical)} JWT(s) are exploitable via algorithm confusion or null signatures",
+            evidence= [j.get("token","")[:30] + "..." for j in critical[:2]],
         ))
-
+    elif jwts:
+        out.append(_sugg(P_HIGH, CONF_CONFIRMED, "jwt_analyzer",
+            action  = "review JWT loot — sensitive data exposure in claims",
+            reason  = "Tokens analyzed; some contain high-value PII or session identifiers",
+        ))
     return out
 
 
@@ -945,12 +967,6 @@ def _build_skip_list(results: dict, ran: set, active_actions: set) -> List[Sugge
     endpoints    = spider_intel.get("endpoints", [])
     secrets      = spider_intel.get("secrets",   [])
 
-    if "phishprep" not in ran and "emptracker" not in ran:
-        skip.append(_sugg(P_SKIP, CONF_POSSIBLE, "skip",
-            action="Phishprep",
-            reason="No employee data collected yet — run EMPtracker first",
-            skip=True,
-        ))
 
     if "fuzzhunter" not in ran and "spider" in ran and len(endpoints) > 20:
         skip.append(_sugg(P_SKIP, CONF_LIKELY, "skip",
@@ -959,12 +975,6 @@ def _build_skip_list(results: dict, ran: set, active_actions: set) -> List[Sugge
             skip=True,
         ))
 
-    if "credleak" not in ran and not secrets:
-        skip.append(_sugg(P_SKIP, CONF_POSSIBLE, "skip",
-            action="CredLeak",
-            reason="No secrets or emails found yet — insufficient data to query leak databases",
-            skip=True,
-        ))
 
     return skip
 
@@ -1003,8 +1013,6 @@ def _detected_attack_chains(results: dict) -> List[str]:
             f"on detected stack [{cve_ids}] -> immediate exploitation path"
         )
 
-    if has_secrets and "credleak" in ran:
-        chains.append("Credential exposure chain: Spider exposed secrets -> CredLeak verified breach -> active key found")
 
     return chains
 
@@ -1040,8 +1048,8 @@ def suggest_report(results: dict) -> SuggestReport:
         "idordetector": _analyze_idordetector,
         "parax":        _analyze_parax,
         "cmdinj":       _analyze_cmdinj,
-        "seige":        _analyze_seige,
-        "credleak":     _analyze_credleak,
+        "graphql_hunter": _analyze_graphql_hunter,
+        "jwt_analyzer":   _analyze_jwt_analyzer,
         "exmap":        _analyze_exmap,
     }
 

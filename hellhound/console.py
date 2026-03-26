@@ -1012,6 +1012,60 @@ class HellhoundConsole(cmd.Cmd):
                                 print(f"         {Fore.LIGHTBLACK_EX}... truncated{Style.RESET_ALL}")
                         print()
 
+            # ── CORSbuster dedicated renderer ─────────────────────
+            elif mod_clean == "corsbuster":
+                cors_vulns = intel.get("cors_vulnerabilities", [])
+                cors_risk  = intel.get("risk_score", 0)
+
+                if cors_vulns:
+                    # Group findings by type
+                    by_type = {}
+                    for f in cors_vulns:
+                        vtype = f.get("type", "Unknown")
+                        by_type.setdefault(vtype, []).append(f)
+
+                    # Severity ordering and colors for each type
+                    type_severity = {
+                        "Origin Reflection":       ("CRITICAL", Fore.MAGENTA + Style.BRIGHT),
+                        "Null Origin Trust":       ("HIGH",     Fore.RED     + Style.BRIGHT),
+                        "Arbitrary Origin Trust":  ("HIGH",     Fore.RED     + Style.BRIGHT),
+                        "Wildcard with Credentials": ("HIGH",   Fore.RED     + Style.BRIGHT),
+                        "Insecure HTTP Trust":     ("MEDIUM",   Fore.YELLOW  + Style.BRIGHT),
+                        "Open CORS (Wildcard)":    ("LOW",      Fore.WHITE),
+                    }
+                    sev_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+
+                    # Sort types by severity
+                    sorted_types = sorted(
+                        by_type.keys(),
+                        key=lambda t: sev_order.index(type_severity.get(t, ("INFO", Fore.WHITE))[0])
+                    )
+
+                    cred_count = sum(1 for f in cors_vulns if f.get("credentials_allowed"))
+                    header = f"  [CORS Misconfigurations — {len(cors_vulns)} finding(s)"
+                    if cred_count:
+                        header += f"  {Fore.RED}{Style.BRIGHT}{cred_count} with credentials{Style.RESET_ALL}{Fore.MAGENTA}{Style.BRIGHT}"
+                    header += "]"
+                    print(Fore.MAGENTA + Style.BRIGHT + header + Style.RESET_ALL)
+                    print()
+
+                    for vtype in sorted_types:
+                        items = by_type[vtype]
+                        sev, sev_c = type_severity.get(vtype, ("INFO", Fore.WHITE))
+
+                        print(f"    {Style.BRIGHT}[{sev_c}{sev}{Style.RESET_ALL}{Style.BRIGHT}] "
+                              f"{Fore.WHITE}{vtype}{Style.RESET_ALL}  "
+                              f"{Fore.LIGHTBLACK_EX}({len(items)} endpoint{'s' if len(items) != 1 else ''}){Style.RESET_ALL}")
+
+                        for f in items:
+                            cred_tag = (f"  {Fore.RED + Style.BRIGHT}[CREDS]{Style.RESET_ALL}"
+                                        if f.get("credentials_allowed") else "")
+                            print(f"       {Fore.CYAN}{f.get('url','')}{Style.RESET_ALL}{cred_tag}")
+                        print()
+                else:
+                    print(Fore.LIGHTBLACK_EX + "  [CORS]  no misconfigurations found" + Style.RESET_ALL)
+                    print()
+
             # ── Exmap dedicated renderer ──────────────────────────
             elif mod_clean == "exmap":
                 components = intel.get("components", [])
@@ -1114,6 +1168,60 @@ class HellhoundConsole(cmd.Cmd):
                         print(f"    {Fore.LIGHTBLACK_EX}{cve.get('id',''):<18}  CVSS:{cve.get('cvss') or 0:<5}  evidence:{cve.get('evidence_score',0)}/100{Style.RESET_ALL}")
                     if len(low_conf) > 5:
                         print(Fore.LIGHTBLACK_EX + f"    ... +{len(low_conf)-5} more (use loot --json)" + Style.RESET_ALL)
+                    print()
+
+            # ── GraphQL Hunter dedicated renderer ─────────────────────
+            elif mod_clean == "graphql_hunter":
+                graphql_eps = intel.get("graphql_endpoints", [])
+                
+                if graphql_eps:
+                    print(Fore.MAGENTA + Style.BRIGHT + f"  [GraphQL Exposed — {len(graphql_eps)} endpoint(s)]" + Style.RESET_ALL)
+                    print()
+                    for ep in graphql_eps:
+                        url = ep.get("endpoint", "")
+                        print(f"    {Fore.RED + Style.BRIGHT}[GRAPHQL]{Style.RESET_ALL} {Fore.WHITE}{url}{Style.RESET_ALL}")
+                        
+                        if ep.get("introspection_enabled"):
+                            print(f"       {Fore.MAGENTA + Style.BRIGHT}[CRITICAL]{Style.RESET_ALL} Introspection is ENABLED")
+                        if ep.get("suggestions_enabled"):
+                            print(f"       {Fore.YELLOW + Style.BRIGHT}[WARNING]{Style.RESET_ALL} Field suggestions are ENABLED")
+                        print()
+                else:
+                    print(Fore.LIGHTBLACK_EX + "  [GraphQL]  no endpoints found" + Style.RESET_ALL)
+                    print()
+
+            # ── JWT Analyzer dedicated renderer ───────────────────────
+            elif mod_clean == "jwt_analyzer":
+                jwts = intel.get("jwts", [])
+                if jwts:
+                    print(Fore.MAGENTA + Style.BRIGHT + f"  [JSON Web Tokens — {len(jwts)} analyzed]" + Style.RESET_ALL)
+                    print()
+                    for token in jwts:
+                        src = token.get("source", "unknown")
+                        vulns = token.get("vulnerabilities", [])
+                        claims = token.get("sensitive_claims", [])
+                        
+                        raw = token.get("token", "")
+                        disp_token = f"{raw[:15]}...{raw[-10:]}" if len(raw) > 30 else raw
+                        
+                        # Decide color based on vulnerabilities
+                        sev_color = Fore.MAGENTA if any("CRITICAL" in v for v in vulns) else Fore.RED if vulns else Fore.YELLOW if claims else Fore.GREEN
+                        sev_tag = "[CRITICAL JWT]" if any("CRITICAL" in v for v in vulns) else "[WEAK JWT]" if vulns else "[SENSITIVE JWT]" if claims else "[JWT FOUND]"
+                        
+                        print(f"    {sev_color + Style.BRIGHT}{sev_tag}{Style.RESET_ALL} {Fore.WHITE}{disp_token}{Style.RESET_ALL}")
+                        print(f"       {Fore.WHITE}source : {Fore.CYAN}{src}{Style.RESET_ALL}")
+                        
+                        if vulns:
+                            for v in vulns:
+                                vc = Fore.MAGENTA + Style.BRIGHT if "CRITICAL" in v else Fore.RED + Style.BRIGHT
+                                print(f"       {vc}vuln   : {v}{Style.RESET_ALL}")
+                                
+                        if claims:
+                            for c in claims:
+                                print(f"       {Fore.YELLOW}claim  : {c}{Style.RESET_ALL}")
+                        print()
+                else:
+                    print(Fore.LIGHTBLACK_EX + "  [JWT]  no tokens discovered" + Style.RESET_ALL)
                     print()
 
             # ── Generic LOOT_SECTIONS path ────────────────────────
@@ -1248,7 +1356,7 @@ class HellhoundConsole(cmd.Cmd):
                         print()
 
                     print(Fore.MAGENTA + f"  [Attack Surface — {len(cluster_map)} endpoints]" + Style.RESET_ALL)
-                    for ep in list(cluster_map.values())[:50]:
+                    for ep in list(cluster_map.values()):
                         tags = []
                         if ep["confidence"] in ("HIGH","CONFIRMED"): tags.append(ep["confidence"])
                         if ep["auth"]:      tags.append("AUTH")
@@ -1256,29 +1364,24 @@ class HellhoundConsole(cmd.Cmd):
                         tag_str    = (Fore.RED + f"[{'|'.join(tags)}]" + Style.RESET_ALL) if tags else ""
                         method_str = "|".join(sorted(ep["methods"]))
                         print(f"    {Fore.WHITE}{method_str:<10}{Style.RESET_ALL} {Fore.WHITE}{ep['url']} {tag_str}")
-                    if len(cluster_map) > 50:
-                        print(Fore.WHITE + f"    ... +{len(cluster_map)-50} more (use loot --json)" + Style.RESET_ALL)
                     print()
 
-                # 4. secrets
                 secrets = intel.get("secrets", [])
                 if secrets:
-                    print(Fore.MAGENTA + f"  [Secrets — {len(secrets)}]" + Style.RESET_ALL)
-                    by_type = {}
+                    print(Fore.MAGENTA + f"  [Secrets — {len(secrets)} found]" + Style.RESET_ALL)
                     for s in secrets:
-                        by_type[s.get("type","unknown")] = by_type.get(s.get("type","unknown"),0)+1
-                    for t, c in by_type.items():
-                        print(f"    {Fore.YELLOW}{t:<20}{Style.RESET_ALL} × {c}")
+                        stype   = s.get("type", "unknown")
+                        content = s.get("content", "")
+                        source  = s.get("source", "")
+                        print(f"    {Fore.YELLOW}{stype:<20}{Style.RESET_ALL} {Fore.WHITE}{content}{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}({source}){Style.RESET_ALL}")
                     print()
 
                 # 5. cors_issues
                 cors = intel.get("cors_issues", [])
                 if cors:
                     print(Fore.MAGENTA + f"  [CORS Issues — {len(cors)}]" + Style.RESET_ALL)
-                    for c in cors[:5]:
+                    for c in cors:
                         print(f"    {Fore.CYAN}{c.get('url','')} {Fore.YELLOW}({c.get('severity','')}){Style.RESET_ALL}")
-                    if len(cors) > 5:
-                        print(Fore.WHITE + f"    ... +{len(cors)-5} more" + Style.RESET_ALL)
                     print()
 
                 # 6. sourcemaps
@@ -1292,7 +1395,8 @@ class HellhoundConsole(cmd.Cmd):
                 # 7. Generic list keys not already handled — future-proof catch-all
                 known_keys = {"vulnerabilities","bac","endpoints","secrets",
                               "cors_issues","sourcemaps","summary","stats",
-                              "tech_stack","robots_paths","graphql","openapi","metadata"}
+                              "tech_stack","robots_paths","graphql","openapi",
+                              "metadata", "jwts", "graphql_endpoints"}
                 for key, val in intel.items():
                     if key in known_keys or not val:
                         continue
