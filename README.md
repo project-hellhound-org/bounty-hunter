@@ -11,7 +11,6 @@
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey?style=flat-square"/>
 </p>
-# Hellhound
 
 ## Web Application Offensive Security Framework
 
