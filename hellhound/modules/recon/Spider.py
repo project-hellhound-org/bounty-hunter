@@ -1166,10 +1166,7 @@ class SPAScanner:
                 page.on("response", on_response)
 
                 try:
-                    await asyncio.wait_for(
-                        page.goto(self.target_url, wait_until="domcontentloaded", timeout=15000),
-                        timeout=20
-                    )
+                    await page.goto(self.target_url, wait_until="networkidle", timeout=20000)
                 except Exception as e:
                     self.emit.info(f"[SPA] Goto warning: {e}")
                 try:
@@ -1348,8 +1345,9 @@ class Spider:
         if "jquery" in body_lo and ("$.ajax" in body or "$(document)" in body): tech.add("jQuery")
         if "material-icons" in body_lo or "mat-" in body_lo: tech.add("Angular Material")
 
+        new_tech = tech - self.store.tech_stack
         for t in tech: self.store.tech_stack.add(t)
-        if tech: self.emit.always_success(f"Tech detected: {', '.join(sorted(tech))}")
+        if new_tech: self.emit.always_success(f"Tech detected: {', '.join(sorted(new_tech))}")
 
     async def _check_sourcemap(self, session, js_url):
         s, _, _ = await fetch(session, "GET", js_url + ".map", self.rl)
@@ -1409,7 +1407,10 @@ class Spider:
                 self.emit.info("[Body-Hints] %s <- %s" % (found, url))
 
     def _process_html(self, url, text, depth, source):
-        soup = BeautifulSoup(text, "lxml")
+        try:
+            soup = BeautifulSoup(text, "lxml")
+        except Exception:
+            soup = BeautifulSoup(text, "html.parser")
         Extractor.html_comments(soup, url, self.store, self.emit)
         for tag in soup.find_all(["a","link","area"], href=True):
             href = tag.get("href","").strip()
@@ -1503,7 +1504,10 @@ class Spider:
                                 ct = (hdrs.get("Content-Type","") or hdrs.get("content-type","")).lower()
                                 if "text/html" in ct:
                                     self.store.add_endpoint(url, source=f"HTML({source})", score=Conf.MEDIUM)
-                                    self._process_html(url, body, depth, source)
+                                    try:
+                                        self._process_html(url, body, depth, source)
+                                    except Exception:
+                                        pass
                                     self._extract_body_param_hints(url, body)
                                 elif "javascript" in ct or url.split("?")[0].endswith(".js"):
                                     self.store.add_endpoint(url, source="JS_File", score=Conf.LOW)
@@ -1600,10 +1604,7 @@ class Spider:
                 spa = SPAScanner(self.target, self.store, self.emit, self.cookies,
                                  self.extra_headers, self.queue, self.is_valid,
                                  enable_spa_interact=self.cfg.enable_spa_interact)
-                try:
-                    await asyncio.wait_for(spa.run(), timeout=90)
-                except asyncio.TimeoutError:
-                    self.emit.always_info("[SPA] Hard timeout (90s) — continuing with partial SPA data")
+                await spa.run()
 
             self.emit.section("Crawling")
             self.emit.always_info(
@@ -1662,25 +1663,7 @@ def _do_run(target: str, cfg: Config, emit,
         spider = Spider(target, cfg, emit, cookies, extra_headers)
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-        # Suppress "Task exception was never retrieved" noise from playwright
-        # driver crashes — those are handled inside SPAScanner.run() already.
-        loop = asyncio.new_event_loop()
-        loop.set_exception_handler(lambda lp, ctx: None)
-        try:
-            loop.run_until_complete(spider.run())
-        finally:
-            # Cancel all pending tasks before closing to prevent
-            # "coroutine ignored GeneratorExit" on GC
-            try:
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            except Exception:
-                pass
-            loop.close()
+        asyncio.run(spider.run())
     except KeyboardInterrupt:
         emit.always_info("Scan interrupted — partial results follow")
     except ValueError as e:

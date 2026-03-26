@@ -58,15 +58,7 @@ class StalkEngine:
         self.domain = parsed.netloc if parsed.netloc else target
 
         self.data = {
-            "infrastructure": {
-                "subdomains": [],
-                "netrange": [],
-                "asn": "",
-                "netname": "",
-                "mx_records": [],
-                "email_provider": [],
-                "waf": "",
-            },
+
             "web": {
                 "http_services": [],
                 "technologies": [],
@@ -78,85 +70,9 @@ class StalkEngine:
                 "leaks": [],
                 "takeover_candidates": []
             },
-            "signals": []
+            "signals": list([])
         }
 
-    # ======================================================
-    # Phase 1 — Infrastructure Intelligence
-    # ======================================================
-
-    def enumerate_subdomains(self):
-        self.emit.info("Phase 1: Subdomain Intelligence")
-
-        clean_target = self.domain.replace("http://", "").replace("https://", "")
-        url = f"https://crt.sh/?q=%.{clean_target}&output=json"
-
-        response = fetch_json(url)
-        if not response:
-            return
-
-        subs = set()
-        for entry in response:
-            names = entry.get("name_value", "")
-            for name in names.split("\n"):
-                name = name.strip()
-                if name.startswith("*."):
-                    name = name[2:]
-                if clean_target in name:
-                    subs.add(name)
-
-        self.data["infrastructure"]["subdomains"] = sorted(subs)
-
-        if len(subs) > 20:
-            self.data["signals"].append("LARGE_ATTACK_SURFACE")
-
-    def extract_netrange_asn(self):
-        if not tool_exists("dig") or not tool_exists("whois"):
-            return
-
-        ip_output = run_cmd(["dig", "+short", self.domain, "A"])
-        if not ip_output:
-            return
-
-        main_ip = ip_output.splitlines()[0]
-
-        whois_output = run_cmd(["whois", main_ip])
-        if not whois_output:
-            return
-
-        cidr = re.findall(r'(NetRange|CIDR|inetnum):\s*([^\n]+)', whois_output)
-        for match in cidr:
-            self.data["infrastructure"]["netrange"].append(match[1].strip())
-
-        asn_match = re.search(r'(Origin|OriginAS):\s*([A-Z0-9]+)', whois_output)
-        if asn_match:
-            self.data["infrastructure"]["asn"] = asn_match.group(2)
-            self.data["signals"].append("ASN_IDENTIFIED")
-
-
-    def analyze_email_stack(self):
-        if not tool_exists("dig"):
-            return
-
-        mx_output = run_cmd(["dig", "+short", self.domain, "MX"])
-        mx_hosts = [line.split()[-1] for line in mx_output.splitlines() if line]
-        self.data["infrastructure"]["mx_records"] = mx_hosts
-
-        txt_output = run_cmd(["dig", "+short", self.domain, "TXT"])
-
-        providers = set()
-
-        for line in txt_output.splitlines():
-            if "google" in line.lower():
-                providers.add("Google Workspace")
-            if "outlook" in line.lower():
-                providers.add("Microsoft O365")
-            if "zoho" in line.lower():
-                providers.add("Zoho")
-
-        if providers:
-            self.data["infrastructure"]["email_provider"] = list(providers)
-            self.data["signals"].append("EMAIL_PROVIDER_IDENTIFIED")
 
     # ======================================================
     # Phase 2 — Web Surface Mapping
@@ -187,7 +103,7 @@ class StalkEngine:
                 self.emit.warn(f"    [!] Fallback mode failed: {e}")
 
         if services:
-            self.data["web"]["http_services"] = services
+            self.data["web"]["http_services"] = list(services)
             if len(services) > 1:
                 self.data["signals"].append("MULTIPLE_WEB_SERVICES")
 
@@ -247,7 +163,6 @@ class StalkEngine:
         self.data["web"]["technologies"] = list(detected_tech)
 
         if waf_detected:
-            self.data["infrastructure"]["waf"] = waf_detected
             if "WAF_DETECTED" not in self.data["signals"]:
                 self.data["signals"].append("WAF_DETECTED")
 
@@ -309,10 +224,12 @@ class StalkEngine:
 
                 content = r.text
 
+                leaks_list = self.data["exposure"]["leaks"]
+                signals_list = self.data["signals"]
                 for pattern in secret_patterns:
                     if re.search(pattern, content):
-                        self.data["exposure"]["leaks"].append(js_url)
-                        self.data["signals"].append("JS_SECRET_EXPOSED")
+                        leaks_list.append(js_url)
+                        signals_list.append("JS_SECRET_EXPOSED")
                         break
 
             except:
@@ -351,53 +268,63 @@ class StalkEngine:
                 # Text-based validation (.env / .git)
                 content = r.text[:5000]  # limit parsing
 
+                leaks_list = self.data["exposure"]["leaks"]
+                signals_list = self.data["signals"]
                 for pattern in fingerprints:
                     if pattern in content:
-                        self.data["exposure"]["leaks"].append(base + path)
-                        self.data["signals"].append("CONFIRMED_FILE_EXPOSED")
+                        leaks_list.append(base + path)
+                        signals_list.append("CONFIRMED_FILE_EXPOSED")
                         break
 
             except Exception:
                 continue
 
 
-    # ======================================================
-    # Phase 4 — IP Reputation
-    # ======================================================
-
-    def check_ip_reputation(self):
-        try:
-            ip = socket.gethostbyname(self.domain)
-            if ip.startswith("127."):
-                self.data["signals"].append("LOCAL_TARGET")
-        except:
-            pass
-
 
     # ======================================================
     # Risk Scoring
     # ======================================================
 
+    def ingest_spider(self):
+        spider_intel = self.options.get("spider_intel", {})
+        if not spider_intel:
+            return
+
+        self.emit.info("Phase 1b: Ingesting Spider Intelligence (Unified)")
+        
+        # Merge URLs
+        eps = spider_intel.get("endpoints", [])
+        for ep in eps:
+            url = ep.get("url", "")
+            if url:
+                self.data["web"]["urls"].append(url)
+                if url.endswith(".js"):
+                    self.data["web"]["js_files"].append(url)
+                
+                params = ep.get("params", {})
+                for ptype, pnames in params.items():
+                    self.data["web"]["parameters"].extend(pnames)
+        
+        # Merge technology stack and ensure it stays a list of strings
+        tech = spider_intel.get("tech_stack", [])
+        combined_tech = set(self.data["web"]["technologies"])
+        for t in tech:
+            combined_tech.add(str(t))
+        self.data["web"]["technologies"] = list(combined_tech)
+        
+        if tech:
+            self.data["signals"].append("TECH_DETECTED_FROM_SPIDER")
+
+    # Risk Score
     def calculate_risk(self):
-
         risk_score = 0
-
-        # Base risk for finding a web service
-        if self.data["web"]["http_services"]:
-            risk_score += 2
-
-        if "WAF_DETECTED" in self.data["signals"]:
-            risk_score += 1
-
-        if "JS_SECRET_EXPOSED" in self.data["signals"]:
-            risk_score += 3
-
-        if "HIGH_RISK_PARAMETER" in self.data["signals"]:
-            risk_score += 2
-
-        if "CONFIRMED_FILE_EXPOSED" in self.data["signals"]:
-            risk_score += 4
-
+        signals = self.data.get("signals", [])
+        if self.data["web"].get("http_services"): risk_score += 2
+        if "WAF_DETECTED" in signals: risk_score += 1
+        if "JS_SECRET_EXPOSED" in signals: risk_score += 3
+        if "HIGH_RISK_PARAMETER" in signals: risk_score += 2
+        if "CONFIRMED_FILE_EXPOSED" in signals: risk_score += 4
+        if "TECH_DETECTED_FROM_SPIDER" in signals: risk_score += 1
         self.data["risk_score"] = risk_score
 
     # ======================================================
@@ -405,15 +332,10 @@ class StalkEngine:
     # ======================================================
 
     def run(self):
-
-        # Phase 1
-        self.enumerate_subdomains()
-        self.extract_netrange_asn()
-        self.analyze_email_stack()
-
         # Phase 2
-        self.probe_http()             # NOW HAS FALLBACK
-        self.fingerprint_tech()        # NOW WORKS IF HTTP SERVICES FOUND
+        self.probe_http()
+        self.fingerprint_tech()
+        self.ingest_spider()           # NEW: Ingest spider data
         self.harvest_urls()
 
         if self.mode == "deep":
@@ -426,8 +348,7 @@ class StalkEngine:
         self.calculate_risk()
 
         summary = (
-            f"Subs: {len(self.data['infrastructure']['subdomains'])} | "
-            f"URLs: {len(self.data['web']['urls'])} | "
+            f"Endpoints: {len(self.data['web']['urls'])} | "
             f"Leaks: {len(self.data['exposure']['leaks'])} | "
             f"Risk Score: {self.data.get('risk_score', 0)}"
         )

@@ -209,3 +209,4 @@ __marimo__/
 # Hellhound runtime data
 hellhound/storage/*
 !hellhound/storage/.gitkeep
+run_diff.py
