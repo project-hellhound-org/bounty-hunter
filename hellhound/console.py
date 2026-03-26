@@ -904,13 +904,55 @@ class HellhoundConsole(cmd.Cmd):
                 print(Fore.WHITE + f"  {raw_stats}" + Style.RESET_ALL)
             print()
 
+            # ── Shared severity helper (used by both paths) ─────
+            def _sev_color(sev):
+                s = sev.upper()
+                if s == "CRITICAL": return Fore.MAGENTA + Style.BRIGHT
+                if s == "HIGH":     return Fore.RED     + Style.BRIGHT
+                if s == "MEDIUM":   return Fore.YELLOW  + Style.BRIGHT
+                return Fore.WHITE
+
+            def _render_findings(findings, label="Vulnerabilities"):
+                """Render any list of finding dicts, sorted by severity."""
+                if not findings:
+                    return
+                sev_weight = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+                sorted_f = sorted(
+                    [f for f in findings if isinstance(f, dict)],
+                    key=lambda x: sev_weight.get(x.get("severity", "info").lower(), 99)
+                )
+                if not sorted_f:
+                    return
+                print(Fore.MAGENTA + f"  [{label}]" + Style.RESET_ALL)
+                for f in sorted_f:
+                    sev   = f.get("severity", "info").upper()
+                    name  = f.get("type", f.get("vulnerability", f.get("name", "Finding")))
+                    url   = f.get("url",   f.get("endpoint", ""))
+                    proof = f.get("proof", f.get("evidence", ""))
+                    sc2   = _sev_color(sev)
+                    print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
+                    if url:
+                        print(f"       {Fore.WHITE}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
+                    if proof:
+                        ps = str(proof)
+                        print(f"       {Fore.WHITE}proof : {Fore.WHITE}{ps[:120]}{'...' if len(ps)>120 else ''}{Style.RESET_ALL}")
+                    poc_curl    = f.get("poc_curl", "")
+                    poc_browser = f.get("poc_browser", "")
+                    if poc_curl:
+                        print(f"       {Fore.WHITE}curl  : {Fore.YELLOW}{poc_curl}{Style.RESET_ALL}")
+                    if poc_browser:
+                        print(f"       {Fore.WHITE}open  : {Fore.CYAN}{poc_browser}{Style.RESET_ALL}")
+                    print()
+
             # ── Try module-declared renderer first ──────────────
-            mod_obj = self._load_module(mod_clean) or self._load_module(self.active_module or "")
+            # Only load the module for THIS iteration key.
+            # Never fall back to self.active_module — that may be
+            # a completely different module, causing wrong sections
+            # to render and real sections to silently disappear.
+            mod_obj       = self._load_module(mod_clean)
             loot_sections = getattr(mod_obj, "LOOT_SECTIONS", None) if mod_obj else None
 
             if loot_sections:
-                # Module exports LOOT_SECTIONS = list of dicts describing what to render
-                # Each section: {"title": str, "key": str, "type": "list"|"findings"|"table"|"kv"}
                 for section in loot_sections:
                     title    = section.get("title", "")
                     key      = section.get("key", "")
@@ -923,33 +965,10 @@ class HellhoundConsole(cmd.Cmd):
                     print(Fore.MAGENTA + f"  [{title}]" + Style.RESET_ALL)
 
                     if renderer == "findings":
-                        # Standard vuln findings list
-                        sev_weight = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-                        sorted_findings = sorted(
-                            data if isinstance(data, list) else [],
-                            key=lambda x: sev_weight.get(x.get("severity", "info").lower(), 99)
-                        )
-                        for f in sorted_findings:
-                            sev  = f.get("severity", "info").upper()
-                            name = f.get("type", f.get("vulnerability", f.get("name", "Unknown")))
-                            url  = f.get("url", f.get("endpoint", ""))
-                            proof= f.get("proof", f.get("evidence", ""))
-                            sc2  = (Fore.MAGENTA if sev == "CRITICAL" else
-                                    Fore.RED     if sev == "HIGH"     else
-                                    Fore.YELLOW  if sev == "MEDIUM"   else Fore.WHITE)
-                            print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
-                            if url:   print(f"       {Fore.WHITE}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
-                            if proof: print(f"       {Fore.WHITE}proof : {Fore.WHITE}{str(proof)[:120]}{Style.RESET_ALL}")
-                            poc_curl = f.get("poc_curl", "")
-                            poc_browser = f.get("poc_browser", "")
-                            if poc_curl:
-                                print(f"       {Fore.WHITE}curl  : {Fore.YELLOW}{poc_curl}{Style.RESET_ALL}")
-                            if poc_browser:
-                                print(f"       {Fore.WHITE}open  : {Fore.CYAN}{poc_browser}{Style.RESET_ALL}")
-                            print()
+                        _render_findings(data if isinstance(data, list) else [], title)
+                        continue
 
                     elif renderer == "table":
-                        # List of dicts — print as key:value rows
                         for row in (data if isinstance(data, list) else []):
                             if isinstance(row, dict):
                                 for k, v in row.items():
@@ -959,13 +978,12 @@ class HellhoundConsole(cmd.Cmd):
                                 print(f"    {Fore.WHITE}{row}")
 
                     elif renderer == "kv":
-                        # Single dict
                         if isinstance(data, dict):
                             for k, v in data.items():
                                 print(f"    {Fore.CYAN}{k:<20}{Style.RESET_ALL} {v}")
                         print()
 
-                    else:  # "list" — plain list of strings or simple items
+                    else:  # "list"
                         for item in (data if isinstance(data, list) else [data]):
                             if isinstance(item, dict):
                                 url = item.get("url", item.get("path", str(item)))
@@ -975,39 +993,19 @@ class HellhoundConsole(cmd.Cmd):
                         print()
 
             else:
-                # ── Generic fallback — works for ANY intel shape ─
-                # Renders whatever keys exist without module-specific knowledge.
+                # ── Universal fallback ───────────────────────────
+                # Checks every known findings key so no module
+                # silently renders blank regardless of intel shape.
 
-                # 1. vulnerabilities / findings (standard key)
+                rendered_something = False
+
+                # 1. Standard vulnerabilities key
                 vulns = intel.get("vulnerabilities", [])
                 if vulns:
-                    print(Fore.MAGENTA + "  [Vulnerabilities]" + Style.RESET_ALL)
-                    sev_weight = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-                    for f in sorted(vulns, key=lambda x: sev_weight.get(
-                            x.get("severity", "info").lower() if isinstance(x, dict) else "info", 99)):
-                        if isinstance(f, dict):
-                            sev  = f.get("severity", "info").upper()
-                            name = f.get("type", f.get("vulnerability", f.get("name", "Finding")))
-                            url  = f.get("url", f.get("endpoint", ""))
-                            proof= f.get("proof", f.get("evidence", ""))
-                            sc2  = (Fore.MAGENTA if sev == "CRITICAL" else
-                                    Fore.RED     if sev == "HIGH"     else
-                                    Fore.YELLOW  if sev == "MEDIUM"   else Fore.WHITE)
-                            print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
-                            if url:   print(f"       {Fore.WHITE}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
-                            if proof: print(f"       {Fore.WHITE}proof : {Fore.WHITE}{str(proof)[:120]}{Style.RESET_ALL}")
-                            poc_curl = f.get("poc_curl", "")
-                            poc_browser = f.get("poc_browser", "")
-                            if poc_curl:
-                                print(f"       {Fore.WHITE}curl  : {Fore.YELLOW}{poc_curl}{Style.RESET_ALL}")
-                            if poc_browser:
-                                print(f"       {Fore.WHITE}open  : {Fore.CYAN}{poc_browser}{Style.RESET_ALL}")
-                            print()
-                        else:
-                            print(f"    {Fore.WHITE}• {f}")
-                    print()
+                    _render_findings(vulns)
+                    rendered_something = True
 
-                # 2. bac nested block (BACdetector legacy)
+                # 2. bac nested block (BACdetector)
                 if "bac" in intel and isinstance(intel["bac"], dict):
                     bac      = intel["bac"]
                     findings = bac.get("findings", [])
@@ -1015,24 +1013,24 @@ class HellhoundConsole(cmd.Cmd):
                     if summary:
                         print(Fore.MAGENTA + "  [Access Control Summary]" + Style.RESET_ALL)
                         for sev in ("Critical", "High", "Medium", "Low", "Info"):
-                            if sev in summary:
-                                sc2 = (Fore.RED if sev in ("Critical","High") else
-                                       Fore.YELLOW if sev == "Medium" else Fore.WHITE)
-                                print(f"    {sc2}{sev:<8} : {summary[sev]}{Style.RESET_ALL}")
+                            cnt = summary.get(sev, 0)
+                            if cnt:
+                                print(f"    {_sev_color(sev)}{sev:<8}{Style.RESET_ALL} : {cnt}")
                         print()
                     if findings:
-                        print(Fore.MAGENTA + "  [Access Control Findings]" + Style.RESET_ALL)
-                        sev_weight = {"Critical":0,"High":1,"Medium":2,"Low":3,"Info":4}
-                        for f in sorted(findings, key=lambda x: sev_weight.get(x.get("severity","Info"),99)):
-                            sev  = f.get("severity","Unknown").upper()
-                            name = f.get("vulnerability","Unknown")
-                            ep   = f.get("endpoint","")
-                            sc2  = (Fore.MAGENTA if sev=="CRITICAL" else
-                                    Fore.RED if sev=="HIGH" else
-                                    Fore.YELLOW if sev=="MEDIUM" else Fore.WHITE)
-                            print(f"    [{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
-                            if ep: print(f"       {Fore.WHITE}endpoint : {Fore.CYAN}{ep}{Style.RESET_ALL}")
-                            print()
+                        # Normalise key names — BAC uses "vulnerability", fallback uses "name"
+                        normed = []
+                        for f in findings:
+                            if isinstance(f, dict):
+                                normed.append({
+                                    "severity":    f.get("severity", "info"),
+                                    "name":        f.get("vulnerability", f.get("name", "Finding")),
+                                    "url":         f.get("endpoint", f.get("url", "")),
+                                    "proof":       f.get("proof", ""),
+                                    "poc_curl":    f.get("poc_curl", ""),
+                                    "poc_browser": f.get("poc_browser", ""),
+                                })
+                        _render_findings(normed, "Access Control Findings")
 
                 # 3. endpoints (Spider / any recon module)
                 endpoints = intel.get("endpoints", [])
