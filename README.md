@@ -31,6 +31,18 @@ Hellhound is built on a distributed intelligence model where independent modules
 
 ## Module Ecosystem
 
+### Reconnaissance Layer
+Discovery and mapping of the target application surface.
+
+| Module | Purpose | Key Capabilities |
+| :--- | :--- | :--- |
+| **Spider** | Surface Discovery | SPA crawling, API endpoint discovery, secret extraction. |
+| **Stalk** | Intelligence Aggregation | Unified mapping from multiple web sources and sub-layers. |
+| **WAFbuster** | Stack Identification | Active/Passive technology stack and WAF identification. |
+| **CORSbuster** | Policy Analysis | Identification of Cross-Origin Resource Sharing vulnerabilities. |
+| **GraphQL** | Schema Analysis | Probing for introspection leaks and field suggestion risks. |
+| **JWTanalyzer** | Token Analysis | Automated decoding and cryptographic vulnerability testing. |
+
 ### Intelligence Layer
 High-fidelity analysis and automated discovery of sensitive assets.
 
