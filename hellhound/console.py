@@ -656,7 +656,7 @@ class HellhoundConsole(cmd.Cmd):
         # Silently inject previously collected spider intel so modules
         # can skip their internal crawlers and use the Spider brain instead.
         spider_result = self.results.get("spider")
-        if spider_result and "spider_intel" not in runtime_options:
+        if spider_result and not runtime_options.get("spider_intel"):
             runtime_options["spider_intel"] = spider_result.get("intel", {})
 
         # ── Cookie raw-token detection warning ────────────────
@@ -1441,20 +1441,38 @@ class HellhoundConsole(cmd.Cmd):
                 for key, val in intel.items():
                     if key in known_keys or not val:
                         continue
+                    
                     if isinstance(val, list) and val:
                         print(Fore.MAGENTA + f"  [{key}]" + Style.RESET_ALL)
                         for item in list(val)[:20]:
                             if isinstance(item, dict):
-                                url = item.get("url", item.get("path", item.get("name", "")))
-                                extra = {k:v for k,v in item.items() if k not in ("url","path","name")}
-                                line_text = f"    {Fore.WHITE}• {url or json.dumps(item, default=str)[:80]}"
-                                if extra: line_text += Fore.WHITE + f"  {json.dumps(extra, default=str)[:60]}"
-                                print(line_text + Style.RESET_ALL)
+                                # Try to find a good primary field to show
+                                primary_keys = ("url", "path", "name", "content", "title", "id", "asset")
+                                primary_val = None
+                                for pk in primary_keys:
+                                    if item.get(pk):
+                                        primary_val = item.get(pk)
+                                        break
+                                
+                                # Collect everything else
+                                exclude = set(primary_keys)
+                                extra = {k:v for k,v in item.items() if k not in exclude}
+                                
+                                if primary_val:
+                                    line_text = f"    {Fore.WHITE}• {str(primary_val)[:100]}"
+                                    if extra:
+                                        line_text += Fore.LIGHTBLACK_EX + f"  {json.dumps(extra, default=str)[:80]}"
+                                    print(line_text + Style.RESET_ALL)
+                                else:
+                                    # Full dump if no primary field found
+                                    print(f"    {Fore.WHITE}• {json.dumps(item, default=str)[:140]}{Style.RESET_ALL}")
                             else:
                                 print(f"    {Fore.WHITE}• {item}{Style.RESET_ALL}")
+                        
                         if len(val) > 20:
                             print(Fore.WHITE + f"    ... +{len(val)-20} more" + Style.RESET_ALL)
                         print()
+                    
                     elif isinstance(val, dict) and val:
                         print(Fore.MAGENTA + f"  [{key}]" + Style.RESET_ALL)
                         for k2, v2 in list(val.items())[:15]:
