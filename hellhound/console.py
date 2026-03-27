@@ -21,99 +21,102 @@ from hellhound.core.suggest import suggest_actions
 
 def _boot_sequence():
     """
-    HELLHOUND boot sequence.
-    Phase 1 — typed boot log lines specific to the framework.
-    Phase 2 — scanline logo reveal (line by line, dim→bright, no cursor tricks).
-    Skippable: any keypress during phase 1 jumps straight to logo.
-    Terminal-safe: no ANSI cursor repositioning.
+    HELLHOUND v12.5 Apex-King Boot Sequence.
+    Features: Red Braille Prefix, Case-Wave Technical Text, Red Pipe Suffix, Smooth Logo Reveal.
     """
-    import select
-    import tty
-    import termios
+    BANNER = r"""
 
-    def _kbhit(timeout=0):
-        """Non-blocking keypress check (Unix only). Returns True if key waiting."""
-        try:
-            dr, _, _ = select.select([sys.stdin], [], [], timeout)
-            return bool(dr)
-        except Exception:
-            return False
 
-    def _flush_stdin():
-        try:
-            termios.tcflush(sys.stdin, termios.TCIFLUSH)
-        except Exception:
-            pass
-
-    prompt  = Fore.LIGHTRED_EX + "hellhound" + Fore.WHITE + "@" + Fore.RED + "core" + Fore.WHITE + ":~# " + Style.RESET_ALL
-    boot_lines = [
-        ("hellhound --init",          Fore.WHITE + "  Initialising HELLHOUND framework v12.0"),
-        ("hellhound --load-modules",  Fore.WHITE + "  Modules loaded: recon, vuln, exploit, intel, analysis"),
-        ("hellhound --verify-chain",  Fore.WHITE + "  Engine ✓  Emit ✓  Session ✓  Loot ✓"),
-        ("hellhound --arm",           Fore.RED           + "  All systems armed. Awaiting operator."),
-    ]
-
-    skipped = False
-    _flush_stdin()
-
-    for cmd_str, response in boot_lines:
-        if skipped or _kbhit(0):
-            skipped = True
-            break
-
-        # Type out the command character by character
-        sys.stdout.write(prompt)
+            .:@@@-..                             ...                                                
+            .#@@@@@@..                        ..+%.                                                 
+           ..@@@@@@@@@%:.                  .-%@:                                                    
+           .#@@@@@@@@@@@@@=.   .::.                             .:.                                 
+           .@@@@@@@@@@@@@@@@@@@@@@@@@@@@#=:...         ....+@@@@@+.                                 
+           .%**=@@@@@@@@@@@@@@@@**@@@@@@@@@#+:......:+@@@@@+..+@#.                                  
+           .%@@%@%:=@@@@@@@@=@@*%@=:#@@@@@@@@@@@@@@@@@@%=*#:%@@@..                                  
+           .#@:%@@@@@:-@@@@@@.#@@@@*-+%@@@@@@@@@@@@@@@@@@@@@@@@:.                                   
+           .=.   -%@@@@%+@@@@@#*@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@:.                                    
+                  .=@@@@@@@@@@@@@@@@@@@@@@@@@@=%%@@@@@@@@@@*.                                       
+                     .:@@@@@@@@@@@@@@@@@@@@@@@@+%@%-#@@@@#.....     ....                            
+            .           .=@*@@@@@@@@@@@@@@@@@@@@@#*@@@@@:..  :@@#-.. ..:-.                          
+           ==   ....  ..%@@-@@.+@@@@@@@@@@@@@@@@@@@=@@@@@@%.. .@@@@@:%:..                           
+          .@%..:@:%@+#@@*-#@@@.+.+@-@@@%@@@:@@@@#-@@*@@@@%:#@+..*@@@@@@*:.                          
+          :%@@@%+--..+@@@@@@@@%:@+. :@@.@@%:.+@@@:.#@@@@@@@@#.-#-:@@@@@@@@@*.                       
+          %@@@@@@@@@@@@@@@-+@@@-@@%.+=:.:@.%@-.#@+::-@@@@@@=@@@@:..:@=+@@=#@@:.                     
+          .*@@@@@@@@@@@@@@@@@@@@@@@+.%@=...@@@%.=#.@=.#@@@@*+@@@@@@@@+:=-@@%:-%#..                  
+            .=@::....::..=@@@@@@@@@@.+@@@:*@@@@@+#.*@#.@@@@%.+@@@@@@@@@@@@@@@@=..+=.                
+                         .@@@@@@@@@#.%@@@@@@@@@@@+.*@@%@@@@#. -@@@@@@@@@@@@@@@@@:       .:          
+                         .@#@@@@@*@:=@@@@@@@@@@@*.-@@@@@@@@=....%@@@#*@@@@@=%%@@@@.. .*@=.          
+                         .%-@@@@@+.-@@@@@@@@-@@-.=@@@@@@@@@...#-.-@@@@@:.#@@@@@*-@@-.*-.            
+                          .+@@@@-.+@@@@@@@@-**.:@@@@@@@@@@:...#@#..*@@@@@#..#@@@@@@@:.              
+                          .#=@@@.%@@@@@@@@-..+@@@@@@@@@@@+@-..%@@@:..@@@@@@@-.-=@@@@@..             
+                          .:.@@@@@@@@@@@@-.%@@@@@@@@@@@@@:.%..@@@@@#..:@@@@@@@=..@@@@:.             
+                            .@@@@@@@@@@@=@@@@@@@@@@@@%:..%@#.:@@@@@@@. .@@@@+:@# .%@@-.             
+                            .@@@@@@@@@@%@@@@@@#@#+-...*@@@@..*@@@@@@@% .@@@+ .=-..@@:.              
+                            .@*@@@+@@@@@@@@@-=*...:@@@@@@@:..@@@@@@@@@. .*@@:     .#@.              
+                            .--@@+:@@@@@@@=.+..=@@@@%%@@@...*@@@@@@@@@. .*@+      .*=.              
+                              -@=.+@@@@@%...=@@@*:..=@@+.. -@@-%@@@@@:...@-.     ..*.               
+                              --. *@@@@=..+@@+.. ..#@%.   -@=.-@@@@@.. .=.        ..                
+                              .. .#@@@:.:@@..   .-@#..   ++...%@@@%..                               
+                                 .@@@:.:@:.   ..%=..  ..#.. .#@@@..                                 
+                                 .@@. .#.    .-.           .%@%..                                   
+                                .#*.  ..                 .+@=..                                     
+                                +.                    ..=+..                                        
+                 ██╗  ██╗███████╗██╗     ██╗     ██╗  ██╗ ██████╗ ██╗   ██╗███╗   ██╗██████╗ 
+                 ██║  ██║██╔════╝██║     ██║     ██║  ██║██╔═══██╗██║   ██║████╗  ██║██╔══██╗
+                 ███████║█████╗  ██║     ██║     ███████║██║   ██║██║   ██║██╔██╗ ██║██║  ██║
+                 ██╔══██║██╔══╝  ██║     ██║     ██╔══██║██║   ██║██║   ██║██║╚██╗██║██║  ██║
+                 ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
+                 ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝ 
+"""
+    # 1. Clear & Initialise Animation
+    os.system('clear' if os.name == 'posix' else 'clear')
+    
+    text = "STARTING HELLHOUND FRAMEWORK CONSOLE"
+    duration = 4.2
+    WHITE = Fore.WHITE + Style.BRIGHT
+    RED = Fore.RED + Style.BRIGHT
+    RESET = Style.RESET_ALL
+    
+    braille_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+    pipe_frames = ['|', '/', '-', '\\']
+    
+    end_time = time.time() + duration
+    frame = 0
+    while time.time() < end_time:
+        prefix = f"{RED}{braille_frames[frame % 10]}{RESET}"
+        
+        # Wave Text
+        res = list(text.upper())
+        idx = frame % len(text)
+        line = ""
+        for i, char in enumerate(res):
+            if i == idx:
+                line += f"{RED}{char.lower()}{WHITE}"
+            elif i == (idx - 1) % len(text) or i == (idx + 1) % len(text):
+                line += f"{RED}{char}{WHITE}"
+            else:
+                line += char
+        
+        pipe = f"{RED}{pipe_frames[frame % 4]}{RESET}"
+        sys.stdout.write(f"\r {prefix}  {WHITE}{line}  {pipe}")
         sys.stdout.flush()
-        for ch in cmd_str:
-            if _kbhit(0):
-                skipped = True
-                break
-            sys.stdout.write(Fore.WHITE + ch)
+        time.sleep(0.06)
+        frame += 1
+
+    print("\n")
+    
+    # 2. Smooth Reveal (Banner)
+    for line in BANNER.split('\n'):
+        if line.strip():
+            sys.stdout.write(Fore.RED + line + Style.RESET_ALL + "\n")
             sys.stdout.flush()
-            time.sleep(0.03)
-
-        print()
-        if not skipped:
-            time.sleep(0.05)
-            print(response + Style.RESET_ALL)
-            time.sleep(0.18)
-
-    if not skipped:
-        print(Fore.GREEN + "\n  [ HELLHOUND ONLINE ]\n" + Style.RESET_ALL)
-        time.sleep(0.3)
-
-
-def _scanline_logo(text):
-    """
-    Reveal the logo line-by-line like a CRT scanline.
-    Each line starts at dim dark-red and snaps to full bright red.
-    No cursor repositioning — fully terminal-safe.
-    """
-    lines = text.split('\n')
-
-    for i, line in enumerate(lines):
-        # Determine brightness based on how far through the logo we are
-        progress = i / max(len(lines) - 1, 1)
-
-        if progress < 0.3:
-            color = Fore.RED
-        elif progress < 0.7:
-            color = Fore.RED
-        else:
-            color = Fore.RED + Style.BRIGHT
-
-        sys.stdout.write(color + line + Style.RESET_ALL + "\n")
-        sys.stdout.flush()
-        time.sleep(0.018)
-
-    # Final flash: reprint last line bright white then back to red
-    if lines:
-        last = lines[-1]
-        sys.stdout.write("\r" + Fore.WHITE + Style.BRIGHT + last + Style.RESET_ALL + "\n")
-        sys.stdout.flush()
-        time.sleep(0.08)
-        sys.stdout.write("\r" + Fore.RED + Style.BRIGHT + last + Style.RESET_ALL + "\n")
-        sys.stdout.flush()
+            time.sleep(0.012)
+    
+    time.sleep(0.3)
+    # The Prompt
+    print(f"\n" + Fore.LIGHTRED_EX + "hellhound" + Fore.WHITE + " > " + Style.RESET_ALL, end="", flush=True)
+    time.sleep(0.5)
 
 
 # ----------------------------
@@ -264,8 +267,7 @@ class HellhoundConsole(cmd.Cmd):
                  ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
                  ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝ 
 """
-                
-        _scanline_logo(logo)
+        # Initialise commands
         print(f"\n{Fore.WHITE}Type '{Fore.YELLOW}help{Fore.WHITE}' to view available commands.\n")
     
     # ============================
@@ -729,50 +731,21 @@ class HellhoundConsole(cmd.Cmd):
             if intel.get("openapi"):
                 module_risk += 3
 
-            # 1️⃣ Direct risk
-            module_risk += output.get("risk_score", 0)
+            # ── Risk Scoring Precision ─────────────────────
+            # Prioritize top-level module score to avoid double-counting nested intel keys.
+            module_risk = 0
+            if "risk_score" in output:
+                module_risk = output["risk_score"]
+            else:
+                # Fallback: sum nested risk only if no top-level score exists
+                module_risk += intel.get("risk_score", 0)
+                if "bac" in intel and isinstance(intel["bac"], dict):
+                    if "risk_score" not in intel:
+                        module_risk += intel["bac"].get("risk_score", 0)
 
-            # 2️⃣ Standard intel risk (Spider style)
-            module_risk += intel.get("risk_score", 0)
-            # ==============================
-            # ENDPOINT INTELLIGENCE (NEW)
-            # ==============================
-
-            endpoints = intel.get("endpoints", [])
-
-            for ep in endpoints:
-
-                # Parameter-sensitive endpoints (high priority)
-                if ep.get("parameter_sensitive"):
-                    module_risk += 5
-
-                # Auth-required endpoints (BAC / IDOR potential)
-                if ep.get("auth_required"):
-                    module_risk += 2
-
-                # Confidence weighting
-                conf = ep.get("confidence_label")
-
-                if conf == "CONFIRMED":
-                    module_risk += 3
-                elif conf == "HIGH":
-                    module_risk += 2
-                elif conf == "MEDIUM":
-                    module_risk += 1
-
-                # Parameter count (attack surface size)
-                params = ep.get("params", {})
-                param_count = sum(len(v) for v in params.values())
-
-                if param_count >= 3:
-                    module_risk += 2
-                elif param_count > 0:
-                    module_risk += 1
-            # 3️⃣ BAC nested risk
+            # 4️⃣ BAC total vulns tracking (regardless of score source)
             if "bac" in intel and isinstance(intel["bac"], dict):
-                bac_data = intel["bac"]
-                module_risk += bac_data.get("risk_score", 0)
-                total_vulns += len(bac_data.get("findings", []))
+                total_vulns += len(intel["bac"].get("findings", []))
 
             # 4️⃣ Generic vulnerabilities
             if "vulnerabilities" in intel:
