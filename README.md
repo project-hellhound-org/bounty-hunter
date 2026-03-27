@@ -29,49 +29,49 @@ Hellhound is built on a distributed intelligence model where independent modules
 
 ---
 
-## Module Ecosystem
+## Module Ecosystem (Arsenal)
 
-### Reconnaissance Layer
-Discovery and mapping of the target application surface.
+Hellhound's power lies in its specialized module ecosystem, organized into functional layers that mirror a professional penetration testing workflow.
+
+### 1. Reconnaissance & Surface Discovery
+*Foundational mapping and identification of the target application's attack surface.*
 
 | Module | Purpose | Key Capabilities |
 | :--- | :--- | :--- |
-| **Spider** | Surface Discovery | SPA crawling, API endpoint discovery, secret extraction. |
-| **Stalk** | Intelligence Aggregation | Unified mapping from multiple web sources and sub-layers. |
-| **WAFbuster** | Stack Identification | Active/Passive technology stack and WAF identification. |
+| **Spider** | Deep Surface Mapping | SPA crawling, API endpoint discovery, JS-level link extraction. |
+| **Stalk** | OSINT Aggregation | Unified mapping from public sources and internal sub-layers. |
+| **FUZZhunter** | Content Discovery | Recursive directory fuzzing with smart 404 similarity detection. |
+| **WAFbuster** | Stack Fingerprinting | Active/Passive identification of WAFs and technology stacks. |
 | **CORSbuster** | Policy Analysis | Identification of Cross-Origin Resource Sharing vulnerabilities. |
-| **GraphQL** | Schema Analysis | Probing for introspection leaks and field suggestion risks. |
-| **JWTanalyzer** | Token Analysis | Automated decoding and cryptographic vulnerability testing. |
+| **GraphQL** | Schema Probing | Schema introspection, field suggestion risks, and DOS pathing. |
+| **JWTanalyzer** | Token Decoding | Automated vulnerability testing (alg:none, weak-key brute force). |
 
-### Intelligence Layer
-High-fidelity analysis and automated discovery of sensitive assets.
-
-| Module | Purpose | Key Capabilities |
-| :--- | :--- | :--- |
-| **SecretScanner** | Token Discovery | Automated detection of API keys, JWTs, and high-entropy secrets. |
-| **CloudScout** | Cloud Discovery | Identification of leaked S3 buckets, Azure blobs, and GCP storage. |
-| **TechProfiler** | Stack Profiling | Deep fingerprinting of frameworks, servers, and micro-services. |
-| **BlobUnpacker** | Intel Reconstruction | Automatic source map unpacking and hidden endpoint extraction. |
-| **FUZZhunter** | Recursive Discovery | Advanced directory fuzzing with recursive scanning and 404 similarity detection. |
-| **JWTanalyzer** | Token Analysis | Automated secret brute-forcing and algorithm confusion testing. |
-| **GraphQL** | API Surface Analysis | Active security testing (Introspection, DOS, Depth, Suggestion). |
-
-### Vulnerability Layer
-Validation of security misconfigurations and logical flaws.
+### 2. Intelligence Layer
+*High-fidelity extraction of sensitive assets and technology profiling.*
 
 | Module | Purpose | Key Capabilities |
 | :--- | :--- | :--- |
-| **BACdetector** | Access Control | Multi-session Broken Access Control and IDOR validation. |
-| **IDORdetector** | Object Scoping | Mass enumeration of insecure direct object references. |
-| **Parax** | Risk Heuristics | Classification of parameter-level risks (SQLi, XSS, LFI). |
+| **SecretScanner** | Token Discovery | Automated detection of API keys, hardcoded secrets, and high-entropy strings. |
+| **CloudScout** | S3/Cloud Discovery | Identification of misconfigured S3 buckets, Azure Blobs, and GCP storage. |
+| **TechProfiler** | Version Profiling | Deep fingerprinting of frameworks, container layers, and micro-services. |
+| **BlobUnpacker** | Asset Reconstruction | Automated source map unpacking and hidden endpoint extraction from minified JS. |
 
-### Exploitation Layer
-Confirmation of exploitable attack paths.
+### 3. Vulnerability & Analysis Layer
+*Validation of security misconfigurations and logical flaws.*
+
+| Module | Purpose | Key Capabilities |
+| :--- | :--- | :--- |
+| **IDORdetector** | Object Scoping | Dual-session mass enumeration of Insecure Direct Object References. |
+| **BACdetector** | Access Control | Multi-role Broken Access Control validation and permission mapping. |
+| **Parax** | Parameter Heuristics | Advanced classification of parameter-level risks (SQLi, XSS, SSRF). |
+
+### 4. Exploitation Layer
+*Confirmation of weaponized attack paths.*
 
 | Module | Purpose | Key Capabilities |
 | :--- | :--- | :--- |
 | **CMDinj** | RCE Confirmation | Automated generation and verification of Command Injection PoCs. |
-| **Exmap** | CVE Correlation | Mapping confirmed technology versions to weaponized exploits. |
+| **Exmap** | CVE Correlation | Mapping confirmed technology versions to weaponized exploits (Metasploit/Internal). |
 
 ---
 
