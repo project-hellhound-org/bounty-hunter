@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 NAME = "fuzz_hunter"
 CATEGORY = "recon"
-DESCRIPTION = "Heuristic directory fuzzing with 404 detection and size filtering"
+DESCRIPTION = "Advanced recursive directory fuzzer with similarity-based 404 detection"
 
 # High-value targets (Used for QUICK mode or fallback)
 INTERNAL_WORDLIST = [
@@ -17,187 +17,150 @@ INTERNAL_WORDLIST = [
 ]
 
 def get_wordlist_path():
-    """
-    Dynamically resolves the path to the wordlist assuming a standard repository structure.
-    Expected Structure:
-    /hellhound/
-       /modules/
-          /recon/
-             fuzzhunter.py (this file)
-       /wordlists/
-          /web/
-             directories.txt
-    """
+    """Resolves path to wordlists/web/directories.txt"""
     try:
-        # Get the directory where this script is located
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # Go up 3 levels to reach the project root (recon -> modules -> root)
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
-        
-        # Construct path to wordlist
         wordlist_path = os.path.join(project_root, "wordlists", "web", "directories.txt")
-        
-        if os.path.exists(wordlist_path):
-            return wordlist_path
-        else:
-            return None
+        return wordlist_path if os.path.exists(wordlist_path) else None
     except Exception:
         return None
 
 class FuzzWorker:
-    def __init__(self, base_url, emit):
-        self.base_url = base_url
+    def __init__(self, base_url, emit, max_depth=2):
+        self.base_url = base_url.rstrip("/")
         self.emit = emit
+        self.max_depth = max_depth
         self.results = []
+        self.found_dirs = set([""]) # Initial root
         self.lock = threading.Lock()
         
         # Heuristics
         self.not_found_size = 0
         self.not_found_status = 0
+        self.not_found_content = ""
 
     def check_baseline(self):
         """Check how the server handles a definitely non-existent page"""
         try:
-            # Use a random string that likely doesn't exist
-            r = requests.get(f"{self.base_url}/hellhound-baseline-check-xyz123", timeout=5)
+            r = requests.get(f"{self.base_url}/hh-baseline-{os.urandom(4).hex()}", timeout=5, allow_redirects=False)
             self.not_found_size = len(r.content)
             self.not_found_status = r.status_code
+            self.not_found_content = r.text[:1000]
             return r.status_code
         except Exception:
             return 0
 
-    def test_path(self, path):
-        """Worker function to test a single path"""
-        url = f"{self.base_url}/{path}"
+    def is_similar_to_404(self, status, content, size):
+        if status != self.not_found_status and self.not_found_status != 0:
+            return False
+        if self.not_found_size > 0:
+            diff = abs(size - self.not_found_size)
+            if diff < 50 or diff < (self.not_found_size * 0.05):
+                if self.not_found_content and content:
+                    from difflib import SequenceMatcher
+                    ratio = SequenceMatcher(None, self.not_found_content, content[:1000]).ratio()
+                    if ratio > 0.8: return True
+                else:
+                    return True
+        return False
+
+    def test_path(self, base_path, word):
+        rel_path = f"{base_path}/{word}".lstrip("/")
+        url = f"{self.base_url}/{rel_path}"
         try:
-            r = requests.get(url, timeout=3)
+            r = requests.get(url, timeout=3, allow_redirects=False)
             size = len(r.content)
-            
             is_interesting = False
             
-            # Logic: 
-            # 1. If status is 200, check size vs baseline.
-            # 2. If size differs significantly from 404 baseline, it's a hit.
-            # 3. 403 (Forbidden) is always interesting (it exists).
-            # 4. 301/302 (Redirects) are interesting.
-            
-            if r.status_code == 200:
-                if self.not_found_size == 0:
-                    # If we couldn't establish a baseline, treat all 200s as hits
-                    is_interesting = True
-                elif abs(size - self.not_found_size) > 20: # Allow small variations
-                    is_interesting = True
-            
-            elif r.status_code == 403:
+            if r.status_code == 403:
                 is_interesting = True
-
             elif r.status_code in [301, 302, 307, 308]:
                 is_interesting = True
+                loc = r.headers.get("Location", "")
+                if loc.endswith("/") or word.endswith("/"):
+                    with self.lock:
+                        if rel_path not in self.found_dirs:
+                            self.found_dirs.add(rel_path)
+            elif r.status_code == 200:
+                if not self.is_similar_to_404(r.status_code, r.text, size):
+                    is_interesting = True
+                    if rel_path.endswith("/") or "." not in word:
+                        with self.lock:
+                            if rel_path not in self.found_dirs:
+                                self.found_dirs.add(rel_path)
 
             if is_interesting:
                 with self.lock:
-                    self.results.append({
-                        "path": path,
-                        "status": r.status_code,
-                        "size": size,
-                        "url": url
-                    })
-                    
-        except requests.RequestException:
+                    if any(res['path'] == rel_path for res in self.results): return
+                    self.results.append({"path": rel_path, "status": r.status_code, "size": size, "url": url})
+        except Exception:
             pass
 
 def run(target, emit, options=None):
-    emit.info(f"[*] Advanced Fuzzing: Starting heuristic scan on {target}")
-    
+    emit.info(f"[*] Advanced Fuzzing: {target}")
     url = target if target.startswith("http") else f"http://{target}"
     
-    # 1. DETERMINE MODE
-    mode = "quick"
-    if options and options.get("mode") == "deep":
-        mode = "deep"
-        emit.info(f"    [i] MODE: DEEP (Loading external wordlist)")
-    else:
-        emit.info(f"    [i] MODE: QUICK (Using internal top-targets)")
-
-    # 2. LOAD WORDLIST
-    words = []
+    max_depth = int(options.get("depth", 2)) if options else 2
+    mode = "deep" if options and options.get("mode") == "deep" else "quick"
     
-    # ── Advanced Contextual Fuzzing ──────────────────────
+    # Load Wordlist
+    words = []
     spider_intel = options.get("spider_intel", {}) if options else {}
     tech_stack = spider_intel.get("tech_stack", [])
     
-    # Extensions to add based on detected tech
     tech_exts = []
-    if any("PHP" in t for t in tech_stack): tech_exts.extend([".php", ".php.bak", ".php.old", ".config.php"])
-    if any("Node" in t for t in tech_stack): tech_exts.extend([".js", "package.json", "npm-debug.log"])
-    if any("Java" in t for t in tech_stack): tech_exts.extend([".jsp", ".do", ".class", "/WEB-INF/web.xml"])
-    if any("Python" in t for t in tech_stack): tech_exts.extend([".py", "requirements.txt", "manage.py"])
-    if any("ASP" in t for t in tech_stack): tech_exts.extend([".aspx", ".asp", "web.config", "Global.asax"])
-    
-    base_words = words if words else INTERNAL_WORDLIST
+    if any("PHP" in t for t in tech_stack): tech_exts.extend([".php", ".php.bak"])
+    if any("Node" in t for t in tech_stack): tech_exts.extend([".js", "package.json"])
     
     if mode == "deep":
-        wordlist_path = get_wordlist_path()
-        if wordlist_path:
+        wp = get_wordlist_path()
+        if wp:
             try:
-                with open(wordlist_path, 'r', encoding='utf-8', errors='ignore') as f:
+                with open(wp, 'r', encoding='utf-8', errors='ignore') as f:
                     words = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-                emit.info(f"    [i] Loaded {len(words)} words from external wordlist.")
-            except Exception as e:
-                emit.warn(f"    [!] Failed to load wordlist: {e}")
-                words = base_words
-        else:
-            emit.warn(f"    [!] Wordlist file not found. Falling back.")
-            words = base_words
-    else:
-        words = base_words
+                emit.info(f"    [i] Loaded {len(words)} words (DEEP)")
+            except: words = INTERNAL_WORDLIST
+        else: words = INTERNAL_WORDLIST
+    else: words = INTERNAL_WORDLIST
 
-    # Append tech-aware variations to the wordlist
-    if tech_exts:
-        emit.info(f"    [i] Adding {len(tech_exts)} technology-specific patterns...")
-        words = list(set(words + tech_exts))
+    if tech_exts: words = list(set(words + tech_exts))
+    scanner = FuzzWorker(url, emit, max_depth=max_depth)
+    baseline = scanner.check_baseline()
+    emit.info(f"    [i] Baseline: {baseline} (Size: {scanner.not_found_size})")
 
-    scanner = FuzzWorker(url, emit)
-    
-    # 3. Establish Baseline
-    baseline_status = scanner.check_baseline()
-    
-    baseline_msg = f"    [i] Baseline Check: Non-existent pages return status {baseline_status}"
-    if baseline_status == 200 or baseline_status == 0:
-        baseline_msg += f" (Size: {scanner.not_found_size} bytes)"
-    emit.info(baseline_msg)
-    
-    # 4. Launch Thread Pool (Safe for large wordlists)
-    # We limit threads to avoid DoS'ing the target or the local machine
-    MAX_THREADS = 50 
-    
-    emit.info(f"    [i] Starting fuzzing with {MAX_THREADS} threads...")
-    
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        # Submit all tasks
-        future_to_path = {executor.submit(scanner.test_path, word): word for word in words}
+    # Recursive Loop
+    current_depth = 0
+    scanned_dirs = set()
+    to_scan = [""]
+
+    while current_depth < max_depth and to_scan:
+        emit.info(f"    [i] Depth {current_depth}: Fuzzing {len(to_scan)} directories...")
+        next_scan = []
         
-        # Wait for completion
-        for future in as_completed(future_to_path):
-            # We just need to consume the futures to ensure they run
-            pass
+        for base in to_scan:
+            if base in scanned_dirs: continue
+            scanned_dirs.add(base)
+            
+            with ThreadPoolExecutor(max_workers=30) as executor:
+                futures = [executor.submit(scanner.test_path, base, word) for word in words]
+                for f in as_completed(futures): pass
+        
+        # Identify new directories found for next depth
+        with scanner.lock:
+            for d in scanner.found_dirs:
+                if d not in scanned_dirs:
+                    next_scan.append(d)
+        
+        to_scan = next_scan
+        current_depth += 1
 
-    # 5. Analyze Results
     if scanner.results:
-        # Sort results by status code (200 first)
         scanner.results.sort(key=lambda x: x['status'])
-        
         emit.success(f"[+] Found {len(scanner.results)} interesting endpoints.")
         for res in scanner.results:
-            status_color = "GREEN" if res['status'] == 200 else "RED" if res['status'] == 403 else "YELLOW"
             emit.info(f"    [{res['status']}] {res['path']} ({res['size']} bytes)")
-            
-        return {
-            "raw": f"Found {len(scanner.results)} endpoints.",
-            "intel": {"endpoints": scanner.results},
-            "signals": ["HIDDEN_ENDPOINTS_FOUND"]
-        }
-    else:
-        emit.info("[-] No hidden files detected via fuzzing.")
-        return {"raw": "No files found", "signals": []}
+        return {"raw": f"Found {len(scanner.results)} endpoints", "intel": {"endpoints": scanner.results}, "signals": ["HIDDEN_ENDPOINTS_FOUND"]}
+    
+    emit.info("[-] No hidden files detected.")
+    return {"raw": "No files found", "signals": []}

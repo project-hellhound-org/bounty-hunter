@@ -1,142 +1,86 @@
 import requests
 import json
 import urllib.parse
+import re
 
 NAME = "graphql_hunter"
 CATEGORY = "recon"
-DESCRIPTION = "Advanced GraphQL endpoint discovery and introspection analysis"
-OPTIONS = [
-    {"name": "manual_endpoint", "type": str, "default": "", "help": "Provide a manual GraphQL endpoint to test (e.g. http://site.com/graphql)"}
-]
+DESCRIPTION = "Advanced GraphQL discovery and active security testing (Depth, Suggestion, Introspection)"
 
 def test_graphql(url, emit):
-    # 1. Test Introspection
-    introspection_query = {"query": "{__schema{types{name}}}"}
-    
-    # 2. Test Field Suggestion (error-based detection)
-    suggestion_query = {"query": "{hellhound_probe}"}
-
     headers = {"Content-Type": "application/json"}
-    
-    findings = {}
     is_graphql = False
-    
-    try:
-        # Try POST suggestion first (lowest impact to confirm it's GraphQL)
-        r = requests.post(url, json=suggestion_query, headers=headers, timeout=5)
-        if r.status_code in [200, 400] and "errors" in r.text:
-            if "Cannot query field" in r.text or "hellhound_probe" in r.text:
-                is_graphql = True
-                findings["endpoint"] = url
-                findings["suggestions_enabled"] = True
-    except Exception:
-        pass
-        
-    try:
-        # Try POST introspection
-        r = requests.post(url, json=introspection_query, headers=headers, timeout=5)
-        if r.status_code == 200 and "data" in r.text and "__schema" in r.text:
-            is_graphql = True
-            findings["endpoint"] = url
-            findings["introspection_enabled"] = True
-    except Exception:
-        pass
-        
-    if not is_graphql:
-        try:
-            # Try GET introspection as fallback
-            get_url = f"{url}?query=%7B__schema%7Btypes%7Bname%7D%7D%7D"
-            r = requests.get(get_url, timeout=5)
-            if r.status_code == 200 and "data" in r.text and "__schema" in r.text:
-                is_graphql = True
-                findings["endpoint"] = url
-                findings["introspection_enabled"] = True
-                findings["get_enabled"] = True
-        except Exception:
-            pass
-            
-    # ── Advanced: Test for Method Variation Bypasses ────────
-    if is_graphql:
-        try:
-            # Test if PUT/DELETE are supported (often misconfigured)
-            r = requests.put(url, json=suggestion_query, headers=headers, timeout=5)
-            if r.status_code in [200, 400] and "errors" in r.text:
-                findings["unusual_methods_allowed"] = True
-        except Exception:
-            pass
+    findings = {"endpoint": url, "vulnerabilities": []}
 
-    return findings if is_graphql else None
+    # 1. Introspection Check
+    introspection = {"query": "{__schema{types{name}}}"}
+    try:
+        r = requests.post(url, json=introspection, headers=headers, timeout=5)
+        if r.status_code == 200 and "__schema" in r.text:
+            is_graphql = True
+            findings["introspection_enabled"] = True
+            findings["vulnerabilities"].append("CRITICAL: Introspection is ENABLED")
+    except: pass
+
+    # 2. Field Suggestions Check
+    suggestion = {"query": "{hellhound_probe}"}
+    try:
+        r = requests.post(url, json=suggestion, headers=headers, timeout=5)
+        if "errors" in r.text and ("Cannot query field" in r.text or "Did you mean" in r.text):
+            is_graphql = True
+            findings["suggestions_enabled"] = True
+            findings["vulnerabilities"].append("MEDIUM: Field Suggestions are ENABLED")
+    except: pass
+
+    if not is_graphql: return None
+
+    # 3. Query Depth / Complexity Test (DOS)
+    # Build a deep query: { user { user { user ... } } }
+    deep_q = "{" + (" user { " * 8) + " id " + (" } " * 8) + "}"
+    try:
+        r = requests.post(url, json={"query": deep_q}, headers=headers, timeout=5)
+        if r.status_code == 200 and "errors" not in r.text:
+            findings["vulnerabilities"].append("HIGH: Deeply nested queries (Depth 8+) accepted (potential DOS)")
+        elif "depth" in r.text.lower() or "too deep" in r.text.lower():
+            findings["vulnerabilities"].append("INFO: Query depth limit detected")
+    except: pass
+
+    # 4. Alias Overload Test (DOS)
+    # query { a: user{id} b: user{id} ... }
+    alias_q = "query { " + " ".join([f"a{i}: __typename" for i in range(50)]) + " }"
+    try:
+        r = requests.post(url, json={"query": alias_q}, headers=headers, timeout=5)
+        if r.status_code == 200 and "data" in r.text:
+            findings["vulnerabilities"].append("MEDIUM: Large number of aliases accepted (potential Resource Exhaustion)")
+    except: pass
+
+    return findings
 
 def run(target, emit, options=None):
-    emit.info(f"[*] GraphQL Hunter: Analyzing {target}")
+    emit.info(f"[*] GraphQL Hunter: {target}")
+    url = target if target.startswith("http") else f"http://{target}"
     
-    base_url = target if target.startswith("http") else f"http://{target}"
-    base_url = base_url.rstrip("/")
+    # 1. Discover Endpoints
+    potential = set([
+        url + "/graphql", url + "/api/graphql", url + "/v1/graphql", 
+        url + "/graphiql", url + "/query", url + "/api/v1/graphql"
+    ])
     
     spider_intel = options.get("spider_intel", {}) if options else {}
-    endpoints = spider_intel.get("endpoints", [])
-    
-    urls_to_test = set()
-    
-    # 1. Manual user endpoint
-    if options and options.get("manual_endpoint"):
-        urls_to_test.add(options.get("manual_endpoint"))
-    
-    # 2. Standard GraphQL paths (expanded)
-    standard_paths = [
-        "/graphql", "/api/graphql", "/v1/graphql", "/v2/graphql",
-        "/graphiql", "/api/graphiql", "/graphql.php", "/graphql/console",
-        "/api/v1/graphql", "/api/v2/graphql", "/query", "/api/query",
-        "/.well-known/graphql", "/explorer", "/api/explorer"
-    ]
-    for p in standard_paths:
-        urls_to_test.add(base_url + p)
-        # Also try without the leading slash if the base_url is just a domain
-        urls_to_test.add(base_url.rstrip("/") + p)
-        
-    # 3. Spider endpoints
-    for ep in endpoints:
-        ep_url = ep.get("url")
-        if ep_url:
-            urls_to_test.add(ep_url.split("?")[0])
-            
-    urls_to_test = list(urls_to_test)
-    if len(urls_to_test) > 150:
-        urls_to_test = urls_to_test[:150]
-        
-    emit.info(f"    [i] Testing {len(urls_to_test)} potential endpoints...")
-    
-    discovered = []
-    signals = []
-    risk_score = 0
-    
-    for url in urls_to_test:
-        result = test_graphql(url, emit)
-        if result:
-            discovered.append(result)
-            emit.success(f"    [+] GraphQL Endpoint found: {url}")
-            if result.get("introspection_enabled"):
-                emit.warn(f"        [!] Introspection is ENABLED (Critical Info Leak)")
-                risk_score += 8
-            if result.get("suggestions_enabled"):
-                emit.warn(f"        [!] Field Suggestions are ENABLED")
-                risk_score += 2
-            if result.get("unusual_methods_allowed"):
-                emit.warn(f"        [!] Server accepts unusual methods (PUT/DELETE) for GraphQL")
-                risk_score += 3
-                
-            # If we explicitly found it on a standard path not in spider, record it
-            if url not in [e.get("url") for e in endpoints]:
-                signals.append("HIDDEN_GRAPHQL_DISCOVERED")
+    for ep in spider_intel.get("endpoints", []):
+        u = ep.get("url", "")
+        if "graphql" in u.lower() or "graphiql" in u.lower():
+            potential.add(u.split("?")[0])
 
-    if discovered:
-        signals.append("GRAPHQL_EXPOSED")
-        emit.success(f"[+] Found {len(discovered)} active GraphQL endpoints.")
-    else:
-        emit.info("[-] No GraphQL endpoints detected.")
-        
-    return {
-        "raw": f"GraphQL Endpoints: {len(discovered)}",
-        "intel": {"graphql_endpoints": discovered, "risk_score": risk_score},
-        "signals": signals
-    }
+    discovered = []
+    risk = 0
+    for up in list(potential)[:50]:
+        res = test_graphql(up, emit)
+        if res:
+            discovered.append(res)
+            emit.success(f"    [+] GraphQL Found: {up}")
+            for v in res["vulnerabilities"]:
+                emit.warn(f"        [!] {v}")
+                risk += 8 if "CRITICAL" in v else 4 if "HIGH" in v else 2
+    
+    return {"raw": f"Found {len(discovered)} GraphQL endpoints", "intel": {"endpoints": discovered, "risk_score": risk}, "signals": ["GRAPHQL_EXPOSED"] if discovered else []}
