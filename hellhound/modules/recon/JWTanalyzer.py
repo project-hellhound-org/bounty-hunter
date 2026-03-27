@@ -41,6 +41,10 @@ def analyze_jwt(token, source, target_url=None):
         findings["payload"] = json.loads(base64.urlsafe_b64decode(pad_base64(parts[1])).decode())
     except: return None
 
+    # Ensure they are dicts to prevent attribute errors
+    if not isinstance(findings["header"], dict): findings["header"] = {}
+    if not isinstance(findings["payload"], dict): findings["payload"] = {}
+
     alg = findings["header"].get("alg", "").lower()
     
     # 1. Algorithm: None
