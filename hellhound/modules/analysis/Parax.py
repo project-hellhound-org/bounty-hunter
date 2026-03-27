@@ -6,12 +6,12 @@ DESCRIPTION = "Advanced parameter risk analysis (SQLi, IDOR, XSS, LFI, Open Redi
 
 # Keyword heuristics (substring-based, not strict match)
 RISK_PATTERNS = {
-    "IDOR_POTENTIAL": ["id", "uid", "user", "account", "profile"],
-    "SQLI_POTENTIAL": ["search", "query", "select", "where", "filter"],
-    "XSS_POTENTIAL": ["name", "msg", "comment", "input", "text"],
-    "OPEN_REDIRECT": ["redirect", "next", "url", "return"],
-    "LFI_POTENTIAL": ["file", "page", "path", "template", "doc"],
-    "COMMAND_INJECTION": ["cmd", "exec", "system", "shell"]
+    "IDOR_POTENTIAL": ["id", "uid", "user", "account", "profile", "member", "owner", "author", "pid", "msg_id"],
+    "SQLI_POTENTIAL": ["search", "query", "select", "where", "filter", "bslug", "slug", "term", "key"],
+    "XSS_POTENTIAL": ["name", "msg", "comment", "input", "text", "bio", "title", "body", "subject"],
+    "OPEN_REDIRECT": ["redirect", "next", "url", "return", "dest", "destination", "forward"],
+    "LFI_POTENTIAL": ["file", "page", "path", "template", "doc", "layout", "inc"],
+    "COMMAND_INJECTION": ["cmd", "exec", "system", "shell", "host", "ping", "ip"]
 }
 
 SEVERITY_SCORE = {

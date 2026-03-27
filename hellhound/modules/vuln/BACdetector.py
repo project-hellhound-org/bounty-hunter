@@ -102,7 +102,7 @@ class FidelityAuditor:
                 self._add_finding("Horizontal Authorization Bypass", "High", ep_url, "UserB accessed UserA resource")
 
         # 5. Admin Action Validation (POST/PUT/DELETE)
-        if ("/api/" in ep_url or "/rest/" in ep_url) and ep_url not in self._critical_urls:
+        if ep_url not in self._critical_urls:
             # If it's a sensitive path, try modifying
             if is_admin_ep:
                 for method in ("POST", "PUT", "DELETE"):
@@ -194,8 +194,8 @@ def run(target: str, emit, options: Optional[Dict[str, Any]] = None):
     spider_intel = opt.get("spider_intel", {})
     all_eps = spider_intel.get("endpoints", [])
     
-    # Target Selection: Every API/Rest endpoint is a candidate for logic flaws
-    targets = {e.get("url") for e in all_eps if ("/api/" in e.get("url","") or "/rest/" in e.get("url",""))}
+    # Target Selection: Every endpoint is a candidate for logic flaws
+    targets = {e.get("url") for e in all_eps if e.get("url")}
     
     # Priority sorting: check admin and auth-required first
     prio_targets = sorted(list(targets), key=lambda x: any(k in x.lower() for k in ADMIN_KEYWORDS), reverse=True)

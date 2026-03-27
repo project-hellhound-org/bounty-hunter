@@ -5091,11 +5091,21 @@ def run(target, emit, options):
     low    = sum(1 for t in targets if t[0] == 1)
 
     # Pre-harvest hint count (from crawler + spider + auth — before active harvest)
+    # Ensure spider_intel IDs are seeded even if harvest fails
+    _hint_seen       = set()
+    crawler_id_hints = []
+    
     pre_harvest_hints = (
         (crawler.id_hints if crawler else [])
         + extra_id_hints
         + auth_id_hints
     )
+    # Add spider discovered IDs to the pool
+    for hint in pre_harvest_hints:
+        k = (hint["id_val"], hint["id_type"])
+        if k not in _hint_seen:
+            _hint_seen.add(k)
+            crawler_id_hints.append(hint)
     tprint(f"  {color('High-signal IDOR surface:', C.BRED,    C.BOLD)} {high} endpoints")
     tprint(f"  {color('Medium-signal:',            C.BYELLOW, C.BOLD)} {medium} endpoints")
     tprint(f"  {color('Low-signal:',               C.DIM)}    {low} endpoints")
@@ -5133,8 +5143,6 @@ def run(target, emit, options):
     harvested_hints = harvest.run()
 
     # Merge all hint sources — trusted order: auth > harvested > spider > crawler
-    _hint_seen       = set()
-    crawler_id_hints = []
     for h in (harvested_hints + auth_id_hints + extra_id_hints +
               (crawler.id_hints if crawler else [])):
         k = (h["id_val"], h["id_type"])
