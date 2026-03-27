@@ -889,8 +889,9 @@ class HellhoundConsole(cmd.Cmd):
             if not isinstance(output, dict):
                 continue
 
-            intel     = output.get("intel", {})
-            raw_stats = output.get("raw", "")
+            intel      = output.get("intel", {})
+            file_reads = intel.get("file_reads", [])
+            raw_stats  = output.get("raw", "")
             mod_score = breakdown.get(mod_clean, 0)
             sc        = _risk_color(_risk_level(mod_score))
 
@@ -988,8 +989,6 @@ class HellhoundConsole(cmd.Cmd):
                         if f.get("poc_browser"):
                             print(f"       {Fore.WHITE}open    : {Fore.CYAN}{f['poc_browser']}{Style.RESET_ALL}")
                         print()
-                else:
-                    print(Fore.LIGHTBLACK_EX + "  [Command Injection]  no findings" + Style.RESET_ALL)
 
                 if file_reads:
                     print(Fore.MAGENTA + Style.BRIGHT + f"  [File Reads — {len(file_reads)} proof(s)]" + Style.RESET_ALL)
@@ -1004,13 +1003,50 @@ class HellhoundConsole(cmd.Cmd):
                         if param:    print(f"       {Fore.WHITE}param    : {Fore.YELLOW}{param}{Style.RESET_ALL}")
                         if strategy: print(f"       {Fore.WHITE}strategy : {Fore.WHITE}{strategy}{Style.RESET_ALL}")
                         if content:
-                            cs = str(content).replace("\\n", "\n")
+                            cs_lines = str(content).replace("\\n", "\n").splitlines()
                             print(f"       {Fore.WHITE}content  :{Style.RESET_ALL}")
-                            for line in cs.splitlines()[:6]:
+                            for line in cs_lines[:6]:
                                 print(f"         {Fore.GREEN}{line.strip()}{Style.RESET_ALL}")
-                            if len(cs.splitlines()) > 6:
+                            if len(cs_lines) > 6:
                                 print(f"         {Fore.LIGHTBLACK_EX}... truncated{Style.RESET_ALL}")
                         print()
+                
+                if not vulns and not file_reads:
+                    print(Fore.LIGHTBLACK_EX + "  [Command Injection]  no findings" + Style.RESET_ALL)
+
+            # ── IDORdetector dedicated renderer ───────────────────────
+            elif mod_clean == "idordetector":
+                vulns = intel.get("vulnerabilities", [])
+
+                if vulns:
+                    print(Fore.MAGENTA + Style.BRIGHT 
+                          + f"  [IDOR Vulnerabilities — {len(vulns)} finding(s)]" 
+                          + Style.RESET_ALL)
+                    print()
+                    sev_w = {"critical":0,"high":1,"medium":2,"low":3,"info":4}
+                    for f in sorted(vulns, key=lambda x: sev_w.get(str(x.get("severity","info")).lower(), 99)):
+                        sev     = str(f.get("severity","high")).upper()
+                        param   = f.get("parameter", f.get("param", ""))
+                        url     = f.get("url", "")
+                        proof   = f.get("proof", f.get("evidence", ""))
+                        sc2     = _sev_color(sev)
+                        
+                        print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}]  "
+                              f"{Fore.WHITE + Style.BRIGHT}Insecure Direct Object Reference{Style.RESET_ALL}")
+                        if url:
+                            print(f"       {Fore.WHITE}url     : {Fore.CYAN}{url}{Style.RESET_ALL}")
+                        if param:
+                            print(f"       {Fore.WHITE}param   : {Fore.YELLOW}{param}{Style.RESET_ALL}")
+                        if proof:
+                            ps = str(proof)
+                            print(f"       {Fore.WHITE}proof   : {Fore.WHITE}{ps[:120]}{'...' if len(ps)>120 else ''}{Style.RESET_ALL}")
+                        if f.get("poc_curl"):
+                            print(f"       {Fore.WHITE}curl    : {Fore.YELLOW}{f['poc_curl']}{Style.RESET_ALL}")
+                        if f.get("poc_browser"):
+                            print(f"       {Fore.WHITE}open    : {Fore.CYAN}{f['poc_browser']}{Style.RESET_ALL}")
+                        print()
+                else:
+                    print(Fore.LIGHTBLACK_EX + "  [IDOR Vulnerabilities]  no findings" + Style.RESET_ALL)
 
             # ── CORSbuster dedicated renderer ─────────────────────
             elif mod_clean == "corsbuster":
@@ -1061,6 +1097,11 @@ class HellhoundConsole(cmd.Cmd):
                             cred_tag = (f"  {Fore.RED + Style.BRIGHT}[CREDS]{Style.RESET_ALL}"
                                         if f.get("credentials_allowed") else "")
                             print(f"       {Fore.CYAN}{f.get('url','')}{Style.RESET_ALL}{cred_tag}")
+                            
+                            if f.get("poc_html"):
+                                # Advanced feature: Provide a "copy-ready" hint
+                                print(f"       {Fore.WHITE}exploit : {Fore.YELLOW}[HTML PoC Generated]{Style.RESET_ALL}")
+                                print(f"       {Fore.LIGHTBLACK_EX}View raw loot ('loot --json') to copy full PoC script.{Style.RESET_ALL}")
                         print()
                 else:
                     print(Fore.LIGHTBLACK_EX + "  [CORS]  no misconfigurations found" + Style.RESET_ALL)
@@ -1347,12 +1388,12 @@ class HellhoundConsole(cmd.Cmd):
                         print(Fore.YELLOW + "  [Critical Signals]" + Style.RESET_ALL)
                         if sensitive:
                             print(Fore.YELLOW + f"    Parameter-Sensitive ({len(sensitive)})" + Style.RESET_ALL)
-                            for e in sensitive[:10]:
-                                print(f"      {Fore.CYAN}{e['url']}{Style.RESET_ALL}")
+                            for e in list(sensitive)[:10]:
+                                print(f"      {Fore.CYAN}{e.get('url','')}{Style.RESET_ALL}")
                         if auth_walls:
                             print(Fore.YELLOW + f"    Auth-Walled ({len(auth_walls)})" + Style.RESET_ALL)
-                            for e in auth_walls[:10]:
-                                print(f"      {Fore.CYAN}{e['url']}{Style.RESET_ALL}")
+                            for e in list(auth_walls)[:10]:
+                                print(f"      {Fore.CYAN}{e.get('url','')}{Style.RESET_ALL}")
                         print()
 
                     print(Fore.MAGENTA + f"  [Attack Surface — {len(cluster_map)} endpoints]" + Style.RESET_ALL)
@@ -1402,13 +1443,13 @@ class HellhoundConsole(cmd.Cmd):
                         continue
                     if isinstance(val, list) and val:
                         print(Fore.MAGENTA + f"  [{key}]" + Style.RESET_ALL)
-                        for item in val[:20]:
+                        for item in list(val)[:20]:
                             if isinstance(item, dict):
                                 url = item.get("url", item.get("path", item.get("name", "")))
                                 extra = {k:v for k,v in item.items() if k not in ("url","path","name")}
-                                line = f"    {Fore.WHITE}• {url or json.dumps(item, default=str)[:80]}"
-                                if extra: line += Fore.WHITE + f"  {json.dumps(extra, default=str)[:60]}"
-                                print(line + Style.RESET_ALL)
+                                line_text = f"    {Fore.WHITE}• {url or json.dumps(item, default=str)[:80]}"
+                                if extra: line_text += Fore.WHITE + f"  {json.dumps(extra, default=str)[:60]}"
+                                print(line_text + Style.RESET_ALL)
                             else:
                                 print(f"    {Fore.WHITE}• {item}{Style.RESET_ALL}")
                         if len(val) > 20:

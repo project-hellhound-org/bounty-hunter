@@ -1,6 +1,7 @@
 import subprocess
 import shutil
 import re
+from hellhound.modules.recon.utils.signatures import WAF_SIGNATURES, TECH_SIGNATURES
 import requests
 import socket
 from urllib.parse import urlparse
@@ -108,7 +109,7 @@ class StalkEngine:
                 self.data["signals"].append("MULTIPLE_WEB_SERVICES")
 
     def fingerprint_tech(self):
-        self.emit.info("Phase 2: Technology Fingerprinting")
+        self.emit.info("Phase 2: Technology WAFbustering")
 
         detected_tech = set()
         waf_detected = None
@@ -123,38 +124,35 @@ class StalkEngine:
                 headers = r.headers
 
                 server = headers.get("Server", "").lower()
-                powered = headers.get("X-Powered-By", "").lower()
                 via = headers.get("Via", "").lower()
                 cf_ray = headers.get("CF-Ray", "")
                 x_akamai = headers.get("X-Akamai-Transformed", "")
                 x_sucuri = headers.get("X-Sucuri-ID", "")
 
-                # --- Server Header ---
-                if server:
-                    detected_tech.add(f"Server: {server}")
-                    if "nginx" in server: detected_tech.add("Nginx")
-                    if "apache" in server: detected_tech.add("Apache")
-                    if "iis" in server: detected_tech.add("Microsoft IIS")
-                    if "werkzeug" in server: detected_tech.add("Werkzeug/Python")
+                # --- Signature Based Detection (Unified) ---
+                # WAFs
+                for waf, sigs in WAF_SIGNATURES.items():
+                    for sig in sigs:
+                        if any(sig in str(h).lower() for h in headers.values()) or sig in r.text.lower():
+                            waf_detected = waf
+                            break
+                
+                # Tech
+                server = headers.get("Server", "").lower()
+                for sig, name in TECH_SIGNATURES["Server"].items():
+                    if sig in server: detected_tech.add(name)
+                
+                powered = headers.get("X-Powered-By", "").lower()
+                for sig, name in TECH_SIGNATURES["Framework"].items():
+                    if sig in powered: detected_tech.add(name)
+                    
+                for cat, sigs in TECH_SIGNATURES.items():
+                    if isinstance(sigs, dict) and cat != "Server" and cat != "Framework":
+                        for sig, name in sigs.items():
+                            if sig in r.text.lower() or any(sig in str(c).lower() for c in r.cookies.get_dict()):
+                                detected_tech.add(name)
 
-                # --- X-Powered-By ---
-                if powered:
-                    detected_tech.add(f"Powered: {powered}")
-                    if "php" in powered: detected_tech.add("PHP")
-                    if "asp" in powered: detected_tech.add("ASP.NET")
-                    if "express" in powered: detected_tech.add("Node/Express")
-
-                # --- CDN / WAF Detection ---
-                if cf_ray or "cloudflare" in server:
-                    waf_detected = "Cloudflare"
-                if x_akamai:
-                    waf_detected = "Akamai"
-                if x_sucuri:
-                    waf_detected = "Sucuri"
-                if via:
-                    detected_tech.add(f"Proxy: {via}")
-
-            except:
+            except Exception:
                 continue
 
         # ---------------------------------------------

@@ -383,7 +383,7 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
                 chain   = "IDORdetector → Parax",
             ))
 
-    # Chain 6: Fingerprint versioned tech + Exmap not run
+    # Chain 6: WAFbuster versioned tech + Exmap not run
     detected_tech = fp_intel.get("detected", {}) or fp_intel.get("technologies", {})
     versioned_tech = {
         k: v for k, v in (detected_tech.items() if isinstance(detected_tech, dict) else {}.items())
@@ -394,9 +394,9 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
         chains.append(_sugg(
             P_HIGH, CONF_STRONG, "correlator",
             action  = "equip Exmap — versioned tech fingerprinted, CVE lookup pending",
-            reason  = "Fingerprint identified specific software versions; Exmap will map these to NVD CVEs with evidence scoring",
-            evidence= [f"Fingerprint: {k} {v}" for k, v in top],
-            chain   = "Fingerprint → Exmap",
+            reason  = "WAFbuster identified specific software versions; Exmap will map these to NVD CVEs with evidence scoring",
+            evidence= [f"WAFbuster: {k} {v}" for k, v in top],
+            chain   = "WAFbuster → Exmap",
         ))
 
     # Chain 7: Spider tech stack detected + Exmap not run

@@ -51,9 +51,20 @@ def test_graphql(url, emit):
                 is_graphql = True
                 findings["endpoint"] = url
                 findings["introspection_enabled"] = True
+                findings["get_enabled"] = True
         except Exception:
             pass
             
+    # ── Advanced: Test for Method Variation Bypasses ────────
+    if is_graphql:
+        try:
+            # Test if PUT/DELETE are supported (often misconfigured)
+            r = requests.put(url, json=suggestion_query, headers=headers, timeout=5)
+            if r.status_code in [200, 400] and "errors" in r.text:
+                findings["unusual_methods_allowed"] = True
+        except Exception:
+            pass
+
     return findings if is_graphql else None
 
 def run(target, emit, options=None):
@@ -110,6 +121,9 @@ def run(target, emit, options=None):
             if result.get("suggestions_enabled"):
                 emit.warn(f"        [!] Field Suggestions are ENABLED")
                 risk_score += 2
+            if result.get("unusual_methods_allowed"):
+                emit.warn(f"        [!] Server accepts unusual methods (PUT/DELETE) for GraphQL")
+                risk_score += 3
                 
             # If we explicitly found it on a standard path not in spider, record it
             if url not in [e.get("url") for e in endpoints]:

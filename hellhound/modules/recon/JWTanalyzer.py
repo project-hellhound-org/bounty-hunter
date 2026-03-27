@@ -1,6 +1,7 @@
 import json
 import base64
 import re
+from urllib.parse import urlparse
 
 NAME = "jwt_analyzer"
 CATEGORY = "recon"
@@ -13,7 +14,7 @@ def pad_base64(data):
     data = data.replace('-', '+').replace('_', '/')
     return data + '=' * (-len(data) % 4)
 
-def analyze_jwt(token, source):
+def analyze_jwt(token, source, target_url=None):
     findings = {
         "token": token,
         "source": source,
@@ -48,35 +49,54 @@ def analyze_jwt(token, source):
     # 1. Check for Alg: None
     alg = findings["header"].get("alg", "")
     if alg and isinstance(alg, str) and alg.lower() == "none":
-        findings["vulnerabilities"].append("Algorithm 'none' accepted (CRITICAL)")
+        findings["vulnerabilities"].append("CRITICAL: Algorithm 'none' accepted")
     
     # 2. Check for weak algorithms
     if alg and isinstance(alg, str) and alg.lower() in ["hs256", "hs384", "hs512"]:
-        findings["vulnerabilities"].append(f"Symmetric Algorithm ({alg.upper()}) - susceptible to offline brute-force")
-        
-    vulns = findings["payload"].get("vulnerabilities", [])
-    if not isinstance(vulns, list):
-        vulns = []
-        findings["payload"]["vulnerabilities"] = vulns
+        findings["vulnerabilities"].append(f"HIGH: Symmetric Algorithm ({alg.upper()}) - susceptible to brute-force")
+    
+    # 3. Check for Header Injection (kid)
+    kid = findings["header"].get("kid")
+    if kid and isinstance(kid, str):
+        if "../" in kid or "/" in kid or "\\" in kid:
+            findings["vulnerabilities"].append("MEDIUM: Potential 'kid' (Key ID) path traversal injection")
+            
+    # 4. Check for JKU (JWK Set URL)
+    jku = findings["header"].get("jku")
+    if jku and isinstance(jku, str):
+        findings["vulnerabilities"].append(f"MEDIUM: External JKU defined: {jku} (potential key spoofing)")
 
-    # 3. Check for expiration
+    # 5. Check for expiration
     exp = findings["payload"].get("exp")
     if exp:
         import time
         try:
             if float(exp) < time.time():
-                vulns.append("Token EXPIRED (Low)")
+                findings["vulnerabilities"].append("LOW: Token EXPIRED")
         except (ValueError, TypeError):
             pass
     else:
-        vulns.append("Missing 'exp' claim (Info)")
+        findings["vulnerabilities"].append("INFO: Missing 'exp' claim")
 
-    # 4. Check for sensitive PII claims in payload
-    sensitive_keys = ["email", "password", "role", "admin", "privilege", "superuser", "username", "uid", "secret", "key", "token", "pwd"]
+    # 6. Check for sensitive PII claims in payload
+    sensitive_keys = ["email", "password", "role", "admin", "privilege", "superuser", "username", "uid", "secret", "key", "token", "pwd", "ssn", "phone"]
     for key, val in findings["payload"].items():
-        if isinstance(key, str) and (any(sk in key.lower() for sk in sensitive_keys) or "id" == key.lower()):
-            findings["sensitive_claims"].append(f"{key}: {val}")
+        if isinstance(key, str):
+            key_low = key.lower()
+            if any(sk in key_low for sk in sensitive_keys) or key_low in ["id", "user_id", "sub"]:
+                findings["sensitive_claims"].append(f"{key}: {val}")
             
+    # 7. Check for Issuer and Audience context
+    if target_url:
+        target_domain = urlparse(target_url).netloc
+        iss = findings["payload"].get("iss")
+        aud = findings["payload"].get("aud")
+        
+        if iss and isinstance(iss, str) and target_domain not in iss:
+            findings["vulnerabilities"].append(f"INFO: Token issuer '{iss}' does not match target domain")
+        if aud and isinstance(aud, str) and target_domain not in aud:
+            findings["vulnerabilities"].append(f"INFO: Token audience '{aud}' does not match target domain")
+
     return findings
 
 def run(target, emit, options=None):
@@ -114,7 +134,7 @@ def run(target, emit, options=None):
     emit.info(f"    [i] Analyzing {len(potential_tokens)} potential JWTs...")
     
     for token, source in potential_tokens:
-        result = analyze_jwt(token, source)
+        result = analyze_jwt(token, source, target_url=target)
         if result:
             analyzed_tokens.append(result)
             emit.success(f"    [+] Valid JWT Found (Source: {source})")

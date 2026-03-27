@@ -259,10 +259,23 @@ class AutoRegistrar:
         
         for ep in raw_endpoints:
             if ep.get("tags") == ["FORM"]:
+                # Normalize params from dict of lists to list of dicts for legacy compat
+                params = ep.get("params", {})
+                norm_params = []
+                if isinstance(params, dict):
+                    for src, items in params.items():
+                        for item in items:
+                            if isinstance(item, str):
+                                norm_params.append({"name": item, "type": "text"})
+                            elif isinstance(item, dict):
+                                norm_params.append(item)
+                elif isinstance(params, list):
+                    norm_params = params
+
                 forms.append({
                     "url": ep.get("url"),
                     "method": ep.get("method", "POST"),
-                    "params": ep.get("params", [])
+                    "params": norm_params
                 })
         return forms
 
