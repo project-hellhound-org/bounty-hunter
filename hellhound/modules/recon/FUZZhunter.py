@@ -123,24 +123,40 @@ def run(target, emit, options=None):
     # 2. LOAD WORDLIST
     words = []
     
+    # ── Advanced Contextual Fuzzing ──────────────────────
+    spider_intel = options.get("spider_intel", {}) if options else {}
+    tech_stack = spider_intel.get("tech_stack", [])
+    
+    # Extensions to add based on detected tech
+    tech_exts = []
+    if any("PHP" in t for t in tech_stack): tech_exts.extend([".php", ".php.bak", ".php.old", ".config.php"])
+    if any("Node" in t for t in tech_stack): tech_exts.extend([".js", "package.json", "npm-debug.log"])
+    if any("Java" in t for t in tech_stack): tech_exts.extend([".jsp", ".do", ".class", "/WEB-INF/web.xml"])
+    if any("Python" in t for t in tech_stack): tech_exts.extend([".py", "requirements.txt", "manage.py"])
+    if any("ASP" in t for t in tech_stack): tech_exts.extend([".aspx", ".asp", "web.config", "Global.asax"])
+    
+    base_words = words if words else INTERNAL_WORDLIST
+    
     if mode == "deep":
         wordlist_path = get_wordlist_path()
         if wordlist_path:
             try:
                 with open(wordlist_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    # Read lines, strip whitespace, ignore empty lines or comments
                     words = [line.strip() for line in f if line.strip() and not line.startswith('#')]
                 emit.info(f"    [i] Loaded {len(words)} words from external wordlist.")
             except Exception as e:
                 emit.warn(f"    [!] Failed to load wordlist: {e}")
-                emit.warn(f"    [!] Falling back to internal list.")
-                words = INTERNAL_WORDLIST
+                words = base_words
         else:
-            emit.warn(f"    [!] Wordlist file not found at expected location.")
-            emit.warn(f"    [!] Falling back to internal list.")
-            words = INTERNAL_WORDLIST
+            emit.warn(f"    [!] Wordlist file not found. Falling back.")
+            words = base_words
     else:
-        words = INTERNAL_WORDLIST
+        words = base_words
+
+    # Append tech-aware variations to the wordlist
+    if tech_exts:
+        emit.info(f"    [i] Adding {len(tech_exts)} technology-specific patterns...")
+        words = list(set(words + tech_exts))
 
     scanner = FuzzWorker(url, emit)
     

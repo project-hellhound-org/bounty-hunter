@@ -11,7 +11,6 @@
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square"/>
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey?style=flat-square"/>
 </p>
-# Hellhound
 
 ## Web Application Offensive Security Framework
 
@@ -39,7 +38,7 @@ Discovery and mapping of the target application surface.
 | :--- | :--- | :--- |
 | **Spider** | Surface Discovery | SPA crawling, API endpoint discovery, secret extraction. |
 | **Stalk** | Intelligence Aggregation | Unified mapping from multiple web sources and sub-layers. |
-| **Fingerprint** | Stack Identification | Active/Passive technology stack and WAF identification. |
+| **WAFbuster** | Stack Identification | Active/Passive technology stack and WAF identification. |
 | **CORSbuster** | Policy Analysis | Identification of Cross-Origin Resource Sharing vulnerabilities. |
 | **GraphQL** | Schema Analysis | Probing for introspection leaks and field suggestion risks. |
 | **JWTanalyzer** | Token Analysis | Automated decoding and cryptographic vulnerability testing. |

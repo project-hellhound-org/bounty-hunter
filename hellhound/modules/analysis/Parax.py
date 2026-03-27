@@ -52,9 +52,25 @@ def run(target, emit, options=None):
         url = ep.get("url")
         method = ep.get("method")
         params = ep.get("params", [])
+        
+        # Normalize params: Spider 12.0 returns a dict of {source: [names]}
+        param_list = []
+        if isinstance(params, dict):
+            for source, p_items in params.items():
+                for item in p_items:
+                    if isinstance(item, str):
+                        param_list.append(item)
+                    elif isinstance(item, dict):
+                        param_list.append(item.get("name", ""))
+        elif isinstance(params, list):
+            for p in params:
+                if isinstance(p, str):
+                    param_list.append(p)
+                elif isinstance(p, dict):
+                    param_list.append(p.get("name", ""))
 
-        for p in params:
-            pname = p.get("name", "")
+        for pname in param_list:
+            if not pname: continue
             risk_type = classify_param(pname)
 
             if risk_type:
