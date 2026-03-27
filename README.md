@@ -51,6 +51,7 @@ High-fidelity analysis and automated discovery of sensitive assets.
 | **SecretScanner** | Token Discovery | Automated detection of API keys, JWTs, and high-entropy secrets. |
 | **CloudScout** | Cloud Discovery | Identification of leaked S3 buckets, Azure blobs, and GCP storage. |
 | **TechProfiler** | Stack Profiling | Deep fingerprinting of frameworks, servers, and micro-services. |
+| **BlobUnpacker** | Intel Reconstruction | Automatic source map unpacking and hidden endpoint extraction. |
 | **FUZZhunter** | Recursive Discovery | Advanced directory fuzzing with recursive scanning and 404 similarity detection. |
 | **JWTanalyzer** | Token Analysis | Automated secret brute-forcing and algorithm confusion testing. |
 | **GraphQL** | API Surface Analysis | Active security testing (Introspection, DOS, Depth, Suggestion). |
