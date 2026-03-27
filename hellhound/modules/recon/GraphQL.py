@@ -12,14 +12,21 @@ def test_graphql(url, emit):
     is_graphql = False
     findings = {"endpoint": url, "vulnerabilities": []}
 
-    # 1. Introspection Check
+    # 1. Introspection Check (POST then GET)
     introspection = {"query": "{__schema{types{name}}}"}
     try:
         r = requests.post(url, json=introspection, headers=headers, timeout=5)
         if r.status_code == 200 and "__schema" in r.text:
             is_graphql = True
             findings["introspection_enabled"] = True
-            findings["vulnerabilities"].append("CRITICAL: Introspection is ENABLED")
+            findings["vulnerabilities"].append("CRITICAL: Introspection is ENABLED (via POST)")
+        
+        # Test for GET-based introspection (often missed by WAFs/Loggers)
+        get_url = f"{url}?query=" + urllib.parse.quote("{__schema{types{name}}}")
+        r_get = requests.get(get_url, timeout=5)
+        if r_get.status_code == 200 and "__schema" in r_get.text:
+            is_graphql = True
+            findings["vulnerabilities"].append("CRITICAL: Introspection is ENABLED (via GET)")
     except: pass
 
     # 2. Field Suggestions Check
@@ -63,7 +70,10 @@ def run(target, emit, options=None):
     # 1. Discover Endpoints
     potential = set([
         url + "/graphql", url + "/api/graphql", url + "/v1/graphql", 
-        url + "/graphiql", url + "/query", url + "/api/v1/graphql"
+        url + "/graphiql", url + "/query", url + "/api/v1/graphql",
+        url + "/api/v2/graphql", url + "/gql", url + "/api/gql",
+        url + "/graph", url + "/api/graph", url + "/explorer",
+        url + "/console"
     ])
     
     spider_intel = options.get("spider_intel", {}) if options else {}
