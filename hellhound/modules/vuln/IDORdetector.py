@@ -93,34 +93,6 @@ def vprint(*a, **kw):
     if VERBOSE: tprint(*a, **kw)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BANNER
-# ─────────────────────────────────────────────────────────────────────────────
-BANNER = r"""
-  ██╗██████╗  ██████╗ ██████╗
-  ██║██╔══██╗██╔═══██╗██╔══██╗
-  ██║██║  ██║██║   ██║██████╔╝
-  ██║██║  ██║██║   ██║██╔══██╗
-  ██║██████╔╝╚██████╔╝██║  ██║
-  ╚═╝╚═════╝  ╚═════╝ ╚═╝  ╚═╝   Agent 30: IDOR_UserData_Detector  v1.2
-"""
-
-def print_banner():
-    grad = [C.BRED, C.BRED, C.RED, C.RED, C.BRED, C.BRED, C.BRED]
-    for i, line in enumerate(BANNER.split("\n")):
-        print(color(line, grad[min(i, len(grad)-1)], C.BOLD))
-    meta = [
-        ("Tool",    "HELLHOUND — Agent 30: IDOR_UserData_Detector"),
-        ("Version", "1.3.0  [SPIDER-JSON+CRAWL+JS+SPA+DUAL-SESSION+ENUM+UNAUTH+DEDUP]"),
-        ("Engine",  "Crawl → ID Harvest → Replay → Differential Analysis"),
-        ("Safety",  "Read-only IDOR checks — write/delete probes require --write-probe"),
-    ]
-    for k, v in meta:
-        print(f"  {color(k+':', C.BYELLOW, C.BOLD):<28} {color(v, C.BWHITE)}")
-    print()
-    print(color("  ⚠  For authorized security testing only. Use responsibly.", C.BYELLOW))
-    print(color("  ─" * 36, C.DIM))
-    print()
-
 # ─────────────────────────────────────────────────────────────────────────────
 # HELLHOUND MODULE CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5060,12 +5032,6 @@ def run(target, emit, options):
     if client_unauth:
         tprint(f"  {info('Unauthenticated client ready for bypass checks.')}")
 
-    # ── Phase 2: Discovery ────────────────────────────────────────────────
-    endpoints = []
-    crawler = None
-    extra_id_hints = []
-    discovery_source = "crawler"
-    
     # ── Phase 2: Discovery ────────────────────────────────────────────────
     endpoints = []
     crawler = None
