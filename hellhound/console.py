@@ -1336,32 +1336,6 @@ class HellhoundConsole(cmd.Cmd):
                                   for f in findings if isinstance(f, dict)]
                         _render_findings(normed, "Access Control Findings")
 
-                # 2. bac nested block (BACdetector legacy)
-                if "bac" in intel and isinstance(intel["bac"], dict):
-                    bac      = intel["bac"]
-                    findings = bac.get("findings", [])
-                    summary  = bac.get("summary", {})
-                    if summary:
-                        print(Fore.MAGENTA + "  [Access Control Summary]" + Style.RESET_ALL)
-                        for sev in ("Critical", "High", "Medium", "Low", "Info"):
-                            if sev in summary:
-                                sc2 = (Fore.RED if sev in ("Critical","High") else
-                                       Fore.YELLOW if sev == "Medium" else Fore.WHITE)
-                                print(f"    {sc2}{sev:<8} : {summary[sev]}{Style.RESET_ALL}")
-                        print()
-                    if findings:
-                        print(Fore.MAGENTA + "  [Access Control Findings]" + Style.RESET_ALL)
-                        sev_weight = {"Critical":0,"High":1,"Medium":2,"Low":3,"Info":4}
-                        for f in sorted(findings, key=lambda x: sev_weight.get(x.get("severity","Info"),99)):
-                            sev  = f.get("severity","Unknown").upper()
-                            name = f.get("vulnerability","Unknown")
-                            ep   = f.get("endpoint","")
-                            sc2  = (Fore.MAGENTA if sev=="CRITICAL" else
-                                    Fore.RED if sev=="HIGH" else
-                                    Fore.YELLOW if sev=="MEDIUM" else Fore.WHITE)
-                            print(f"    [{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
-                            if ep: print(f"       {Fore.WHITE}endpoint : {Fore.CYAN}{ep}{Style.RESET_ALL}")
-                            print()
 
                 # 3. endpoints (Spider / any recon module)
                 endpoints = intel.get("endpoints", [])
@@ -1491,8 +1465,8 @@ class HellhoundConsole(cmd.Cmd):
         if high_value:
             high_value = sorted(high_value,
                 key=lambda e: (e.get("confidence_label")=="CONFIRMED",
-                               e.get("parameter_sensitive"),
-                               e.get("auth_required")), reverse=True)
+                               bool(e.get("parameter_sensitive")),
+                               bool(e.get("auth_required"))), reverse=True)
             print(Fore.RED + Style.BRIGHT + "  ── HIGH VALUE TARGETS ──" + Style.RESET_ALL)
             for ep in high_value[:10]:
                 conf_color = Fore.RED if ep.get("confidence_label") in ("HIGH","CONFIRMED") else Fore.YELLOW

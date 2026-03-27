@@ -1,373 +1,145 @@
-import subprocess
-import shutil
-import re
-from hellhound.modules.recon.utils.signatures import WAF_SIGNATURES, TECH_SIGNATURES
 import requests
-import socket
-from urllib.parse import urlparse
+import re
+import os
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urljoin, urlparse
+from typing import Dict, List, Optional, Any, Set
 
 NAME = "stalk"
 CATEGORY = "recon"
-DESCRIPTION = "Unified Recon Engine (Infrastructure + Web + Exposure Intelligence)"
+DESCRIPTION = "Universal Deep Web Asset Discovery (Active JS & Chunk Prober)"
 
-
-# ==========================================================
-# Helpers
-# ==========================================================
-
-def tool_exists(tool):
-    return shutil.which(tool) is not None
-
-
-def run_cmd(cmd):
-    try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=60
-        )
-        return result.stdout.strip()
-    except Exception:
-        return ""
-
-
-def fetch_json(url):
-    try:
-        r = requests.get(url, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return None
-
+# Module Options
+OPTIONS = [
+    {"name": "concurrency", "default": 20, "required": False, "help": "Max concurrent JS fetches"},
+    {"name": "depth", "default": 4, "required": False, "help": "Recursion depth for JS chunks"},
+    {"name": "proactive", "default": True, "required": False, "help": "Proactively enumerate chunks (0.js, 1.js, etc)"}
+]
 
 # ==========================================================
-# Stalk Engine
+# UNIVERSAL DISCOVERY PATTERNS
 # ==========================================================
 
-class StalkEngine:
+# Aggressive API discovery including internal routes
+API_ROOT_REGEX = re.compile(
+    r'(?:["\'`])(?:/(?:api|rest|v[0-9]|graphql|auth|internal|service|app|api-docs|v1|v2|v3))'
+    r'(?:/[a-zA-Z0-9_\-\.]+){0,6}(?:["\'`])'
+)
 
-    def __init__(self, target, emit, options=None):
-        self.target = target
+# Common JS service constants and environment vars
+CONSTANT_REGEX = re.compile(
+    r'(?:const|let|var|this|process\.env|window|global)\.?([A-Z0-9_]{3,30})\s*[:=]\s*(?:["\'`])([^"\'`\n]{2,150})(?:["\'`])'
+)
+
+# Dynamic Import / Chunk Discovery
+DYNAMIC_IMPORT_REGEX = re.compile(r'(?:import|require\.e|require\.ensure)\s*\(\s*["\'`]([^"\'`\n]+)["\'`]\s*\)')
+WEBPACK_CHUNK_REGEX = re.compile(r'\b([0-9]{1,5})\.js\b')
+ROUTING_PATH_REGEX = re.compile(r'(?:path|route|alias)\s*[:=]\s*["\'`](/[a-zA-Z0-9_\-\./\*]+)["\'`]')
+
+# ==========================================================
+# CORE PROBER ENGINE
+# ==========================================================
+
+class UniversalMiner:
+    def __init__(self, emit, concurrency=20):
         self.emit = emit
-        self.options = options or {}
-        self.mode = "deep" if self.options.get("mode") == "deep" else "quick"
+        self.concurrency = concurrency
+        self.assets: List[Dict[str, Any]] = []
+        self.visited_urls: Set[str] = set()
+        self._lock = threading.Lock()
 
-        parsed = urlparse(target)
-        self.domain = parsed.netloc if parsed.netloc else target
+    def mine(self, url: str, depth=3, is_proactive=False):
+        if depth < 0 or url in self.visited_urls: return
+        self.visited_urls.add(url)
 
-        self.data = {
+        try:
+            resp = requests.get(url, timeout=10, verify=False)
+            if resp.status_code != 200: return
+            content = resp.text
+        except: return
 
-            "web": {
-                "http_services": [],
-                "technologies": [],
-                "urls": [],
-                "js_files": [],
-                "parameters": []
-            },
-            "exposure": {
-                "leaks": [],
-                "takeover_candidates": []
-            },
-            "signals": list([])
-        }
-
-
-    # ======================================================
-    # Phase 2 — Web Surface Mapping
-    # ======================================================
-
-    def probe_http(self):
-        self.emit.info("Phase 2: Web Surface Mapping")
-
-        services = []
-
-        # 1. Try httpx (Best for discovery)
-        if tool_exists("httpx"):
-            ports = "80,443,8080,8443,8000,8888"
-            out = run_cmd(["httpx", "-silent", "-u", self.domain, "-ports", ports])
-            services = list(set(out.splitlines()))
-
-        # 2. FALLBACK: Use Python Requests (Guaranteed to work)
-        # If httpx isn't installed, we manually check the target
-        if not services:
-            try:
-                # Check if target is an IP or Domain
-                url = self.target if self.target.startswith("http") else f"http://{self.target}"
-                r = requests.get(url, timeout=5)
-                if r.status_code == 200:
-                    services.append(url)
-                    self.emit.info(f"    [i] Fallback mode: Detected service at {url}")
-            except Exception as e:
-                self.emit.warn(f"    [!] Fallback mode failed: {e}")
-
-        if services:
-            self.data["web"]["http_services"] = list(services)
-            if len(services) > 1:
-                self.data["signals"].append("MULTIPLE_WEB_SERVICES")
-
-    def fingerprint_tech(self):
-        self.emit.info("Phase 2: Technology WAFbustering")
-
-        detected_tech = set()
-        waf_detected = None
-
-        # We iterate over services found in probe_http
-        for url in self.data["web"]["http_services"]:
-
-            # --- Header Analysis (Python Native) ---
-            try:
-                r = requests.get(url, timeout=6)
-
-                headers = r.headers
-
-                server = headers.get("Server", "").lower()
-                via = headers.get("Via", "").lower()
-                cf_ray = headers.get("CF-Ray", "")
-                x_akamai = headers.get("X-Akamai-Transformed", "")
-                x_sucuri = headers.get("X-Sucuri-ID", "")
-
-                # --- Signature Based Detection (Unified) ---
-                # WAFs
-                for waf, sigs in WAF_SIGNATURES.items():
-                    for sig in sigs:
-                        if any(sig in str(h).lower() for h in headers.values()) or sig in r.text.lower():
-                            waf_detected = waf
-                            break
-                
-                # Tech
-                server = headers.get("Server", "").lower()
-                for sig, name in TECH_SIGNATURES["Server"].items():
-                    if sig in server: detected_tech.add(name)
-                
-                powered = headers.get("X-Powered-By", "").lower()
-                for sig, name in TECH_SIGNATURES["Framework"].items():
-                    if sig in powered: detected_tech.add(name)
-                    
-                for cat, sigs in TECH_SIGNATURES.items():
-                    if isinstance(sigs, dict) and cat != "Server" and cat != "Framework":
-                        for sig, name in sigs.items():
-                            if sig in r.text.lower() or any(sig in str(c).lower() for c in r.cookies.get_dict()):
-                                detected_tech.add(name)
-
-            except Exception:
-                continue
-
-        # ---------------------------------------------
-        # Store Results
-        # ---------------------------------------------
-        self.data["web"]["technologies"] = list(detected_tech)
-
-        if waf_detected:
-            if "WAF_DETECTED" not in self.data["signals"]:
-                self.data["signals"].append("WAF_DETECTED")
-
-        if detected_tech:
-             self.data["signals"].append("TECH_DETECTED")
-
-        # Strategic Signals
-        if len(detected_tech) > 5:
-            self.data["signals"].append("COMPLEX_TECH_STACK")
-
-    def harvest_urls(self):
-        if self.mode != "deep":
-            return
-
-        # Only use external tools if available
-        if tool_exists("gau"):
-            out = run_cmd(["gau", self.domain])
-            self.data["web"]["urls"].extend(out.splitlines())
-
-        if tool_exists("katana"):
-            out = run_cmd(["katana", "-u", f"http://{self.domain}", "-silent"])
-            for u in out.splitlines():
-                self.data["web"]["urls"].append(u)
-                if u.endswith(".js"):
-                    self.data["web"]["js_files"].append(u)
-
-        # Extract parameters
-        for url in self.data["web"]["urls"]:
-            if "?" in url:
-                params = url.split("?", 1)[1]
-                for pair in params.split("&"):
-                    key = pair.split("=")[0]
-                    if key:
-                        risky_keywords = ["id", "user", "uid", "account", "file", "path", "cmd", "token"]
-                        if key.lower() in risky_keywords:
-                            self.data["signals"].append("HIGH_RISK_PARAMETER")
-                            
-                        self.data["web"]["parameters"].append(key)
-
-    # ======================================================
-    # Phase 2 — JavaScript Secret Analysis
-    # ======================================================
-
-    def scan_js_for_secrets(self):
-        self.emit.info("Phase 2: JavaScript Secret Analysis")
-
-        secret_patterns = [
-            r"AKIA[0-9A-Z]{16}",
-            r"AIza[0-9A-Za-z-_]{35}",
-            r"sk_live_[0-9a-zA-Z]{24}",
-            r"(?i)api[_-]?key\s*=\s*['\"]?[A-Za-z0-9_\-]{16,}"
-        ]
-
-        for js_url in self.data["web"]["js_files"]:
-            try:
-                r = requests.get(js_url, timeout=5)
-                if r.status_code != 200:
-                    continue
-
-                content = r.text
-
-                leaks_list = self.data["exposure"]["leaks"]
-                signals_list = self.data["signals"]
-                for pattern in secret_patterns:
-                    if re.search(pattern, content):
-                        leaks_list.append(js_url)
-                        signals_list.append("JS_SECRET_EXPOSED")
-                        break
-
-            except:
-                continue
-
-
-    # ======================================================
-    # Phase 3 — Exposure Detection
-    # ======================================================
-
-    def detect_leaks(self):
-        self.emit.info("Phase 3: Exposure Analysis")
-
-        base = f"http://{self.domain}"
-        leak_paths = {
-            "/.env": ["DB_PASSWORD=", "APP_KEY=", "AWS_SECRET", "DATABASE_URL="],
-            "/.git/config": ["repositoryformatversion", "[core]", "remote \"origin\""],
-            "/backup.zip": ["PK\x03\x04"]
-        }
-
-        for path, fingerprints in leak_paths.items():
-            try:
-                r = requests.get(base + path, timeout=5, allow_redirects=False)
-
-                if r.status_code != 200:
-                    continue
-
-                # ZIP validation
-                if path.endswith(".zip"):
-                    if "zip" in r.headers.get("Content-Type", "").lower():
-                        if r.content.startswith(b"PK"):
-                            self.data["exposure"]["leaks"].append(base + path)
-                            self.data["signals"].append("CONFIRMED_ZIP_EXPOSED")
-                    continue
-
-                # Text-based validation (.env / .git)
-                content = r.text[:5000]  # limit parsing
-
-                leaks_list = self.data["exposure"]["leaks"]
-                signals_list = self.data["signals"]
-                for pattern in fingerprints:
-                    if pattern in content:
-                        leaks_list.append(base + path)
-                        signals_list.append("CONFIRMED_FILE_EXPOSED")
-                        break
-
-            except Exception:
-                continue
-
-
-
-    # ======================================================
-    # Risk Scoring
-    # ======================================================
-
-    def ingest_spider(self):
-        spider_intel = self.options.get("spider_intel", {})
-        if not spider_intel:
-            return
-
-        self.emit.info("Phase 1b: Ingesting Spider Intelligence (Unified)")
+        # 1. API Roots & Internal Routes
+        for r in API_ROOT_REGEX.findall(content):
+            self._add_asset("API_ROOT", r.strip("\"'`"), url)
         
-        # Merge URLs
-        eps = spider_intel.get("endpoints", [])
-        for ep in eps:
-            url = ep.get("url", "")
-            if url:
-                self.data["web"]["urls"].append(url)
-                if url.endswith(".js"):
-                    self.data["web"]["js_files"].append(url)
-                
-                params = ep.get("params", {})
-                for ptype, pnames in params.items():
-                    self.data["web"]["parameters"].extend(pnames)
-        
-        # Merge technology stack and ensure it stays a list of strings
-        tech = spider_intel.get("tech_stack", [])
-        combined_tech = set(self.data["web"]["technologies"])
-        for t in tech:
-            combined_tech.add(str(t))
-        self.data["web"]["technologies"] = list(combined_tech)
-        
-        if tech:
-            self.data["signals"].append("TECH_DETECTED_FROM_SPIDER")
+        for p in ROUTING_PATH_REGEX.findall(content):
+            self._add_asset("SPA_ROUTE", p, url)
 
-    # Risk Score
-    def calculate_risk(self):
-        risk_score = 0
-        signals = self.data.get("signals", [])
-        if self.data["web"].get("http_services"): risk_score += 2
-        if "WAF_DETECTED" in signals: risk_score += 1
-        if "JS_SECRET_EXPOSED" in signals: risk_score += 3
-        if "HIGH_RISK_PARAMETER" in signals: risk_score += 2
-        if "CONFIRMED_FILE_EXPOSED" in signals: risk_score += 4
-        if "TECH_DETECTED_FROM_SPIDER" in signals: risk_score += 1
-        self.data["risk_score"] = risk_score
+        # 2. Constants / Env
+        for name, val in CONSTANT_REGEX.findall(content):
+            atype = "INTERNAL_SERVICE" if "/" in val or "http" in val else "ENVIRONMENTAL"
+            self._add_asset(atype, f"{name}: {val}", url)
 
-    # ======================================================
-    # RUN
-    # ======================================================
+        # 3. Dynamic Imports & Webpack Chunks
+        imports = DYNAMIC_IMPORT_REGEX.findall(content)
+        for imp in imports:
+            self._add_asset("DYNAMIC_IMPORT", imp, url)
+            chunk_url = urljoin(url, imp)
+            self.mine(chunk_url, depth - 1)
 
-    def run(self):
-        # Phase 2
-        self.probe_http()
-        self.fingerprint_tech()
-        self.ingest_spider()           # NEW: Ingest spider data
-        self.harvest_urls()
+        # 4. Proactive Chunk Enumeration (Numeric)
+        numeric_chunks = list(set(WEBPACK_CHUNK_REGEX.findall(content)))
+        if numeric_chunks:
+            base_dir = "/".join(url.split("/")[:-1]) + "/"
+            for num in numeric_chunks[:10]:
+                self._add_asset("CHUNK_ID", f"{num}.js", url)
+                # Proactively probe adjacent chunks
+                if is_proactive:
+                    n = int(num)
+                    for adjacent in range(max(0, n-2), n+3):
+                        adj_url = urljoin(base_dir, f"{adjacent}.js")
+                        if adj_url not in self.visited_urls:
+                            self.emit.info(f"    [+] Stalk: Proactively probing chunk {adjacent}.js")
+                            self.mine(adj_url, depth - 1)
 
-        if self.mode == "deep":
-            self.scan_js_for_secrets()
+    def _add_asset(self, type_str, val, source):
+        with self._lock:
+            if any(a["asset"] == val and a["type"] == type_str for a in self.assets): return
+            self.assets.append({"type": type_str, "asset": val, "source": source})
 
-        # Phase 3
-        self.detect_leaks()
+def run(target: str, emit, options: Optional[Dict[str, Any]] = None):
+    emit.info(f"[*] Stalk v12.3 (Universal prober): {target}")
+    opt = options or {}
+    base_url = target if target.startswith("http") else f"http://{target}"
+    
+    # Ingest intelligence for initial seeds
+    spider_intel = opt.get("spider_intel", {})
+    initial_scripts = set()
+    for ep in spider_intel.get("endpoints", []):
+        url = ep.get("url", "")
+        if url.endswith(".js"): initial_scripts.add(url)
 
-        # Risk Score
-        self.calculate_risk()
+    if not initial_scripts:
+        initial_scripts = {urljoin(base_url, b) for b in ["main.js", "runtime.js", "polyfills.js", "vendor.js"]}
 
-        summary = (
-            f"Endpoints: {len(self.data['web']['urls'])} | "
-            f"Leaks: {len(self.data['exposure']['leaks'])} | "
-            f"Risk Score: {self.data.get('risk_score', 0)}"
-        )
+    miner = UniversalMiner(emit, concurrency=opt.get("concurrency", 20))
+    is_proactive = opt.get("proactive", True)
+    
+    with ThreadPoolExecutor(max_workers=opt.get("concurrency", 20)) as pool:
+        for script_url in initial_scripts:
+            pool.submit(miner.mine, script_url, depth=opt.get("depth", 4), is_proactive=is_proactive)
 
-        return {
-            "raw": summary,
-            "intel": self.data
-        }
+    unique_assets = {}
+    for a in miner.assets:
+        key = f"{a['type']}:{a['asset']}"
+        unique_assets[key] = a
 
-# ==========================================================
-# Framework Entry
-# ==========================================================
+    api_roots = [a for a in unique_assets.values() if a["type"] in ("API_ROOT", "SPA_ROUTE")]
+    chunks = [a for a in unique_assets.values() if a["type"] in ("DYNAMIC_IMPORT", "CHUNK_ID")]
+    env_vars = [a for a in unique_assets.values() if a["type"] in ("ENVIRONMENTAL", "INTERNAL_SERVICE")]
 
-def run(target, emit, options=None, stop_check=None, pause_check=None):
+    emit.info(f"    [✔] Stalk: Universal discovery complete.")
+    emit.info(f"    [✔] Found {len(api_roots)} roots and {len(miner.visited_urls)} unique JS bundles.")
 
-    emit.info(f"Stalk Recon Started: {target}")
-
-    engine = StalkEngine(target, emit, options)
-    result = engine.run()
-
-    emit.success("Stalk reconnaissance complete.")
-    emit.success(result["raw"])
-
-    return result
+    return {
+        "raw": f"Discovered {len(unique_assets)} unique assets across {len(miner.visited_urls)} bundles.",
+        "intel": {
+            "endpoints": [{"url": a["asset"], "confidence_label": "HIGH", "source": "stalk_universal"} for a in api_roots],
+            "js_chunks": list(set([c["asset"] for c in chunks])),
+            "secrets": [{"type": a["type"], "content": a["asset"], "source": a["source"]} for a in env_vars],
+            "risk_score": len(api_roots) * 3 + len(env_vars) * 5
+        },
+        "risk_score": len(api_roots) + len(env_vars) * 2
+    }
