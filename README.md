@@ -54,7 +54,8 @@ Hellhound's power lies in its specialized module ecosystem, organized into funct
 | **SecretScanner** | Token Discovery | Automated detection of API keys, hardcoded secrets, and high-entropy strings. |
 | **CloudScout** | S3/Cloud Discovery | Identification of misconfigured S3 buckets, Azure Blobs, and GCP storage. |
 | **TechProfiler** | Version Profiling | Deep fingerprinting of frameworks, container layers, and micro-services. |
-| **BlobUnpacker** | Asset Reconstruction | Automated source map unpacking and hidden endpoint extraction from minified JS. |
+| **BlobUnpacker** | Source Discovery | High-fidelity sourcemap discovery, source reconstruction, and backend mining. |
+| **SourceAuditor** | Static Analysis | Automated vulnerability auditing (XSS, SQLi, RCE) of recovered source code. |
 
 ### 3. Vulnerability & Analysis Layer
 *Validation of security misconfigurations and logical flaws.*

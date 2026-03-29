@@ -661,6 +661,11 @@ class HellhoundConsole(cmd.Cmd):
         if spider_result and not runtime_options.get("spider_intel"):
             runtime_options["spider_intel"] = spider_result.get("intel", {})
 
+        # ── Auto-feed BlobUnpacker intel ────────────────────────
+        blob_result = self.results.get("blobunpacker")
+        if blob_result and not runtime_options.get("blobunpacker_intel"):
+            runtime_options["blobunpacker_intel"] = blob_result.get("intel", {})
+
         # ── Cookie raw-token detection warning ────────────────
         raw_cookie_val = self.target_context.get("cookies") or runtime_options.get("cookie")
         if raw_cookie_val and isinstance(raw_cookie_val, str) and "=" not in raw_cookie_val:
@@ -1236,6 +1241,80 @@ class HellhoundConsole(cmd.Cmd):
                         print()
                 else:
                     print(Fore.LIGHTBLACK_EX + "  [JWT]  no tokens discovered" + Style.RESET_ALL)
+                    print()
+
+            # ── Stalk (Hybrid OSINT) dedicated renderer ───────────
+            elif mod_clean == "stalk":
+                subdomains = intel.get("subdomains", [])
+                urls       = intel.get("historical_urls", [])
+                git        = intel.get("git_exposed", [])
+                cloud      = intel.get("cloud_assets", [])
+                leaks      = intel.get("leak_candidates", [])
+                banners    = intel.get("banners", [])
+
+                if subdomains:
+                    print(Fore.MAGENTA + Style.BRIGHT + f"  [Subdomains — {len(subdomains)} discovered]" + Style.RESET_ALL)
+                    for s in subdomains:
+                        host = s.get("host", "unknown")
+                        ip   = s.get("ip", "unresolved")
+                        src  = s.get("source", "unknown")
+                        res  = s.get("resolved", False)
+                        
+                        host_c = Fore.WHITE + Style.BRIGHT if res else Fore.WHITE
+                        ip_c   = Fore.CYAN if res else Fore.LIGHTBLACK_EX
+                        print(f"    • {host_c}{host:<30}{Style.RESET_ALL} {ip_c}{ip:<16}{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}[{src}]{Style.RESET_ALL}")
+                    print()
+
+                if git:
+                    print(Fore.RED + Style.BRIGHT + f"  [Git Exposure — {len(git)} repository found!]" + Style.RESET_ALL)
+                    for g in git:
+                        url = g.get("url", "unknown")
+                        print(f"    {Fore.RED + Style.BRIGHT}[!] EXPOSED:{Style.RESET_ALL} {Fore.WHITE}{url}{Style.RESET_ALL}")
+                        if g.get("head"):
+                            print(f"        {Fore.LIGHTBLACK_EX}HEAD: {g['head'][:80]}{Style.RESET_ALL}")
+                    print()
+
+                if cloud:
+                    print(Fore.YELLOW + Style.BRIGHT + f"  [Cloud Assets — {len(cloud)} buckets/containers]" + Style.RESET_ALL)
+                    for c in cloud:
+                        status = c.get("status", "unknown").upper()
+                        provider = c.get("provider", "unknown")
+                        url = c.get("url", "unknown")
+                        sc = Fore.RED + Style.BRIGHT if "PUBLIC" in status else Fore.YELLOW
+                        print(f"    • {sc}[{status}]{Style.RESET_ALL} {Fore.WHITE}{url}{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}({provider}){Style.RESET_ALL}")
+                    print()
+
+                if urls:
+                    limit = 150
+                    print(Fore.MAGENTA + Style.BRIGHT + f"  [Historical URLs — showing {min(len(urls), limit)}/{len(urls)}]" + Style.RESET_ALL)
+                    for u in urls[:limit]:
+                        url = u.get("url", "unknown")
+                        src = u.get("source", "unknown")
+                        print(f"    {Fore.WHITE}• {url} {Fore.LIGHTBLACK_EX}[{src}]{Style.RESET_ALL}")
+                    if len(urls) > limit:
+                        print(f"    {Fore.LIGHTBLACK_EX}... +{len(urls)-limit} more (use loot --json to see all){Style.RESET_ALL}")
+                    print()
+
+                if leaks:
+                    print(Fore.RED + Style.BRIGHT + f"  [Leak Candidates — {len(leaks)} findings]" + Style.RESET_ALL)
+                    for l in leaks:
+                        url = l.get("url", "unknown")
+                        snippet = l.get("snippet", "")
+                        print(f"    {Fore.YELLOW}[leak]{Style.RESET_ALL} {Fore.WHITE}{url}{Style.RESET_ALL}")
+                        if snippet:
+                            print(f"           {Fore.LIGHTBLACK_EX}\"{snippet[:100]}...\"{Style.RESET_ALL}")
+                    print()
+
+                if banners:
+                    print(Fore.CYAN + Style.BRIGHT + f"  [Banner Exposure — {len(banners)} records]" + Style.RESET_ALL)
+                    for b in banners:
+                        host   = b.get("host", "unknown")
+                        port   = b.get("port", "unknown")
+                        banner = b.get("banner", "")
+                        src    = b.get("source", "unknown")
+                        print(f"    • {Fore.WHITE}{host}:{port}{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}[{src}]{Style.RESET_ALL}")
+                        if banner:
+                            print(f"      {Fore.CYAN}{banner[:100]}{Style.RESET_ALL}")
                     print()
 
             # ── Generic LOOT_SECTIONS path ────────────────────────
