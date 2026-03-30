@@ -2,12 +2,13 @@ import requests
 import json
 import urllib.parse
 import re
+from hellhound.core import http_utils
 
 NAME = "graphql_hunter"
 CATEGORY = "recon"
 DESCRIPTION = "Advanced GraphQL discovery and active security testing (Depth, Suggestion, Introspection)"
 
-def test_graphql(url, emit):
+def test_graphql(url, emit, session=None):
     headers = {"Content-Type": "application/json"}
     is_graphql = False
     findings = {"endpoint": url, "vulnerabilities": []}
@@ -15,7 +16,11 @@ def test_graphql(url, emit):
     # 1. Introspection Check (POST then GET)
     introspection = {"query": "{__schema{types{name}}}"}
     try:
-        r = requests.post(url, json=introspection, headers=headers, timeout=5)
+        if session:
+            r = session.post(url, json=introspection, timeout=5)
+        else:
+            r = requests.post(url, json=introspection, headers=headers, timeout=5)
+            
         if r.status_code == 200 and "__schema" in r.text:
             is_graphql = True
             findings["introspection_enabled"] = True
@@ -23,7 +28,11 @@ def test_graphql(url, emit):
         
         # Test for GET-based introspection (often missed by WAFs/Loggers)
         get_url = f"{url}?query=" + urllib.parse.quote("{__schema{types{name}}}")
-        r_get = requests.get(get_url, timeout=5)
+        if session:
+            r_get = session.get(get_url, timeout=5)
+        else:
+            r_get = requests.get(get_url, timeout=5)
+            
         if r_get.status_code == 200 and "__schema" in r_get.text:
             is_graphql = True
             findings["vulnerabilities"].append("CRITICAL: Introspection is ENABLED (via GET)")
@@ -32,7 +41,11 @@ def test_graphql(url, emit):
     # 2. Field Suggestions Check
     suggestion = {"query": "{hellhound_probe}"}
     try:
-        r = requests.post(url, json=suggestion, headers=headers, timeout=5)
+        if session:
+            r = session.post(url, json=suggestion, timeout=5)
+        else:
+            r = requests.post(url, json=suggestion, headers=headers, timeout=5)
+            
         if "errors" in r.text and ("Cannot query field" in r.text or "Did you mean" in r.text):
             is_graphql = True
             findings["suggestions_enabled"] = True
@@ -45,7 +58,11 @@ def test_graphql(url, emit):
     # Build a deep query: { user { user { user ... } } }
     deep_q = "{" + (" user { " * 8) + " id " + (" } " * 8) + "}"
     try:
-        r = requests.post(url, json={"query": deep_q}, headers=headers, timeout=5)
+        if session:
+            r = session.post(url, json=deep_q, timeout=5)
+        else:
+            r = requests.post(url, json={"query": deep_q}, headers=headers, timeout=5)
+            
         if r.status_code == 200 and "errors" not in r.text:
             findings["vulnerabilities"].append("HIGH: Deeply nested queries (Depth 8+) accepted (potential DOS)")
         elif "depth" in r.text.lower() or "too deep" in r.text.lower():
@@ -56,7 +73,11 @@ def test_graphql(url, emit):
     # query { a: user{id} b: user{id} ... }
     alias_q = "query { " + " ".join([f"a{i}: __typename" for i in range(50)]) + " }"
     try:
-        r = requests.post(url, json={"query": alias_q}, headers=headers, timeout=5)
+        if session:
+            r = session.post(url, json=alias_q, timeout=5)
+        else:
+            r = requests.post(url, json={"query": alias_q}, headers=headers, timeout=5)
+            
         if r.status_code == 200 and "data" in r.text:
             findings["vulnerabilities"].append("MEDIUM: Large number of aliases accepted (potential Resource Exhaustion)")
     except: pass
@@ -84,8 +105,14 @@ def run(target, emit, options=None):
 
     discovered = []
     risk = 0
+    
+    # Configure session with global proxy and headers
+    session = requests.Session()
+    http_utils.apply_session_config(session, options)
+    session.headers.update({"Content-Type": "application/json"})
+    
     for up in list(potential)[:50]:
-        res = test_graphql(up, emit)
+        res = test_graphql(up, emit, session=session)
         if res:
             discovered.append(res)
             emit.success(f"    [+] GraphQL Found: {up}")

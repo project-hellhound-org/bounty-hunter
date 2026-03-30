@@ -6,6 +6,7 @@ import difflib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Any, Set
+from hellhound.core import http_utils
 
 NAME = "bacdetector"
 CATEGORY = "vuln"
@@ -56,6 +57,19 @@ class SessionMgr:
             auth = t if t.startswith("Bearer ") else f"Bearer {t}"
             self.sessions["userA"].headers["Authorization"] = auth
             self.emit.info(f"    [*] BAC: UserA session loaded via JWT")
+
+        # Apply Global Proxy & Headers
+        proxy = options.get("proxy")
+        global_headers = options.get("global_headers", {})
+        enable_waf = options.get("enable_waf_bypass")
+
+        for s in self.sessions.values():
+            if proxy:
+                http_utils.apply_proxy_to_session(s, proxy)
+            if global_headers:
+                s.headers.update(global_headers)
+            if enable_waf:
+                s.headers.update(http_utils.get_waf_bypass_header())
 
 class FidelityAuditor:
     def __init__(self, base_url: str, sessions: Dict[str, requests.Session], emit):

@@ -1,0 +1,1 @@
+export const login = () => { return axios.post('/api/auth/v2/login-shadow', {user: 'admin'}); }

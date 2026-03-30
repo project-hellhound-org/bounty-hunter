@@ -1,0 +1,1 @@
+export const query_db = (id) => { const q = 'SELECT * FROM users WHERE id = ' + id; eval('console.log(q)'); return q; }

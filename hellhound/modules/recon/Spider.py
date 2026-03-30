@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Set
 from urllib.parse import urlparse, urljoin, parse_qs, urlencode, urlunparse
 
 from bs4 import BeautifulSoup, Comment
+from hellhound.core import http_utils
 
 try:
     from playwright.async_api import async_playwright
@@ -291,12 +292,14 @@ class DomainRateLimiter:
 # FETCH HELPER
 # ══════════════════════════════════════════════════════════════════════
 
-async def fetch(session, method, url, rl, max_retries=3, base_delay=0.5, **kw):
+async def fetch(session, method, url, rl, max_retries=3, base_delay=0.5, proxy=None, **kw):
+    if proxy is None and hasattr(session, "_hellhound_proxy"):
+        proxy = session._hellhound_proxy
     domain = urlparse(url).netloc
     await rl.wait(domain)
     for attempt in range(max_retries + 1):
         try:
-            async with session.request(method, url, ssl=False, **kw) as resp:
+            async with session.request(method, url, ssl=False, proxy=proxy, **kw) as resp:
                 if resp.status == 429:
                     rl.backoff(domain)
                     await asyncio.sleep(float(resp.headers.get("Retry-After", base_delay * (2**attempt))))
@@ -1040,11 +1043,12 @@ class RobotsParser:
 # ══════════════════════════════════════════════════════════════════════
 
 class SPAScanner:
-    def __init__(self, target_url, store, emit, cookies, extra_headers, queue, is_valid_fn, enable_spa_interact=False):
+    def __init__(self, target_url, store, emit, cookies, extra_headers, queue, is_valid_fn, enable_spa_interact=False, options=None):
         self.target_url = target_url; self.store = store; self.emit = emit
         self.cookies = cookies; self.extra_headers = extra_headers
         self.queue = queue; self.is_valid = is_valid_fn
         self._enable_spa_interact = enable_spa_interact
+        self.options = options or {}
 
     async def run(self):
         if not PLAYWRIGHT_AVAILABLE:
@@ -1054,9 +1058,17 @@ class SPAScanner:
         try:
             async with async_playwright() as pw:
                 try:
-                    browser = await pw.chromium.launch(headless=True, args=[
-                        "--no-sandbox","--disable-dev-shm-usage",
-                        "--disable-blink-features=AutomationControlled"])
+                    launch_args = {
+                        "headless": True,
+                        "args": [
+                            "--no-sandbox","--disable-dev-shm-usage",
+                            "--disable-blink-features=AutomationControlled"
+                        ]
+                    }
+                    if self.options.get("proxy"):
+                        launch_args["proxy"] = {"server": self.options["proxy"]}
+                        
+                    browser = await pw.chromium.launch(**launch_args)
                 except Exception as launch_err:
                     err_str = str(launch_err)
                     if "Connection closed" in err_str or "cli.js" in err_str or "driver" in err_str.lower():
@@ -1258,9 +1270,10 @@ class SPAScanner:
 # ══════════════════════════════════════════════════════════════════════
 
 class Spider:
-    def __init__(self, target, cfg, emit, cookies, extra_headers):
+    def __init__(self, target, cfg, emit, cookies, extra_headers, options=None):
         self.target = target; self.cfg = cfg; self.emit = emit
         self.cookies = cookies; self.extra_headers = extra_headers
+        self.options = options or {}
         self.base_domain = urlparse(target).netloc
         self.store = Store()
         self.visited: Set[str] = set()
@@ -1558,6 +1571,7 @@ class Spider:
                     await asyncio.sleep(delay)
 
     async def run(self):
+        # Initial request headers
         req_headers = {
             "User-Agent": self.cfg.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -1565,10 +1579,20 @@ class Spider:
             "Accept-Language": "en-US,en;q=0.9",
         }
         req_headers.update(self.extra_headers)
+        
+        # Apply Global Proxy & Headers
+        proxy = self.options.get("proxy")
+        global_headers = self.options.get("global_headers", {})
+        enable_waf = self.options.get("enable_waf_bypass")
+        
+        req_headers.update(global_headers)
+        if enable_waf:
+            req_headers.update(http_utils.get_waf_bypass_header())
         connector = aiohttp.TCPConnector(limit=self.cfg.concurrency, ttl_dns_cache=300, ssl=False)
         timeout   = aiohttp.ClientTimeout(total=self.cfg.timeout)
         async with aiohttp.ClientSession(headers=req_headers, cookies=self.cookies,
                                           timeout=timeout, connector=connector) as session:
+            session._hellhound_proxy = proxy
             if self.cfg.enable_graphql:
                 await probe_graphql(session, self.target, self.store, self.emit, self.rl)
             if self.cfg.enable_openapi:
@@ -1603,7 +1627,8 @@ class Spider:
             if self.cfg.use_playwright:
                 spa = SPAScanner(self.target, self.store, self.emit, self.cookies,
                                  self.extra_headers, self.queue, self.is_valid,
-                                 enable_spa_interact=self.cfg.enable_spa_interact)
+                                 enable_spa_interact=self.cfg.enable_spa_interact,
+                                 options=self.options)
                 await spa.run()
 
             self.emit.section("Crawling")
@@ -1651,7 +1676,7 @@ def _auto_save(store: Store, target: str, out_path: Optional[str], fmt: str, emi
 # ══════════════════════════════════════════════════════════════════════
 
 def _do_run(target: str, cfg: Config, emit,
-            cookies: Dict[str, str], extra_headers: Dict[str, str]) -> dict:
+            cookies: Dict[str, str], extra_headers: Dict[str, str], options: dict = None) -> dict:
     if not target.startswith("http"):
         target = "https://" + target
 
@@ -1660,7 +1685,7 @@ def _do_run(target: str, cfg: Config, emit,
 
     spider: Optional[Spider] = None
     try:
-        spider = Spider(target, cfg, emit, cookies, extra_headers)
+        spider = Spider(target, cfg, emit, cookies, extra_headers, options=options)
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(spider.run())
@@ -1777,4 +1802,4 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
         emit_obj.info("No credentials — unauthenticated scan")
 
     emit = ModuleEmit(emit_obj, verbose=cfg.verbose)
-    return _do_run(target, cfg, emit, cookies, xhdrs)
+    return _do_run(target, cfg, emit, cookies, xhdrs, options=opts)
