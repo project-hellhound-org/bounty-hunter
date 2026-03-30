@@ -1,1 +1,0 @@
-export const App = () => { const DB_PASSWORD = 'SuperSecretPass123!'; const isAdmin = true; return <div dangerouslySetInnerHTML={{__html: '<h1>App</h1>'}} /> }

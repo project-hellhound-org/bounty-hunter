@@ -1,1 +1,0 @@
-export const App = () => { const secret = 'sk-live_REDACTED_BY_HELLHOUND'; return <div>App</div>; }
