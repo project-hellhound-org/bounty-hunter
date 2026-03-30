@@ -1,5 +1,6 @@
 import requests
 import urllib.parse
+from hellhound.core import http_utils
 
 NAME = "cors_buster"
 CATEGORY = "recon"
@@ -32,12 +33,17 @@ def generate_poc(url, origin, credentials):
 """
     return poc_html.strip()
 
-def test_cors(url, origin):
+def test_cors(url, origin, session=None):
     headers = {"Origin": origin}
     try:
-        r = requests.options(url, headers=headers, timeout=5)
-        if "Access-Control-Allow-Origin" not in r.headers:
-            r = requests.get(url, headers=headers, timeout=5)
+        if session:
+            r = session.options(url, headers=headers, timeout=5)
+            if "Access-Control-Allow-Origin" not in r.headers:
+                r = session.get(url, headers=headers, timeout=5)
+        else:
+            r = requests.options(url, headers=headers, timeout=5)
+            if "Access-Control-Allow-Origin" not in r.headers:
+                r = requests.get(url, headers=headers, timeout=5)
             
         acao = r.headers.get("Access-Control-Allow-Origin")
         if not acao:
@@ -51,6 +57,10 @@ def test_cors(url, origin):
 
 def run(target, emit, options=None):
     emit.info(f"[*] CORS Buster: Analyzing Origins for {target}")
+    
+    # Configure session with global proxy and headers
+    session = requests.Session()
+    http_utils.apply_session_config(session, options)
     
     base_url = target if target.startswith("http") else f"http://{target}"
     parsed = urllib.parse.urlparse(base_url)
@@ -85,7 +95,7 @@ def run(target, emit, options=None):
     
     for url in urls_to_test:
         for payload in payloads:
-            result = test_cors(url, payload)
+            result = test_cors(url, payload, session=session)
             if not result:
                 continue
                 

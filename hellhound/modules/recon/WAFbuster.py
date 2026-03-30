@@ -1,6 +1,7 @@
 import requests
 import re
 from bs4 import BeautifulSoup
+from hellhound.core import http_utils
 
 NAME = "wafbuster"
 CATEGORY = "recon"
@@ -8,7 +9,7 @@ DESCRIPTION = "Advanced WAF detection and Technology Fingerprinting (Passive + A
 
 from hellhound.modules.recon.utils.signatures import WAF_SIGNATURES, TECH_SIGNATURES
 
-def active_trigger(url, emit):
+def active_trigger(url, emit, session=None):
     """Sends a suspicious payload to trigger WAF response patterns"""
     payloads = [
         "/?id=<script>alert(1)</script>",
@@ -20,7 +21,10 @@ def active_trigger(url, emit):
     
     for p in payloads:
         try:
-            r = requests.get(url + p, timeout=5, headers={"User-Agent": "Hellhound/1.0"})
+            if session:
+                r = session.get(url + p, timeout=5)
+            else:
+                r = requests.get(url + p, timeout=5, headers={"User-Agent": "Hellhound/1.0"})
             
             # Cloudflare 403 / 1020
             if r.status_code in [403, 1020] and "error code: 1020" in r.text.lower():
@@ -49,8 +53,13 @@ def run(target, emit, options=None):
     signals = []
 
     try:
+        # Configure session with global proxy and headers
+        session = requests.Session()
+        http_utils.apply_session_config(session, options)
+        session.headers.update({"User-Agent": "Hellhound/1.0"})
+
         # --- Phase 1: Passive Analysis ---
-        r = requests.get(base_url, timeout=10, headers={"User-Agent": "Hellhound/1.0"})
+        r = session.get(base_url, timeout=10)
         headers_low = {k.lower(): str(v).lower() for k, v in r.headers.items()}
         cookies_low = {k.lower(): str(v).lower() for k, v in r.cookies.get_dict().items()}
         body_low = r.text.lower()
@@ -92,7 +101,7 @@ def run(target, emit, options=None):
 
         # --- Phase 2: Active Triggering ---
         emit.info("    [i] Performing active WAF triggering...")
-        active_results = active_trigger(base_url, emit)
+        active_results = active_trigger(base_url, emit, session=session)
         detected_wafs.extend(active_results)
 
     except Exception as e:

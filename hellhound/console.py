@@ -185,7 +185,11 @@ class HellhoundConsole(cmd.Cmd):
         self.target_context = {
             "url": None,
             "cookies": None,
-            "headers": {}
+            "headers": {},
+            "proxy": None,
+            "proxy_enabled": True,
+            "global_headers": {},
+            "enable_waf_bypass": False
         }
 
         self.aliases = {
@@ -198,6 +202,8 @@ class HellhoundConsole(cmd.Cmd):
             "quit": "exit",
             "q": "exit",
             "cls": "clear",
+            "setg": "setg",
+            "show": "show"
         }
 
         # ---- Command history via readline ----
@@ -460,97 +466,136 @@ class HellhoundConsole(cmd.Cmd):
     # OPTIONS & CONFIGURATION
     # ============================
 
+    def _print_opt_line(self, name, current, required, helptext, C_NAME=22, C_VAL=24, C_REQ=10):
+        if current is None or current == "" or current == {}:
+            disp = ""
+        elif isinstance(current, str) and len(current) > 100 and current.startswith("eyJ"):
+            c_str = str(current)
+            disp = f"{c_str[:8]}...{c_str[-4:]}"
+        elif isinstance(current, str) and current.lower().startswith("bearer "):
+            c_str = str(current)
+            tok  = c_str[7:]
+            disp = f"Bearer {tok[:8]}...{tok[-4:]}"
+        elif isinstance(current, str) and "=" in current and len(current) > C_VAL:
+            c_str = str(current)
+            first = c_str.split(";")[0].strip()
+            if "=" in first:
+                k, v  = first.split("=", 1)
+                max_v = max(4, C_VAL - len(k) - 4)
+                disp  = f"{k}={v[:max_v]}..." if len(v) > max_v else f"{k}={v}"
+            else:
+                disp = first[:C_VAL-3] + "..."
+        else:
+            raw = str(current)
+            disp = raw[:C_VAL - 3] + "..." if len(raw) > C_VAL else raw
+
+        if disp:
+            val_color = Fore.GREEN + Style.BRIGHT
+        elif required:
+            val_color = Fore.RED
+            disp      = "not set"
+        else:
+            val_color = Fore.LIGHTBLACK_EX
+            disp      = ""
+
+        req_str   = "yes" if required else "no"
+        req_color = Fore.RED + Style.BRIGHT if required else Fore.WHITE
+
+        pad_name = " " * max(0, C_NAME - len(name))
+        pad_val  = " " * max(0, C_VAL  - len(disp))
+        pad_req  = " " * max(0, C_REQ  - len(req_str))
+
+        print(f"   {Fore.CYAN + Style.BRIGHT}{name}{Style.RESET_ALL}{pad_name}"
+              f"{val_color}{disp}{Style.RESET_ALL}{pad_val}"
+              f"{req_color}{req_str}{Style.RESET_ALL}{pad_req}"
+              f"{Fore.WHITE}{helptext}{Style.RESET_ALL}")
+
     def do_options(self, arg):
-        """options → Show current module options"""
-        if not self.active_module:
-            print(Style.BRIGHT + Fore.YELLOW + "[•] No module equipped. Use 'equip <module>' first." + Style.RESET_ALL)
-            return
-
-        mod_obj = self._load_module(self.active_module)
-        if not mod_obj:
-            print(Style.BRIGHT + Fore.RED + "[✖] Could not reload module for options." + Style.RESET_ALL)
-            return
-
-        options_def = getattr(mod_obj, "OPTIONS", [])
-        if not options_def:
-            print(Style.BRIGHT + Fore.YELLOW + "[•] This module has no configurable options." + Style.RESET_ALL)
-            return
-
+        """options → Show current module and global options"""
         # Column widths
         C_NAME = 22
         C_VAL  = 24
         C_REQ  = 10
 
-        # Header
-        cat = self.modules.get(self.active_module, {}).get("category", "module")
-        print(f"\n  Module options ({Fore.CYAN + Style.BRIGHT}{cat}/{self.active_module}{Style.RESET_ALL}):\n")
-
-        # Column labels
+        # Labels & Separators
         h_name = f"{'Name':<{C_NAME}}"
         h_val  = f"{'Current Setting':<{C_VAL}}"
         h_req  = f"{'Required':<{C_REQ}}"
         h_desc = "Description"
-        print(f"   {Style.BRIGHT + Fore.WHITE}{h_name}{h_val}{h_req}{h_desc}{Style.RESET_ALL}")
-
-        # Separator — dashes under each header word only (Metasploit style)
+        
         sep_name = "-" * len("Name")
         sep_val  = "-" * len("Current Setting")
         sep_req  = "-" * len("Required")
         sep_desc = "-" * len("Description")
-        print(f"   {Fore.WHITE}"
-              f"{sep_name:<{C_NAME}}{sep_val:<{C_VAL}}{sep_req:<{C_REQ}}{sep_desc}"
-              f"{Style.RESET_ALL}")
+        
+        header_line = f"   {Style.BRIGHT + Fore.WHITE}{h_name}{h_val}{h_req}{h_desc}{Style.RESET_ALL}"
+        sep_line    = f"   {Fore.WHITE}{sep_name:<{C_NAME}}{sep_val:<{C_VAL}}{sep_req:<{C_REQ}}{sep_desc}{Style.RESET_ALL}"
 
-        for opt in options_def:
-            name     = opt.get("name", "")
-            default  = opt.get("default")
-            helptext = opt.get("help", "")
-            required = opt.get("required", False)
-            current  = self.module_options.get(name, default)
+        # ── 1. Module Options ─────────────────────────────────────
+        if self.active_module:
+            mod_obj = self._load_module(self.active_module)
+            options_def = getattr(mod_obj, "OPTIONS", []) if mod_obj else []
+            cat = self.modules.get(self.active_module, {}).get("category", "module")
+            
+            print(f"\n  Module options ({Fore.CYAN + Style.BRIGHT}{cat}/{self.active_module}{Style.RESET_ALL}):\n")
+            print(header_line)
+            print(sep_line)
 
-            # ── Value display ──────────────────────────────────────
-            if current is None or current == "" or current == {}:
-                disp = ""
-            elif isinstance(current, str) and current.startswith("eyJ"):
-                # Raw JWT — show head...tail only
-                disp = f"{current[:8]}...{current[-4:]}"
-            elif isinstance(current, str) and current.lower().startswith("bearer "):
-                tok  = current[7:]
-                disp = f"Bearer {tok[:8]}...{tok[-4:]}"
-            elif isinstance(current, str) and "=" in current and len(current) > C_VAL:
-                # Cookie key=value style
-                first = current.split(";")[0].strip()
-                k, v  = first.split("=", 1)
-                max_v = max(4, C_VAL - len(k) - 4)
-                disp  = f"{k}={v[:max_v]}..." if len(v) > max_v else f"{k}={v}"
-            else:
-                raw = str(current)
-                disp = raw[:C_VAL - 3] + "..." if len(raw) > C_VAL else raw
+            for opt in options_def:
+                name     = opt.get("name", "")
+                default  = opt.get("default")
+                helptext = opt.get("help", "")
+                required = opt.get("required", False)
+                current  = self.module_options.get(name, default)
+                self._print_opt_line(name, current, required, helptext, C_NAME, C_VAL, C_REQ)
+            print()
+        else:
+            print(Style.BRIGHT + Fore.YELLOW + "\n[•] No module equipped. Showing global options only." + Style.RESET_ALL)
 
-            # Colors
-            if disp:
-                val_color = Fore.GREEN + Style.BRIGHT
-            elif required:
-                val_color = Fore.RED
-                disp      = "not set"
-            else:
-                val_color = Fore.LIGHTBLACK_EX
-                disp      = ""
+        # ── 2. Global Options ─────────────────────────────────────
+        print(f"  Global options:\n")
+        print(header_line)
+        print(sep_line)
 
-            req_str   = "yes" if required else "no"
-            req_color = Fore.RED + Style.BRIGHT if required else Fore.WHITE
-
-            # Padding uses only visible char counts — no ANSI in disp
-            pad_name = " " * max(0, C_NAME - len(name))
-            pad_val  = " " * max(0, C_VAL  - len(disp))
-            pad_req  = " " * max(0, C_REQ  - len(req_str))
-
-            print(f"   {Fore.CYAN + Style.BRIGHT}{name}{Style.RESET_ALL}{pad_name}"
-                  f"{val_color}{disp}{Style.RESET_ALL}{pad_val}"
-                  f"{req_color}{req_str}{Style.RESET_ALL}{pad_req}"
-                  f"{Fore.WHITE}{helptext}{Style.RESET_ALL}")
-
+        # Proxy
+        p_val = self.target_context.get("proxy")
+        if p_val:
+            p_status = " (ENABLED)" if self.target_context.get("proxy_enabled", True) else " (DISABLED)"
+            p_disp   = f"{p_val}{p_status}"
+        else:
+            p_disp   = ""
+        self._print_opt_line("proxy", p_disp, False, "Global HTTP/S proxy (use 'proxy enable/disable' to toggle)", C_NAME, C_VAL, C_REQ)
+        
+        # BugBounty
+        bb = self.target_context.get("global_headers", {}).get("X-Bugbounty", "")
+        self._print_opt_line("bugbounty", bb, False, "Bug Bounty ID added to X-Bugbounty header", C_NAME, C_VAL, C_REQ)
+        
+        # WAF Bypass
+        waf = "true" if self.target_context.get("enable_waf_bypass") else "false"
+        self._print_opt_line("wafbypass", waf, False, "Enable automatic WAF/IPS bypass header injection", C_NAME, C_VAL, C_REQ)
+        
         print()
+
+    def do_show(self, arg):
+        """show <options|modules|loot> → Display various framework states"""
+        cmd = arg.lower().strip()
+        if not cmd:
+            print(Fore.YELLOW + "[!] Usage: show <options|modules|loot|info>")
+            return
+        
+        if cmd == "options":
+            self.do_options("")
+        elif cmd in ("modules", "arsenal"):
+            self.do_arsenal("")
+        elif cmd in ("loot", "results"):
+            self.do_loot("")
+        elif cmd == "info":
+            if self.active_module:
+                self.do_equip(self.active_module)
+            else:
+                print(Fore.YELLOW + "[!] No module equipped to show info for.")
+        else:
+            print(Fore.RED + f"[x] Unknown show target: {cmd}")
 
 
     def do_set(self, arg):
@@ -601,6 +646,70 @@ class HellhoundConsole(cmd.Cmd):
 
         self.module_options[key] = coerced
         print(Fore.GREEN + f"[✓] {key} => {coerced}" + Style.RESET_ALL)
+
+    def do_setg(self, arg):
+        """setg <option> <value> → Set a global option (proxy | bugbounty | wafbypass)"""
+        parts = arg.split(None, 1)
+        if len(parts) < 1:
+            print(Fore.CYAN + "── GLOBAL CONFIGURATION ──")
+            p = self.target_context.get("proxy", "None") or "None"
+            s = "ENABLED" if self.target_context.get("proxy_enabled", True) else "DISABLED"
+            color = Fore.GREEN if s == "ENABLED" else Fore.RED
+            print(f"  Proxy:      {p} [{color}{s}{Fore.CYAN}]")
+            print(f"  WAF Bypass: {'ENABLED' if self.target_context.get('enable_waf_bypass') else 'DISABLED'}")
+            print(f"  Headers:    {self.target_context.get('global_headers', {})}")
+            return
+
+        if len(parts) < 2:
+            key = parts[0].lower()
+            if key == "proxy":
+                self.target_context["proxy"] = None
+                print(Fore.GREEN + "[✓] Global Proxy cleared.")
+            else:
+                print(Fore.YELLOW + "[!] Usage: setg <proxy|bugbounty|wafbypass> <value>")
+            return
+
+        key, val = parts[0].lower(), parts[1]
+
+        if key == "proxy":
+            self.target_context["proxy"] = val
+            self.target_context["proxy_enabled"] = True
+            print(Fore.GREEN + f"[✓] Global Proxy => {val} (ENABLED)")
+        elif key == "bugbounty":
+            self.target_context["global_headers"]["X-Bugbounty"] = val
+            print(Fore.GREEN + f"[✓] BugBounty Header => X-Bugbounty: {val}")
+        elif key == "wafbypass":
+            self.target_context["enable_waf_bypass"] = val.lower() in ("true", "1", "yes")
+            state = "ENABLED" if self.target_context["enable_waf_bypass"] else "DISABLED"
+            print(Fore.GREEN + f"[✓] Global WAF Bypass => {state}")
+        else:
+            # Custom global header
+            if ":" in arg:
+                k, v = arg.split(":", 1)
+                self.target_context["global_headers"][k.strip()] = v.strip()
+                print(Fore.GREEN + f"[✓] Global Header => {k.strip()}: {v.strip()}")
+            else:
+                print(Fore.RED + f"[x] Unknown global setting: {key}")
+
+    def do_proxy(self, arg):
+        """proxy <enable|disable|status> → Toggle or check the global proxy status"""
+        cmd = arg.lower().strip()
+        if cmd == "enable":
+            if not self.target_context.get("proxy"):
+                print(Fore.YELLOW + "[!] No proxy URL set. Use 'setg proxy <url>' first.")
+                return
+            self.target_context["proxy_enabled"] = True
+            print(Fore.GREEN + f"[✓] Proxy Enabled: {self.target_context['proxy']}")
+        elif cmd == "disable":
+            self.target_context["proxy_enabled"] = False
+            print(Fore.YELLOW + "[!] Proxy Disabled (Traffic will be direct)")
+        elif cmd == "status" or not cmd:
+            p = self.target_context.get("proxy", "None") or "None"
+            s = "ENABLED" if self.target_context.get("proxy_enabled", True) else "DISABLED"
+            color = Fore.GREEN if s == "ENABLED" else Fore.RED
+            print(f"[*] Proxy: {p} [{color}{s}{Style.RESET_ALL}]")
+        else:
+            print(Fore.RED + f"[x] Unknown command: {cmd}. Use 'enable', 'disable', or 'status'.")
 
     def complete_set(self, text, line, begidx, endidx):
         """TAB completion for: set <option>"""
@@ -660,6 +769,16 @@ class HellhoundConsole(cmd.Cmd):
         spider_result = self.results.get("spider")
         if spider_result and not runtime_options.get("spider_intel"):
             runtime_options["spider_intel"] = spider_result.get("intel", {})
+
+        # ── Auto-feed Global Session Context ───────────────────
+        if self.target_context.get("proxy") and self.target_context.get("proxy_enabled", True):
+            runtime_options["proxy"] = self.target_context["proxy"]
+        
+        # Feed global headers and waf_bypass too
+        if self.target_context.get("global_headers"):
+            runtime_options.setdefault("global_headers", {}).update(self.target_context["global_headers"])
+        if self.target_context.get("enable_waf_bypass"):
+            runtime_options["enable_waf_bypass"] = self.target_context["enable_waf_bypass"]
 
         # ── Auto-feed BlobUnpacker intel ────────────────────────
         blob_result = self.results.get("blobunpacker")

@@ -46,6 +46,7 @@ import ssl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from html.parser import HTMLParser
+from hellhound.core import http_utils
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SSL — accept self-signed certs (test apps)
@@ -239,7 +240,8 @@ class HTTPClient:
     def __init__(self, timeout=12, cookie=None, extra_header=None,
                  login_url=None, login_user=None, login_pass=None,
                  login_user_field="username", login_pass_field="password",
-                 user_agent=None):
+                 user_agent=None, options=None):
+        options = options or {}
         self.timeout           = timeout
         self._login_url        = login_url
         self._login_user       = login_user
@@ -270,6 +272,13 @@ class HTTPClient:
             self.headers[k.strip()] = v.strip()
         if login_url and login_user and login_pass:
             self._do_login()
+        
+        # apply global proxy
+        self._proxy = options.get("proxy")
+        self._opener = http_utils.get_urllib_opener(self._proxy)
+        
+        # merge global headers
+        self.headers = http_utils.merge_global_context(options, self.headers)
 
 # ── login ──────────────────────────────────────────────────────────────
     def _do_login(self):
@@ -345,7 +354,7 @@ class HTTPClient:
 
         return False
 
-    def clone_no_auth(self):
+    def clone_no_auth(self, options=None):
         """Return a client copy with no auth headers (for unauthenticated checks)."""
         c = HTTPClient.__new__(HTTPClient)
         c.timeout           = self.timeout
@@ -357,6 +366,10 @@ class HTTPClient:
         # Copy all headers EXCEPT auth
         c.headers = {k: v for k, v in self.headers.items()
                      if k not in ("Cookie", "Authorization")}
+        
+        # Apply proxy to clone
+        c._proxy = self._proxy
+        c._opener = self._opener
         return c
 
     # ── HTTP verbs ──────────────────────────────────────────────────────────
@@ -390,8 +403,8 @@ class HTTPClient:
 
         def _execute():
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout,
-                                            context=_SSL_CTX) as r:
+                # Use the proxied opener
+                with self._opener.open(req, timeout=self.timeout) as r:
                     text = r.read(512 * 1024).decode("utf-8", errors="replace")
                     result[0] = {"ok": True, "status": r.status, "body": text,
                                  "elapsed": time.time() - t0, "url": r.url,
@@ -3242,7 +3255,8 @@ class IDHarvestPass:
     real object IDs. Results are merged into the id_hints pool before testing.
     """
 
-    def __init__(self, client_a, targets, threads=8, delay=0, client_b=None):
+    def __init__(self, client_a, targets, threads=8, delay=0, client_b=None, options=None):
+        self.options  = options or {}
         self.client_a = client_a
         self.client_b = client_b
         self.targets  = targets
@@ -3358,7 +3372,7 @@ class IDHarvestPass:
                 # No ownership keywords — likely public catalogue data.
                 # Confirm by checking if unauthenticated GET returns 200.
                 try:
-                    bare_resp = HTTPClient(timeout=8).get(ctx_url, {})
+                    bare_resp = HTTPClient(timeout=8, options=self.options).get(ctx_url, {})
                     if bare_resp.get("status", 0) in range(200, 210):
                         vprint(f"    [harvest:derive] Skipping public catalogue path: {ctx_url}")
                         continue
@@ -4883,7 +4897,7 @@ def run(target, emit, options):
     section("PHASE 1/5 — SESSION INITIALISATION")
 
     # Bare unauthenticated client used by AuthEngine for probing
-    bare_client = HTTPClient(timeout=args.timeout, user_agent=ua)
+    bare_client = HTTPClient(timeout=args.timeout, user_agent=ua, options=options)
 
     # Detect which auth mode the operator chose
     has_cookie_a = bool(args.cookie_a or args.header_a)
@@ -4901,12 +4915,14 @@ def run(target, emit, options):
         client_a = HTTPClient(
             timeout=args.timeout, cookie=args.cookie_a,
             extra_header=args.header_a, user_agent=ua,
+            options=options
         )
         if has_cookie_b:
             tprint(f"  {info('Mode: dual-session IDOR scan (User A vs User B)')}")
             client_b = HTTPClient(
                 timeout=args.timeout, cookie=args.cookie_b,
                 extra_header=args.header_b, user_agent=ua,
+                options=options
             )
             tprint(f"  {ok('User A: token injected directly')}")
             tprint(f"  {ok('User B: token injected directly')}")
@@ -5139,6 +5155,7 @@ def run(target, emit, options):
     harvest = IDHarvestPass(
         harvest_client, targets,
         threads=args.threads, delay=args.delay,
+        options=options
     )
     harvested_hints = harvest.run()
 
