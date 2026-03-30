@@ -12,6 +12,7 @@ import re
 from colorama import Fore, Back, Style, init
 init(autoreset=True)
 
+from hellhound.core import oob_utils
 from hellhound.core.engine import HellhoundEngine
 from hellhound.core.suggest import suggest_actions
 
@@ -189,7 +190,9 @@ class HellhoundConsole(cmd.Cmd):
             "proxy": None,
             "proxy_enabled": True,
             "global_headers": {},
-            "enable_waf_bypass": False
+            "enable_waf_bypass": False,
+            "oob_url": None,
+            "oob_server": None
         }
 
         self.aliases = {
@@ -574,6 +577,10 @@ class HellhoundConsole(cmd.Cmd):
         waf = "true" if self.target_context.get("enable_waf_bypass") else "false"
         self._print_opt_line("wafbypass", waf, False, "Enable automatic WAF/IPS bypass header injection", C_NAME, C_VAL, C_REQ)
         
+        # OOB
+        oob = self.target_context.get("oob_url", "")
+        self._print_opt_line("oob", oob, False, "Global OOB URL for blind detection", C_NAME, C_VAL, C_REQ)
+        
         print()
 
     def do_show(self, arg):
@@ -648,7 +655,7 @@ class HellhoundConsole(cmd.Cmd):
         print(Fore.GREEN + f"[✓] {key} => {coerced}" + Style.RESET_ALL)
 
     def do_setg(self, arg):
-        """setg <option> <value> → Set a global option (proxy | bugbounty | wafbypass)"""
+        """setg <option> <value> → Set a global option (proxy | bugbounty | wafbypass | oob)"""
         parts = arg.split(None, 1)
         if len(parts) < 1:
             print(Fore.CYAN + "── GLOBAL CONFIGURATION ──")
@@ -657,6 +664,8 @@ class HellhoundConsole(cmd.Cmd):
             color = Fore.GREEN if s == "ENABLED" else Fore.RED
             print(f"  Proxy:      {p} [{color}{s}{Fore.CYAN}]")
             print(f"  WAF Bypass: {'ENABLED' if self.target_context.get('enable_waf_bypass') else 'DISABLED'}")
+            print(f"  OOB URL:    {self.target_context.get('oob_url') or 'None'}")
+            print(f"  OOB Server: {'RUNNING' if self.target_context.get('oob_server') and self.target_context.get('oob_server')._server else 'STOPPED'}")
             print(f"  Headers:    {self.target_context.get('global_headers', {})}")
             return
 
@@ -666,22 +675,25 @@ class HellhoundConsole(cmd.Cmd):
                 self.target_context["proxy"] = None
                 print(Fore.GREEN + "[✓] Global Proxy cleared.")
             else:
-                print(Fore.YELLOW + "[!] Usage: setg <proxy|bugbounty|wafbypass> <value>")
+                print(Fore.YELLOW + "[!] Usage: setg <proxy|bugbounty|wafbypass|oob> <value>")
             return
 
-        key, val = parts[0].lower(), parts[1]
+        key, raw_value = parts[0].lower(), parts[1]
 
         if key == "proxy":
-            self.target_context["proxy"] = val
+            self.target_context["proxy"] = raw_value
             self.target_context["proxy_enabled"] = True
-            print(Fore.GREEN + f"[✓] Global Proxy => {val} (ENABLED)")
+            print(Fore.GREEN + f"[✓] Global Proxy => {raw_value} (ENABLED)")
         elif key == "bugbounty":
-            self.target_context["global_headers"]["X-Bugbounty"] = val
-            print(Fore.GREEN + f"[✓] BugBounty Header => X-Bugbounty: {val}")
+            self.target_context["global_headers"]["X-Bugbounty"] = raw_value
+            print(Fore.GREEN + f"[✓] BugBounty Header => X-Bugbounty: {raw_value}")
         elif key == "wafbypass":
-            self.target_context["enable_waf_bypass"] = val.lower() in ("true", "1", "yes")
+            self.target_context["enable_waf_bypass"] = raw_value.lower() in ("true", "1", "yes")
             state = "ENABLED" if self.target_context["enable_waf_bypass"] else "DISABLED"
             print(Fore.GREEN + f"[✓] Global WAF Bypass => {state}")
+        elif key == "oob":
+            self.target_context["oob_url"] = raw_value
+            print(Fore.GREEN + f"[✓] Global OOB URL set: {raw_value}" + Style.RESET_ALL)
         else:
             # Custom global header
             if ":" in arg:
@@ -689,7 +701,49 @@ class HellhoundConsole(cmd.Cmd):
                 self.target_context["global_headers"][k.strip()] = v.strip()
                 print(Fore.GREEN + f"[✓] Global Header => {k.strip()}: {v.strip()}")
             else:
-                print(Fore.RED + f"[x] Unknown global setting: {key}")
+                print(Fore.RED + f"[x] Unknown global option: {key}. Supported: proxy, bugbounty, wafbypass, oob" + Style.RESET_ALL)
+
+    def do_oob(self, arg):
+        """oob <start|stop|status> → Manage the global Out-of-Band (OOB) listener"""
+        cmd = arg.lower().strip()
+        if not cmd or cmd == "status":
+            srv = self.target_context.get("oob_server")
+            if srv and srv._server:
+                print(Fore.GREEN + f"[*] OOB Server: RUNNING on {srv.get_url()}" + Style.RESET_ALL)
+                print(Fore.WHITE + f"    Total Hits: {len(srv.hits)}")
+            else:
+                print(Fore.YELLOW + "[!] OOB Server: STOPPED" + Style.RESET_ALL)
+            
+            if self.target_context.get("oob_url"):
+                print(Fore.CYAN + f"[*] External Collaborator: {self.target_context['oob_url']}" + Style.RESET_ALL)
+            return
+
+        if cmd == "start":
+            if not self.target_context.get("oob_server"):
+                self.target_context["oob_server"] = oob_utils.OOBServer()
+            
+            srv = self.target_context["oob_server"]
+            if srv._server:
+                print(Fore.YELLOW + f"[!] OOB Server is already running on {srv.get_url()}" + Style.RESET_ALL)
+                return
+            
+            print(Fore.WHITE + "[*] Starting local OOB listener..." + Style.RESET_ALL)
+            host, port = srv.start()
+            if host and port:
+                print(Fore.GREEN + f"[✓] OOB Listener active: http://{host}:{port}" + Style.RESET_ALL)
+                print(Fore.WHITE + "    All modules will now use this for blind detection.")
+            else:
+                print(Fore.RED + "[x] Failed to start OOB listener." + Style.RESET_ALL)
+
+        elif cmd == "stop":
+            srv = self.target_context.get("oob_server")
+            if srv and srv._server:
+                srv.stop()
+                print(Fore.YELLOW + "[*] OOB Server stopped." + Style.RESET_ALL)
+            else:
+                print(Fore.WHITE + "[*] No OOB server running." + Style.RESET_ALL)
+        else:
+            print(Fore.RED + f"[x] Unknown oob command: {cmd}. Usage: oob <start|stop|status>" + Style.RESET_ALL)
 
     def do_proxy(self, arg):
         """proxy <enable|disable|status> → Toggle or check the global proxy status"""
@@ -789,6 +843,12 @@ class HellhoundConsole(cmd.Cmd):
         raw_cookie_val = self.target_context.get("cookies") or runtime_options.get("cookie")
         if raw_cookie_val and isinstance(raw_cookie_val, str) and "=" not in raw_cookie_val:
             print(Style.BRIGHT + Fore.YELLOW + "[•] Session token detected (auto-mapped)" + Style.RESET_ALL)
+
+        # ── Auto-feed OOB Context ──────────────────────────────
+        if self.target_context.get("oob_url"):
+            runtime_options["oob_url"] = self.target_context["oob_url"]
+        if self.target_context.get("oob_server"):
+            runtime_options["oob_server"] = self.target_context["oob_server"]
 
         # ── Minimal strike header ──────────────────────────────
         print(Style.BRIGHT + Fore.RED + "\n[ STRIKE ]" + Style.RESET_ALL)
