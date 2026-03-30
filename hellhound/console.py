@@ -15,6 +15,7 @@ init(autoreset=True)
 from hellhound.core import oob_utils
 from hellhound.core.engine import HellhoundEngine
 from hellhound.core.suggest import suggest_actions
+from hellhound.core import ai_utils
 
 # ----------------------------
 # BOOT ANIMATION
@@ -192,7 +193,9 @@ class HellhoundConsole(cmd.Cmd):
             "global_headers": {},
             "enable_waf_bypass": False,
             "oob_url": None,
-            "oob_server": None
+            "oob_server": None,
+            "ai_key": None,
+            "ai_provider": "gemini"
         }
 
         self.aliases = {
@@ -200,6 +203,9 @@ class HellhoundConsole(cmd.Cmd):
             "run": "strike",
             "use": "equip",
             "back": "release",
+            "OPTIONS": [
+                {"name": "use_ai", "type": bool, "default": False, "help": "Use AI (LLM) to verify findings and reduce false positives"},
+            ],
             "ls": "arsenal",
             "results": "loot",
             "quit": "exit",
@@ -581,6 +587,13 @@ class HellhoundConsole(cmd.Cmd):
         oob = self.target_context.get("oob_url", "")
         self._print_opt_line("oob", oob, False, "Global OOB URL for blind detection", C_NAME, C_VAL, C_REQ)
         
+        # AI
+        ai_k = self.target_context.get("ai_key", "")
+        self._print_opt_line("ai_key", ai_k, False, "API key for AI-powered intelligence", C_NAME, C_VAL, C_REQ)
+        
+        ai_p = self.target_context.get("ai_provider", "gemini")
+        self._print_opt_line("ai_provider", ai_p, False, "AI provider: gemini | openai | anthropic", C_NAME, C_VAL, C_REQ)
+        
         print()
 
     def do_show(self, arg):
@@ -694,6 +707,16 @@ class HellhoundConsole(cmd.Cmd):
         elif key == "oob":
             self.target_context["oob_url"] = raw_value
             print(Fore.GREEN + f"[✓] Global OOB URL set: {raw_value}" + Style.RESET_ALL)
+        elif key == "ai_key":
+            self.target_context["ai_key"] = raw_value
+            print(Fore.GREEN + f"[✓] Global AI Key => {raw_value[:4]}...{raw_value[-4:] if len(raw_value)>8 else ''}")
+        elif key in ("ai_provider", "aiprovider"):
+            prov = raw_value.lower().strip()
+            if prov in ("gemini", "openai", "anthropic"):
+                self.target_context["ai_provider"] = prov
+                print(Fore.GREEN + f"[✓] Global AI Provider => {prov}")
+            else:
+                print(Fore.RED + f"[x] Unsupported AI provider: {prov}. Use gemini | openai | anthropic")
         else:
             # Custom global header
             if ":" in arg:
@@ -849,6 +872,11 @@ class HellhoundConsole(cmd.Cmd):
             runtime_options["oob_url"] = self.target_context["oob_url"]
         if self.target_context.get("oob_server"):
             runtime_options["oob_server"] = self.target_context["oob_server"]
+
+        # ── Auto-feed AI Context ──────────────────────────────
+        if self.target_context.get("ai_key"):
+            runtime_options["ai_key"] = self.target_context["ai_key"]
+            runtime_options["ai_provider"] = self.target_context.get("ai_provider", "gemini")
 
         # ── Minimal strike header ──────────────────────────────
         print(Style.BRIGHT + Fore.RED + "\n[ STRIKE ]" + Style.RESET_ALL)
@@ -1713,7 +1741,27 @@ class HellhoundConsole(cmd.Cmd):
             print(Fore.YELLOW + Style.BRIGHT + "[!] No intelligence collected yet — run Spider first." + Style.RESET_ALL)
             return
 
-        # ── Import structured report ──────────────────────────
+        # ── AI Enhanced Howl ──────────────────────────────────
+        ai_key = self.target_context.get("ai_key")
+        ai_provider = self.target_context.get("ai_provider", "gemini")
+        if ai_key:
+            print(Fore.MAGENTA + Style.BRIGHT + f"\n[ Howl — AI Correlation Engine ({ai_provider.upper()}) ]")
+            print(Fore.WHITE + "  Asking Hellhound Intelligence for attack chains...\n" + Style.RESET_ALL)
+            
+            prompt = ai_utils.format_howl_prompt(self.results)
+            ai_response = ai_utils.call_ai(prompt, ai_provider, ai_key)
+            
+            if ai_response.startswith("Error"):
+                print(Fore.RED + f"  [x] AI analysis failed: {ai_response}")
+            else:
+                # Print AI response with consistent formatting
+                for line in ai_response.split('\n'):
+                    if line.strip():
+                        print(f"  {Fore.CYAN}{line}{Style.RESET_ALL}")
+                print(Fore.RED + "\n  " + "─" * 45 + Style.RESET_ALL + "\n")
+                return
+
+        # ── Rule-based fallback ─────────────────────────────
         try:
             from hellhound.core.suggest import suggest_report
             report = suggest_report(self.results)
