@@ -1,10 +1,13 @@
 NAME = "SourceAuditor"
 DESCRIPTION = "Automated Static Analysis of Recovered Source Code"
-OPTIONS = []
+OPTIONS = [
+    {"name": "use_ai", "type": bool, "default": False, "help": "Use AI (LLM) to verify findings and reduce false positives"},
+]
 
 import os
 import re
 from urllib.parse import urlparse
+from hellhound.core import ai_utils
 
 # Vulnerability Signatures
 SIGNATURES = [
@@ -96,21 +99,45 @@ class SourceAuditor:
         self.loot = {
             "vulnerabilities": [],
             "files_scanned": 0,
-            "risk_score": 0
+            "risk_score": 0,
+            "ai_insights": []
         }
 
-    def audit_file(self, content, filename):
+    def audit_file(self, content, filename, use_ai=False, ai_key=None, ai_provider="gemini"):
         file_findings = []
         for sig in SIGNATURES:
-            if re.search(sig["pattern"], content, re.IGNORECASE):
+            match = re.search(sig["pattern"], content, re.IGNORECASE)
+            if match:
                 finding = {
                     "id": sig["id"],
                     "name": sig["name"],
                     "description": sig["description"],
                     "severity": sig["severity"],
                     "type": sig["type"],
-                    "file": filename
+                    "file": filename,
+                    "ai_verified": False
                 }
+                
+                # Perform Deep AI Audit if requested and high severity
+                if use_ai and ai_key and sig["severity"] >= 7:
+                    # Extract context (20 lines around match)
+                    start = max(0, match.start() - 500)
+                    end = min(len(content), match.end() + 500)
+                    snippet = content[start:end]
+                    
+                    self.emit.info(f"      [AI] Deep auditing {sig['id']} in {filename} ({ai_provider})...")
+                    prompt = ai_utils.format_audit_prompt(snippet, sig["name"])
+                    ai_result = ai_utils.call_ai(prompt, ai_provider, ai_key)
+                    
+                    if "TRUE POSITIVE" in ai_result.upper():
+                        finding["ai_verified"] = True
+                        finding["ai_insight"] = ai_result
+                        self.emit.success(f"      [AI] confirmed TRUE POSITIVE for {sig['id']}")
+                    elif "FALSE POSITIVE" in ai_result.upper():
+                        finding["severity"] = 1 # Downgrade
+                        finding["ai_insight"] = ai_result
+                        self.emit.warn(f"      [AI] flagged FALSE POSITIVE for {sig['id']}")
+
                 file_findings.append(finding)
                 self.loot["vulnerabilities"].append(finding)
         return file_findings
@@ -136,7 +163,8 @@ def run(target, emit, options=None):
         if reconstructed_content:
             emit.info(f"    [i] Auditing {len(reconstructed_content)} files from memory...")
             for filename, content in reconstructed_content.items():
-                auditor.audit_file(content, filename)
+                auditor.audit_file(content, filename, use_ai=opt.get("use_ai"), 
+                                 ai_key=opt.get("ai_key"), ai_provider=opt.get("ai_provider", "gemini"))
                 auditor.loot["files_scanned"] += 1
         else:
             emit.warn("    [!] No reconstructed source found. Run 'BlobUnpacker' first.")
@@ -150,7 +178,8 @@ def run(target, emit, options=None):
                 try:
                     with open(filepath, "r", encoding="utf-8") as f:
                         content = f.read()
-                        auditor.audit_file(content, rel_path)
+                        auditor.audit_file(content, rel_path, use_ai=options.get("use_ai"), 
+                                         ai_key=options.get("ai_key"), ai_provider=options.get("ai_provider", "gemini"))
                         auditor.loot["files_scanned"] += 1
                 except:
                     pass
