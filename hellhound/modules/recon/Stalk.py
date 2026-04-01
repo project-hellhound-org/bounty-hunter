@@ -723,6 +723,12 @@ def active_cloud_permutation(
     concurrency: int
 ):
     emit.info("  [*] Cloud asset permutation probing (S3 / Azure / GCP)...")
+    
+    # ── Local Target Protection ──────────────────────────
+    if domain.lower() in ("localhost", "127.0.0.1", "0.0.0.0"):
+        emit.info("    [i] Local target detected — skipping cloud permutation (too noisy)")
+        return
+    
     org = _extract_org_name(domain)
 
     candidates = set()

@@ -14,8 +14,37 @@ init(autoreset=True)
 
 from hellhound.core import oob_utils
 from hellhound.core.engine import HellhoundEngine
-from hellhound.core.suggest import suggest_actions
+from hellhound.core.suggest import suggest_actions, suggest_report
 from hellhound.core import ai_utils
+from hellhound.core.repro_engine import ReproEngine
+
+# ----------------------------
+# UI / COLOR CONSTANTS
+# ----------------------------
+
+W          = 70           # Global Banner Width
+R          = Style.RESET_ALL
+C_BORDER   = Fore.RED     + Style.BRIGHT
+C_HEAD     = Fore.RED     + Style.BRIGHT
+C_CRITICAL = Fore.RED     + Style.BRIGHT
+C_HIGH     = Fore.YELLOW  + Style.BRIGHT
+C_MEDIUM   = Fore.CYAN    + Style.BRIGHT
+C_LOW      = Fore.WHITE
+C_CHAIN    = Fore.MAGENTA + Style.BRIGHT
+C_SKIP     = Fore.LIGHTBLACK_EX
+C_LABEL    = Fore.WHITE   + Style.BRIGHT
+C_DIM      = Fore.WHITE
+C_EVIDENCE = Fore.CYAN
+C_STEP     = Fore.RED     + Style.BRIGHT
+C_URL      = Fore.YELLOW
+C_OK       = Fore.GREEN   + Style.BRIGHT
+
+CONF_COLORS = {
+    "confirmed": Fore.RED    + Style.BRIGHT,
+    "strong":    Fore.YELLOW + Style.BRIGHT,
+    "likely":    Fore.CYAN   + Style.BRIGHT,
+    "possible":  Fore.WHITE,
+}
 
 # ----------------------------
 # BOOT ANIMATION
@@ -195,7 +224,10 @@ class HellhoundConsole(cmd.Cmd):
             "oob_url": None,
             "oob_server": None,
             "ai_key": None,
-            "ai_provider": "gemini"
+            "ai_provider": "gemini",
+            "ai_model": "gemini-1.5-flash-latest",
+            "ai_status_label": "NOT CONNECTED",
+            "proxy_mode": "repro_only"
         }
 
         self.aliases = {
@@ -410,6 +442,12 @@ class HellhoundConsole(cmd.Cmd):
                 active_marker = Style.BRIGHT + Fore.GREEN + " ◀ ACTIVE" + Style.RESET_ALL if name == self.active_module else ""
                 print(f"    {Fore.WHITE + Style.BRIGHT}{name:<16}{Style.RESET_ALL}{Fore.WHITE}{desc}{Style.RESET_ALL}{active_marker}")
 
+        # ── CORE ENGINES (Universal Commands) ─────────────────
+        print(f"\n  {Fore.RED + Style.BRIGHT}[ CORE ENGINES ]{Style.RESET_ALL}")
+        print(f"    {Fore.WHITE + Style.BRIGHT}{'howl':<16}{Style.RESET_ALL}{Fore.WHITE}AI-Powered Attack Path Correlation & Reasoning{Style.RESET_ALL}")
+        print(f"    {Fore.WHITE + Style.BRIGHT}{'reproduce':<16}{Style.RESET_ALL}{Fore.WHITE}Universal Vulnerability Replay Engine (Alias: repro){Style.RESET_ALL}")
+        print()
+
         print()
 
     # ============================
@@ -575,6 +613,10 @@ class HellhoundConsole(cmd.Cmd):
             p_disp   = ""
         self._print_opt_line("proxy", p_disp, False, "Global HTTP/S proxy (use 'proxy enable/disable' to toggle)", C_NAME, C_VAL, C_REQ)
         
+        # Proxy Mode
+        pm_val = self.target_context.get("proxy_mode", "repro_only").upper()
+        self._print_opt_line("proxy_mode", pm_val, False, "Proxy behavior: repro_only (Silent Scan) | all", C_NAME, C_VAL, C_REQ)
+
         # BugBounty
         bb = self.target_context.get("global_headers", {}).get("X-Bugbounty", "")
         self._print_opt_line("bugbounty", bb, False, "Bug Bounty ID added to X-Bugbounty header", C_NAME, C_VAL, C_REQ)
@@ -586,13 +628,24 @@ class HellhoundConsole(cmd.Cmd):
         # OOB
         oob = self.target_context.get("oob_url", "")
         self._print_opt_line("oob", oob, False, "Global OOB URL for blind detection", C_NAME, C_VAL, C_REQ)
+        print()
+
+        # ── 3. AI Intelligence (Professional Block) ────────────────
+        print(f"  {Fore.MAGENTA + Style.BRIGHT}╔══════════════════════════════════════╗")
+        print(f"  ║         {Fore.WHITE}HELLHOUND — INTELLIGENCE     {Fore.MAGENTA}║")
+        print(f"  ╚══════════════════════════════════════╝{Style.RESET_ALL}\n")
         
-        # AI
+        ai_label = self.target_context.get("ai_status_label", "NOT CONNECTED")
+        st_color = Fore.GREEN if "CONNECTED" in ai_label else Fore.RED
+        
+        print(f"   Status     : {st_color}{ai_label}{Style.RESET_ALL}")
+        
         ai_k = self.target_context.get("ai_key", "")
-        self._print_opt_line("ai_key", ai_k, False, "API key for AI-powered intelligence", C_NAME, C_VAL, C_REQ)
-        
-        ai_p = self.target_context.get("ai_provider", "gemini")
-        self._print_opt_line("ai_provider", ai_p, False, "AI provider: gemini | openai | anthropic", C_NAME, C_VAL, C_REQ)
+        if ai_k:
+            masked = f"{ai_k[:4]}...{ai_k[-4:] if len(ai_k)>8 else ''}"
+            print(f"   Key        : {Fore.WHITE}{masked}{Style.RESET_ALL}")
+        else:
+            print(f"   Key        : {Fore.RED}NOT SET{Style.RESET_ALL}")
         
         print()
 
@@ -629,7 +682,11 @@ class HellhoundConsole(cmd.Cmd):
             print(Fore.YELLOW + "[!] Usage: set <option> <value>" + Style.RESET_ALL)
             return
 
-        key, raw_value = parts[0].strip(), parts[1].strip()
+        key, raw_value = parts[0].strip().lower(), parts[1].strip()
+
+        # Catch Global AI settings for Zero-Config experience
+        if key in ("ai_key", "aikey"):
+            return self.do_setg(f"ai_key {raw_value}")
 
         mod_obj = self._load_module(self.active_module)
         options_def = getattr(mod_obj, "OPTIONS", []) if mod_obj else []
@@ -668,7 +725,7 @@ class HellhoundConsole(cmd.Cmd):
         print(Fore.GREEN + f"[✓] {key} => {coerced}" + Style.RESET_ALL)
 
     def do_setg(self, arg):
-        """setg <option> <value> → Set a global option (proxy | bugbounty | wafbypass | oob)"""
+        """setg <option> <value> → Set a global option (proxy | bugbounty | wafbypass | oob | ai_key)"""
         parts = arg.split(None, 1)
         if len(parts) < 1:
             print(Fore.CYAN + "── GLOBAL CONFIGURATION ──")
@@ -680,6 +737,13 @@ class HellhoundConsole(cmd.Cmd):
             print(f"  OOB URL:    {self.target_context.get('oob_url') or 'None'}")
             print(f"  OOB Server: {'RUNNING' if self.target_context.get('oob_server') and self.target_context.get('oob_server')._server else 'STOPPED'}")
             print(f"  Headers:    {self.target_context.get('global_headers', {})}")
+            print(f"  Proxy Mode: {self.target_context.get('proxy_mode', 'repro_only').upper()}")
+            
+            # Integrated AI view in setg summary
+            ai_lbl = self.target_context.get("ai_status_label", "NOT CONNECTED")
+            ai_color = Fore.GREEN if "CONNECTED" in ai_lbl else Fore.RED
+            print(f"  Intelligence: {ai_color}{ai_lbl}{Style.RESET_ALL}")
+
             return
 
         if len(parts) < 2:
@@ -688,7 +752,7 @@ class HellhoundConsole(cmd.Cmd):
                 self.target_context["proxy"] = None
                 print(Fore.GREEN + "[✓] Global Proxy cleared.")
             else:
-                print(Fore.YELLOW + "[!] Usage: setg <proxy|bugbounty|wafbypass|oob> <value>")
+                print(Fore.YELLOW + "[!] Usage: setg <proxy|bugbounty|wafbypass|oob|ai_key> <value>")
             return
 
         key, raw_value = parts[0].lower(), parts[1]
@@ -707,16 +771,43 @@ class HellhoundConsole(cmd.Cmd):
         elif key == "oob":
             self.target_context["oob_url"] = raw_value
             print(Fore.GREEN + f"[✓] Global OOB URL set: {raw_value}" + Style.RESET_ALL)
-        elif key == "ai_key":
+        elif key in ("ai_key", "key"):
             self.target_context["ai_key"] = raw_value
             print(Fore.GREEN + f"[✓] Global AI Key => {raw_value[:4]}...{raw_value[-4:] if len(raw_value)>8 else ''}")
+            
+            # Universal Handshake (Professional Discovery)
+            print(f"[*] Starting Intelligence discovery handshake...")
+            result = ai_utils.universal_handshake(raw_value)
+            
+            if result["success"]:
+                self.target_context["ai_provider"] = result["provider"]
+                self.target_context["ai_model"] = result["model"]
+                self.target_context["ai_status_label"] = f"CONNECTED: {result['label']}"
+                print(Fore.GREEN + f"[✓] Intelligence Connected: {Style.BRIGHT}{result['label']}")
+            else:
+                self.target_context["ai_status_label"] = "FAILED (Key Rejected)"
+                print(Fore.RED + f"[x] Intelligence Discovery Failed: {result['message']}")
+
         elif key in ("ai_provider", "aiprovider"):
+            # Still allow manual override if needed, but mark as manual
             prov = raw_value.lower().strip()
             if prov in ("gemini", "openai", "anthropic"):
                 self.target_context["ai_provider"] = prov
-                print(Fore.GREEN + f"[✓] Global AI Provider => {prov}")
+                self.target_context["ai_status_label"] = f"MANUAL: {prov.upper()}"
+                print(Fore.GREEN + f"[✓] Global AI Provider => {prov} (Manual Override)")
             else:
                 print(Fore.RED + f"[x] Unsupported AI provider: {prov}. Use gemini | openai | anthropic")
+        elif key == "ai_model":
+            self.target_context["ai_model"] = raw_value
+            self.target_context["ai_status_label"] = f"MANUAL: {raw_value.upper()}"
+            print(Fore.GREEN + f"[✓] Global AI Model => {raw_value} (Manual Override)")
+        elif key == "proxy_mode":
+            mode = raw_value.lower().strip()
+            if mode in ("all", "repro_only", "none"):
+                self.target_context["proxy_mode"] = mode
+                print(Fore.GREEN + f"[✓] Global Proxy Mode => {mode.upper()}")
+            else:
+                print(Fore.RED + f"[x] Unsupported proxy mode: {mode}. Use all | repro_only | none")
         else:
             # Custom global header
             if ":" in arg:
@@ -724,7 +815,7 @@ class HellhoundConsole(cmd.Cmd):
                 self.target_context["global_headers"][k.strip()] = v.strip()
                 print(Fore.GREEN + f"[✓] Global Header => {k.strip()}: {v.strip()}")
             else:
-                print(Fore.RED + f"[x] Unknown global option: {key}. Supported: proxy, bugbounty, wafbypass, oob" + Style.RESET_ALL)
+                print(Fore.RED + f"[x] Unknown global option: {key}. Supported: proxy, bugbounty, wafbypass, oob, ai_key, key" + Style.RESET_ALL)
 
     def do_oob(self, arg):
         """oob <start|stop|status> → Manage the global Out-of-Band (OOB) listener"""
@@ -785,8 +876,26 @@ class HellhoundConsole(cmd.Cmd):
             s = "ENABLED" if self.target_context.get("proxy_enabled", True) else "DISABLED"
             color = Fore.GREEN if s == "ENABLED" else Fore.RED
             print(f"[*] Proxy: {p} [{color}{s}{Style.RESET_ALL}]")
+
+    def do_verify_ai(self, arg):
+        """verify-ai → Test AI connectivity and API key health"""
+        key = self.target_context.get("ai_key")
+        prov = self.target_context.get("ai_provider", "gemini")
+        model = self.target_context.get("ai_model", "gemini-1.5-flash-latest")
+
+        if not key:
+            print(Fore.RED + "[x] AI Key not set. Use 'setg ai_key <key>' first.")
+            return
+
+        print(f"[*] Testing {prov.upper()} connectivity ({model})...")
+        status = ai_utils.verify_ai(key, prov, model)
+        
+        if "[✓]" in status:
+            print(Fore.GREEN + status)
         else:
-            print(Fore.RED + f"[x] Unknown command: {cmd}. Use 'enable', 'disable', or 'status'.")
+            print(Fore.RED + f"[x] AI Verification failed: {status}")
+            if "404" in status or "not found" in status.lower():
+                print(Fore.YELLOW + "    Tip: Check if the model name is correct for your region/key.")
 
     def complete_set(self, text, line, begidx, endidx):
         """TAB completion for: set <option>"""
@@ -843,13 +952,22 @@ class HellhoundConsole(cmd.Cmd):
         # ── Auto-feed Spider intel to any module that wants it ──
         # Silently inject previously collected spider intel so modules
         # can skip their internal crawlers and use the Spider brain instead.
-        spider_result = self.results.get("spider")
-        if spider_result and not runtime_options.get("spider_intel"):
-            runtime_options["spider_intel"] = spider_result.get("intel", {})
+        if not runtime_options.get("spider_intel"):
+            for mod_name in ["spider", "idordetector", "bacdetector"]: # Best sources first
+                res = self.results.get(mod_name)
+                if res and res.get("intel") and res["intel"].get("endpoints"):
+                    runtime_options["spider_intel"] = res["intel"]
+                    break
 
         # ── Auto-feed Global Session Context ───────────────────
-        if self.target_context.get("proxy") and self.target_context.get("proxy_enabled", True):
-            runtime_options["proxy"] = self.target_context["proxy"]
+        proxy = self.target_context.get("proxy")
+        proxy_mode = self.target_context.get("proxy_mode", "repro_only")
+        
+        if proxy and self.target_context.get("proxy_enabled", True):
+            if proxy_mode == "all":
+                runtime_options["proxy"] = proxy
+            elif proxy_mode == "none":
+                pass
         
         # Feed global headers and waf_bypass too
         if self.target_context.get("global_headers"):
@@ -877,9 +995,11 @@ class HellhoundConsole(cmd.Cmd):
         if self.target_context.get("ai_key"):
             runtime_options["ai_key"] = self.target_context["ai_key"]
             runtime_options["ai_provider"] = self.target_context.get("ai_provider", "gemini")
+            runtime_options["ai_model"] = self.target_context.get("ai_model", "gemini-1.5-flash-latest")
 
         # ── Minimal strike header ──────────────────────────────
         print(Style.BRIGHT + Fore.RED + "\n[ STRIKE ]" + Style.RESET_ALL)
+        
         print(Style.BRIGHT + Fore.WHITE + "  Module" + Style.RESET_ALL +
               " : " + Style.BRIGHT + Fore.CYAN + self.active_module.upper() + Style.RESET_ALL)
         print(Style.BRIGHT + Fore.WHITE + "  Target" + Style.RESET_ALL +
@@ -889,7 +1009,6 @@ class HellhoundConsole(cmd.Cmd):
             result = self.engine.run_single(
                 module_name=self.active_module,
                 target=self.target,
-                emit=self,
                 options=runtime_options
             )
         except Exception as e:
@@ -899,7 +1018,7 @@ class HellhoundConsole(cmd.Cmd):
         if result:
             self.results[self.active_module.lower()] = result
             print(Style.BRIGHT + Fore.GREEN + f"\n[✔] Strike complete. Intel stored under '{self.active_module.lower()}'." + Style.RESET_ALL)
-            print(Fore.CYAN + "    Use 'loot' to view results or 'howl' for suggestions.\n" + Style.RESET_ALL)
+            print(Fore.CYAN + "    Use 'loot' to view results, 'howl' for suggestions, or 'repro' to verify.\n" + Style.RESET_ALL)
         else:
             print(Style.BRIGHT + Fore.YELLOW + "[•] Module returned no results." + Style.RESET_ALL)
 
@@ -1232,6 +1351,66 @@ class HellhoundConsole(cmd.Cmd):
                         print()
                 else:
                     print(Fore.LIGHTBLACK_EX + "  [IDOR Vulnerabilities]  no findings" + Style.RESET_ALL)
+
+            # ── BlobUnpacker dedicated renderer ──────────────────────
+            elif mod_clean == "blobunpacker":
+                files_recovered = intel.get("recovered_files_count", 0) or len(intel.get("reconstructed", []))
+                endpoints = intel.get("new_endpoints", [])
+                secrets = intel.get("secrets", [])
+                
+                print(f"  {Fore.MAGENTA + Style.BRIGHT}╔════════════ SOURCE INTELLIGENCE ════════════╗")
+                print(f"  ║ {Fore.WHITE}Engine: BLOBUNPACKER   Status: {Fore.GREEN}DECODED{Fore.MAGENTA}      ║")
+                print(f"  ╚════════════════════════════════════════════╝{Style.RESET_ALL}")
+                
+                print(f"\n    {Fore.WHITE + Style.BRIGHT}Inventory:{Style.RESET_ALL}")
+                print(f"      • Recovered Files : {Fore.GREEN}{files_recovered}{Style.RESET_ALL}")
+                print(f"      • API Endpoints   : {Fore.CYAN}{len(endpoints)}{Style.RESET_ALL}")
+                print(f"      • Secrets Found   : {Fore.RED if secrets else Fore.GREEN}{len(secrets)}{Style.RESET_ALL}")
+
+                if secrets:
+                    print(f"\n    {Fore.RED + Style.BRIGHT}[ CRITICAL SECRETS ]{Style.RESET_ALL}")
+                    for s in secrets[:10]:
+                        val = s.get("content", s.get("value", ""))
+                        stype = s.get("type", "Secret")
+                        sfile = s.get("source", s.get("file", "unknown"))
+                        print(f"      {Fore.WHITE}• {stype} : {Fore.MAGENTA}{val}{Style.RESET_ALL} ({Fore.LIGHTBLACK_EX}{sfile}{Style.RESET_ALL})")
+
+                if endpoints:
+                    print(f"\n    {Fore.CYAN + Style.BRIGHT}[ NEW ENDPOINTS (SAMPLE) ]{Style.RESET_ALL}")
+                    for ep in endpoints[:10]:
+                        print(f"      {Fore.WHITE}• {Fore.CYAN}{ep.get('url','')}{Style.RESET_ALL}")
+                print()
+
+            # ── SourceAuditor dedicated renderer ─────────────────────
+            elif mod_clean == "sourceauditor":
+                vulns = intel.get("vulnerabilities", [])
+                files_count = intel.get("files_scanned", 0)
+                
+                print(f"  {Fore.CYAN + Style.BRIGHT}╔══════════════ DEEP SOURCE AUDIT ════════════╗")
+                print(f"  ║ {Fore.WHITE}Engine: SOURCEAUDITOR   Files: {Fore.CYAN}{files_count:02d}{Fore.CYAN}       ║")
+                print(f"  ╚════════════════════════════════════════════╝{Style.RESET_ALL}")
+
+                if vulns:
+                    print(f"\n    {Fore.WHITE + Style.BRIGHT}Security Findings ({len(vulns)}):{Style.RESET_ALL}")
+                    for f in vulns:
+                        sev = str(f.get("severity", "HIGH")).upper()
+                        s_color = _sev_color(sev)
+                        name = f.get("name", "Vulnerability")
+                        f_id = f.get("id", "SA-???")
+                        f_path = f.get("file", "unknown")
+                        ai_tag = f" {Fore.MAGENTA + Style.BRIGHT}[AI VERIFIED]{Style.RESET_ALL}" if f.get("ai_verified") else ""
+                        
+                        print(f"      {Style.BRIGHT}[{s_color}{sev}{Style.RESET_ALL}]{ai_tag} {Fore.WHITE + Style.BRIGHT}{f_id}: {name}{Style.RESET_ALL}")
+                        print(f"        {Fore.WHITE}File    : {Fore.CYAN}{f_path}{Style.RESET_ALL}")
+                        
+                        insight = f.get("ai_insight") or f.get("ai_reasoning")
+                        if insight:
+                            clean_insight = insight.replace("\n", " ").strip()
+                            if len(clean_insight) > 200: clean_insight = clean_insight[:197] + "..."
+                            print(f"        {Fore.MAGENTA}Insight : {Fore.WHITE}{clean_insight}{Style.RESET_ALL}")
+                else:
+                    print(f"\n    {Fore.GREEN}[✓] No critical source-level vulnerabilities found.{Style.RESET_ALL}")
+                print()
 
             # ── CORSbuster dedicated renderer ─────────────────────
             elif mod_clean == "corsbuster":
@@ -1744,216 +1923,82 @@ class HellhoundConsole(cmd.Cmd):
         # ── AI Enhanced Howl ──────────────────────────────────
         ai_key = self.target_context.get("ai_key")
         ai_provider = self.target_context.get("ai_provider", "gemini")
+        model = self.target_context.get("ai_model", "gemini-1.5-flash")
+        
         if ai_key:
             print(Fore.MAGENTA + Style.BRIGHT + f"\n[ Howl — AI Correlation Engine ({ai_provider.upper()}) ]")
-            print(Fore.WHITE + "  Asking Hellhound Intelligence for attack chains...\n" + Style.RESET_ALL)
+            print(Fore.WHITE + f"  Asking Hellhound Intelligence for attack chains ({model})...\n" + Style.RESET_ALL)
             
             prompt = ai_utils.format_howl_prompt(self.results)
-            ai_response = ai_utils.call_ai(prompt, ai_provider, ai_key)
+            ai_response = ai_utils.call_ai(prompt, ai_provider, ai_key, model=model, system_prompt=ai_utils.CORRELATION_PERSONA)
             
-            if ai_response.startswith("Error"):
+            if not ai_response or ai_response.startswith("Error"):
                 print(Fore.RED + f"  [x] AI analysis failed: {ai_response}")
             else:
-                # Print AI response with consistent formatting
+                # Professional High-Fidelity AI Renderer
                 for line in ai_response.split('\n'):
-                    if line.strip():
+                    line = line.strip()
+                    if not line: continue
+                    
+                    # Transform Markdown Headers into Professional Terminal Headers
+                    if line.startswith("###") or line.startswith("##") or line.startswith("#"):
+                        clean_header = line.lstrip("#").strip().upper()
+                        print(f"\n  {Fore.MAGENTA}{Style.BRIGHT}{clean_header}{Style.RESET_ALL}")
+                    # Transform Bold markers into Bright White
+                    elif "**" in line:
+                        parts = line.split("**")
+                        # Basic bold replacement (first pair only for simplicity/fidelity)
+                        if len(parts) >= 3:
+                            processed = f"{parts[0]}{Style.BRIGHT}{parts[1]}{Style.NORMAL}{parts[2]}"
+                            print(f"  {Fore.CYAN}{processed}{Style.RESET_ALL}")
+                        else:
+                            print(f"  {Fore.CYAN}{line.replace('**', '')}{Style.RESET_ALL}")
+                    # Bullet points
+                    elif line.startswith("*") or line.startswith("-"):
+                        print(f"  {Fore.WHITE}• {Fore.CYAN}{line.lstrip('*-').strip()}{Style.RESET_ALL}")
+                    else:
                         print(f"  {Fore.CYAN}{line}{Style.RESET_ALL}")
-                print(Fore.RED + "\n  " + "─" * 45 + Style.RESET_ALL + "\n")
-                return
+            print()
+        else:
+            print(Fore.YELLOW + "[!] AI Not Configured. Run 'setg ai_key <your_key>' to enable Howl attack chaining." + Style.RESET_ALL)
 
-        # ── Rule-based fallback ─────────────────────────────
-        try:
-            from hellhound.core.suggest import suggest_report
-            report = suggest_report(self.results)
-        except ImportError:
-            # Legacy fallback: suggest_actions returns List[str]
-            from hellhound.core.suggest import suggest_actions
-            lines = suggest_actions(self.results)
-            print(Fore.RED + Style.BRIGHT + "\n[ Howl — Intelligence Correlation Engine ]\n" + Style.RESET_ALL)
-            for l in lines:
-                print(f"  {Fore.CYAN}{l}{Style.RESET_ALL}")
+    def do_repro(self, arg):
+        """repro → Alias for reproduce"""
+        self.do_reproduce(arg)
+
+    def do_reproduce(self, arg):
+        """reproduce → Instantly replay and verify all findings through the global proxy"""
+        if not self.results:
+            print(Fore.YELLOW + Style.BRIGHT + "[!] No intelligence collected in this session to reproduce." + Style.RESET_ALL)
             return
 
-        # ── Color constants ───────────────────────────────────
-        C_BORDER   = Fore.RED     + Style.BRIGHT
-        C_HEAD     = Fore.RED     + Style.BRIGHT
-        C_CRITICAL = Fore.RED     + Style.BRIGHT
-        C_HIGH     = Fore.YELLOW  + Style.BRIGHT
-        C_MEDIUM   = Fore.CYAN    + Style.BRIGHT
-        C_LOW      = Fore.WHITE
-        C_CHAIN    = Fore.MAGENTA + Style.BRIGHT
-        C_SKIP     = Fore.LIGHTBLACK_EX
-        C_LABEL    = Fore.WHITE   + Style.BRIGHT
-        C_DIM      = Fore.WHITE
-        C_EVIDENCE = Fore.CYAN
-        C_STEP     = Fore.RED     + Style.BRIGHT
-        C_URL      = Fore.YELLOW
-        C_OK       = Fore.GREEN   + Style.BRIGHT
-        R          = Style.RESET_ALL
-
-        CONF_COLORS = {
-            "confirmed": Fore.RED    + Style.BRIGHT,
-            "strong":    Fore.YELLOW + Style.BRIGHT,
-            "likely":    Fore.CYAN   + Style.BRIGHT,
-            "possible":  Fore.WHITE,
+        proxy = self.target_context.get("proxy") if (self.target_context.get("proxy_enabled", True)) else None
+        
+        # Repro Engine Options
+        options = {
+            "timeout": 10,
+            "delay": 0.5
         }
+        
+        # Parse potential arg overrides (e.g. reproduce timeout=20)
+        if arg:
+            parts = arg.split()
+            for p in parts:
+                if "=" in p:
+                    try:
+                        k, v = p.split("=", 1)
+                        options[k] = float(v) if "." in v else int(v)
+                    except: pass
 
-        W = 62  # inner content width
-
-        def _section_head(title, color=None):
-            color = color or C_HEAD
-            side  = "─" * 3
-            pad   = max(0, W - len(title) - 8)
-            print(f"\n  {C_BORDER}{side}{R} {color}{title}{R} {C_BORDER}{side + '─' * pad}{R}")
-
-        def _priority_badge(s):
-            plabel = s.priority_label
-            if plabel == "CRITICAL":
-                return C_CRITICAL + "[CRIT]" + R
-            elif plabel == "HIGH":
-                return C_HIGH + "[HIGH]" + R
-            elif plabel == "MEDIUM":
-                return C_MEDIUM + "[MED] " + R
-            else:
-                return C_LOW + "[LOW] " + R
-
-        def _conf_inline(s):
-            """Short coloured confidence tag for inline display."""
-            cc = CONF_COLORS.get(s.confidence, Fore.WHITE)
-            bar = cc + s.confidence_bar + R
-            tag = cc + s.confidence + R
-            return f"{bar} {tag}"
-
-        def _print_suggestion(s, index=None):
-            badge = _priority_badge(s)
-
-            # Step counter or chain bullet
-            if index is not None:
-                prefix = f"{C_STEP}[{index:02d}]{R}"
-            else:
-                prefix = f"{C_CHAIN}  +--{R}"
-
-            # ── Action line with inline badge ──────────────────
-            print(f"  {prefix} {badge}  {C_LABEL}{s.action}{R}")
-
-            # ── Why ────────────────────────────────────────────
-            print(f"       {C_DIM}why        {R}{s.reason}")
-
-            # ── Confidence ─────────────────────────────────────
-            print(f"       {C_DIM}confidence {R}{_conf_inline(s)}")
-
-            # ── Evidence — URLs get URL colour, others get evidence colour ──
-            for ev in s.evidence:
-                ev = ev.strip()
-                if not ev:
-                    continue
-                if ev.startswith("http"):
-                    print(f"       {C_DIM}evidence   {R}{C_URL}{ev}{R}")
-                else:
-                    print(f"       {C_DIM}evidence   {R}{C_EVIDENCE}{ev}{R}")
-
-            # ── Chain label ────────────────────────────────────
-            if s.chain:
-                print(f"       {C_DIM}chain      {R}{C_CHAIN}{s.chain}{R}")
-
-        def _print_optional(s):
-            conf_c = CONF_COLORS.get(s.confidence, Fore.WHITE)
-            badge  = _priority_badge(s)
-            print(f"  {C_MEDIUM}  [+]{R} {badge}  {Fore.WHITE + Style.BRIGHT}{s.action}{R}")
-            print(f"       {C_DIM}why        {R}{s.reason}")
-            print(f"       {C_DIM}confidence {R}{_conf_inline(s)}")
-            for ev in s.evidence[:3]:
-                ev = ev.strip()
-                if not ev:
-                    continue
-                if ev.startswith("http"):
-                    print(f"       {C_DIM}evidence   {R}{C_URL}{ev}{R}")
-                else:
-                    print(f"       {C_DIM}evidence   {R}{C_EVIDENCE}{ev}{R}")
-            if s.chain:
-                print(f"       {C_DIM}chain      {R}{C_CHAIN}{s.chain}{R}")
-
-        def _print_skip(s):
-            print(f"  {C_SKIP}  [-] {s.action:<30}  {s.reason}{R}")
-
-        # ── Header banner ─────────────────────────────────────
+        engine = ReproEngine(self)
+        engine.run(
+            target=self.target,
+            all_results=self.results,
+            proxy=proxy,
+            options=options
+        )
         print()
-        print(C_BORDER + "  " + "═" * W + R)
-        inner = "HELLHOUND  —  HOWL  ENGINE"
-        title_pad = (W - len(inner)) // 2
-        print(C_BORDER + "  ║" + " " * title_pad
-              + Fore.WHITE + Style.BRIGHT + inner
-              + " " * (W - title_pad - len(inner) - 2) + C_BORDER + "║" + R)
-        print(C_BORDER + "  " + "═" * W + R)
 
-        # ── Session context block ─────────────────────────────
-        if report.ran_modules:
-            mods_str = "  ".join(m.upper() for m in sorted(report.ran_modules))
-            print(f"\n  {C_LABEL}Modules analysed:{R}  {C_EVIDENCE}{mods_str}{R}")
-
-        # Quick risk tally line
-        n_crit  = sum(1 for s in report.critical_path if s.priority_label == "CRITICAL")
-        n_high  = sum(1 for s in report.critical_path if s.priority_label == "HIGH")
-        n_chain = len(report.chains)
-        print(
-            f"  {C_LABEL}Session risk:{R}  "
-            f"{C_CRITICAL}{n_crit} critical{R}  "
-            f"{C_HIGH}{n_high} high{R}  "
-            f"{C_CHAIN}{n_chain} chain(s){R}"
-        )
-
-        # ── Confirmed attack chains (top — operator sees them first) ──
-        if report.attack_chains:
-            _section_head("CONFIRMED CHAINS", C_CHAIN)
-            print(f"  {C_DIM}End-to-end exploitation paths proven this session.{R}\n")
-            for chain in report.attack_chains:
-                print(f"  {C_CHAIN}  [⚡]{R} {Fore.WHITE + Style.BRIGHT}{chain}{R}")
-            print()
-
-        # ── Critical Path ─────────────────────────────────────
-        if report.critical_path:
-            _section_head("CRITICAL PATH", C_CRITICAL)
-            print(f"  {C_DIM}Run these. In this order. Do not skip.{R}\n")
-            for i, s in enumerate(report.critical_path, 1):
-                _print_suggestion(s, index=i)
-                print()
-        else:
-            _section_head("CRITICAL PATH", C_CRITICAL)
-            print(f"  {C_DIM}No critical-path findings yet.{R}")
-
-        # ── Attack Chains ─────────────────────────────────────
-        if report.chains:
-            _section_head("ATTACK CHAINS", C_CHAIN)
-            print(f"  {C_DIM}Cross-module correlations — multi-step exploitation paths.{R}\n")
-            for s in report.chains:
-                _print_suggestion(s)
-                print()
-
-        # ── Optional Intel ────────────────────────────────────
-        if report.optional_intel:
-            _section_head("OPTIONAL INTEL", C_MEDIUM)
-            print(f"  {C_DIM}Useful context — pursue when critical path is done.{R}\n")
-            for s in report.optional_intel:
-                _print_optional(s)
-                print()
-
-        # ── Skip List ─────────────────────────────────────────
-        if report.skip_list:
-            _section_head("SKIP FOR NOW", C_SKIP)
-            print(f"  {C_DIM}Not recommended — reason given for each.{R}\n")
-            for s in report.skip_list:
-                _print_skip(s)
-            print()
-
-        # ── Footer ────────────────────────────────────────────
-        print(C_BORDER + "\n  " + "─" * W + R)
-        print(
-            f"  {C_DIM}Critical/High:{R} {C_CRITICAL}{len(report.critical_path)}{R}"
-            f"  {C_DIM}Chains:{R} {C_CHAIN}{len(report.chains)}{R}"
-            f"  {C_DIM}Optional:{R} {C_MEDIUM}{len(report.optional_intel)}{R}"
-            f"  {C_DIM}Skipped:{R} {C_SKIP}{len(report.skip_list)}{R}"
-        )
-        print(C_BORDER + "  " + "─" * W + R + "\n")
 
     # ============================
     # SYSTEM

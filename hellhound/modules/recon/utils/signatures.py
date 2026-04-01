@@ -1,7 +1,7 @@
 # Shared Technology and WAF Signatures
 
 WAF_SIGNATURES = {
-    "Cloudflare": ["cf-ray", "__cfduid", "cloudflare"],
+    "Cloudflare": ["cf-ray", "cf-cache-status", "cloudflare-nginx"],
     "Akamai": ["akamai-ghost", "akamaighost", "x-akamai"],
     "Sucuri": ["x-sucuri", "sucuri"],
     "Imperva": ["incapsula", "visid_incap", "nlbi_"],
@@ -9,7 +9,7 @@ WAF_SIGNATURES = {
     "Barracuda": ["barra_counter_scope", "bni_persistence"],
     "F5 BIG-IP": ["bigipserver", "mrhtool", "f5_cspm"],
     "Fortinet": ["fortiweb", "fortigate"],
-    "ModSecurity": ["mod_security", "no-cache=\"set-cookie\""],
+    "ModSecurity": ["mod_security", "modsec"],
     "DenyAll": ["sessioncookie=", "denyall"],
     "Radware": ["x-sl-compid", "x-rdw-"]
 }

@@ -99,105 +99,94 @@ class FidelityAuditor:
             r_g = self._req("guest", ep_url, headers=headers)
             if self._is_hit(r_g, r_a):
                 method_name = f"(via {list(headers.keys())[0]})" if bypass_h else "(Direct)"
-                self._add_finding("Missing Authentication", "Critical", ep_url, f"Guest accessed protected API {method_name}")
+                repro = {
+                    "url": ep_url,
+                    "method": "GET",
+                    "headers": dict(self.sessions["guest"].headers),
+                    "body": None
+                }
+                self._add_finding("Missing Authentication", "Critical", ep_url, f"Guest accessed protected API {method_name}", repro_context=repro)
                 self._critical_urls.add(ep_url); break
 
         # 3. RBAC/Vertical check
         is_admin_ep = any(k in ep_url.lower() for k in ADMIN_KEYWORDS)
         if is_admin_ep and ep_url not in self._critical_urls:
-            # If UserA (likely non-admin) can access administrative endpoints
-            # We assume UserA is our testing token
-            self._add_finding("Vertical Privilege Escalation", "High", ep_url, "Low-priv session accessed administrative resource")
+            r_b = self._req("userB", ep_url)
+            if self._is_hit(r_b, r_a):
+                repro = {
+                    "url": ep_url,
+                    "method": "GET",
+                    "headers": dict(self.sessions["userB"].headers),
+                    "body": None
+                }
+                self._add_finding("Vertical Privilege Escalation", "High", ep_url, "Low-priv session accessed administrative resource", repro_context=repro)
 
         # 4. UserB check (Horizontal Access Control)
         if ep_url not in self._critical_urls:
             r_b = self._req("userB", ep_url)
             if self._is_hit(r_b, r_a):
-                self._add_finding("Horizontal Authorization Bypass", "High", ep_url, "UserB accessed UserA resource")
+                repro = {
+                    "url": ep_url,
+                    "method": "GET",
+                    "headers": dict(self.sessions["userB"].headers),
+                    "body": None
+                }
+                self._add_finding("Horizontal Authorization Bypass", "High", ep_url, "UserB accessed UserA resource", repro_context=repro)
 
         # 5. Admin Action Validation (POST/PUT/DELETE)
         if ep_url not in self._critical_urls:
-            # If it's a sensitive path, try modifying
             if is_admin_ep:
                 for method in ("POST", "PUT", "DELETE"):
-                    # Empty body or simple update
                     payload = {"id": 1, "test": "logic-probe"}
-                    res = self.sessions["userA"].request(method, ep_url, json=payload, timeout=5)
-                    # 200/201/204 on an admin path for a non-admin is a HUGE hit
-                    if res.status_code in (200, 201, 204) and self._is_state_change_hit(res):
-                        self._add_finding(f"Unauthorized Admin Action — {method}", "Critical", ep_url, f"Non-admin performed state change via {method}")
+                    try:
+                        res = self.sessions["userA"].request(method, ep_url, json=payload, timeout=5)
+                        if res.status_code in (200, 201, 204) and self._is_state_change_hit(res):
+                            repro = {
+                                "url": ep_url,
+                                "method": method,
+                                "headers": dict(self.sessions["userA"].headers),
+                                "body": payload
+                            }
+                            self._add_finding(f"Unauthorized Admin Action — {method}", "Critical", ep_url, f"Non-admin performed state change via {method}", repro_context=repro)
+                    except: pass
 
-    def _is_hit(self, test_resp, baseline_resp) -> bool:
-        """Determines if a test response is a 'hit' based on similarity and content"""
-        if test_resp.status_code not in (200, 201, 204): return False
-        
-        # If response is almost identical to baseline, it's definitely a hit
-        # (This catches cases where userB sees userA's private dashboard)
-        ratio = difflib.SequenceMatcher(None, test_resp.text[:1000], baseline_resp.text[:1000]).ratio()
-        if ratio > 0.90: return True
-        
-        # If it's valid JSON and contains common 'Success' indicators
-        try:
-            data = test_resp.json()
-            if isinstance(data, dict):
-                # Strong indicator of success if response contains data/status success
-                if data.get("status") == "success" or "data" in data: return True
-                # Look for common user-specific fields that prove access
-                hit_fields = {"email", "username", "id", "role", "profile"}
-                if any(f in data for f in hit_fields): return True
-        except: pass
-        
-        return False
+    def _is_hit(self, r_test, r_base):
+        if r_test.status_code != r_base.status_code: return False
+        # If response length is significantly different, it's likely a custom 403 or error page
+        if abs(len(r_test.text) - len(r_base.text)) > 200: return False
+        # Compare content similarity
+        ratio = difflib.SequenceMatcher(None, r_test.text[:5000], r_base.text[:5000]).ratio()
+        return ratio > 0.85
 
-    def _is_state_change_hit(self, resp) -> bool:
-        """Checks if a state change request (POST/PUT) actually looks like a success"""
-        try:
-            data = resp.json()
-            if isinstance(data, dict):
-                # If the API says 'success' or returns the object
-                if data.get("status") == "success" or "data" in data: return True
-                if any(k in data for k in ("id", "message", "status")):
-                    # Check for error keywords
-                    msg = str(data).lower()
-                    if not any(e in msg for e in ("error", "fail", "denied", "forbidden", "unauthorized")):
-                        return True
-        except:
-            # If plain text contains success
-            if "success" in resp.text.lower() and resp.status_code < 400: return True
-        return False
+    def _is_state_change_hit(self, res):
+        # A successful state change usually returns a JSON status or remains 2xx
+        return res.status_code in (200, 201, 204)
 
-    def _check_exposure(self, resp, url):
-        try:
-            data = resp.json()
-            keys = set()
-            def find(d):
-                if isinstance(d, dict):
-                    for k, v in d.items(): keys.add(str(k).lower()); find(v)
-                elif isinstance(d, list):
-                    for i in d: find(i)
-            find(data)
-            leaks = keys.intersection(SENSITIVE_FIELDS)
-            if leaks:
-                self._add_finding("Excessive Data Exposure", "Medium", url, f"Endpoint returns sensitive fields: {', '.join(leaks)}")
-        except: pass
+    def _check_exposure(self, r, url):
+        # Scan for sensitive field exposure in baseline
+        leaks = [f for f in SENSITIVE_FIELDS if f in r.text]
+        if leaks:
+            self._add_finding("Excessive Data Exposure", "Medium", url, f"Endpoint returns sensitive fields: {', '.join(leaks)}")
 
-    def _req(self, role: str, url: str, headers: Dict = {}):
+    def _req(self, role, url, headers=None):
         try: return self.sessions[role].get(url, timeout=10, headers=headers, allow_redirects=False)
         except: return requests.Response()
 
-    def _add_finding(self, name, severity, ep, details):
+    def _add_finding(self, name, severity, ep, details, repro_context=None):
         with self._lock:
-            # Logic: If we already found a Critical Auth Bypass, don't spam lower sev findings for same URL
             if ep in self._critical_urls and severity != "Critical": return
             if any(f["endpoint"] == ep and f["vulnerability"] == name for f in self.findings): return
             
-            self.findings.append({
+            finding = {
                 "vulnerability": name, 
                 "severity": severity, 
                 "endpoint": ep, 
                 "details": details,
                 "proof": details
-            })
+            }
+            if repro_context:
+                finding["repro_data"] = repro_context
+            self.findings.append(finding)
             self.emit.warn(f"    [!] Discovery: {severity} - {name} @ {ep.split('/')[-1]}")
 
 def run(target: str, emit, options: Optional[Dict[str, Any]] = None):
@@ -208,15 +197,12 @@ def run(target: str, emit, options: Optional[Dict[str, Any]] = None):
     spider_intel = opt.get("spider_intel", {})
     all_eps = spider_intel.get("endpoints", [])
     
-    # Target Selection: Every endpoint is a candidate for logic flaws
     targets = {e.get("url") for e in all_eps if e.get("url")}
-    
-    # Priority sorting: check admin and auth-required first
     prio_targets = sorted(list(targets), key=lambda x: any(k in x.lower() for k in ADMIN_KEYWORDS), reverse=True)
     
     auditor = FidelityAuditor(target, mgr.sessions, emit)
     with ThreadPoolExecutor(max_workers=int(opt.get("threads", 20))) as pool:
-        pool.map(auditor.audit, prio_targets[:150]) # Limit to 150 high-value endpoints
+        pool.map(auditor.audit, prio_targets[:150])
 
     if not auditor.findings:
         emit.info("[-] No logic flaws discovered.")
@@ -229,7 +215,10 @@ def run(target: str, emit, options: Optional[Dict[str, Any]] = None):
 
     return {
         "raw": f"Discovered {len(auditor.findings)} logic flaws across the matrix.",
-        "intel": {"bac": {"findings": auditor.findings, "summary": summary, "risk_score": risk_score}},
+        "intel": {
+            "vulnerabilities": auditor.findings,
+            "bac": {"summary": summary, "risk_score": risk_score}
+        },
         "risk_score": risk_score,
         "parameter_sensitive": True
     }

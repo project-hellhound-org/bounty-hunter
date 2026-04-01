@@ -3894,6 +3894,13 @@ class IDORTester:
                         "poc_curl":          _poc_cmd,
                         "poc_browser":       _poc_browser,
                         "poc_session_label": _poc_label,
+                        # [HELLHOUND] Reproduction Data
+                        "repro_data": {
+                            "url": t_url,
+                            "method": method,
+                            "headers": dict(self.client_b.headers if not self.single_session else self.client_a.headers),
+                            "body": (t_params if method != "GET" else None)
+                        }
                     }
                     if self._record_finding(finding):
                         self._print_hit(finding)
@@ -3913,6 +3920,13 @@ class IDORTester:
                             "status":       unauth_resp.get("status"),
                             "body_snippet": (unauth_resp.get("body", "") or "")[:300],
                             "session":      "unauthenticated",
+                            # [HELLHOUND] Reproduction Data
+                            "repro_data": {
+                                "url": t_url,
+                                "method": method,
+                                "headers": dict(self.client_unauth.headers),
+                                "body": (t_params if method != "GET" else None)
+                            }
                         }
                         if self._record_finding(ua_finding):
                             tprint(
@@ -3969,6 +3983,13 @@ class IDORTester:
                         "poc_curl":          _poc_cmd,
                         "poc_browser":       _poc_browser,
                         "poc_session_label": _poc_label,
+                        # [HELLHOUND] Reproduction Data
+                        "repro_data": {
+                            "url": t_url,
+                            "method": method,
+                            "headers": dict(self.client_b.headers if not self.single_session else self.client_a.headers),
+                            "body": None
+                        }
                     }
                     if self._record_finding(finding):
                         self._print_hit(finding)
