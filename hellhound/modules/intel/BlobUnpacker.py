@@ -40,6 +40,7 @@ class BlobUnpacker:
         self.loot = {
             "reconstructed_files": [],
             "reconstructed_content": {}, # filename -> content
+            "minified_content": {},      # url -> content
             "secrets": [],
             "new_endpoints": [],
             "target_wordlist": []
@@ -144,6 +145,7 @@ class BlobUnpacker:
             if resp.status_code == 200:
                 # 1. Mine the JS file itself as it may contain secrets/routes even if minified
                 self._mine_content(resp.text, js_url)
+                self.loot["minified_content"][js_url] = resp.text
                 
                 # 2. Look for the map reference
                 match = MAP_COMMENT_REGEX.search(resp.text[-2000:]) # Usually at the end
@@ -205,6 +207,7 @@ def run(target, emit, options=None):
         "intel": {
             "reconstructed": unpacker.loot["reconstructed_files"],
             "reconstructed_content": unpacker.loot["reconstructed_content"],
+            "minified_content": unpacker.loot.get("minified_content", {}), # New link for SourceAuditor
             "secrets": unpacker.loot["secrets"],
             "new_endpoints": unpacker.loot["new_endpoints"],
             "wordlist_hints": list(set(unpacker.loot["target_wordlist"])),

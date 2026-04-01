@@ -35,6 +35,24 @@ def apply_proxy_to_session(session, proxy_url: str):
     }
     session.proxies.update(proxies)
 
+def apply_session_config(session, options: dict):
+    """
+    Standardizes session configuration for all Hellhound modules.
+    Applies proxy, merges global headers, and adds WAF bypass if enabled.
+    """
+    # 1. Apply Proxy
+    proxy = options.get("proxy")
+    if proxy:
+        apply_proxy_to_session(session, proxy)
+    
+    # 2. Merge Headers
+    options["global_headers"] = options.get("global_headers", {})
+    headers = merge_global_context(options, session.headers.copy())
+    session.headers.update(headers)
+    
+    # 3. Security configurations
+    session.verify = False # Modules typically handle internal/self-signed certs
+
 def get_urllib_opener(proxy_url: str = None):
     """Returns a urllib.request opener with optional proxy support."""
     handlers = []

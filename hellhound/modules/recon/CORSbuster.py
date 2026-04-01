@@ -130,7 +130,12 @@ def run(target, emit, options=None):
                         "type": vuln_type,
                         "payload": payload,
                         "credentials_allowed": acac,
-                        "poc_html": generate_poc(url, payload, acac)
+                        "poc_html": generate_poc(url, payload, acac),
+                        "repro_data": {
+                            "method": "OPTIONS",
+                            "url": url,
+                            "headers": {"Origin": payload}
+                        }
                     }
                     findings.append(finding)
                     risk_score += risk_val

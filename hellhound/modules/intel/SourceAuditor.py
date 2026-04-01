@@ -103,7 +103,7 @@ class SourceAuditor:
             "ai_insights": []
         }
 
-    def audit_file(self, content, filename, use_ai=False, ai_key=None, ai_provider="gemini"):
+    def audit_file(self, content, filename, use_ai=False, ai_key=None, ai_provider="gemini", ai_model="gemini-1.5-flash-latest"):
         file_findings = []
         for sig in SIGNATURES:
             match = re.search(sig["pattern"], content, re.IGNORECASE)
@@ -115,7 +115,12 @@ class SourceAuditor:
                     "severity": sig["severity"],
                     "type": sig["type"],
                     "file": filename,
-                    "ai_verified": False
+                    "ai_verified": False,
+                    "repro_data": {
+                        "type": "static_analysis",
+                        "file": filename,
+                        "pattern": sig["pattern"]
+                    }
                 }
                 
                 # Perform Deep AI Audit if requested and high severity
@@ -125,18 +130,19 @@ class SourceAuditor:
                     end = min(len(content), match.end() + 500)
                     snippet = content[start:end]
                     
-                    self.emit.info(f"      [AI] Deep auditing {sig['id']} in {filename} ({ai_provider})...")
+                    self.emit.info(f"      [AI] Deep auditing {sig['id']} in {filename} ({ai_provider}/{ai_model})...")
                     prompt = ai_utils.format_audit_prompt(snippet, sig["name"])
-                    ai_result = ai_utils.call_ai(prompt, ai_provider, ai_key)
+                    ai_result = ai_utils.call_ai(prompt, ai_provider, ai_key, model=ai_model, system_prompt=ai_utils.AUDIT_PERSONA)
                     
-                    if "TRUE POSITIVE" in ai_result.upper():
-                        finding["ai_verified"] = True
-                        finding["ai_insight"] = ai_result
-                        self.emit.success(f"      [AI] confirmed TRUE POSITIVE for {sig['id']}")
-                    elif "FALSE POSITIVE" in ai_result.upper():
-                        finding["severity"] = 1 # Downgrade
-                        finding["ai_insight"] = ai_result
-                        self.emit.warn(f"      [AI] flagged FALSE POSITIVE for {sig['id']}")
+                    if ai_result:
+                        if "TRUE POSITIVE" in ai_result.upper():
+                            finding["ai_verified"] = True
+                            finding["ai_insight"] = ai_result
+                            self.emit.success(f"      [AI] confirmed TRUE POSITIVE for {sig['id']}")
+                        elif "FALSE POSITIVE" in ai_result.upper():
+                            finding["severity"] = 1 # Downgrade
+                            finding["ai_insight"] = ai_result
+                            self.emit.warn(f"      [AI] flagged FALSE POSITIVE for {sig['id']}")
 
                 file_findings.append(finding)
                 self.loot["vulnerabilities"].append(finding)
@@ -150,27 +156,18 @@ def run(target, emit, options=None):
     host = urlparse(target).netloc.replace(":", "_")
     source_dir = os.path.join(os.getcwd(), "reconstructed_source", host)
 
-    if not os.path.exists(source_dir):
-        # Fallback: check if content was passed in options (auto-fed from BlobUnpacker)
-        opt = options or {}
-        blob_intel = opt.get("blobunpacker_intel", {})
-        reconstructed_content = blob_intel.get("reconstructed_content", {})
-        
-        if not reconstructed_content:
-            # Backup: check for direct reconstructed_content if manually passed
-            reconstructed_content = opt.get("reconstructed_content", {})
+    # Ensure we use global AI settings from options if provided
+    ai_key = options.get("ai_key")
+    ai_provider = options.get("ai_provider", "gemini")
+    ai_model = options.get("ai_model", "gemini-1.5-flash")
 
-        if reconstructed_content:
-            emit.info(f"    [i] Auditing {len(reconstructed_content)} files from memory...")
-            for filename, content in reconstructed_content.items():
-                auditor.audit_file(content, filename, use_ai=opt.get("use_ai"), 
-                                 ai_key=opt.get("ai_key"), ai_provider=opt.get("ai_provider", "gemini"))
-                auditor.loot["files_scanned"] += 1
-        else:
-            emit.warn("    [!] No reconstructed source found. Run 'BlobUnpacker' first.")
-            return {"raw": "No source files found for auditing.", "intel": {}, "risk_score": 0}
-    else:
-        emit.info(f"    [i] Auditing files in {source_dir}...")
+    # Zero-Config AI: Auto-enable if key is present
+    use_ai = options.get("use_ai", False)
+    if ai_key and not options.get("use_ai_disabled"):
+        use_ai = True
+        
+    if os.path.exists(source_dir):
+        emit.info(f"    [i] Auditing files in {source_dir} (AI: {'ENABLED' if use_ai else 'OFF'})...")
         for root, _, files in os.walk(source_dir):
             for file in files:
                 filepath = os.path.join(root, file)
@@ -178,11 +175,35 @@ def run(target, emit, options=None):
                 try:
                     with open(filepath, "r", encoding="utf-8") as f:
                         content = f.read()
-                        auditor.audit_file(content, rel_path, use_ai=options.get("use_ai"), 
-                                         ai_key=options.get("ai_key"), ai_provider=options.get("ai_provider", "gemini"))
+                        auditor.audit_file(content, rel_path, use_ai=use_ai, 
+                                         ai_key=ai_key, ai_provider=ai_provider,
+                                         ai_model=ai_model)
                         auditor.loot["files_scanned"] += 1
                 except:
                     pass
+    else:
+        blob_intel = options.get("blobunpacker_intel", {})
+        reconstructed_content = blob_intel.get("reconstructed_content", {})
+        minified_content = blob_intel.get("minified_content", {}) 
+        
+        if not reconstructed_content and minified_content:
+            emit.info(f"    [i] Auditing {len(minified_content)} minified files from memory (AI: {'ENABLED' if use_ai else 'OFF'})...")
+            for url, content in minified_content.items():
+                filename = url.split("/")[-1]
+                auditor.audit_file(content, filename, use_ai=use_ai, 
+                                 ai_key=ai_key, ai_provider=ai_provider,
+                                 ai_model=ai_model)
+                auditor.loot["files_scanned"] += 1
+        elif reconstructed_content:
+            emit.info(f"    [i] Auditing {len(reconstructed_content)} reconstructed files from memory (AI: {'ENABLED' if use_ai else 'OFF'})...")
+            for filename, content in reconstructed_content.items():
+                auditor.audit_file(content, filename, use_ai=use_ai, 
+                                 ai_key=ai_key, ai_provider=ai_provider,
+                                 ai_model=ai_model)
+                auditor.loot["files_scanned"] += 1
+        else:
+            emit.warn("    [!] No source found (reconstructed or minified). Run 'BlobUnpacker' first.")
+            return {"raw": "No source files found for auditing.", "intel": {}, "risk_score": 0}
 
     # Calculate Risk Score
     max_severity = 0

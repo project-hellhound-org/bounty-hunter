@@ -1,5 +1,6 @@
 import requests
 import re
+import urllib.parse
 from bs4 import BeautifulSoup
 from hellhound.core import http_utils
 
@@ -100,8 +101,14 @@ def run(target, emit, options=None):
             detected_tech.append(gen["content"])
 
         # --- Phase 2: Active Triggering ---
-        emit.info("    [i] Performing active WAF triggering...")
-        active_results = active_trigger(base_url, emit, session=session)
+        parsed_target = urllib.parse.urlparse(base_url).netloc.split(":")[0].lower()
+        if parsed_target in ("localhost", "127.0.0.1", "0.0.0.0"):
+             emit.info("    [i] Local target detected — skipping active WAF triggering")
+             active_results = []
+        else:
+             emit.info("    [i] Performing active WAF triggering...")
+             active_results = active_trigger(base_url, emit, session=session)
+             
         detected_wafs.extend(active_results)
 
     except Exception as e:

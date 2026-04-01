@@ -8,6 +8,10 @@ from urllib.parse import urlparse
 NAME = "jwt_analyzer"
 CATEGORY = "recon"
 DESCRIPTION = "Advanced JWT analysis with automated brute-forcing and algorithm confusion testing"
+OPTIONS = [
+    {"name": "token", "default": None, "required": False, "help": "Manual JWT token to analyze"},
+    {"name": "cookie", "default": None, "required": False, "help": "Cookie string to extract JWT from (format: key=jwt_val)"}
+]
 
 COMMON_SECRETS = [
     "secret", "123456", "password", "key", "jwt", "admin", "12345678", 
@@ -89,6 +93,11 @@ def run(target, emit, options=None):
     
     if token_opt := options.get("token") if options else None:
         tokens.add((token_opt, "manual"))
+    
+    if cookie_opt := options.get("cookie") if options else None:
+        # Extract everything that looks like a JWT from the cookie string
+        matches = re.findall(r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+", str(cookie_opt))
+        for m in matches: tokens.add((m, "manual_cookie"))
 
     if not tokens:
         emit.info("[-] No JWTs discovered.")
