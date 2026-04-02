@@ -70,7 +70,7 @@ Hellhound utilizes an interactive console designed for speed and modularity.
 
 ### 1. Initialize Intelligence (Zero-Config)
 ```bash
-hellhound > prey http://juice-shop.herokuapp.com
+hellhound > prey http://example.com
 hellhound > setg ai_key sk-xxxxxxxxxxxx
 ```
 *Hellhound will instantly discover the best model, verify your quota, and persist the connection.*
