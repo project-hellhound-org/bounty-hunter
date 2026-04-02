@@ -84,9 +84,13 @@ def run(target, emit, options=None):
     payloads = [
         "https://evil.com", 
         "null", 
-        f"https://{domain}.evil.com", # Post-domain trust
-        f"https://evil{domain}",      # Pre-domain trust
-        f"http://{domain}"            # HTTP trust on HTTPS
+        f"https://{domain}.evil.com",    # Post-domain trust (subdomain of evil)
+        f"https://evil{domain}",         # Pre-domain trust (joined word)
+        f"https://{domain}evil.com",     # Post-domain trust (joined word)
+        f"http://{domain}",              # HTTP trust on HTTPS
+        f"https://sub.{domain}.evil.com", # Deep subdomain of evil
+        f"https://{domain}.local",       # Local variant trust
+        f"https://{domain.replace('.', '-')}.evil.com" # Hyphenated variant
     ]
     
     findings = []

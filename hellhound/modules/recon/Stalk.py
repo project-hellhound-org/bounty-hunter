@@ -422,17 +422,18 @@ def harvest_banners(domain: str, collector: IntelCollector, emit, timeout: int):
 
 def _detect_wildcard(domain: str, emit) -> Set[str]:
     """
-    Resolve 3 random canary subdomains.
+    Resolve 8 random canary subdomains.
     CDN providers (Cloudflare, Fastly) load-balance across multiple anycast IPs —
-    a single canary only catches one of them. Three canaries builds the full set.
+    a single canary only catches one of them. Eight canaries builds a more robust set.
     Returns the set of wildcard IPs (empty set = no wildcard).
     """
     import random
     import string
     wildcard_ips: Set[str] = set()
+    # Increase to 8 canaries for better coverage of CDN IP pools
     canaries = [
-        f"stalk-{''.join(random.choices(string.ascii_lowercase, k=8))}.{domain}"
-        for _ in range(3)
+        f"stalk-{''.join(random.choices(string.ascii_lowercase, k=10))}.{domain}"
+        for _ in range(8)
     ]
     for canary in canaries:
         try:
@@ -443,9 +444,9 @@ def _detect_wildcard(domain: str, emit) -> Set[str]:
 
     if wildcard_ips:
         emit.warn(f"Wildcard DNS detected: *.{domain} → {', '.join(sorted(wildcard_ips))}")
-        emit.warn(f"{len(wildcard_ips)} wildcard IP(s) will be filtered from permutation results")
+        emit.info(f"    [!] {len(wildcard_ips)} wildcard IP(s) will be filtered from ALL results")
     else:
-        emit.info("No wildcard DNS detected — permutation brute is clean")
+        emit.info("No wildcard DNS detected — active discovery is clean")
     return wildcard_ips
 
 
@@ -489,11 +490,12 @@ def active_dns_permutation(
     emit,
     depth: str,
     concurrency: int,
+    wildcard_ips: Set[str],
     timeout: int = 8,
 ):
     emit.info("  [*] DNS permutation bruteforce...")
 
-    wildcard_ips = _detect_wildcard(domain, emit)
+    # Wildcard detection moved to run() entry point for global availability
     behind_cdn = len(wildcard_ips) > 0
 
     wordlist = SUBDOMAIN_PERMUTATIONS_FULL if depth == "full" else SUBDOMAIN_PERMUTATIONS_COMMON
@@ -552,7 +554,7 @@ def active_dns_permutation(
         emit.success(f"DNS permutation: {confirmed} live subdomains confirmed")
 
 
-def active_resolve_passive_subdomains(collector: IntelCollector, emit, concurrency: int):
+def active_resolve_passive_subdomains(collector: IntelCollector, emit, concurrency: int, wildcard_ips: Set[str]):
     emit.info("  [*] Resolving passive subdomains (DNS A-record confirmation)...")
     unresolved = [s for s in collector.subdomains if not s["resolved"]]
     if not unresolved:
@@ -560,6 +562,7 @@ def active_resolve_passive_subdomains(collector: IntelCollector, emit, concurren
         return
 
     confirmed = 0
+    filtered = 0
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         fut_to_sub = {pool.submit(_resolve_host, s["host"]): s for s in unresolved}
         for fut in as_completed(fut_to_sub):
@@ -567,6 +570,10 @@ def active_resolve_passive_subdomains(collector: IntelCollector, emit, concurren
             try:
                 ip = fut.result()
                 if ip:
+                    # FIX: Filter passive resolution hits against wildcard DNS IPs
+                    if wildcard_ips and ip in wildcard_ips:
+                        filtered += 1
+                        continue
                     with collector._lock:
                         sub["resolved"] = True
                         sub["ip"] = ip
@@ -574,6 +581,8 @@ def active_resolve_passive_subdomains(collector: IntelCollector, emit, concurren
             except Exception:
                 pass
 
+    if filtered:
+        emit.info(f"    [-] {filtered} legacy passive hits filtered (wildcard noise)")
     emit.success(f"Resolution pass: {confirmed}/{len(unresolved)} passive hosts live")
 
 
@@ -812,6 +821,15 @@ def run(target: str, emit, options: Optional[Dict[str, Any]] = None):
 
     domain = _normalise_domain(target)
     emit.always_info(f"Stalk v2.0 — Hybrid OSINT Engine")
+    # ── PHASE 0: PRE-FLIGHT ────────────────────────────────────
+    # Identify local machine to prevent ghost results / recursive local loop
+    local_host = socket.gethostname().lower()
+    if domain in ("localhost", "127.0.0.1", "0.0.0.0", local_host, f"{local_host}.local", f"{local_host}.lan"):
+        emit.warn(f"Target matches local hostname/loopback ({domain})")
+        emit.info("    [i] Stalk will skip interactive active probes to prevent False Positives.")
+        # We still return the collector but with limited scope
+        return {"raw": "Local machine scan skipped for safety", "intel": {}, "risk_score": 0}
+
     emit.info(f"Target domain: {domain}")
     emit.info(f"Concurrency: {concurrency} | Depth: {depth} | Wayback limit: {wayback_lim}")
 
@@ -824,6 +842,10 @@ def run(target: str, emit, options: Optional[Dict[str, Any]] = None):
     harvest_wayback(domain, collector, emit, wayback_lim, timeout)
     harvest_dorks(domain, collector, emit, timeout)
     harvest_banners(domain, collector, emit, timeout)
+    
+    # ── WILDCARD DETECTION (Global Filter) ────────────────────
+    # Perform wildcard detection BEFORE active resolution to filter passive findings
+    wildcard_ips = _detect_wildcard(domain, emit)
 
     emit.info("")
     emit.info(f"[*] Phase 1 complete — {len(collector.subdomains)} subdomains, "
@@ -836,9 +858,9 @@ def run(target: str, emit, options: Optional[Dict[str, Any]] = None):
     emit.section("PHASE 2: ACTIVE CONFIRMATION")
 
     if do_resolve:
-        active_resolve_passive_subdomains(collector, emit, concurrency)
+        active_resolve_passive_subdomains(collector, emit, concurrency, wildcard_ips)
 
-    active_dns_permutation(domain, collector, emit, depth, concurrency, timeout)
+    active_dns_permutation(domain, collector, emit, depth, concurrency, wildcard_ips, timeout)
     active_git_detection(collector, emit, timeout, concurrency)
 
     if do_cloud:
