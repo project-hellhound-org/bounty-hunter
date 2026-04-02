@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  HELLHOUND — Agent 30: IDOR_UserData_Detector  v1.2                        ║
+║  HELLHOUND — IDOR_UserData_Detector  v1.2                                 ║
 ║  Insecure Direct Object Reference — User Data Variant                      ║
 ║                                                                             ║
 ║  Pipeline:                                                                  ║
-║    1. Threaded crawler + JS/SPA endpoint extraction (same as HELLHOUND)    ║
+║    1. Threaded crawler + JS/SPA endpoint extraction (shared)               ║
 ║    2. IDOR surface detection — URL path segments, query params, body keys  ║
 ║       carrying numeric/UUID/slug identifiers                                ║
 ║    3. Dual-user authentication (User A + User B)                           ║
@@ -99,7 +99,7 @@ def vprint(*a, **kw):
 # ─────────────────────────────────────────────────────────────────────────────
 NAME = "idordetector"
 CATEGORY = "vuln"
-DESCRIPTION = "Agent 30: IDOR_UserData_Detector v1.2"
+DESCRIPTION = "Horizontal & Vertical Insecure Direct Object Reference Detector"
 AUTHOR = "Hellhound Framework"
 
 OPTIONS = [
@@ -4347,10 +4347,10 @@ def export_json(findings, target, stats, out_path):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SPIDER BRIDGE
-# Ingests Agent 2 / HELLHOUND spider JSON output and converts it to the
+# Ingests Hellhound Spider / HELLHOUND spider JSON output and converts it to the
 # standard internal endpoint list used throughout this agent.
 #
-# Accepted spider JSON schema (Agent 2 compatible):
+# Accepted spider JSON schema (Hellhound Spider compatible):
 #   {
 #     "target":    "http://...",          # optional
 #     "endpoints": [                      # or "urls" / "results"
@@ -4384,7 +4384,7 @@ class SpiderBridge:
     # Param bucket priority order — higher buckets = higher IDOR confidence
     _BUCKET_ORDER    = ["runtime", "query", "openapi", "js", "form"]
     _PRIORITY_BUCKETS = {"runtime", "query"}
-    # Strip common suffixes Agent 2 sometimes appends
+    # Strip common suffixes Hellhound Spider sometimes appends
     _STRIP_SFX = re.compile(
         r'^(.+?)(?:_raw|_sanitized|_input|_clean|_safe|_encoded|_value)$', re.I)
     # Auth params: skip injecting these (passwords, tokens, CSRF)
@@ -4497,7 +4497,7 @@ class SpiderBridge:
                 is_bucketed = any(isinstance(v, list)
                                   for v in raw_params.values())
                 if is_bucketed:
-                    # Agent 2 bucketed format
+                    # Hellhound Spider bucketed format
                     for bucket in self._BUCKET_ORDER:
                         for pname in (raw_params.get(bucket) or []):
                             pk = self._strip(pname)
@@ -4760,7 +4760,7 @@ def build_parser():
 
     gs = p.add_argument_group("Spider integration")
     gs.add_argument("--spider-json",   metavar="FILE",
-                    help="Load endpoints from an Agent 2 / HELLHOUND spider JSON file.\n"
+                    help="Load endpoints from an Hellhound Spider / HELLHOUND spider JSON file.\n"
                          "Skips the built-in crawler entirely.\n"
                          "Schema: {target, endpoints:[{url, methods, params:{query,form,js,...}}]}")
     gs.add_argument("--spider",        metavar="FILE",

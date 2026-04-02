@@ -53,11 +53,14 @@ Hellhound's AI Core has been refactored for professional offensive speed:
 | Layer | Module | Purpose | AI Persona |
 | :--- | :--- | :--- | :--- |
 | **Recon** | **Spider** | Deep SPA/API Surface Mapping | The Strategist |
-| **Intel** | **BlobUnpacker** | Source Reconstruction | The Architect |
-| **Intel** | **SourceAuditor** | Static Analysis | **Deep Logic Auditor** |
-| **Vuln** | **IDORdetector** | Object Scoping | Logic Prediction |
-| **Vuln** | **BACdetector** | Access Control Flaws | Role Matrix Audit |
-| **Exploit** | **CMDinj** | RCE Confirmation | Payload Optimization |
+| **Recon** | **Stalk** | Passive OSINT & Passive Recon | The Observer |
+| **Intel** | **BlobUnpacker** | Source Reconstruction from Maps | The Architect |
+| **Intel** | **SourceAuditor** | Static Analysis & Sink Detection | **Deep Logic Auditor** |
+| **Intel** | **SecretScanner** | API Key & Secret Extraction | The Harvester |
+| **Vuln** | **IDORdetector** | Object Scoping & IDOR Auditor | Logic Prediction |
+| **Vuln** | **PATHtraveller** | 6-Tier Path Traversal Auditor | The Navigator |
+| **Vuln** | **RBAC** | Multi-Role Privilege Escalation | Role Matrix Audit |
+| **Exploit** | **CMDinj** | RCE Confirmation & Proof | The Executioner |
 
 ---
 
@@ -75,7 +78,8 @@ hellhound > setg ai_key sk-xxxxxxxxxxxx
 ### 2. Map & Audit
 ```bash
 hellhound [Spider] > strike
-hellhound [SourceAuditor] > strike
+hellhound [PATHtraveller] > strike
+hellhound [RBAC] > strike
 ```
 *Modules will automatically utilize AI insights if a key is available.*
 
