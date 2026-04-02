@@ -90,6 +90,22 @@ SIGNATURES = [
         "description": "Potential hidden administrative or debugging route found in source code.",
         "severity": 5,
         "type": "Information Disclosure"
+    },
+    {
+        "id": "SA-011",
+        "name": "Prototype Pollution",
+        "pattern": r'__proto__|constructor\[["\']prototype["\']\]|Object\.assign\s*\(|jQuery\.extend\s*\(\s*(?:true|false)\s*,',
+        "description": "Unsafe object merging or prototype access detected. Vulnerable to Prototype Pollution which can lead to RCE or Logic Bypass.",
+        "severity": 8,
+        "type": "Prototype Pollution"
+    },
+    {
+        "id": "SA-012",
+        "name": "Insecure postMessage Listener",
+        "pattern": r'\.addEventListener\s*\(\s*["\']message["\']|window\.onmessage\s*=',
+        "description": "Web Messaging (postMessage) listener without origin validation can lead to XSS or sensitive data theft.",
+        "severity": 7,
+        "type": "Cross-Window Communication"
     }
 ]
 
@@ -106,8 +122,11 @@ class SourceAuditor:
     def audit_file(self, content, filename, use_ai=False, ai_key=None, ai_provider="gemini", ai_model="gemini-1.5-flash-latest"):
         file_findings = []
         for sig in SIGNATURES:
-            match = re.search(sig["pattern"], content, re.IGNORECASE)
-            if match:
+            # Use finditer to catch ALL instances in the file (Joe-Style thoroughness)
+            for match in re.finditer(sig["pattern"], content, re.IGNORECASE):
+                # Extract line number
+                line_no = content.count('\n', 0, match.start()) + 1
+                
                 finding = {
                     "id": sig["id"],
                     "name": sig["name"],
@@ -115,33 +134,38 @@ class SourceAuditor:
                     "severity": sig["severity"],
                     "type": sig["type"],
                     "file": filename,
+                    "line": line_no,
                     "ai_verified": False,
                     "repro_data": {
                         "type": "static_analysis",
                         "file": filename,
-                        "pattern": sig["pattern"]
+                        "line": line_no,
+                        "pattern": sig["pattern"],
+                        "context": content[max(0, match.start()-40):min(len(content), match.end()+40)].strip()
                     }
                 }
                 
-                # Perform Deep AI Audit if requested and high severity
-                if use_ai and ai_key and sig["severity"] >= 7:
-                    # Extract context (20 lines around match)
+                # Perform Deep AI Audit if requested, high severity, and unique finding
+                # (We only AI-audit the FIRST occurrence of a signature in a file to save tokens/time)
+                is_first_of_type = not any(f["id"] == sig["id"] for f in file_findings)
+                
+                if use_ai and ai_key and sig["severity"] >= 7 and is_first_of_type:
+                    # Extract larger context (1000 chars)
                     start = max(0, match.start() - 500)
                     end = min(len(content), match.end() + 500)
                     snippet = content[start:end]
                     
-                    self.emit.info(f"      [AI] Deep auditing {sig['id']} in {filename} ({ai_provider}/{ai_model})...")
+                    self.emit.info(f"      [AI] Deep auditing {sig['id']} in {filename} (line {line_no})...")
                     prompt = ai_utils.format_audit_prompt(snippet, sig["name"])
                     ai_result = ai_utils.call_ai(prompt, ai_provider, ai_key, model=ai_model, system_prompt=ai_utils.AUDIT_PERSONA)
                     
                     if ai_result:
+                        finding["ai_insight"] = ai_result
                         if "TRUE POSITIVE" in ai_result.upper():
                             finding["ai_verified"] = True
-                            finding["ai_insight"] = ai_result
                             self.emit.success(f"      [AI] confirmed TRUE POSITIVE for {sig['id']}")
                         elif "FALSE POSITIVE" in ai_result.upper():
                             finding["severity"] = 1 # Downgrade
-                            finding["ai_insight"] = ai_result
                             self.emit.warn(f"      [AI] flagged FALSE POSITIVE for {sig['id']}")
 
                 file_findings.append(finding)
