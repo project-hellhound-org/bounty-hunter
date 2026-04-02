@@ -4335,7 +4335,7 @@ def export_json(findings, target, stats, out_path):
 
     stats = {**stats, "findings": len(enriched)}
     payload = {
-        "agent":    "HELLHOUND-Agent30-IDOR_UserData_Detector",
+        "module_id": "HELLHOUND-Vuln-IDOR",
         "version":  "1.3.0",
         "target":   target,
         "stats":    stats,
@@ -4729,7 +4729,7 @@ class SpiderBridge:
         ]
 
         payload = {
-            "agent":      "HELLHOUND-Agent30-IDOR_UserData_Detector",
+            "module_id":  "HELLHOUND-Vuln-IDOR",
             "version":    "1.3.0",
             "target":     target,
             "endpoints":  export_eps,
@@ -4750,8 +4750,8 @@ class SpiderBridge:
 # ─────────────────────────────────────────────────────────────────────────────
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="idor_agent30",
-        description="HELLHOUND Agent 30 — IDOR_UserData_Detector v1.3",
+        prog="idor_auditor",
+        description="HELLHOUND IDOR Auditor v1.3",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     p.add_argument("target", nargs="?", default=None,
@@ -4788,7 +4788,7 @@ def build_parser():
     ga.add_argument("--auto-register",     action="store_true",
                     help="Auto-create two test accounts via the app's register form.\n"
                          "Use when no existing accounts are available.\n"
-                         "Agent discovers the register endpoint automatically.")
+                         "The module discovers the register endpoint automatically.")
 
     gb = p.add_argument_group("User B (attacker session) — optional for single-session BAC mode")
     gb.add_argument("--cookie-b",          metavar="COOKIE",
