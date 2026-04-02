@@ -115,10 +115,17 @@ class BlobUnpacker:
                 # If it's a tuple (from groups), take the first group
                 val = m[0] if isinstance(m, tuple) else m
                 if val and len(val) > 4:
-                    # Garbage Filter: If it looks like code (short words + brackets/operators), skip it
-                    if any(c in val for c in ["{", "}", "(", ")", ";", "=>", "return"]):
+                    # Garbage Filter: If it looks like code (common JS words + brackets)
+                    garbage_words = ["handle", "onPress", "firesOn", "callback", "return", "function", "const", "let", "var"]
+                    if any(w in val.lower() for w in garbage_words) or any(c in val for c in ["{", "}", "(", ")", ";", "=>"]):
                         continue
                         
+                    # Entropy Validation: Most real secrets have entropy > 3.5
+                    if label in ["AWS Secret Key", "Generic Secret"]:
+                        entropy = shannon_entropy(val)
+                        if entropy < 3.2: # Likely code or predictable string
+                            continue
+                            
                     # Deduplication: If this exact content was already found as a specialized key, skip generic
                     if label == "Generic Secret":
                         if any(s["content"] == val for s in self.loot["secrets"] if s["type"] != "Generic Secret"):
