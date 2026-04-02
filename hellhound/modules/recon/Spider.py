@@ -672,11 +672,12 @@ class Extractor:
         (r'["\']([0-9a-fA-F]{32})["\']',                                  "Possible_MD5"),
     ]
     _API_RE = [
-        r'["\']([/][a-zA-Z0-9_\-\.\/]*(?:api|v\d+|graphql|admin|auth|login|logout|rest|search|data|internal|upload|download)[a-zA-Z0-9_\-\.\/]*(?:\?[^"\'#\s]*)?)["\']',
-        r'(?:fetch|axios)\s*\(\s*["\']([^"\'#\s]{5,})["\']',
-        r'\.\s*(?:get|post|put|delete|patch)\s*\(\s*["\']([^"\'#\s]{5,})["\']',
+        r'["\']([/][a-zA-Z0-9_\-\.\/]*(?:api|v\d+|graphql|admin|auth|login|logout|rest|search|data|internal|upload|download|config|settings|user|profile|account|msg|post|comment|item|product|cart|checkout|pay|order|invoice|report|log|status|health|healthcheck|metrics|debug|test|dev|internal|hidden)[a-zA-Z0-9_\-\.\/]*(?:\?[^"\'#\s]*)?)["\']',
+        r'(?:fetch|axios|request|api|service)\s*\(\s*["\']([^"\'#\s]{5,})["\']',
+        r'\.\s*(?:get|post|put|delete|patch|head|options)\s*\(\s*["\']([^"\'#\s]{5,})["\']',
         r'`\$\{[^}]+\}(/[a-zA-Z0-9_\-\/]+(?:\?[^`#\s]*)?)`',
-        r'(?:fetch|axios|\.\s*(?:get|post|put|delete|patch))\s*\(\s*["\']([/][^"\'#\s]{3,})["\']',
+        r'(?:path|route|url|endpoint|action|href)\s*[:=]\s*["\']([/][^"\'#\s]{3,})["\']',
+        r'["\']((?:https?://|//)[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}(?::\d+)?(?:/[a-zA-Z0-9_\-\.\/]*)*)["\']',
     ]
 
     @classmethod

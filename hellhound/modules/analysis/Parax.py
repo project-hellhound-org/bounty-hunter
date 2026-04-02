@@ -6,20 +6,24 @@ DESCRIPTION = "Advanced parameter risk analysis (SQLi, IDOR, XSS, LFI, Open Redi
 
 # Keyword heuristics (substring-based, not strict match)
 RISK_PATTERNS = {
-    "IDOR_POTENTIAL": ["id", "uid", "user", "account", "profile", "member", "owner", "author", "pid", "msg_id"],
-    "SQLI_POTENTIAL": ["search", "query", "select", "where", "filter", "bslug", "slug", "term", "key"],
-    "XSS_POTENTIAL": ["name", "msg", "comment", "input", "text", "bio", "title", "body", "subject"],
-    "OPEN_REDIRECT": ["redirect", "next", "url", "return", "dest", "destination", "forward"],
-    "LFI_POTENTIAL": ["file", "page", "path", "template", "doc", "layout", "inc"],
-    "COMMAND_INJECTION": ["cmd", "exec", "system", "shell", "host", "ping", "ip"]
+    "IDOR_POTENTIAL": ["id", "uid", "user", "account", "profile", "member", "owner", "author", "pid", "msg_id", "order", "invoice", "doc"],
+    "SQLI_POTENTIAL": ["search", "query", "select", "where", "filter", "bslug", "slug", "term", "key", "sort", "order", "by"],
+    "XSS_POTENTIAL": ["name", "msg", "comment", "input", "text", "bio", "title", "body", "subject", "message", "description"],
+    "OPEN_REDIRECT": ["redirect", "next", "url", "return", "dest", "destination", "forward", "goto", "callback", "oauth_callback"],
+    "LFI_POTENTIAL": ["file", "page", "path", "template", "doc", "layout", "inc", "resource", "action", "load"],
+    "COMMAND_INJECTION": ["cmd", "exec", "system", "shell", "host", "ping", "ip", "process", "service"],
+    "SSRF_POTENTIAL": ["url", "link", "src", "source", "proxy", "request", "domain", "host", "site", "target"],
+    "DATA_LEAK_POTENTIAL": ["email", "token", "auth", "session", "secret", "key", "config", "debug", "env"]
 }
 
 SEVERITY_SCORE = {
     "COMMAND_INJECTION": 5,
     "SQLI_POTENTIAL": 4,
     "LFI_POTENTIAL": 4,
+    "SSRF_POTENTIAL": 4,
     "IDOR_POTENTIAL": 3,
     "XSS_POTENTIAL": 3,
+    "DATA_LEAK_POTENTIAL": 3,
     "OPEN_REDIRECT": 2
 }
 

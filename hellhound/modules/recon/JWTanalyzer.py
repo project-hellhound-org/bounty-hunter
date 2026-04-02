@@ -15,7 +15,10 @@ OPTIONS = [
 
 COMMON_SECRETS = [
     "secret", "123456", "password", "key", "jwt", "admin", "12345678", 
-    "qwerty", "supersecret", "changeit", "access", "root", "dev", "test"
+    "qwerty", "supersecret", "changeit", "access", "root", "dev", "test",
+    "private", "public", "master", "default", "guest", "webmaster",
+    "0123456789", "111111", "abcdef", "identity", "auth", "security",
+    "development", "production", "staging"
 ]
 
 def pad_base64(data):
@@ -61,18 +64,33 @@ def analyze_jwt(token, source, target_url=None):
         if weak_secret:
             findings["vulnerabilities"].append(f"CRITICAL: Weak HS256 secret found: {weak_secret}")
     
-    # 3. Algorithm Confusion (Logic only, needs user to provide pubkey if available)
+    # 3. Algorithm Confusion Detection
     if alg == "rs256":
         findings["vulnerabilities"].append("INFO: RS256 found. Potential for algorithm confusion if public key is leaked.")
+        # Rule: If RS256 is used, any exposed public keys in the same target should be flagged for downgrade testing
+        findings["vulnerabilities"].append("ACTION: Test RS256 -> HS256 downgrade using any discovered public keys.")
 
     # 4. Header Injections (kid)
     kid = findings["header"].get("kid")
     if kid and isinstance(kid, str):
-        if any(c in kid for c in ["../", "/", "\\", "'", "\"", " "]):
-            findings["vulnerabilities"].append(f"MEDIUM: Potential 'kid' injection/traversal: {kid}")
+        # Deterministic injection patterns
+        injection_indicators = {
+            "SQLi": ["'", "\"", "--", ";", "UNION", "SELECT"],
+            "LFI/Traversal": ["../", "..\\", "/etc/passwd"],
+            "Command Injection": ["|", "&", "$(", "`", ";"],
+            "XSS": ["<img", "<script", "javascript:"]
+        }
+        
+        for vuln, patterns in injection_indicators.items():
+            if any(p in kid for p in patterns):
+                findings["vulnerabilities"].append(f"HIGH: Suspected {vuln} in 'kid' parameter: {kid}")
+        
+        # Generic suspicious characters
+        if any(c in kid for c in [" ", "\t", "\n", "\r"]):
+            findings["vulnerabilities"].append(f"MEDIUM: Suspicious whitespace in 'kid': {kid}")
 
     # 5. Sensitive Claims
-    sens = ["email", "role", "admin", "password", "secret", "id", "user"]
+    sens = ["email", "role", "admin", "password", "secret", "id", "user", "privilege", "internal"]
     for k, v in findings["payload"].items():
         if any(s in k.lower() for s in sens):
             findings["sensitive_claims"].append(f"{k}: {v}")
