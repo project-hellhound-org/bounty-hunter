@@ -202,9 +202,9 @@ def format_howl_prompt(results: dict) -> str:
     summary = results.get("spider", {}).get("intel", {}).get("summary", {})
     endpoints = results.get("spider", {}).get("intel", {}).get("endpoints", [])[:50]
     vulns = []
-    for mod in ["bacdetector", "idordetector", "cmdinj", "parax", "exmap"]:
+    for mod in ["bacdetector", "idordetector", "cmdinj", "hydra", "exmap"]:
         intel = results.get(mod, {}).get("intel", {})
-        v = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", [])
+        v = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", []) or intel.get("surfaces", [])
         if v: vulns.append({mod: v[:20]})
     return f"Identify the 3 most promising ATTACK CHAINS from these findings.\nSUMMARY: {json.dumps(summary)}\nENDPOINTS (Sample): {json.dumps(endpoints)}\nVULNERABILITIES (Sample): {json.dumps(vulns)}\nTASK:\n- ACTION: Next module/target.\n- WHY: Logical correlation.\n- CONFIDENCE: (Confirmed | High | Medium | Possible)\n"
 
