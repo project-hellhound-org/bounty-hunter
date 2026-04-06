@@ -15,4 +15,4 @@ jobs:
         run: pip install bandit
 
       - name: Run Bandit Scan
-        run: bandit -r .
+        run: bandit -r . -x tests,venv,__pycache__
