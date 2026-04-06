@@ -357,6 +357,7 @@ class Store:
         self.graphql:      List[dict]       = []
         self.openapi:      List[dict]       = []
         self.sourcemaps:   List[dict]       = []
+        self.well_known:   List[dict]       = []
 
     def _key(self, url, method):
         return f"{method.upper()}:{cluster(normalize(url))}"
@@ -538,6 +539,14 @@ class Store:
             "allow_credentials": creds, "severity": "HIGH" if creds else "MEDIUM"
         })
 
+    def add_well_known(self, url, content_snippet, discovered_paths=None):
+        if not any(w["url"] == url for w in self.well_known):
+            self.well_known.append({
+                "url": url,
+                "content": content_snippet,
+                "discovered_paths": discovered_paths or []
+            })
+
     def add_sourcemap(self, map_url, parent):
         if not any(s["url"] == map_url for s in self.sourcemaps):
             self.sourcemaps.append({"url": map_url, "parent": parent})
@@ -567,6 +576,7 @@ class Store:
             "graphql": self.graphql, "openapi": self.openapi,
             "sourcemaps": self.sourcemaps, "comments": self.comments,
             "robots_disallowed": self.robots_paths,
+            "well_known": self.well_known,
             "tech_stack": sorted(self.tech_stack),
         }
 
@@ -1610,20 +1620,38 @@ class Spider:
                     if _s == 200 and _t:
                         await robots.parse_sitemap(_smap_url)
 
-            # Probe .well-known paths
-            for _wk in ("/.well-known/security.txt", "/.well-known/change-password"):
+            # Probe .well-known and sensitive root paths
+            _WK_PATHS = (
+                "/.well-known/security.txt", 
+                "/security.txt",
+                "/.well-known/change-password",
+                "/.well-known/openid-configuration",
+                "/.well-known/assetlinks.json",
+                "/.well-known/apple-app-site-association",
+                "/.env",
+                "/.git/config"
+            )
+            for _wk in _WK_PATHS:
                 _wk_url = urljoin(self.target, _wk)
                 _s, _, _t = await fetch(session, "GET", _wk_url, self.rl)
                 if _s == 200 and _t:
                     self.store.add_endpoint(_wk_url, source="WellKnown", score=Conf.LOW)
-                    self.emit.always_success(f".well-known found: {_wk_url}")
-                    for _m in re.finditer(r'(?:^|\s)((?:https?://[^\s]+|/[a-zA-Z0-9_\-/]+))', _t, re.M):
+                    discovered = []
+                    # Improved generic path extractor (handles relative and absolute)
+                    for _m in re.finditer(r'(?:^|\s|\"|\')((?:https?://[^\s\"\'\>]+|/[a-zA-Z0-9_\-\./\?\#]+))', _t, re.M):
                         _path = _m.group(1).strip()
-                        if _path.startswith("/"):
+                        if _path.startswith("/") and len(_path) > 1:
                             _full = urljoin(self.target, _path)
                             if self.is_valid(_full):
                                 self.store.add_endpoint(_full, source="WellKnown", score=Conf.LOW)
                                 self._queue_url(_full, 1, "WellKnown")
+                                discovered.append(_full)
+                        elif _path.startswith("http") and self.is_valid(_path):
+                            self.store.add_endpoint(_path, source="WellKnown", score=Conf.LOW)
+                            discovered.append(_path)
+                    
+                    self.store.add_well_known(_wk_url, _t[:200].replace("\n", " "), discovered)
+                    self.emit.always_success(f"Well-known discovered: {_wk_url} ({len(discovered)} paths found)")
 
             if self.cfg.use_playwright:
                 spa = SPAScanner(self.target, self.store, self.emit, self.cookies,

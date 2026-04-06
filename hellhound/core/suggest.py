@@ -35,9 +35,9 @@ from urllib.parse import urlparse
 # ─────────────────────────────────────────────────────────────
 
 KNOWN_MODULES = {
-    "spider", "bacdetector", "cmdinj", "parax",
+    "spider", "bacdetector", "cmdinj", "hydra",
     "graphql_hunter", "jwt_analyzer", "wafbuster", "exmap",
-    "idordetector",
+    "idordetector", "sqli_tester",
 }
 
 
@@ -298,14 +298,14 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
     chains = []
 
     spider_intel = results.get("spider",      {}).get("intel", {})
-    parax_intel  = results.get("parax",       {}).get("intel", {})
+    hydra_intel  = results.get("hydra",       {}).get("intel", {})
     fp_intel     = results.get("fingerprint", {}).get("intel", {})
 
     endpoints     = spider_intel.get("endpoints", [])
     bac_findings  = _extract_bac_findings(results)
     idor_findings = _extract_idor_findings(results)
     confirmed_rce = _extract_cmdi_confirmed(results)
-    parax_vulns   = parax_intel.get("vulnerabilities", [])
+    hydra_vulns   = hydra_intel.get("vulnerabilities", [])
 
     dynamic_eps  = [e for e in endpoints if not _is_static_asset(e.get("url", ""))]
     bac_bypasses = [f for f in bac_findings if f.get("severity","") in ("critical","high")]
@@ -368,19 +368,19 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
         ))
 
     # Chain 5: Confirmed IDOR endpoints + SQLi params
-    if idor_findings and "parax" not in ran:
+    if idor_findings and "hydra" not in ran:
         idor_urls    = {f.get("url", f.get("endpoint","")) for f in idor_findings}
         sqli_overlap = [e for e in dynamic_eps if e.get("url","") in idor_urls and _flat_params(e) & SQLI_PARAMS]
         if sqli_overlap:
             chains.append(_sugg(
                 P_HIGH, CONF_STRONG, "correlator",
-                action  = "equip Parax — confirmed IDOR endpoints also carry SQLi-risk params",
+                action  = "equip Hydra — confirmed IDOR endpoints also carry SQLi-risk params",
                 reason  = "Same endpoints with confirmed IDOR have query params matching SQLi patterns",
                 evidence= [
                     f"IDOR-confirmed endpoints with SQLi params: {len(sqli_overlap)}",
                     f"Example: {sqli_overlap[0].get('url','')}",
                 ],
-                chain   = "IDORdetector → Parax",
+                chain   = "IDORdetector → Hydra",
             ))
 
     # Chain 6: WAFbuster versioned tech + Exmap not run
@@ -413,15 +413,25 @@ def _correlate(results: dict, ran: set) -> List[Suggestion]:
             chain   = "Spider → Exmap",
         ))
 
-    # Chain 8: Parax high-risk + CMDinj not run
-    high_parax = [v for v in parax_vulns if v.get("risk","").lower() in ("critical","high")]
-    if high_parax and "cmdinj" not in ran:
+    # Chain 8: Hydra high-risk + CMDinj/SQLi not run
+    high_hydra = [v for v in hydra_vulns if v.get("risk","").lower() in ("critical","high")]
+    if high_hydra and "cmdinj" not in ran:
         chains.append(_sugg(
             P_HIGH, CONF_STRONG, "correlator",
-            action  = "equip CMDinj — Parax confirmed high-risk params, injection not yet probed",
-            reason  = "Parax classified params as high risk for injection; CMDinj will actively exploit these",
-            evidence= [f"Parax: {len(high_parax)} high/critical-risk param(s)"],
-            chain   = "Parax → CMDinj",
+            action  = "equip CMDinj — Hydra confirmed high-risk params, injection not yet probed",
+            reason  = "Hydra classified params as high risk for injection; CMDinj will actively exploit these",
+            evidence= [f"Hydra: {len(high_hydra)} high/critical-risk param(s)"],
+            chain   = "Hydra → CMDinj",
+        ))
+
+    sqli_hints = [v for v in hydra_vulns if v.get("recommended_auditor") == "sqli_tester"]
+    if sqli_hints and "sqli_tester" not in ran:
+        chains.append(_sugg(
+            P_HIGH, CONF_STRONG, "correlator",
+            action  = "equip SQLI_Tester — Hydra identified targeted SQLi surface",
+            reason  = "Hydra performed differential analysis and confirmed server dynamism — high probability of SQLi",
+            evidence= [f"Hydra: {len(sqli_hints)} targeted SQLi surface(s) found"],
+            chain   = "Hydra → SQLI_Tester",
         ))
 
     # Chain 9: GraphQL endpoints found + hunter not run
@@ -523,20 +533,20 @@ def _analyze_spider(results, ran) -> List[Suggestion]:
             evidence= [f"Matched params: {', '.join(top_risk['hits'].get('cmdi',[]))}"] + top3,
         ))
 
-    if sqli_eps and "parax" not in ran:
+    if sqli_eps and "hydra" not in ran:
         top_url, top_risk = sqli_eps[0]
         top3 = [f"  {u}  →  {', '.join(r['hits'].get('sqli',[]))}" for u,r in sqli_eps[:3]]
         out.append(_sugg(P_HIGH, top_risk["confidence"], "spider",
-            action  = "equip Parax",
+            action  = "equip Hydra",
             reason  = f"{len(sqli_eps)} dynamic endpoint(s) carry SQLi-risk params",
             evidence= [f"Matched params: {', '.join(top_risk['hits'].get('sqli',[]))}"] + top3,
         ))
 
-    if lfi_eps and "parax" not in ran:
+    if lfi_eps and "hydra" not in ran:
         top_url, top_risk = lfi_eps[0]
         top3 = [f"  {u}  →  {', '.join(r['hits'].get('lfi',[]))}" for u,r in lfi_eps[:3]]
         out.append(_sugg(P_HIGH, top_risk["confidence"], "spider",
-            action  = "equip Parax (LFI-risk params detected)",
+            action  = "equip Hydra (LFI-risk params detected)",
             reason  = f"{len(lfi_eps)} endpoint(s) carry LFI-risk params — file inclusion risk",
             evidence= [f"Matched params: {', '.join(top_risk['hits'].get('lfi',[]))}"] + top3,
         ))
@@ -576,9 +586,9 @@ def _analyze_spider(results, ran) -> List[Suggestion]:
             evidence= [c.get("url","") for c in high_cors[:3]],
         ))
 
-    if redirect_eps and "parax" not in ran:
+    if redirect_eps and "hydra" not in ran:
         out.append(_sugg(P_MEDIUM, CONF_LIKELY, "spider",
-            action  = "equip Parax (open redirect params)",
+            action  = "equip Hydra (open redirect params)",
             reason  = f"{len(redirect_eps)} endpoint(s) with redirect params — phishing pivot potential",
             evidence= [u for u,_ in redirect_eps[:2]],
         ))
@@ -727,46 +737,56 @@ def _analyze_idordetector(results, ran) -> List[Suggestion]:
             ],
         ))
 
-    if "parax" not in ran:
+    if "hydra" not in ran:
         out.append(_sugg(P_HIGH, CONF_LIKELY, "idordetector",
-            action  = "equip Parax — test IDOR-confirmed endpoints for SQLi/LFi",
-            reason  = "IDOR-confirmed endpoints are high-value injection targets; Parax will probe the same surface",
+            action  = "equip Hydra — test IDOR-confirmed endpoints for SQLi/LFi",
+            reason  = "IDOR-confirmed endpoints are high-value injection targets; Hydra will probe the same surface",
         ))
 
     return out
 
 
-def _analyze_parax(results, ran) -> List[Suggestion]:
+def _analyze_hydra(results, ran) -> List[Suggestion]:
     out   = []
-    intel = results["parax"].get("intel", {})
+    intel = results["hydra"].get("intel", {})
     vulns = intel.get("vulnerabilities", [])
 
     if not vulns:
-        out.append(_sugg(P_LOW, CONF_POSSIBLE, "parax",
-            action="review Parax config — no param risks found, verify coverage",
-            reason="Zero findings; confirm Parax scanned all discovered endpoints",
+        out.append(_sugg(P_LOW, CONF_POSSIBLE, "hydra",
+            action="review Hydra config — no param risks found, verify coverage",
+            reason="Zero findings; confirm Hydra scanned all discovered endpoints",
         ))
         return out
 
+    surfaces = intel.get("surfaces", [])
+    
     by_class = {}
-    for v in vulns:
-        cls = v.get("type", v.get("class","unknown"))
-        by_class[cls] = by_class.get(cls, 0) + 1
+    for v in surfaces:
+        roles = v.get("roles", [])
+        for r in roles:
+            by_class[r] = by_class.get(r, 0) + 1
 
-    high = [v for v in vulns if v.get("risk","").lower() in ("critical","high")]
+    high = [v for v in surfaces if v.get("differential") and v.get("differential", {}).get("delta_type") == "DYNAMISM_DETECTED"]
 
     out.append(_sugg(
         P_CRITICAL if high else P_HIGH,
-        CONF_CONFIRMED, "parax",
-        action  = "review loot — parameter risks classified, highest-confidence first",
-        reason  = f"{len(vulns)} param risk(s) across {len(by_class)} class(es): {', '.join(by_class.keys())}",
+        CONF_CONFIRMED, "hydra",
+        action  = "review loot — parameter risks classified by Hydra Orchestrator",
+        reason  = f"{len(surfaces)} attack surfaces mapped across {len(by_class)} semantic roles",
         evidence= [f"{cls}: {cnt}" for cls, cnt in by_class.items()],
     ))
 
+    sqli_hits = [v for v in surfaces if v.get("recommended_auditor") == "sqli_tester"]
+    if sqli_hits and "sqli_tester" not in ran:
+        out.append(_sugg(P_HIGH, CONF_STRONG, "hydra",
+            action  = "equip SQLI_Tester — Hydra confirmed targeted SQLi surface",
+            reason  = f"{len(sqli_hits)} high-confidence SQLi surface(s) identified via differential analysis",
+        ))
+
     if high and "cmdinj" not in ran:
-        out.append(_sugg(P_HIGH, CONF_STRONG, "parax",
-            action  = "equip CMDinj — Parax classified params as high injection risk",
-            reason  = f"{len(high)} high/critical param risks; active exploitation not yet attempted",
+        out.append(_sugg(P_HIGH, CONF_STRONG, "hydra",
+            action  = "equip CMDinj — Hydra identified high-dynamism injection risk",
+            reason  = f"{len(high)} surfaces showed significant response deltas during probing",
         ))
 
     return out

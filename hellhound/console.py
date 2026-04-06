@@ -1629,6 +1629,57 @@ class HellhoundConsole(cmd.Cmd):
                     print(Fore.LIGHTBLACK_EX + "  [JWT]  no tokens discovered" + Style.RESET_ALL)
                     print()
 
+            # ── Hydra dedicated renderer ─────────────────────────
+            elif mod_clean == "hydra":
+                surfaces = intel.get("surfaces", [])
+                logic_chains = intel.get("logic_chains", [])
+                
+                print(f"  {Fore.MAGENTA + Style.BRIGHT}╔════════════ HYDRA LOGIC AUDIT ════════════╗")
+                print(f"  ║ {Fore.WHITE}Engine: HYDRA (Geryon/Lailaps/Cerberus) ║")
+                print(f"  ╚═══════════════════════════════════════════╝{Style.RESET_ALL}")
+                
+                if surfaces:
+                    print(f"\n    {Fore.WHITE + Style.BRIGHT}Mapped Surfaces ({len(surfaces)}):{Style.RESET_ALL}")
+                    show_surfaces = surfaces[:30]
+                    for s in show_surfaces:
+                        pname = s.get("parameter", "unknown")
+                        url   = s.get("url", "")
+                        roles = s.get("roles", [])
+                        delta = s.get("differential")
+                        recom = s.get("recommended_auditor")
+                        
+                        # Color coding based on roles
+                        role_str = ""
+                        if roles:
+                            role_c = Fore.RED if "SENSITIVE_DATA" in roles else Fore.YELLOW if any(x in roles for x in ["OBJECT_IDENTIFIER", "JWT_TOKEN"]) else Fore.WHITE
+                            role_str = f" {role_c}[{'/'.join(roles)}]{Style.RESET_ALL}"
+                        
+                        print(f"      • {Fore.WHITE}{pname:<16}{Style.RESET_ALL} {Style.BRIGHT}{Fore.WHITE}->{Style.RESET_ALL} {Fore.CYAN}{url}{Style.RESET_ALL}{role_str}")
+                        
+                        if delta:
+                            d_type = delta.get("delta_type", "DYNAMISM")
+                            l_shift = delta.get("length_shift", 0)
+                            s_shift = "STATUS_SHIFT " if delta.get("status_shift") else ""
+                            print(f"        {Fore.GREEN}└─ Lailaps Probe : {s_shift}{d_type} (ΔLen: {l_shift}){Style.RESET_ALL}")
+                        
+                        if recom:
+                            print(f"        {Fore.MAGENTA}└─ Target Auditor: {Fore.WHITE + Style.BRIGHT}{recom}{Style.RESET_ALL}")
+                    if len(surfaces) > 30:
+                        print(f"\n      {Fore.LIGHTBLACK_EX}... +{len(surfaces)-30} more surfaces (use --json for full list){Style.RESET_ALL}")
+                
+                if logic_chains:
+                    print(f"\n    {Fore.MAGENTA + Style.BRIGHT}[ GERYON Logic Correlations ]{Style.RESET_ALL}")
+                    for chain in logic_chains:
+                        pname = chain.get("parameter", "unknown")
+                        ctype = chain.get("type", "CORRELATION")
+                        urls  = chain.get("urls", [])
+                        print(f"      • {Fore.WHITE + Style.BRIGHT}{pname}{Style.RESET_ALL} : {Fore.YELLOW}{ctype}{Style.RESET_ALL}")
+                        for u in urls[:3]:
+                            print(f"        {Fore.WHITE}- {u}{Style.RESET_ALL}")
+                        if len(urls) > 3:
+                            print(f"        {Fore.LIGHTBLACK_EX}  ... +{len(urls)-3} more{Style.RESET_ALL}")
+                print()
+
             # ── Stalk (Hybrid OSINT) dedicated renderer ───────────
             elif mod_clean == "stalk":
                 subdomains = intel.get("subdomains", [])
@@ -1775,7 +1826,7 @@ class HellhoundConsole(cmd.Cmd):
                         _render_findings(normed, "Access Control Findings")
 
 
-                # 3. endpoints (Spider / any recon module)
+                # 4. endpoints (Spider / any recon module)
                 endpoints = intel.get("endpoints", [])
                 if endpoints:
                     # Build cluster map
@@ -1845,11 +1896,31 @@ class HellhoundConsole(cmd.Cmd):
                         print(f"    {Fore.CYAN}{sm.get('url',sm)}{Style.RESET_ALL}")
                     print()
 
-                # 7. Generic list keys not already handled — future-proof catch-all
+                # 7. well_known
+                well_known = intel.get("well_known", [])
+                if well_known:
+                    print(Fore.MAGENTA + f"  [Well-Known Discovery — {len(well_known)} file(s)]" + Style.RESET_ALL)
+                    for wk in well_known:
+                        url     = wk.get("url", "")
+                        content = wk.get("content", "")
+                        paths   = wk.get("discovered_paths", [])
+                        
+                        print(f"    {Fore.WHITE + Style.BRIGHT}File: {Fore.CYAN}{url}{Style.RESET_ALL}")
+                        if content:
+                            print(f"      {Fore.LIGHTBLACK_EX}Content: {content[:100]}...{Style.RESET_ALL}")
+                        if paths:
+                            print(f"      {Fore.GREEN}Discovered {len(paths)} unique path(s) inside{Style.RESET_ALL}")
+                            for p in paths[:5]:
+                                print(f"        {Fore.WHITE}• {p}{Style.RESET_ALL}")
+                            if len(paths) > 5:
+                                print(f"        {Fore.LIGHTBLACK_EX}... +{len(paths)-5} more{Style.RESET_ALL}")
+                    print()
+
+                # 8. Generic list keys not already handled — future-proof catch-all
                 known_keys = {"vulnerabilities","bac","endpoints","secrets",
                               "cors_issues","sourcemaps","summary","stats",
                               "tech_stack","robots_paths","graphql","openapi",
-                              "metadata", "jwts", "graphql_endpoints"}
+                              "metadata", "jwts", "graphql_endpoints", "well_known"}
                 for key, val in intel.items():
                     if key in known_keys or not val:
                         continue

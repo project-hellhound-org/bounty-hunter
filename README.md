@@ -33,7 +33,7 @@ Hellhound utilizes a distributed intelligence model structured into four functio
 
 1. **Reconnaissance (Surface Layer)**: Deep mapping of the target's public and internal surface using SPA-aware crawling and OSINT.
 2. **Intelligence (Asset Layer)**: High-fidelity extraction of sensitive assets, technology profiling, and source code reconstruction.
-3. **Vulnerability (Analysis Layer)**: Logical flaw validation, parameter-level risk assessment, and broken access control mapping.
+3. **Vulnerability (Analysis Layer)**: Logical flaw validation, autonomous parameter audit, and broken access control mapping. Powered by the **Hydra** logic engine.
 4. **AI Core (Correlation Layer)**: Intelligent synthesis of all collected "loot" via specialized offensive personas.
 
 ---
@@ -54,6 +54,7 @@ Hellhound's AI Core has been refactored for professional offensive speed:
 | :--- | :--- | :--- | :--- |
 | **Recon** | **Spider** | Deep SPA/API Surface Mapping | The Strategist |
 | **Recon** | **Stalk** | Passive OSINT & Passive Recon | The Observer |
+| **Intel** | **Hydra** | Universal Logic & Parameter Auditor | The Polymath |
 | **Intel** | **BlobUnpacker** | Source Reconstruction from Maps | The Architect |
 | **Intel** | **SourceAuditor** | Static Analysis & Sink Detection | **Deep Logic Auditor** |
 | **Intel** | **SecretScanner** | API Key & Secret Extraction | The Harvester |
@@ -61,6 +62,18 @@ Hellhound's AI Core has been refactored for professional offensive speed:
 | **Vuln** | **PATHtraveller** | 6-Tier Path Traversal Auditor | The Navigator |
 | **Vuln** | **RBAC** | Multi-Role Privilege Escalation | Role Matrix Audit |
 | **Exploit** | **CMDinj** | RCE Confirmation & Proof | The Executioner |
+
+---
+
+## 🐲 The Hydra Logic Engine
+
+Version 12.5 introduces **Hydra**, a multi-headed analysis engine that bridges the gap between reconnaissance and exploitation. Hydra doesn't just find parameters; it understands their **intent**.
+
+*   **Cerberus Head (Entropy)**: Discovers hidden data roles (IDs, Tokens, Secrets) using passive heuristic analysis and technology profiling.
+*   **Lailaps Head (Differential)**: Actively probes for dynamism. Identifies how the application reacts to parameter shifts, length deltas, and status code variations.
+*   **Geryon Head (Correlation)**: Correlates parameters across distinct endpoints to identify potential cross-context logic flaws (e.g., a "username" from a profile page leaking into an unauthenticated API).
+
+Hydra acts as the **Intelligence Orchestrator**, automatically recommending and seeding specialized auditors like `IDORdetector` or `CORSbuster` with high-fidelity targets.
 
 ---
 
