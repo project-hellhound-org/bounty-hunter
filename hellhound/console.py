@@ -153,7 +153,9 @@ def _boot_sequence():
 # ----------------------------
 # Load modules from filesystem + config.yaml (descriptions only)
 # ----------------------------
-def load_modules():
+_MODULE_LOAD_ERRORS = {}   # module_name → error string (for debug display)
+
+def load_modules(debug: bool = False):
     modules = {}
 
     base = pkg_resources.files("hellhound").joinpath("modules")
@@ -178,9 +180,15 @@ def load_modules():
                 description = getattr(module, "DESCRIPTION", "No description provided")
                 real_category = getattr(module, "CATEGORY", category)
 
-            except Exception:
-                description = "No description available"
+            except Exception as exc:
+                description = f"[BROKEN] Failed to load"
                 real_category = category
+                _MODULE_LOAD_ERRORS[module_name] = str(exc)
+                if debug:
+                    print(
+                        Fore.YELLOW + f"[!] Module '{module_name}' failed to load: "
+                        + Fore.RED + str(exc) + Style.RESET_ALL
+                    )
 
             modules[module_name] = {
                 "category": real_category,
@@ -396,6 +404,21 @@ class HellhoundConsole(cmd.Cmd):
         """exit → Leave console"""
         print(Fore.RED + "[+] Exiting Hellhound console")
         return True
+
+    def do_debug(self, arg):
+        """debug modules → Show list of modules that failed to load and the error reason"""
+        cmd = arg.strip().lower()
+        if cmd == "modules" or not cmd:
+            if not _MODULE_LOAD_ERRORS:
+                print(Fore.GREEN + Style.BRIGHT + "[✓] All modules loaded successfully. No errors." + Style.RESET_ALL)
+                return
+            print(Fore.YELLOW + Style.BRIGHT + f"\n[!] {len(_MODULE_LOAD_ERRORS)} module(s) failed to load:\n" + Style.RESET_ALL)
+            for mod, err in _MODULE_LOAD_ERRORS.items():
+                print(f"  {Fore.RED + Style.BRIGHT}✗ {mod}{Style.RESET_ALL}")
+                print(f"    {Fore.WHITE}{err}{Style.RESET_ALL}\n")
+        else:
+            print(Fore.YELLOW + "[!] Usage: debug modules")
+
 
     # ============================
     # DISPLAY

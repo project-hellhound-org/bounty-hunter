@@ -1,0 +1,111 @@
+name: Verify Modules (PR Gatekeeper)
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'hellhound/**'
+      - 'requirements.txt'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check — changed files
+        run: |
+          echo "Checking syntax of changed Python files..."
+          git diff --name-only origin/main...HEAD | grep '\.py$' | while read f; do
+            if [ -f "$f" ]; then
+              echo "  Checking: $f"
+              python -m py_compile "$f" || exit 1
+            fi
+          done
+          echo "Syntax check passed."
+
+      - name: Metadata check — new modules
+        run: |
+          python - << 'EOF'
+          import subprocess, os, sys
+
+          result = subprocess.run(
+              ["git", "diff", "--name-only", "--diff-filter=A", "origin/main...HEAD"],
+              capture_output=True, text=True
+          )
+          new_files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+          
+          errors = []
+          for path in new_files:
+              if not (path.startswith("hellhound/modules/") and path.endswith(".py")):
+                  continue
+              if os.path.basename(path).startswith("__"):
+                  continue
+              if not os.path.exists(path):
+                  continue
+              content = open(path).read()
+              missing = []
+              if "DESCRIPTION" not in content:
+                  missing.append("DESCRIPTION")
+              if "CATEGORY" not in content:
+                  missing.append("CATEGORY")
+              if missing:
+                  errors.append(f"{path}: missing {', '.join(missing)}")
+
+          if errors:
+              print("\n❌ Module metadata verification FAILED:")
+              for e in errors:
+                  print(f"   ✗ {e}")
+              print("\nNew modules MUST define DESCRIPTION and CATEGORY at module level.")
+              print("Run 'python scaffold_module.py <name>' to generate a valid template.")
+              sys.exit(1)
+
+          print("✓ All new modules passed metadata check.")
+          EOF
+
+      - name: Import check — new modules
+        run: |
+          python - << 'EOF'
+          import subprocess, sys, importlib.util
+
+          result = subprocess.run(
+              ["git", "diff", "--name-only", "--diff-filter=A", "origin/main...HEAD"],
+              capture_output=True, text=True
+          )
+          new_files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+
+          errors = []
+          for path in new_files:
+              if not (path.startswith("hellhound/modules/") and path.endswith(".py")):
+                  continue
+              import os
+              if not os.path.exists(path) or os.path.basename(path).startswith("__"):
+                  continue
+              spec = importlib.util.spec_from_file_location("mod_check", path)
+              mod = importlib.util.module_from_spec(spec)
+              try:
+                  spec.loader.exec_module(mod)
+              except Exception as e:
+                  errors.append(f"{path}: import error — {e}")
+
+          if errors:
+              print("\n❌ Module import check FAILED:")
+              for e in errors:
+                  print(f"   ✗ {e}")
+              sys.exit(1)
+
+          print("✓ All new modules imported successfully.")
+          EOF
