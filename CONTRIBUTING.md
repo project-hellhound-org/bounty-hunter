@@ -40,7 +40,7 @@ The `main` branch is protected. All contributions must come via a feature branch
 main
  └── feature/sqli-error-based      ← Your new module
  └── feature/xss-dom-scanner       ← Another contributor's module
- └── fix/fix-stalk-timeout         ← A bug fix
+ └── fix/fix-stalk-timeout         ← A bug fix (requires approval)
 ```
 
 **Create your branch:**
@@ -53,6 +53,9 @@ Use descriptive names:
 - `feature/sqli-union-based`
 - `feature/xss-reflected`
 - `fix/stalk-timeout-bug`
+
+> [!WARNING]
+> **Protected Core Files**: Any modifications to `hellhound/core/`, `hellhound/console.py`, or root-level workflow/config files will trigger a **CORE-PROTECTION** failure in CI/CD. These changes require explicit discussion with the project lead before a PR is opened.
 
 ---
 
@@ -89,11 +92,54 @@ def run(target_context: dict, options: dict, emit) -> dict:
         emit:           Callable to print colored output to the console
     
     Returns:
-        dict: MUST include a 'results' key containing a list of findings
+        dict: MUST include a 'results' key containing a list of findings.
     """
-    ...
-    return {"results": [...]}
+    findings = []
+    # logic...
+    findings.append({
+        "severity": "HIGH",
+        "finding_type":    "SQL Injection",     # Note: use finding_type instead of title
+        "url":      target,
+        "parameter":"id",
+        "proof":    "error in response...",
+        "poc_curl": "curl -X GET ..."
+    })
+    
+    # Store dynamic data in the intel schema
+    intel_data = {
+        "vulnerabilities": findings,
+        "endpoints": [{"url": target, "confidence_label": "CONFIRMED"}]
+    }
+    
+    return {"intel": intel_data}
 ```
+
+### Universal Renderer `intel` Schema
+
+To ensure your findings are rendered beautifully in the `loot` view without modifying the console, your module should return an `intel` dictionary containing categorized lists.
+
+> [!IMPORTANT]
+> **Data-Driven Logging Requirement**
+> Modules **must not** implement their own `print()` formatting for findings. The framework's Universal Renderer handles all data structures dynamically. Common noisy metadata (e.g., `meta`, `summary`, `risk_score`) is automatically silently suppressed from terminal output to keep the UI clean.
+
+**Supported Vulnerability Schema:**
+If your array is named `vulnerabilities` or has security keys, it automatically receives professional High-Fidelity UI formatting.
+
+| Key | Type | Description |
+|---|---|---|
+| `severity` | string | `CRITICAL` \| `HIGH` \| `MEDIUM` \| `LOW` \| `INFO` |
+| `finding_type` | string | Short name of the vulnerability (e.g., "CORS Misconfiguration") |
+| `url` | string | The affected endpoint URL |
+| `parameter` | string | (Optional) The vulnerable parameter name |
+| `proof` | string | (Optional) Evidence or payload used |
+| `poc_curl` | string | (Optional) Prepared curl command for reproduction |
+| `poc_browser`| string | (Optional) URL to open in browser for reproduction |
+
+Any extra custom keys you add to the dictionary will dynamically render underneath the finding automatically!
+
+**Custom Hooks:**
+If your module requires a custom ASCII banner (like the Spider summary block), simply add a `def render_header(self, intel):` method to your class. The Universal UI will auto-detect and execute it.
+---
 
 ### The `emit` Callable
 
@@ -154,6 +200,7 @@ Every Pull Request automatically triggers the **Verify Modules** workflow. It wi
 | **Syntax Check** | `py_compile` on all changed files |
 | **Metadata Check** | Ensures `DESCRIPTION` and `CATEGORY` are present |
 | **Import Check** | Attempts to import the module to catch missing dependencies |
+| **Core Protection**| Fails if files outside `hellhound/modules/` are modified |
 
 > [!IMPORTANT]
 > All three checks must **pass** before a PR can be merged into `main`. If a check fails, you will see a detailed error message in the Actions tab. Fix the issue and `git push` to re-trigger the checks automatically.

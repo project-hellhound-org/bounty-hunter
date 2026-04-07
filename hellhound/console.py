@@ -1243,18 +1243,21 @@ class HellhoundConsole(cmd.Cmd):
             def _render_findings(findings, label="Vulnerabilities"):
                 if not findings:
                     return
-                sev_w = {"critical":0,"high":1,"medium":2,"low":3,"info":4}
+                sev_w = {"critical":0,"high":1,"medium":2,"low":3,"info":4,"confirmed":1}
                 sf = sorted([f for f in findings if isinstance(f, dict)],
-                            key=lambda x: sev_w.get(str(x.get("severity","info")).lower(), 99))
+                            key=lambda x: sev_w.get(str(x.get("severity", x.get("confidence", "info"))).lower(), 99))
                 if not sf:
                     return
-                print(Fore.MAGENTA + f"  [{label}]" + Style.RESET_ALL)
+                print(Fore.MAGENTA + Style.BRIGHT + f"  [ {label} — {len(sf)} ]" + Style.RESET_ALL)
                 for f in sf:
-                    sev   = str(f.get("severity","info")).upper()
-                    name  = f.get("type", f.get("vulnerability", f.get("name","Finding")))
+                    sev   = str(f.get("severity", f.get("confidence", "info"))).upper()
+                    name  = str(f.get("type", f.get("vulnerability", f.get("finding_type", f.get("name","Finding")))))
                     url   = f.get("url",  f.get("endpoint",""))
                     proof = f.get("proof",f.get("evidence",""))
                     sc2   = _sev_color(sev)
+                    
+                    # Format title nicely
+                    name = name.replace("_", " ").title()
                     print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
                     if url:
                         print(f"       {Fore.WHITE}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
@@ -1265,6 +1268,29 @@ class HellhoundConsole(cmd.Cmd):
                         print(f"       {Fore.WHITE}curl  : {Fore.YELLOW}{f['poc_curl']}{Style.RESET_ALL}")
                     if f.get("poc_browser"):
                         print(f"       {Fore.WHITE}open  : {Fore.CYAN}{f['poc_browser']}{Style.RESET_ALL}")
+                        
+                    # Universal dynamic extraction of leftover metadata keys for cleaner structure
+                    handled_keys = {"severity", "confidence", "type", "vulnerability", "finding_type", 
+                                    "name", "url", "endpoint", "proof", "evidence", "poc_curl", "poc_browser", "poc_html"}
+                    
+                    for k, v in f.items():
+                        if k in handled_keys or not v:
+                            continue
+                        # format key beautifully
+                        k_nice = k.replace("_", " ")
+                        if isinstance(v, dict):
+                            # Stringify dict values cleanly instead of raw JSON
+                            v_clean = " ".join([f"{dk}={dv}" for dk, dv in v.items() if dv])
+                            if not v_clean: v_clean = str(v)
+                        elif isinstance(v, list):
+                            v_clean = ", ".join(str(i) for i in v)
+                        else:
+                            v_clean = str(v)
+                            
+                        # Wrap long values
+                        if len(v_clean) > 130:
+                            v_clean = v_clean[:127] + "..."
+                        print(f"       {Fore.LIGHTBLACK_EX}{k_nice:<5} : {Fore.WHITE}{v_clean}{Style.RESET_ALL}")
                     print()
 
             # ── Module-specific renderers ─────────────────────────
@@ -1273,512 +1299,163 @@ class HellhoundConsole(cmd.Cmd):
             mod_obj       = self._load_module(mod_clean)
             loot_sections = getattr(mod_obj, "LOOT_SECTIONS", None) if mod_obj else None
 
-            # ── CMDinj dedicated renderer ─────────────────────────
-            if mod_clean == "cmdinj":
-                vulns      = intel.get("vulnerabilities", [])
-                file_reads = intel.get("file_reads", [])
+            # ── Dynamic Module UI Hook ──────────────────────────────
+            if hasattr(mod_obj, "render_header") and callable(mod_obj.render_header):
+                try:
+                    mod_obj.render_header(intel)
+                except Exception as e:
+                    print(Fore.RED + f"  [!] Custom renderer failed: {e}" + Style.RESET_ALL)
+            
+            rendered_anything = False
 
-                if vulns:
-                    confirmed   = [v for v in vulns if v.get("detection") not in (None,"") or v.get("confirmed")]
-                    n_confirmed = len(confirmed)
-                    print(Fore.MAGENTA + Style.BRIGHT
-                          + f"  [Command Injection — {len(vulns)} finding(s)"
-                          + (f"  {Fore.RED}{n_confirmed} confirmed" if n_confirmed else "")
-                          + Fore.MAGENTA + Style.BRIGHT + "]" + Style.RESET_ALL)
+            # 1. Attempt to extract findings from standard top-level 'results'
+            top_findings = output.get("results", [])
+            if isinstance(top_findings, list) and top_findings:
+                if not rendered_anything:
                     print()
-                    sev_w = {"critical":0,"high":1,"medium":2,"low":3,"info":4}
-                    for f in sorted(vulns, key=lambda x: sev_w.get(str(x.get("severity","info")).lower(),99)):
-                        sev     = str(f.get("severity","critical")).upper()
-                        det     = f.get("detection","")
-                        param   = f.get("parameter", f.get("param",""))
-                        payload = f.get("payload","")
-                        url     = f.get("url","")
-                        proof   = f.get("proof", f.get("evidence",""))
-                        os_tag  = f.get("os","")
-                        sc2     = _sev_color(sev)
-                        det_c   = Fore.GREEN + Style.BRIGHT if det in ("direct-output","direct_output") else Fore.YELLOW + Style.BRIGHT
-                        det_tag = f" [{det_c}{det.upper().replace('-',' ')}{Style.RESET_ALL}]" if det else ""
-                        print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}]{det_tag}  "
-                              f"{Fore.WHITE + Style.BRIGHT}Command Injection{Style.RESET_ALL}")
-                        if url:
-                            print(f"       {Fore.WHITE}url     : {Fore.CYAN}{url}{Style.RESET_ALL}")
-                        if param:
-                            print(f"       {Fore.WHITE}param   : {Fore.YELLOW}{param}{Style.RESET_ALL}")
-                        if payload:
-                            print(f"       {Fore.WHITE}payload : {Fore.RED}{payload}{Style.RESET_ALL}")
-                        if os_tag:
-                            print(f"       {Fore.WHITE}os      : {Fore.WHITE}{os_tag}{Style.RESET_ALL}")
-                        if proof:
-                            ps = str(proof)
-                            print(f"       {Fore.WHITE}proof   : {Fore.WHITE}{ps[:120]}{'...' if len(ps)>120 else ''}{Style.RESET_ALL}")
-                        if f.get("poc_curl"):
-                            print(f"       {Fore.WHITE}curl    : {Fore.YELLOW}{f['poc_curl']}{Style.RESET_ALL}")
-                        if f.get("poc_browser"):
-                            print(f"       {Fore.WHITE}open    : {Fore.CYAN}{f['poc_browser']}{Style.RESET_ALL}")
-                        print()
+                    rendered_anything = True
+                _render_findings(top_findings, "Identified Findings")
 
-                if file_reads:
-                    print(Fore.MAGENTA + Style.BRIGHT + f"  [File Reads — {len(file_reads)} proof(s)]" + Style.RESET_ALL)
-                    for fr in file_reads:
-                        fpath    = fr.get("file","")
-                        endpoint = fr.get("endpoint", fr.get("url",""))
-                        param    = fr.get("param","")
-                        strategy = fr.get("strategy","")
-                        content  = fr.get("content","")
-                        print(f"    {Fore.RED + Style.BRIGHT}{fpath}{Style.RESET_ALL}")
-                        if endpoint: print(f"       {Fore.WHITE}endpoint : {Fore.CYAN}{endpoint}{Style.RESET_ALL}")
-                        if param:    print(f"       {Fore.WHITE}param    : {Fore.YELLOW}{param}{Style.RESET_ALL}")
-                        if strategy: print(f"       {Fore.WHITE}strategy : {Fore.WHITE}{strategy}{Style.RESET_ALL}")
-                        if content:
-                            cs_lines = str(content).replace("\\n", "\n").splitlines()
-                            print(f"       {Fore.WHITE}content  :{Style.RESET_ALL}")
-                            for line in cs_lines[:6]:
-                                print(f"         {Fore.GREEN}{line.strip()}{Style.RESET_ALL}")
-                            if len(cs_lines) > 6:
-                                print(f"         {Fore.LIGHTBLACK_EX}... truncated{Style.RESET_ALL}")
-                        print()
-                
-                if not vulns and not file_reads:
-                    print(Fore.LIGHTBLACK_EX + "  [Command Injection]  no findings" + Style.RESET_ALL)
+            # 2. Iteratively process intelligence keys for maximum module support
+            if isinstance(intel, dict):
+                # Sort keys to ensure 'vulnerabilities' or main findings appear first if present
+                priority_keys = ["vulnerabilities", "cors_vulnerabilities", "sqli_vulnerabilities"]
+                sorted_keys = sorted(intel.keys(), key=lambda k: (0 if k in priority_keys else 1, k))
 
-            # ── IDORdetector dedicated renderer ───────────────────────
-            elif mod_clean == "idordetector":
-                vulns = intel.get("vulnerabilities", [])
-
-                if vulns:
-                    print(Fore.MAGENTA + Style.BRIGHT 
-                          + f"  [IDOR Vulnerabilities — {len(vulns)} finding(s)]" 
-                          + Style.RESET_ALL)
-                    print()
-                    sev_w = {"critical":0,"high":1,"medium":2,"low":3,"info":4}
-                    for f in sorted(vulns, key=lambda x: sev_w.get(str(x.get("severity","info")).lower(), 99)):
-                        sev     = str(f.get("severity","high")).upper()
-                        param   = f.get("parameter", f.get("param", ""))
-                        url     = f.get("url", "")
-                        proof   = f.get("proof", f.get("evidence", ""))
-                        sc2     = _sev_color(sev)
+                for key in sorted_keys:
+                    val = intel[key]
+                    
+                    # Handle duplicates: skip Spider's 'cors_issues' if CORSbuster is operating in the framework
+                    if key == "cors_issues" and any(k.lower() == "corsbuster" for k in self.results.keys()):
+                        continue
                         
-                        print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}]  "
-                              f"{Fore.WHITE + Style.BRIGHT}Insecure Direct Object Reference{Style.RESET_ALL}")
-                        if url:
-                            print(f"       {Fore.WHITE}url     : {Fore.CYAN}{url}{Style.RESET_ALL}")
-                        if param:
-                            print(f"       {Fore.WHITE}param   : {Fore.YELLOW}{param}{Style.RESET_ALL}")
-                        if proof:
-                            ps = str(proof)
-                            print(f"       {Fore.WHITE}proof   : {Fore.WHITE}{ps[:120]}{'...' if len(ps)>120 else ''}{Style.RESET_ALL}")
-                        if f.get("poc_curl"):
-                            print(f"       {Fore.WHITE}curl    : {Fore.YELLOW}{f['poc_curl']}{Style.RESET_ALL}")
-                        if f.get("poc_browser"):
-                            print(f"       {Fore.WHITE}open    : {Fore.CYAN}{f['poc_browser']}{Style.RESET_ALL}")
-                        print()
-                else:
-                    print(Fore.LIGHTBLACK_EX + "  [IDOR Vulnerabilities]  no findings" + Style.RESET_ALL)
+                    # Skip empty elements or raw stats, as well as redundant internal metadata
+                    if not val or key in ("status", "raw", "summary_stats", "file_reads", "meta", "summary", "risk_score", "tech_stack", "comments"):
+                        continue
 
-            # ── BlobUnpacker dedicated renderer ──────────────────────
-            elif mod_clean == "blobunpacker":
-                files_recovered = intel.get("recovered_files_count", 0) or len(intel.get("reconstructed", []))
-                endpoints = intel.get("new_endpoints", [])
-                secrets = intel.get("secrets", [])
-                
-                print(f"  {Fore.MAGENTA + Style.BRIGHT}╔════════════ SOURCE INTELLIGENCE ════════════╗")
-                print(f"  ║ {Fore.WHITE}Engine: BLOBUNPACKER   Status: {Fore.GREEN}DECODED{Fore.MAGENTA}      ║")
-                print(f"  ╚════════════════════════════════════════════╝{Style.RESET_ALL}")
-                
-                print(f"\n    {Fore.WHITE + Style.BRIGHT}Inventory:{Style.RESET_ALL}")
-                print(f"      • Recovered Files : {Fore.GREEN}{files_recovered}{Style.RESET_ALL}")
-                print(f"      • API Endpoints   : {Fore.CYAN}{len(endpoints)}{Style.RESET_ALL}")
-                print(f"      • Secrets Found   : {Fore.RED if secrets else Fore.GREEN}{len(secrets)}{Style.RESET_ALL}")
+                    # Format title (e.g. "cors_vulnerabilities" -> "Cors Vulnerabilities")
+                    title = str(key).replace("_", " ").title()
 
-                if secrets:
-                    print(f"\n    {Fore.RED + Style.BRIGHT}[ CRITICAL SECRETS ]{Style.RESET_ALL}")
-                    for s in secrets[:10]:
-                        val = s.get("content", s.get("value", ""))
-                        stype = s.get("type", "Secret")
-                        sfile = s.get("source", s.get("file", "unknown"))
-                        print(f"      {Fore.WHITE}• {stype} : {Fore.MAGENTA}{val}{Style.RESET_ALL} ({Fore.LIGHTBLACK_EX}{sfile}{Style.RESET_ALL})")
-
-                if endpoints:
-                    print(f"\n    {Fore.CYAN + Style.BRIGHT}[ NEW ENDPOINTS (SAMPLE) ]{Style.RESET_ALL}")
-                    for ep in endpoints[:10]:
-                        print(f"      {Fore.WHITE}• {Fore.CYAN}{ep.get('url','')}{Style.RESET_ALL}")
-                print()
-
-            # ── SourceAuditor dedicated renderer ─────────────────────
-            elif mod_clean == "sourceauditor":
-                vulns = intel.get("vulnerabilities", [])
-                files_count = intel.get("files_scanned", 0)
-                
-                print(f"  {Fore.CYAN + Style.BRIGHT}╔══════════════ DEEP SOURCE AUDIT ════════════╗")
-                print(f"  ║ {Fore.WHITE}Engine: SOURCEAUDITOR   Files: {Fore.CYAN}{files_count:02d}{Fore.CYAN}       ║")
-                print(f"  ╚════════════════════════════════════════════╝{Style.RESET_ALL}")
-
-                if vulns:
-                    print(f"\n    {Fore.WHITE + Style.BRIGHT}Security Findings ({len(vulns)}):{Style.RESET_ALL}")
-                    for f in vulns:
-                        sev = str(f.get("severity", "HIGH")).upper()
-                        s_color = _sev_color(sev)
-                        name = f.get("name", "Vulnerability")
-                        f_id = f.get("id", "SA-???")
-                        f_path = f.get("file", "unknown")
-                        ai_tag = f" {Fore.MAGENTA + Style.BRIGHT}[AI VERIFIED]{Style.RESET_ALL}" if f.get("ai_verified") else ""
+                    if isinstance(val, list):
+                        if not rendered_anything:
+                            print(); rendered_anything = True
                         
-                        print(f"      {Style.BRIGHT}[{s_color}{sev}{Style.RESET_ALL}]{ai_tag} {Fore.WHITE + Style.BRIGHT}{f_id}: {name}{Style.RESET_ALL}")
-                        print(f"        {Fore.WHITE}File    : {Fore.CYAN}{f_path}{Style.RESET_ALL}")
-                        
-                        insight = f.get("ai_insight") or f.get("ai_reasoning")
-                        if insight:
-                            clean_insight = insight.replace("\n", " ").strip()
-                            if len(clean_insight) > 200: clean_insight = clean_insight[:197] + "..."
-                            print(f"        {Fore.MAGENTA}Insight : {Fore.WHITE}{clean_insight}{Style.RESET_ALL}")
-                else:
-                    print(f"\n    {Fore.GREEN}[✓] No critical source-level vulnerabilities found.{Style.RESET_ALL}")
-                print()
-
-            # ── CORSbuster dedicated renderer ─────────────────────
-            elif mod_clean == "corsbuster":
-                cors_vulns = intel.get("cors_vulnerabilities", [])
-                cors_risk  = intel.get("risk_score", 0)
-
-                if cors_vulns:
-                    # Group findings by type
-                    by_type = {}
-                    for f in cors_vulns:
-                        vtype = f.get("type", "Unknown")
-                        by_type.setdefault(vtype, []).append(f)
-
-                    # Severity ordering and colors for each type
-                    type_severity = {
-                        "Origin Reflection":       ("CRITICAL", Fore.MAGENTA + Style.BRIGHT),
-                        "Null Origin Trust":       ("HIGH",     Fore.RED     + Style.BRIGHT),
-                        "Arbitrary Origin Trust":  ("HIGH",     Fore.RED     + Style.BRIGHT),
-                        "Wildcard with Credentials": ("HIGH",   Fore.RED     + Style.BRIGHT),
-                        "Insecure HTTP Trust":     ("MEDIUM",   Fore.YELLOW  + Style.BRIGHT),
-                        "Open CORS (Wildcard)":    ("LOW",      Fore.WHITE),
-                    }
-                    sev_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
-
-                    # Sort types by severity
-                    sorted_types = sorted(
-                        by_type.keys(),
-                        key=lambda t: sev_order.index(type_severity.get(t, ("INFO", Fore.WHITE))[0])
-                    )
-
-                    cred_count = sum(1 for f in cors_vulns if f.get("credentials_allowed"))
-                    header = f"  [CORS Misconfigurations — {len(cors_vulns)} finding(s)"
-                    if cred_count:
-                        header += f"  {Fore.RED}{Style.BRIGHT}{cred_count} with credentials{Style.RESET_ALL}{Fore.MAGENTA}{Style.BRIGHT}"
-                    header += "]"
-                    print(Fore.MAGENTA + Style.BRIGHT + header + Style.RESET_ALL)
-                    print()
-
-                    for vtype in sorted_types:
-                        items = by_type[vtype]
-                        sev, sev_c = type_severity.get(vtype, ("INFO", Fore.WHITE))
-
-                        print(f"    {Style.BRIGHT}[{sev_c}{sev}{Style.RESET_ALL}{Style.BRIGHT}] "
-                              f"{Fore.WHITE}{vtype}{Style.RESET_ALL}  "
-                              f"{Fore.LIGHTBLACK_EX}({len(items)} endpoint{'s' if len(items) != 1 else ''}){Style.RESET_ALL}")
-
-                        for f in items:
-                            cred_tag = (f"  {Fore.RED + Style.BRIGHT}[CREDS]{Style.RESET_ALL}"
-                                        if f.get("credentials_allowed") else "")
-                            print(f"       {Fore.CYAN}{f.get('url','')}{Style.RESET_ALL}{cred_tag}")
+                        if val and isinstance(val[0], dict):
+                            # Treat lists as findings if they contain core definitive structural vulnerability keys
+                            is_security_item = any(k in item for item in val[:5] for k in ["severity", "vulnerability", "finding_type"])
+                            is_security_title = title.lower() in ("vulnerabilities", "cors vulnerabilities", "sqli vulnerabilities", "findings")
                             
-                            if f.get("poc_html"):
-                                # Advanced feature: Provide a "copy-ready" hint
-                                print(f"       {Fore.WHITE}exploit : {Fore.YELLOW}[HTML PoC Generated]{Style.RESET_ALL}")
-                                print(f"       {Fore.LIGHTBLACK_EX}View raw loot ('loot --json') to copy full PoC script.{Style.RESET_ALL}")
+                            if is_security_item or is_security_title:
+                                _render_findings(val, title)
+                            else:
+                                # Fallback list-of-dicts dynamic renderer
+                                print(Fore.MAGENTA + Style.BRIGHT + f"  [ {title} — {len(val)} ]" + Style.RESET_ALL)
+                                for item in val:
+                                    # Primary anchor key deduction
+                                    p_keys = ("url", "origin", "file", "endpoint", "path", "name", "type", "asset")
+                                    primary_val = None
+                                    primary_k = None
+                                    
+                                    for pk in p_keys:
+                                        if pk in item and item[pk]:
+                                            primary_val = item[pk]
+                                            primary_k = pk
+                                            break
+                                            
+                                    print(f"    {Style.BRIGHT}{Fore.WHITE}•{Style.RESET_ALL}", end="")
+                                    if primary_val:
+                                        print(f" {Fore.CYAN + Style.BRIGHT}{primary_val}{Style.RESET_ALL}")
+                                    else:
+                                        print()
+                                        
+                                    clean_extras = []
+                                    long_content = None
+                                    for k, v in item.items():
+                                        # Silence universally noisy keys from bullet metadata
+                                        if k in (primary_k, "poc_html", "cluster", "baseline", "confidence", "hash", "source") or not v: 
+                                            continue
+                                            
+                                        if k == "content":
+                                            long_content = str(v)
+                                            continue
+                                        if isinstance(v, dict):
+                                            subitems = [f"{dk}: {dv}" for dk, dv in v.items() if dv]
+                                            if subitems: clean_extras.append(f"{k}: [{' | '.join(subitems)}]")
+                                        elif isinstance(v, list) and not v:
+                                            continue
+                                        else:
+                                            clean_extras.append(f"{k}: {v}")
+                                            
+                                    if clean_extras:
+                                        extra_str = " | ".join(clean_extras)
+                                        # Brighten the gray to light blue with white symbol for visibility
+                                        print(f"       {Fore.WHITE}↳ {Fore.LIGHTBLUE_EX}{extra_str}{Style.RESET_ALL}")
+                                        
+                                    # Print multiline raw content dynamically for deeper visibility (e.g., well_known files)
+                                    if long_content:
+                                        lines = long_content.strip().splitlines()
+                                        for line in lines[:8]:
+                                            print(f"         {Fore.LIGHTGREEN_EX}{line.strip()[:140]}{Style.RESET_ALL}")
+                                        if len(lines) > 8:
+                                            print(f"         {Fore.LIGHTGREEN_EX}... (truncated){Style.RESET_ALL}")
+                                    
+                                    # Visual separator between items if long content was printed
+                                    if long_content:
+                                        print()
+                                print()
+                        elif val:
+                            # Render flat list
+                            print(Fore.MAGENTA + Style.BRIGHT + f"  [ {title} — {len(val)} ]" + Style.RESET_ALL)
+                            for item in list(val):
+                                print(f"    {Fore.WHITE}• {item}{Style.RESET_ALL}")
+                            print()
+
+                    elif isinstance(val, dict):
+                        if not rendered_anything:
+                            print(); rendered_anything = True
+                        print(Fore.MAGENTA + Style.BRIGHT + f"  [ {title} ]" + Style.RESET_ALL)
+                        for sub_k, sub_v in list(val.items())[:15]:
+                            print(f"    {Fore.WHITE}{str(sub_k):<20}:{Style.RESET_ALL} {Fore.CYAN}{sub_v}{Style.RESET_ALL}")
                         print()
+                        
+                    elif isinstance(val, (str, int, float, bool)):
+                        if not rendered_anything:
+                            print(); rendered_anything = True
+                        print(f"  {Fore.MAGENTA + Style.BRIGHT}[ {title} ]{Style.RESET_ALL} {Fore.CYAN}{val}{Style.RESET_ALL}")
+
+            # 3. Special case for file_reads (common across many modules, outside intel)
+            if isinstance(file_reads, list) and file_reads:
+                if not rendered_anything:
+                    print(); rendered_anything = True
+                print(Fore.MAGENTA + Style.BRIGHT + f"  [ Disclosed Files — {len(file_reads)} ]" + Style.RESET_ALL)
+                for fr in file_reads:
+                    fpath = fr.get("file", "unknown_file")
+                    print(f"    {Fore.RED + Style.BRIGHT}✗ {fpath}{Style.RESET_ALL}")
+                    if fr.get("content"):
+                        content = str(fr["content"]).strip().splitlines()
+                        for line in content[:5]:
+                            print(f"       {Fore.GREEN}{line.strip()}{Style.RESET_ALL}")
+                        if len(content) > 5:
+                            print(f"       {Fore.LIGHTBLACK_EX}... (truncated){Style.RESET_ALL}")
+                    print()
+
+            # 4. Fallback: if absolutely nothing got rendered, dump the raw keys
+            if not rendered_anything:
+                keys = [k for k in output.keys() if k not in ("results", "intel", "raw", "status")]
+                if keys:
+                    print(Fore.LIGHTBLACK_EX + f"  [ Metadata: {', '.join(keys)} ]" + Style.RESET_ALL)
+                    for k in keys:
+                        val = str(output[k])
+                        print(f"    {Fore.WHITE}{k:<12}: {val[:80]}{'...' if len(val) > 80 else ''}")
+                    print()
                 else:
-                    print(Fore.LIGHTBLACK_EX + "  [CORS]  no misconfigurations found" + Style.RESET_ALL)
+                    print(Fore.LIGHTBLACK_EX + "  (No parsable findings identified)" + Style.RESET_ALL)
                     print()
 
-            # ── Exmap dedicated renderer ──────────────────────────
-            elif mod_clean == "exmap":
-                components = intel.get("components", [])
-                cves       = intel.get("cves", [])
-                low_conf   = intel.get("low_confidence", [])
-                exploits   = intel.get("exploits", [])
-                msf        = intel.get("metasploit_modules", [])
 
-                def _cvss_color(score):
-                    try: s = float(score or 0)
-                    except: s = 0.0
-                    if s >= 9.0: return Fore.MAGENTA + Style.BRIGHT
-                    if s >= 7.0: return Fore.RED     + Style.BRIGHT
-                    if s >= 4.0: return Fore.YELLOW  + Style.BRIGHT
-                    return Fore.WHITE
 
-                def _ev_bar(score):
-                    try: s = int(score or 0)
-                    except: s = 0
-                    filled = round(s / 25)
-                    bar = "█" * filled + "░" * (4 - filled)
-                    c = (Fore.GREEN + Style.BRIGHT if s >= 75 else
-                         Fore.YELLOW + Style.BRIGHT if s >= 50 else Fore.RED)
-                    return f"{c}{bar}{Style.RESET_ALL}"
-
-                if components:
-                    print(Fore.MAGENTA + Style.BRIGHT + "  [Mapped Components]" + Style.RESET_ALL)
-                    for comp in components:
-                        if comp.get("has_version"):
-                            print(f"    {Fore.CYAN + Style.BRIGHT}{comp.get('name',''):<22}{Style.RESET_ALL}"
-                                  f"  {Fore.GREEN + Style.BRIGHT}v{comp.get('version',''):<14}{Style.RESET_ALL}"
-                                  f"  {Fore.WHITE}{comp.get('source','')}{Style.RESET_ALL}")
-                        else:
-                            print(f"    {Fore.CYAN}{comp.get('name',''):<22}{Style.RESET_ALL}"
-                                  f"  {Fore.LIGHTBLACK_EX}no version      {Style.RESET_ALL}"
-                                  f"  {Fore.WHITE}{comp.get('source','')}{Style.RESET_ALL}")
-                    print()
-
-                if cves:
-                    sev_w = {"critical":0,"high":1,"medium":2,"low":3,"info":4}
-                    sc = sorted(cves, key=lambda x: (sev_w.get(str(x.get("severity","info")).lower(),4), -(x.get("evidence_score") or 0)))
-                    crit_c = sum(1 for c in sc if (c.get("cvss") or 0) >= 9.0)
-                    high_c = sum(1 for c in sc if 7.0 <= (c.get("cvss") or 0) < 9.0)
-                    wpn_c  = sum(1 for c in sc if c.get("weaponized"))
-                    print(Fore.MAGENTA + Style.BRIGHT + f"  [CVE Findings — {len(sc)} confirmed"
-                          + (f"  {crit_c} critical" if crit_c else "")
-                          + (f"  {high_c} high"     if high_c else "")
-                          + (f"  {wpn_c} weaponized" if wpn_c  else "")
-                          + "]" + Style.RESET_ALL)
-                    print()
-                    for cve in sc:
-                        cvss = cve.get("cvss") or 0
-                        sev  = str(cve.get("severity","")).upper() or ("CRITICAL" if cvss>=9 else "HIGH" if cvss>=7 else "MEDIUM")
-                        ev   = cve.get("evidence_score",0)
-                        wpn  = cve.get("weaponized",False)
-                        comp = cve.get("component","")
-                        cv   = cve.get("component_version","")
-                        cc   = _cvss_color(cvss)
-                        wpn_tag = (Fore.RED + Style.BRIGHT + " [WEAPONIZED]" + Style.RESET_ALL) if wpn else ""
-                        print(f"    {cc}[{sev}]{Style.RESET_ALL}{wpn_tag}  "
-                              f"{Fore.WHITE + Style.BRIGHT}{cve.get('id','')}{Style.RESET_ALL}  "
-                              f"{cc}CVSS:{cvss}{Style.RESET_ALL}  "
-                              f"evidence:{_ev_bar(ev)} {Fore.WHITE}{ev}/100{Style.RESET_ALL}  "
-                              f"{Fore.CYAN}{comp}{(' '+cv) if cv else ''}{Style.RESET_ALL}")
-                        summary = cve.get("summary","")
-                        nvd_url = cve.get("nvd_url","")
-                        cwes    = cve.get("cwes",[])
-                        notes   = cve.get("evidence_notes",[])
-                        if summary:
-                            print(f"       {Fore.WHITE}{summary[:110]}{'...' if len(summary)>110 else ''}{Style.RESET_ALL}")
-                        if nvd_url:
-                            print(f"       {Fore.LIGHTBLACK_EX}nvd   : {Fore.CYAN}{nvd_url}{Style.RESET_ALL}")
-                        if cwes:
-                            print(f"       {Fore.LIGHTBLACK_EX}cwe   : {Fore.WHITE}{', '.join(cwes[:4])}{Style.RESET_ALL}")
-                        if notes:
-                            print(f"       {Fore.LIGHTBLACK_EX}score : {Fore.WHITE}{' | '.join(notes[:3])}{Style.RESET_ALL}")
-                        print()
-                else:
-                    print(Fore.LIGHTBLACK_EX + "  [CVE Findings]  no CVEs above evidence threshold" + Style.RESET_ALL)
-                    print()
-
-                if exploits:
-                    print(Fore.MAGENTA + Style.BRIGHT + f"  [ExploitDB — {len(exploits)} exploit(s)]" + Style.RESET_ALL)
-                    for ex in exploits[:10]:
-                        print(f"    {Fore.RED + Style.BRIGHT}EDB-{ex.get('edb_id',''):<8}{Style.RESET_ALL}  "
-                              f"{Fore.WHITE + Style.BRIGHT}{ex.get('title','')}{Style.RESET_ALL}  "
-                              f"{Fore.YELLOW}[{ex.get('type','')}]{Style.RESET_ALL}")
-                        if ex.get("url"): print(f"       {Fore.LIGHTBLACK_EX}{ex['url']}{Style.RESET_ALL}")
-                    print()
-
-                if msf:
-                    print(Fore.MAGENTA + Style.BRIGHT + f"  [Metasploit Modules — {len(msf)}]" + Style.RESET_ALL)
-                    for m in msf[:10]:
-                        print(f"    {Fore.RED}{m}{Style.RESET_ALL}")
-                    print()
-
-                if low_conf:
-                    print(Fore.LIGHTBLACK_EX + f"  [Suppressed — {len(low_conf)} CVE(s) below evidence threshold]" + Style.RESET_ALL)
-                    for cve in low_conf[:5]:
-                        print(f"    {Fore.LIGHTBLACK_EX}{cve.get('id',''):<18}  CVSS:{cve.get('cvss') or 0:<5}  evidence:{cve.get('evidence_score',0)}/100{Style.RESET_ALL}")
-                    if len(low_conf) > 5:
-                        print(Fore.LIGHTBLACK_EX + f"    ... +{len(low_conf)-5} more (use loot --json)" + Style.RESET_ALL)
-                    print()
-
-            # ── GraphQL Hunter dedicated renderer ─────────────────────
-            elif mod_clean == "graphql_hunter":
-                graphql_eps = intel.get("graphql_endpoints", [])
-                
-                if graphql_eps:
-                    print(Fore.MAGENTA + Style.BRIGHT + f"  [GraphQL Exposed — {len(graphql_eps)} endpoint(s)]" + Style.RESET_ALL)
-                    print()
-                    for ep in graphql_eps:
-                        url = ep.get("endpoint", "")
-                        print(f"    {Fore.RED + Style.BRIGHT}[GRAPHQL]{Style.RESET_ALL} {Fore.WHITE}{url}{Style.RESET_ALL}")
-                        
-                        if ep.get("introspection_enabled"):
-                            print(f"       {Fore.MAGENTA + Style.BRIGHT}[CRITICAL]{Style.RESET_ALL} Introspection is ENABLED")
-                        if ep.get("suggestions_enabled"):
-                            print(f"       {Fore.YELLOW + Style.BRIGHT}[WARNING]{Style.RESET_ALL} Field suggestions are ENABLED")
-                        print()
-                else:
-                    print(Fore.LIGHTBLACK_EX + "  [GraphQL]  no endpoints found" + Style.RESET_ALL)
-                    print()
-
-            # ── JWT Analyzer dedicated renderer ───────────────────────
-            elif mod_clean == "jwt_analyzer":
-                jwts = intel.get("jwts", [])
-                if jwts:
-                    print(Fore.MAGENTA + Style.BRIGHT + f"  [JSON Web Tokens — {len(jwts)} analyzed]" + Style.RESET_ALL)
-                    print()
-                    for token in jwts:
-                        src = token.get("source", "unknown")
-                        vulns = token.get("vulnerabilities", [])
-                        claims = token.get("sensitive_claims", [])
-                        
-                        raw = token.get("token", "")
-                        disp_token = f"{raw[:15]}...{raw[-10:]}" if len(raw) > 30 else raw
-                        
-                        # Decide color based on vulnerabilities
-                        sev_color = Fore.MAGENTA if any("CRITICAL" in v for v in vulns) else Fore.RED if vulns else Fore.YELLOW if claims else Fore.GREEN
-                        sev_tag = "[CRITICAL JWT]" if any("CRITICAL" in v for v in vulns) else "[WEAK JWT]" if vulns else "[SENSITIVE JWT]" if claims else "[JWT FOUND]"
-                        
-                        print(f"    {sev_color + Style.BRIGHT}{sev_tag}{Style.RESET_ALL} {Fore.WHITE}{disp_token}{Style.RESET_ALL}")
-                        print(f"       {Fore.WHITE}source : {Fore.CYAN}{src}{Style.RESET_ALL}")
-                        
-                        if vulns:
-                            for v in vulns:
-                                vc = Fore.MAGENTA + Style.BRIGHT if "CRITICAL" in v else Fore.RED + Style.BRIGHT
-                                print(f"       {vc}vuln   : {v}{Style.RESET_ALL}")
-                                
-                        if claims:
-                            for c in claims:
-                                print(f"       {Fore.YELLOW}claim  : {c}{Style.RESET_ALL}")
-                        print()
-                else:
-                    print(Fore.LIGHTBLACK_EX + "  [JWT]  no tokens discovered" + Style.RESET_ALL)
-                    print()
-
-            # ── Hydra dedicated renderer ─────────────────────────
-            elif mod_clean == "hydra":
-                surfaces = intel.get("surfaces", [])
-                logic_chains = intel.get("logic_chains", [])
-                
-                print(f"  {Fore.MAGENTA + Style.BRIGHT}╔════════════ HYDRA LOGIC AUDIT ════════════╗")
-                print(f"  ║ {Fore.WHITE}Engine: HYDRA (Geryon/Lailaps/Cerberus) ║")
-                print(f"  ╚═══════════════════════════════════════════╝{Style.RESET_ALL}")
-                
-                if surfaces:
-                    print(f"\n    {Fore.WHITE + Style.BRIGHT}Mapped Surfaces ({len(surfaces)}):{Style.RESET_ALL}")
-                    show_surfaces = surfaces[:30]
-                    for s in show_surfaces:
-                        pname = s.get("parameter", "unknown")
-                        url   = s.get("url", "")
-                        roles = s.get("roles", [])
-                        delta = s.get("differential")
-                        recom = s.get("recommended_auditor")
-                        
-                        # Color coding based on roles
-                        role_str = ""
-                        if roles:
-                            role_c = Fore.RED if "SENSITIVE_DATA" in roles else Fore.YELLOW if any(x in roles for x in ["OBJECT_IDENTIFIER", "JWT_TOKEN"]) else Fore.WHITE
-                            role_str = f" {role_c}[{'/'.join(roles)}]{Style.RESET_ALL}"
-                        
-                        print(f"      • {Fore.WHITE}{pname:<16}{Style.RESET_ALL} {Style.BRIGHT}{Fore.WHITE}->{Style.RESET_ALL} {Fore.CYAN}{url}{Style.RESET_ALL}{role_str}")
-                        
-                        if delta:
-                            d_type = delta.get("delta_type", "DYNAMISM")
-                            l_shift = delta.get("length_shift", 0)
-                            s_shift = "STATUS_SHIFT " if delta.get("status_shift") else ""
-                            print(f"        {Fore.GREEN}└─ Lailaps Probe : {s_shift}{d_type} (ΔLen: {l_shift}){Style.RESET_ALL}")
-                        
-                        if recom:
-                            print(f"        {Fore.MAGENTA}└─ Target Auditor: {Fore.WHITE + Style.BRIGHT}{recom}{Style.RESET_ALL}")
-                    if len(surfaces) > 30:
-                        print(f"\n      {Fore.LIGHTBLACK_EX}... +{len(surfaces)-30} more surfaces (use --json for full list){Style.RESET_ALL}")
-                
-                if logic_chains:
-                    print(f"\n    {Fore.MAGENTA + Style.BRIGHT}[ GERYON Logic Correlations ]{Style.RESET_ALL}")
-                    for chain in logic_chains:
-                        pname = chain.get("parameter", "unknown")
-                        ctype = chain.get("type", "CORRELATION")
-                        urls  = chain.get("urls", [])
-                        print(f"      • {Fore.WHITE + Style.BRIGHT}{pname}{Style.RESET_ALL} : {Fore.YELLOW}{ctype}{Style.RESET_ALL}")
-                        for u in urls[:3]:
-                            print(f"        {Fore.WHITE}- {u}{Style.RESET_ALL}")
-                        if len(urls) > 3:
-                            print(f"        {Fore.LIGHTBLACK_EX}  ... +{len(urls)-3} more{Style.RESET_ALL}")
-                print()
-
-            # ── Stalk (Hybrid OSINT) dedicated renderer ───────────
-            elif mod_clean == "stalk":
-                subdomains = intel.get("subdomains", [])
-                urls       = intel.get("historical_urls", [])
-                git        = intel.get("git_exposed", [])
-                cloud      = intel.get("cloud_assets", [])
-                leaks      = intel.get("leak_candidates", [])
-                banners    = intel.get("banners", [])
-
-                if subdomains:
-                    print(Fore.MAGENTA + Style.BRIGHT + f"  [Subdomains — {len(subdomains)} discovered]" + Style.RESET_ALL)
-                    for s in subdomains:
-                        host = s.get("host", "unknown")
-                        ip   = s.get("ip", "unresolved")
-                        src  = s.get("source", "unknown")
-                        res  = s.get("resolved", False)
-                        
-                        host_c = Fore.WHITE + Style.BRIGHT if res else Fore.WHITE
-                        ip_c   = Fore.CYAN if res else Fore.LIGHTBLACK_EX
-                        print(f"    • {host_c}{host:<30}{Style.RESET_ALL} {ip_c}{ip:<16}{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}[{src}]{Style.RESET_ALL}")
-                    print()
-
-                if git:
-                    print(Fore.RED + Style.BRIGHT + f"  [Git Exposure — {len(git)} repository found!]" + Style.RESET_ALL)
-                    for g in git:
-                        url = g.get("url", "unknown")
-                        print(f"    {Fore.RED + Style.BRIGHT}[!] EXPOSED:{Style.RESET_ALL} {Fore.WHITE}{url}{Style.RESET_ALL}")
-                        if g.get("head"):
-                            print(f"        {Fore.LIGHTBLACK_EX}HEAD: {g['head'][:80]}{Style.RESET_ALL}")
-                    print()
-
-                if cloud:
-                    print(Fore.YELLOW + Style.BRIGHT + f"  [Cloud Assets — {len(cloud)} buckets/containers]" + Style.RESET_ALL)
-                    for c in cloud:
-                        status = c.get("status", "unknown").upper()
-                        provider = c.get("provider", "unknown")
-                        url = c.get("url", "unknown")
-                        sc = Fore.RED + Style.BRIGHT if "PUBLIC" in status else Fore.YELLOW
-                        print(f"    • {sc}[{status}]{Style.RESET_ALL} {Fore.WHITE}{url}{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}({provider}){Style.RESET_ALL}")
-                    print()
-
-                if urls:
-                    limit = 150
-                    print(Fore.MAGENTA + Style.BRIGHT + f"  [Historical URLs — showing {min(len(urls), limit)}/{len(urls)}]" + Style.RESET_ALL)
-                    for u in urls[:limit]:
-                        url = u.get("url", "unknown")
-                        src = u.get("source", "unknown")
-                        print(f"    {Fore.WHITE}• {url} {Fore.LIGHTBLACK_EX}[{src}]{Style.RESET_ALL}")
-                    if len(urls) > limit:
-                        print(f"    {Fore.LIGHTBLACK_EX}... +{len(urls)-limit} more (use loot --json to see all){Style.RESET_ALL}")
-                    print()
-
-                if leaks:
-                    print(Fore.RED + Style.BRIGHT + f"  [Leak Candidates — {len(leaks)} findings]" + Style.RESET_ALL)
-                    for l in leaks:
-                        url = l.get("url", "unknown")
-                        snippet = l.get("snippet", "")
-                        print(f"    {Fore.YELLOW}[leak]{Style.RESET_ALL} {Fore.WHITE}{url}{Style.RESET_ALL}")
-                        if snippet:
-                            print(f"           {Fore.LIGHTBLACK_EX}\"{snippet[:100]}...\"{Style.RESET_ALL}")
-                    print()
-
-                if banners:
-                    print(Fore.CYAN + Style.BRIGHT + f"  [Banner Exposure — {len(banners)} records]" + Style.RESET_ALL)
-                    for b in banners:
-                        host   = b.get("host", "unknown")
-                        port   = b.get("port", "unknown")
-                        banner = b.get("banner", "")
-                        src    = b.get("source", "unknown")
-                        print(f"    • {Fore.WHITE}{host}:{port}{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}[{src}]{Style.RESET_ALL}")
-                        if banner:
-                            print(f"      {Fore.CYAN}{banner[:100]}{Style.RESET_ALL}")
-                    print()
-
-            # ── Generic LOOT_SECTIONS path ────────────────────────
-            elif loot_sections:
+            # ── Generic LOOT_SECTIONS path (module-defined sections) ───
+            if loot_sections:
                 for section in loot_sections:
                     title    = section.get("title","")
                     key      = section.get("key","")
@@ -1812,198 +1489,55 @@ class HellhoundConsole(cmd.Cmd):
                                 print(f"    {Fore.WHITE}• {item}")
                         print()
 
-            else:
-                # ── Universal fallback ────────────────────────────
-                # Covers any module not explicitly handled above.
-
-                # 1. vulnerabilities key
-                vulns = intel.get("vulnerabilities", [])
-                if vulns:
-                    _render_findings(vulns)
-
-                # 2. findings key (alternate)
-                top_findings = intel.get("findings", [])
-                if top_findings and not vulns:
-                    _render_findings(top_findings, "Findings")
-
-                # 3. bac nested block
-                if "bac" in intel and isinstance(intel.get("bac"), dict):
-                    bac      = intel["bac"]
-                    findings = bac.get("findings", [])
-                    summary  = bac.get("summary", {})
-                    if summary:
-                        print(Fore.MAGENTA + "  [Access Control Summary]" + Style.RESET_ALL)
-                        for sev in ("Critical","High","Medium","Low","Info"):
-                            cnt = summary.get(sev, 0)
-                            if cnt:
-                                print(f"    {_sev_color(sev)}{sev:<8}{Style.RESET_ALL} : {cnt}")
-                        print()
-                    if findings:
-                        normed = [{"severity": f.get("severity","info"),
-                                   "name":     f.get("vulnerability", f.get("name","Finding")),
-                                   "url":      f.get("endpoint", f.get("url","")),
-                                   "proof":    f.get("proof",""),
-                                   "poc_curl": f.get("poc_curl",""),
-                                   "poc_browser": f.get("poc_browser","")}
-                                  for f in findings if isinstance(f, dict)]
-                        _render_findings(normed, "Access Control Findings")
-
-
-                # 4. endpoints (Spider / any recon module)
-                endpoints = intel.get("endpoints", [])
-                if endpoints:
-                    # Build cluster map
-                    cluster_map = {}
-                    for ep in endpoints:
-                        cl = ep.get("cluster", ep.get("url",""))
-                        if cl not in cluster_map:
-                            cluster_map[cl] = {
-                                "url":       ep.get("url",""),
-                                "methods":   set(ep.get("methods",[])),
-                                "confidence":ep.get("confidence_label",""),
-                                "auth":      ep.get("auth_required",False),
-                                "sensitive": ep.get("parameter_sensitive",False),
-                            }
-                        else:
-                            cluster_map[cl]["methods"].update(ep.get("methods",[]))
-
-                    # Critical signals
-                    sensitive = [v for v in cluster_map.values() if v["sensitive"]]
-                    auth_walls= [v for v in cluster_map.values() if v["auth"]]
-                    if sensitive or auth_walls:
-                        print(Fore.YELLOW + "  [Critical Signals]" + Style.RESET_ALL)
-                        if sensitive:
-                            print(Fore.YELLOW + f"    Parameter-Sensitive ({len(sensitive)})" + Style.RESET_ALL)
-                            for e in list(sensitive)[:10]:
-                                print(f"      {Fore.CYAN}{e.get('url','')}{Style.RESET_ALL}")
-                        if auth_walls:
-                            print(Fore.YELLOW + f"    Auth-Walled ({len(auth_walls)})" + Style.RESET_ALL)
-                            for e in list(auth_walls)[:10]:
-                                print(f"      {Fore.CYAN}{e.get('url','')}{Style.RESET_ALL}")
-                        print()
-
-                    print(Fore.MAGENTA + f"  [Attack Surface — {len(cluster_map)} endpoints]" + Style.RESET_ALL)
-                    for ep in list(cluster_map.values()):
-                        tags = []
-                        if ep["confidence"] in ("HIGH","CONFIRMED"): tags.append(ep["confidence"])
-                        if ep["auth"]:      tags.append("AUTH")
-                        if ep["sensitive"]: tags.append("SENS")
-                        tag_str    = (Fore.RED + f"[{'|'.join(tags)}]" + Style.RESET_ALL) if tags else ""
-                        method_str = "|".join(sorted(ep["methods"]))
-                        print(f"    {Fore.WHITE}{method_str:<10}{Style.RESET_ALL} {Fore.WHITE}{ep['url']} {tag_str}")
-                    print()
-
-                secrets = intel.get("secrets", [])
-                if secrets:
-                    print(Fore.MAGENTA + f"  [Secrets — {len(secrets)} found]" + Style.RESET_ALL)
-                    for s in secrets:
-                        stype   = s.get("type", "unknown")
-                        content = s.get("content", "")
-                        source  = s.get("source", "")
-                        print(f"    {Fore.YELLOW}{stype:<20}{Style.RESET_ALL} {Fore.WHITE}{content}{Style.RESET_ALL} {Fore.LIGHTBLACK_EX}({source}){Style.RESET_ALL}")
-                    print()
-
-                # 5. cors_issues
-                cors = intel.get("cors_issues", [])
-                if cors:
-                    print(Fore.MAGENTA + f"  [CORS Issues — {len(cors)}]" + Style.RESET_ALL)
-                    for c in cors:
-                        print(f"    {Fore.CYAN}{c.get('url','')} {Fore.YELLOW}({c.get('severity','')}){Style.RESET_ALL}")
-                    print()
-
-                # 6. sourcemaps
-                sourcemaps = intel.get("sourcemaps", [])
-                if sourcemaps:
-                    print(Fore.MAGENTA + f"  [Source Maps — {len(sourcemaps)}]" + Style.RESET_ALL)
-                    for sm in sourcemaps:
-                        print(f"    {Fore.CYAN}{sm.get('url',sm)}{Style.RESET_ALL}")
-                    print()
-
-                # 7. well_known
-                well_known = intel.get("well_known", [])
-                if well_known:
-                    print(Fore.MAGENTA + f"  [Well-Known Discovery — {len(well_known)} file(s)]" + Style.RESET_ALL)
-                    for wk in well_known:
-                        url     = wk.get("url", "")
-                        content = wk.get("content", "")
-                        paths   = wk.get("discovered_paths", [])
-                        
-                        print(f"    {Fore.WHITE + Style.BRIGHT}File: {Fore.CYAN}{url}{Style.RESET_ALL}")
-                        if content:
-                            print(f"      {Fore.LIGHTBLACK_EX}Content: {content[:100]}...{Style.RESET_ALL}")
-                        if paths:
-                            print(f"      {Fore.GREEN}Discovered {len(paths)} unique path(s) inside{Style.RESET_ALL}")
-                            for p in paths[:5]:
-                                print(f"        {Fore.WHITE}• {p}{Style.RESET_ALL}")
-                            if len(paths) > 5:
-                                print(f"        {Fore.LIGHTBLACK_EX}... +{len(paths)-5} more{Style.RESET_ALL}")
-                    print()
-
-                # 8. Generic list keys not already handled — future-proof catch-all
-                known_keys = {"vulnerabilities","bac","endpoints","secrets",
-                              "cors_issues","sourcemaps","summary","stats",
-                              "tech_stack","robots_paths","graphql","openapi",
-                              "metadata", "jwts", "graphql_endpoints", "well_known"}
-                for key, val in intel.items():
-                    if key in known_keys or not val:
-                        continue
-                    
-                    if isinstance(val, list) and val:
-                        print(Fore.MAGENTA + f"  [{key}]" + Style.RESET_ALL)
-                        for item in list(val)[:20]:
-                            if isinstance(item, dict):
-                                # Try to find a good primary field to show
-                                primary_keys = ("url", "path", "name", "content", "title", "id", "asset")
-                                primary_val = None
-                                for pk in primary_keys:
-                                    if item.get(pk):
-                                        primary_val = item.get(pk)
-                                        break
-                                
-                                # Collect everything else
-                                exclude = set(primary_keys)
-                                extra = {k:v for k,v in item.items() if k not in exclude}
-                                
-                                if primary_val:
-                                    line_text = f"    {Fore.WHITE}• {str(primary_val)[:100]}"
-                                    if extra:
-                                        line_text += Fore.LIGHTBLACK_EX + f"  {json.dumps(extra, default=str)[:80]}"
-                                    print(line_text + Style.RESET_ALL)
-                                else:
-                                    # Full dump if no primary field found
-                                    print(f"    {Fore.WHITE}• {json.dumps(item, default=str)[:140]}{Style.RESET_ALL}")
-                            else:
-                                print(f"    {Fore.WHITE}• {item}{Style.RESET_ALL}")
-                        
-                        if len(val) > 20:
-                            print(Fore.WHITE + f"    ... +{len(val)-20} more" + Style.RESET_ALL)
-                        print()
-                    
-                    elif isinstance(val, dict) and val:
-                        print(Fore.MAGENTA + f"  [{key}]" + Style.RESET_ALL)
-                        for k2, v2 in list(val.items())[:15]:
-                            print(f"    {Fore.CYAN}{str(k2):<20}{Style.RESET_ALL} {v2}")
-                        print()
 
         # ── High value targets across all modules ─────────────
         high_value = []
+        hvt_keywords = ["admin", "api", "login", "upload", "password", "env", "config", "token", "ftp", "secret", "auth", "graphql", "swagger", "openapi", "backup"]
+        
+        # Gather URLs that have active vulnerabilities to prioritize them
+        vuln_urls = set()
+        for mod, output in self.results.items():
+            if not isinstance(output, dict): continue
+            intel = output.get("intel", {})
+            for key in ["vulnerabilities", "cors_vulnerabilities", "sqli_vulnerabilities"]:
+                for vuln in intel.get(key, []):
+                    if isinstance(vuln, dict):
+                        sev = str(vuln.get("severity", vuln.get("confidence", "info"))).upper()
+                        if sev in ("CRITICAL", "HIGH", "MEDIUM") and vuln.get("url"):
+                            vuln_urls.add(vuln.get("url"))
+
         for mod, output in self.results.items():
             if not isinstance(output, dict): continue
             for ep in output.get("intel", {}).get("endpoints", []):
-                if ep.get("parameter_sensitive") or ep.get("auth_required") or \
-                        ep.get("confidence_label") in ("HIGH","CONFIRMED"):
+                url = ep.get("url", "")
+                
+                is_vuln = url in vuln_urls
+                has_params = bool(ep.get("parameter_sensitive"))
+                has_auth = bool(ep.get("auth_required"))
+                is_confirmed = ep.get("confidence_label") in ("HIGH", "CONFIRMED")
+                has_keyword = any(kw in url.lower() for kw in hvt_keywords)
+                
+                # Sophisticated True-Positive High Value Target Selection
+                if is_vuln or (has_params and has_auth) or (is_confirmed and has_keyword) or (has_params and is_confirmed):
                     high_value.append(ep)
 
         if high_value:
+            # Deduplicate by URL
+            unique_hvts = {}
+            for ep in high_value:
+                unique_hvts[ep.get("url")] = ep
+            high_value = list(unique_hvts.values())
+            
             high_value = sorted(high_value,
-                key=lambda e: (e.get("confidence_label")=="CONFIRMED",
+                key=lambda e: (e.get("url") in vuln_urls,
                                bool(e.get("parameter_sensitive")),
                                bool(e.get("auth_required"))), reverse=True)
             print(Fore.RED + Style.BRIGHT + "  ── HIGH VALUE TARGETS ──" + Style.RESET_ALL)
-            for ep in high_value[:10]:
-                conf_color = Fore.RED if ep.get("confidence_label") in ("HIGH","CONFIRMED") else Fore.YELLOW
+            for ep in high_value[:15]:
+                conf_color = Fore.RED if ep.get("url") in vuln_urls else Fore.YELLOW
+                label = "VULNERABLE" if ep.get("url") in vuln_urls else ep.get("confidence_label", "CONFIRMED")
                 print(f"  {Fore.CYAN}{ep.get('url','')} "
-                      f"{conf_color}[{ep.get('confidence_label','')}]{Style.RESET_ALL}")
+                      f"{conf_color}[{label}]{Style.RESET_ALL}")
             print()
 
         print(Fore.RED + "  " + "─" * 38 + Style.RESET_ALL + "\n")
