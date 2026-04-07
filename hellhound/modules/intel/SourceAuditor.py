@@ -1,5 +1,6 @@
 NAME = "SourceAuditor"
 DESCRIPTION = "Automated Static Analysis of Recovered Source Code"
+CATEGORY    = "intel"
 OPTIONS = [
     {"name": "use_ai", "type": bool, "default": False, "help": "Use AI (LLM) to verify findings and reduce false positives"},
 ]
