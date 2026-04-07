@@ -1388,8 +1388,8 @@ class HellhoundConsole(cmd.Cmd):
                                             
                                     if clean_extras:
                                         extra_str = " | ".join(clean_extras)
-                                        # Brighten the gray to light blue with white symbol for visibility
-                                        print(f"       {Fore.WHITE}↳ {Fore.LIGHTBLUE_EX}{extra_str}{Style.RESET_ALL}")
+                                        # Use standard visible WHITE instead of blue/gray to distinct layout from URL
+                                        print(f"       {Fore.WHITE}↳ {extra_str}{Style.RESET_ALL}")
                                         
                                     # Print multiline raw content dynamically for deeper visibility (e.g., well_known files)
                                     if long_content:
