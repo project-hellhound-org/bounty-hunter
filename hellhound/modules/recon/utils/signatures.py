@@ -1,5 +1,6 @@
 # Shared Technology and WAF Signatures
-
+DESCRIPTION = "Utility - Signatures Library"
+CATEGORY = "util"
 WAF_SIGNATURES = {
     "Cloudflare": ["cf-ray", "cf-cache-status", "cloudflare-nginx"],
     "Akamai": ["akamai-ghost", "akamaighost", "x-akamai"],

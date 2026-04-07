@@ -1,5 +1,6 @@
 NAME = "BlobUnpacker"
 DESCRIPTION = "Source Map Recon & Wordlist Mining (Intelligence Extractor)"
+CATEGORY    = "intel"
 OPTIONS = []
 
 import re
