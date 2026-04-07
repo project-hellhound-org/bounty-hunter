@@ -77,6 +77,16 @@ Hydra acts as the **Intelligence Orchestrator**, automatically recommending and 
 
 ---
 
+## 💻 The Universal Visual Renderer
+
+Version 12.5 replaces hardcoded terminal loops with a completely dynamic, **schema-agnostic universal rendering engine**.
+
+*   **Intelligent UI Hooking**: Modules no longer execute their own `print()` commands. The console automatically detects data clusters (`intel`), parses them, and organizes them neatly without code duplication.
+*   **True-Positive High Value Targets**: The console autonomously correlates the output of all modules to synthesize a hyper-accurate hitlist of endpoints featuring confirmed vulnerabilities, parameter-sensitive auth-walls, and privileged access routes.
+*   **Professional Output**: Terminal visualizations strictly leverage clean arrays, gracefully handling multi-line source reconstruction, recursive JSON cleaning, and immersive visual data aggregation perfectly.
+
+---
+
 ##  Operational Workflow
 
 Hellhound utilizes an interactive console designed for speed and modularity.
