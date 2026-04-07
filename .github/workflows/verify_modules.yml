@@ -76,6 +76,41 @@ jobs:
           print("✓ All new modules passed metadata check.")
           EOF
 
+      - name: Core protection — restricted files
+        run: |
+          python - << 'EOF'
+          import subprocess, sys, os
+
+          # Identify all changed files between origin/main and HEAD
+          result = subprocess.run(
+              ["git", "diff", "--name-only", "origin/main...HEAD"],
+              capture_output=True, text=True
+          )
+          changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+
+          protected_violations = []
+          for path in changed_files:
+              # Allowed: Anything in hellhound/modules/
+              if path.startswith("hellhound/modules/"):
+                  continue
+              # Allowed: New requirements for the module (though discouraged, sometimes needed)
+              # if path == "requirements.txt": continue
+              
+              # Everything else is PROTECTED
+              protected_violations.append(path)
+
+          if protected_violations:
+              print("\n❌ CORE PROTECTION VIOLATION:")
+              for v in protected_violations:
+                  print(f"   ! {v} (PROTECTED)")
+              print("\nContributors are ONLY allowed to modify files in 'hellhound/modules/'.")
+              print("Modifying core engine files or configuration is STRICTLY RESTRICTED.")
+              print("If you need to propose a core change, please open a separate issue first.")
+              sys.exit(1)
+
+          print("✓ No core protection violations found.")
+          EOF
+
       - name: Import check — new modules
         run: |
           python - << 'EOF'

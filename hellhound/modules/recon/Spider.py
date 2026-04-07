@@ -1832,3 +1832,61 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
 
     emit = ModuleEmit(emit_obj, verbose=cfg.verbose)
     return _do_run(target, cfg, emit, cookies, xhdrs, options=opts)
+
+# ══════════════════════════════════════════════════════════════════════
+# CUSTOM RENDERER HOOK
+# ══════════════════════════════════════════════════════════════════════
+
+def render_header(intel: dict):
+    """
+    Called dynamically by Hellhound console during `loot` to render
+    a custom module-specific ASCII banner before the generic tables.
+    """
+    from colorama import Fore, Style
+    
+    summary   = intel.get("summary", {})
+    endpoints = intel.get("endpoints", [])
+    secrets   = intel.get("secrets", [])
+    cors      = intel.get("cors_issues", [])
+    maps      = intel.get("sourcemaps", [])
+    tech      = intel.get("tech_stack", summary.get("tech_stack", []))
+    
+    total   = summary.get("total_endpoints", len(endpoints))
+    conf    = summary.get("confirmed", 0)
+    highs   = summary.get("high", 0)
+    auth_n  = summary.get("auth_required", 0)
+    param_n = summary.get("parameter_sensitive", 0)
+    sec_n   = summary.get("secrets", len(secrets))
+    cors_n  = summary.get("cors_issues", len(cors))
+    maps_n  = summary.get("sourcemaps_exposed", len(maps))
+
+    line1 = f"Endpoints: {total}    Confirmed: {conf}    High: {highs}    Auth-Walled: {auth_n}    Param-Sensitive: {param_n}"
+    t_str = ", ".join(tech) if tech else "Unknown"
+    if len(t_str) > 25: t_str = t_str[:22] + "..."
+    line2 = f"Secrets: {sec_n}      CORS: {cors_n}         Maps: {maps_n}        Tech: {t_str}"
+
+    print(f"  {Fore.CYAN + Style.BRIGHT}╔══════════════════ SPIDER RECONNAISSANCE ══════════════════╗{Style.RESET_ALL}")
+    
+    # Calculate padding dynamically for perfect right border alignment
+    for raw_line in (line1, line2):
+        padding = 59 - len(raw_line)
+        if padding < 0: padding = 0
+        
+        # Colorize specific keywords after length calculation to avoid ANSI width issues
+        colored = raw_line
+        colored = colored.replace(f"Endpoints: {total}", f"{Fore.WHITE}Endpoints: {Fore.GREEN + Style.BRIGHT}{total}{Fore.WHITE}")
+        colored = colored.replace(f"Confirmed: {conf}", f"Confirmed: {Fore.GREEN + Style.BRIGHT}{conf}{Fore.WHITE}")
+        colored = colored.replace(f"High: {highs}", f"High: {(Fore.RED + Style.BRIGHT) if highs else Fore.WHITE}{highs}{Fore.WHITE}")
+        colored = colored.replace(f"Auth-Walled: {auth_n}", f"Auth-Walled: {Fore.YELLOW + Style.BRIGHT}{auth_n}{Fore.WHITE}")
+        colored = colored.replace(f"Param-Sensitive: {param_n}", f"Param-Sensitive: {Fore.YELLOW + Style.BRIGHT}{param_n}{Fore.WHITE}")
+        
+        # Line 2 replacements
+        colored = colored.replace(f"Secrets: {sec_n}", f"{Fore.WHITE}Secrets: {(Fore.RED + Style.BRIGHT) if sec_n else Fore.GREEN}{sec_n}{Fore.WHITE}")
+        colored = colored.replace(f"CORS: {cors_n}", f"CORS: {(Fore.YELLOW + Style.BRIGHT) if cors_n else Fore.GREEN}{cors_n}{Fore.WHITE}")
+        colored = colored.replace(f"Maps: {maps_n}", f"Maps: {(Fore.YELLOW + Style.BRIGHT) if maps_n else Fore.GREEN}{maps_n}{Fore.WHITE}")
+        colored = colored.replace(f"Tech: {t_str}", f"Tech: {Fore.CYAN}{t_str}{Fore.WHITE}")
+        
+        print(f"  {Fore.CYAN + Style.BRIGHT}║{Style.RESET_ALL}  {Fore.WHITE}{colored}{Style.RESET_ALL}{' ' * padding}{Fore.CYAN + Style.BRIGHT}║{Style.RESET_ALL}")
+        
+    print(f"  {Fore.CYAN + Style.BRIGHT}╚═══════════════════════════════════════════════════════════╝{Style.RESET_ALL}")
+    print()
