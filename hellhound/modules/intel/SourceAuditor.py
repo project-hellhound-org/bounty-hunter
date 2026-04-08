@@ -107,6 +107,38 @@ SIGNATURES = [
         "description": "Web Messaging (postMessage) listener without origin validation can lead to XSS or sensitive data theft.",
         "severity": 7,
         "type": "Cross-Window Communication"
+    },
+    {
+        "id": "SA-013",
+        "name": "Weak Encryption Algorithm",
+        "pattern": r'(?:MD5|SHA1|RC4|DES)\s*\(|crypto\.(?:createHash|createCipheriv?)\s*\(\s*["\'](?:md5|sha1|rc4|des)["\']',
+        "description": "Usage of deprecated and weak cryptographic algorithms detected.",
+        "severity": 6,
+        "type": "Cryptography"
+    },
+    {
+        "id": "SA-014",
+        "name": "Client Storage Leak",
+        "pattern": r'(?:sessionStorage|indexedDB)\.(?:setItem|open|put|add)',
+        "description": "Sensitive data might be stored in insecure client-side storage mechanisms.",
+        "severity": 4,
+        "type": "Data Leakage"
+    },
+    {
+        "id": "SA-015",
+        "name": "Sensitive Logger Leak",
+        "pattern": r'console\.(?:log|error|warn|info|debug)\s*\(\s*[^)]*(?:password|token|key|secret|auth|cred)[^)]*\)',
+        "description": "Console logging of potentially sensitive variables (tokens, passwords).",
+        "severity": 5,
+        "type": "Information Disclosure"
+    },
+    {
+        "id": "SA-016",
+        "name": "Outdated/Insecure SDK Reference",
+        "pattern": r'https?://(?:cdn\.jsdelivr\.net|unpkg\.com|cdnjs\.cloudflare\.com)/.*?/(?:jquery|angular|react|vue)@[0-2]\.',
+        "description": "Reference to an older, potentially vulnerable major version of a frontend framework/SDK via CDN.",
+        "severity": 3,
+        "type": "Dependency Vulnerability"
     }
 ]
 
