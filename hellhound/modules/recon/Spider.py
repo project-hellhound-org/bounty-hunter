@@ -755,6 +755,21 @@ class Extractor:
                 store.add_secret(val, stype, url)
 
     @classmethod
+    def exposed_files(cls, text, base_url, store, emit):
+        # Passive discovery of common backend/backup/config extensions
+        _EXPOSED_RE = r'(?:https?://|//|/)[a-zA-Z0-9_\-\.\/]*\.(?:log|bak|sql|old|txt|zip|tar\.gz|env|json|xml|yml|yaml|ini|conf)\b'
+        _seen = set()
+        for m in re.finditer(_EXPOSED_RE, text, re.I):
+            raw = m.group(0)
+            if raw in _seen: continue
+            _seen.add(raw)
+            if raw.startswith("//"): full = "http:" + raw
+            elif raw.startswith("/"): full = urljoin(base_url, raw)
+            else: full = raw
+            store.add_endpoint(full, source="Leaked_File", score=Conf.MEDIUM)
+            emit.info(f"[Leaked-File] {full}")
+
+    @classmethod
     def js_endpoints(cls, text, base_url, store, emit):
         _seen_paths: set = set()
         for pat in cls._API_RE:
@@ -1314,6 +1329,15 @@ class Spider:
         xpb     = (headers.get("X-Powered-By","") or headers.get("x-powered-by","")).lower()
         body_lo = body.lower()
 
+        # ── Leakage: Expose highly verbose Server headers ───────────────
+        raw_srv = headers.get("Server") or headers.get("server", "")
+        raw_xpb = headers.get("X-Powered-By") or headers.get("x-powered-by", "")
+        raw_asp = headers.get("X-AspNet-Version") or headers.get("x-aspnet-version", "")
+        if raw_srv: tech.add(f"Server: {raw_srv}")
+        if raw_xpb: tech.add(f"X-Powered-By: {raw_xpb}")
+        if raw_asp: tech.add(f"X-AspNet-Version: {raw_asp}")
+
+        # ── Server / infrastructure ──────────────────────────────────────
         if "nginx"      in srv: tech.add("Nginx")
         if "apache"     in srv: tech.add("Apache")
         if "cloudflare" in srv: tech.add("Cloudflare")
@@ -1450,6 +1474,7 @@ class Spider:
                 Extractor.js_endpoints(tag.string, url, self.store, self.emit)
                 Extractor.js_params(tag.string, url, self.store, self.emit)
                 Extractor.secrets(tag.string, url, self.store, self.emit)
+                Extractor.exposed_files(tag.string, url, self.store, self.emit)
         for form in soup.find_all("form"):
             action = form.get("action") or url
             full   = urljoin(url, action)
@@ -1488,6 +1513,7 @@ class Spider:
         Extractor.secrets(text, url, self.store, self.emit)
         Extractor.js_endpoints(text, url, self.store, self.emit)
         Extractor.js_params(text, url, self.store, self.emit)
+        Extractor.exposed_files(text, url, self.store, self.emit)
         await self._check_sourcemap(session, url)
         for m in re.finditer(r'import\s*\(\s*["\']([^"\']+)["\']', text):
             full = urljoin(url, m.group(1))
@@ -1521,6 +1547,18 @@ class Spider:
                                 self.store.add_endpoint(url, source=source,
                                                         score=Conf.MEDIUM, auth_required=True)
                                 self.emit.info(f"[Auth-wall:{s}] {url}")
+                            elif s in (500, 501, 502, 503) and body:
+                                _ERR_RE = re.compile(
+                                    r'(?:Traceback|Exception in thread|SyntaxError|ParseError|'
+                                    r'SQLSTATE|You have an error in your SQL|ORA-\d{5}|'
+                                    r'Fatal error:|Warning:|Uncaught \w+Error|'
+                                    r'at [a-zA-Z\.]+\([a-zA-Z]+\.java:\d+\))',
+                                    re.I
+                                )
+                                if _ERR_RE.search(body):
+                                    self.store.add_endpoint(url, source="Error_Leak", score=Conf.HIGH)
+                                    self.store.add_secret(body[:200], "Error_Stack_Trace", url)
+                                    self.emit.info(f"[Error-Leak] Verbose error at {url}")
                             elif s == 200:
                                 if depth <= 1:
                                     self._detect_tech(hdrs, body, url)
@@ -1538,6 +1576,18 @@ class Spider:
                                     await self._process_js(url, body, session)
                                 elif "json" in ct:
                                     self.store.add_endpoint(url, source="JSON_Response", score=Conf.MEDIUM)
+                                    # -- Geo-location leak
+                                    _GEO_RE = re.compile(
+                                        r'(?:"latitude"|"lat"|"lng"|"longitude"|"geo"|"coordinates")'
+                                        r'\s*:\s*(-?\d{1,3}\.\d+)',
+                                        re.I
+                                    )
+                                    for _gm in _GEO_RE.finditer(body):
+                                        self.store.add_secret(
+                                            f"GeoCoord: {_gm.group(0)[:60]}",
+                                            "GeoLocation_Leak", url)
+                                        self.emit.info(f"[Geo-Leak] Coordinates in response: {url}")
+                                        break
                                     for m in re.finditer(r'"([/][a-zA-Z0-9_\-\/]+)"', body):
                                         path = m.group(1)
                                         if len(path) > 3:
@@ -1622,23 +1672,29 @@ class Spider:
 
             # Probe .well-known and sensitive root paths
             _WK_PATHS = (
+                "/.git/HEAD",
+                "/.git/config",
+                "/.env",
                 "/.well-known/security.txt", 
                 "/security.txt",
                 "/.well-known/change-password",
                 "/.well-known/openid-configuration",
                 "/.well-known/assetlinks.json",
                 "/.well-known/apple-app-site-association",
-                "/.env",
-                "/.git/config"
             )
             for _wk in _WK_PATHS:
                 _wk_url = urljoin(self.target, _wk)
-                _s, _, _t = await fetch(session, "GET", _wk_url, self.rl)
+                _s, _hdrs, _t = await fetch(session, "GET", _wk_url, self.rl)
                 if _s == 200 and _t:
-                    self.store.add_endpoint(_wk_url, source="WellKnown", score=Conf.LOW)
+                    _ct = (_hdrs or {}).get("content-type", "").lower()
+                    # Skip SPA false positives (Angular/React return 200+HTML for unknown paths)
+                    if "text/html" in _ct and "<html" in _t.lower():
+                        continue
+                    self.store.add_endpoint(_wk_url, source="WellKnown", score=Conf.CONFIRMED)
+                    self.emit.always_success(f"[Surface] Exposed: {_wk_url}")
                     discovered = []
-                    # Improved generic path extractor (handles relative and absolute)
-                    for _m in re.finditer(r'(?:^|\s|\"|\')((?:https?://[^\s\"\'\>]+|/[a-zA-Z0-9_\-\./\?\#]+))', _t, re.M):
+                    # Extract relative/absolute paths from body
+                    for _m in re.finditer(r'(?:^|\s|"|\'|)((?:https?://[^\s"\'>]+|/[a-zA-Z0-9_\-\./\?\#]+))', _t, re.M):
                         _path = _m.group(1).strip()
                         if _path.startswith("/") and len(_path) > 1:
                             _full = urljoin(self.target, _path)
@@ -1651,7 +1707,6 @@ class Spider:
                             discovered.append(_path)
                     
                     self.store.add_well_known(_wk_url, _t[:200].replace("\n", " "), discovered)
-                    self.emit.always_success(f"Well-known discovered: {_wk_url} ({len(discovered)} paths found)")
 
             if self.cfg.use_playwright:
                 spa = SPAScanner(self.target, self.store, self.emit, self.cookies,
