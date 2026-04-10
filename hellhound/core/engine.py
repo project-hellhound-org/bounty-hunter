@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import traceback
 import pkgutil
+import asyncio
+import inspect
 
 import hellhound.modules
 from hellhound.core.emit import PlainEmit, ConsoleEmit
@@ -68,7 +70,23 @@ class HellhoundEngine:
             return ""
 
         try:
-            return module.run(target, active_emit, options=options)
+            # Check if run is a coroutine function or a regular function returning a coroutine
+            result = module.run(target, active_emit, options=options)
+            
+            if inspect.iscoroutine(result):
+                # Synchronous bridge to async execution
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # If loop is already running, we might need to handle it differently 
+                        # but in the sync console, this shouldn't happen.
+                        return loop.run_until_complete(result)
+                    else:
+                        return asyncio.run(result)
+                except RuntimeError:
+                    # No event loop exists in this thread
+                    return asyncio.run(result)
+            return result
         except Exception as e:
             active_emit.warn(f"Module '{module_name}' crashed:\n{traceback.format_exc()}")
             return ""

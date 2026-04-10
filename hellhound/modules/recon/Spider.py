@@ -533,10 +533,12 @@ class Store:
         self.secrets.append({"content": val, "type": stype, "source": source_url})
         return True
 
-    def add_cors(self, url, origin_sent, reflected, creds):
+    def add_cors(self, url, origin_sent, reflected, creds, severity=None):
+        if not severity:
+            severity = "HIGH" if creds else "MEDIUM"
         self.cors_issues.append({
             "url": url, "origin_sent": origin_sent, "reflected": reflected,
-            "allow_credentials": creds, "severity": "HIGH" if creds else "MEDIUM"
+            "allow_credentials": creds, "severity": severity
         })
 
     def add_well_known(self, url, content_snippet, discovered_paths=None):
@@ -977,12 +979,20 @@ class IntelligentProber:
         evil = "https://evil.hellhound.test"
         _, hdrs, _ = await fetch(self.session, "GET", url, self.rl, headers={"Origin": evil})
         if not hdrs: return
-        acao = hdrs.get("Access-Control-Allow-Origin","") or hdrs.get("access-control-allow-origin","")
+        acao = (hdrs.get("Access-Control-Allow-Origin","") or 
+                hdrs.get("access-control-allow-origin",""))
         acac = (hdrs.get("Access-Control-Allow-Credentials","") or
                 hdrs.get("access-control-allow-credentials","")).lower() == "true"
-        if acao and (acao == "*" or acao == evil):
-            # Stored in intel — no output
-            self.store.add_cors(url, evil, acao, acac)
+        
+        if acao:
+            if acao == evil:
+                # High-fidelity reflection
+                self.store.add_cors(url, evil, acao, acac, severity="HIGH" if acac else "MEDIUM")
+            elif acao == "*":
+                # Wildcard: only report once per run if not already reported as global issue
+                # Unless credentials are allowed (which is a major misconfig/browser error if both set)
+                if acac or not any(c["reflected"] == "*" for c in self.store.cors_issues):
+                    self.store.add_cors(url, evil, acao, acac, severity="LOW" if not acac else "HIGH")
 
 # ══════════════════════════════════════════════════════════════════════
 # ROBOTS + SITEMAP PARSER

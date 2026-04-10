@@ -37,6 +37,19 @@ _DEFAULT_PAGE_SIGS = [
     (re.compile(r'Whoa, you found a secret feature', re.I), "Express Debug Page"),
 ]
 
+_EXPOSURE_SIGNATURES = {
+    ".git/config": [r"\[core\]", r"repositoryformatversion"],
+    ".env": [r"^\w+=", r"DB_", r"API_", r"SECRET"],
+    ".dockerconfigjson": [r'"auths":', r'{\s*"auths"'],
+    ".DS_Store": [r"Bud1"],
+    "phpinfo.php": [r"PHP Version", r"System"],
+    "info.php": [r"PHP Version", r"System"],
+    "robots.txt": [r"User-agent:", r"Disallow:"],
+    "security.txt": [r"Contact:", r"Encryption:"],
+    ".well-known/security.txt": [r"Contact:", r"Encryption:"],
+    ".htaccess": [r"RewriteEngine", r"Options"],
+}
+
 _DEFAULT_PATHS = [
     "/", "/server-status", "/server-info",
     "/phpmyadmin", "/pma", "/adminer",
@@ -108,6 +121,35 @@ def check_default_pages(base_url: str, session) -> list:
                             "url": url,
                             "description": f"Default installation page or exposed admin panel detected at {url}."})
                         break
+        except Exception:
+            pass
+    return findings
+
+def check_data_exposure(base_url: str, session) -> list:
+    """High-fidelity sensitive file exposure audit."""
+    findings = []
+    for path, patterns in _EXPOSURE_SIGNATURES.items():
+        url = base_url.rstrip("/") + "/" + path
+        try:
+            r = session.get(url, timeout=5, allow_redirects=False)
+            if r.status_code == 200:
+                body = r.text
+                # Signature Check
+                matched = any(re.search(p, body, re.M | re.I) for p in patterns)
+                if not matched: continue
+                
+                # Boilerplate Filter
+                if any(x in body.lower()[:500] for x in ["404", "not found", "cannot find"]):
+                    continue
+                
+                severity = 9 if ".git" in path or ".env" in path else 4
+                findings.append({
+                    "id": "SA-201", "severity": severity,
+                    "name": f"Sensitive File Exposed: {path}",
+                    "url": url,
+                    "description": f"Confirmed {path} leak via signature verification. "
+                                   f"Contains sensitive architectural or credential data."
+                })
         except Exception:
             pass
     return findings
@@ -355,6 +397,16 @@ def run(target, emit, options=None):
             emit.warn(f"    [!] {f['name']} at {f['url']}")
         if not df:
             emit.info("    [✔] No default configuration pages detected")
+
+    # ── 1.5 Data Exposure ───────────────────────────────────────────
+    emit.info("    [Exposure] Auditing for sensitive file leaks...")
+    ex_f = check_data_exposure(base_url, session)
+    for f in ex_f:
+        all_findings.append(f)
+        risk_score += f["severity"]
+        emit.warn(f"    [!] {f['name']} at {f['url']}")
+    if not ex_f:
+        emit.info("    [✔] No sensitive file exposures confirmed")
 
     # ── 2. CDN Config ───────────────────────────────────────────────
     if options.get("check_cdn", True):
