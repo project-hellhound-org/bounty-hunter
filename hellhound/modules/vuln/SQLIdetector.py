@@ -85,20 +85,48 @@ class SQLIAuditor:
         return None
 
     async def check_time_based(self, url, method, pname, original_value):
-        """Checks for execution delays."""
+        """Checks for execution delays using a baseline heuristic."""
         if not self.options.get("enable_time_based"):
             return None
 
         delay = self.options.get("time_delay", 5)
+        
+        # Phase 1: Establish Baseline
+        try:
+            t0 = time.time()
+            async with self.session.request(method, url, timeout=10) as r:
+                await r.read()
+                baseline = time.time() - t0
+        except:
+            baseline = 0.5 # Fallback
+            
+        # Threshold: Baseline + Delay - (small margin)
+        # We also need to verify it wasn't just a slow request by doing a secondary check if positive.
+        
         for p in TIME_PROBES:
             payload = p.format(delay=delay)
             try:
                 t0 = time.time()
-                async with self.session.request(method, url, params={pname: payload}, timeout=delay + 5) as r:
+                async with self.session.request(method, url, params={pname: payload}, timeout=delay + 10) as r:
                     await r.read()
                     elapsed = time.time() - t0
-                    if elapsed >= delay:
-                        return {"type": "TIME_BASED", "evidence": f"Server delayed by {elapsed:.2f}s", "payload": payload}
+                    
+                    if elapsed >= (baseline + delay - 0.5):
+                        # Potential hit, verify once more with a different delay to confirm linearity
+                        # (The "Precision" step)
+                        new_delay = delay + 2
+                        new_payload = p.format(delay=new_delay)
+                        t0_v = time.time()
+                        async with self.session.request(method, url, params={pname: new_payload}, timeout=new_delay + 10) as r_v:
+                            await r_v.read()
+                            elapsed_v = time.time() - t0_v
+                            
+                            if elapsed_v >= (baseline + new_delay - 0.5):
+                                return {
+                                    "type": "TIME_BASED", 
+                                    "evidence": f"Confirmed time-delay (Baseline: {baseline:.2f}s, Prob1: {elapsed:.2f}s, Prob2: {elapsed_v:.2f}s)", 
+                                    "payload": payload
+                                }
             except:
                 continue
         return None

@@ -122,12 +122,16 @@ def run(target, emit, options=None):
                 risk_val = 5 
                 
             elif acao == "*" and not acac:
+                # Open CORS (Wildcard) is only a minor issue for public files
+                # Don't flood the results if it's the same across many URLs
                 vuln_type = "Open CORS (Wildcard)"
                 risk_val = 1
                 
             if vuln_type:
-                # Prevent duplicate finding types for the same URL
-                duplicate = any(f["url"] == url and f["type"] == vuln_type for f in findings)
+                # Deduplication: If many URLs have the same 'Open CORS' issue, only report it once for the base target
+                is_repetitive = vuln_type == "Open CORS (Wildcard)"
+                duplicate = any(f["type"] == vuln_type and (f["url"] == url or is_repetitive) for f in findings)
+                
                 if not duplicate:
                     finding = {
                         "url": url,
@@ -143,7 +147,7 @@ def run(target, emit, options=None):
                     }
                     findings.append(finding)
                     risk_score += risk_val
-                    emit.warn(f"    [!] {vuln_type} on {url} (Origin: {payload}) [Creds: {acac}]")
+                    emit.warn(f"    [!] {vuln_type}: {url} matches Origin: {payload}")
 
     if findings:
         signals.append("CORS_MISCONFIGURATION")
