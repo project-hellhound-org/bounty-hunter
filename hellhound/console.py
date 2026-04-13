@@ -1,4 +1,5 @@
 import cmd
+import threading
 import yaml
 import importlib.resources as pkg_resources
 import os
@@ -237,6 +238,7 @@ class HellhoundConsole(cmd.Cmd):
             "ai_status_label": "NOT CONNECTED",
             "proxy_mode": "repro_only"
         }
+        self.update_available = False
 
         self.aliases = {
             "hunt": "prey",
@@ -275,55 +277,66 @@ class HellhoundConsole(cmd.Cmd):
     # ----------------------------
     def preloop(self):
         os.system('cls' if os.name == 'nt' else 'clear')
+
+        # ── 1. Start background update check ──────────────────
+        # Runs during the boot animation to save time.
+        check_thread = threading.Thread(target=self._check_for_updates, daemon=True)
+        check_thread.start()
+
+        # ── 2. Run Boot Animation ─────────────────────────────
         _boot_sequence()
 
-        logo = r"""
-
-
-            .:@@@-..                             ...                                                
-            .#@@@@@@..                        ..+%.                                                 
-           ..@@@@@@@@@%:.                  .-%@:                                                    
-           .#@@@@@@@@@@@@@=.   .::.                             .:.                                 
-           .@@@@@@@@@@@@@@@@@@@@@@@@@@@@#=:...         ....+@@@@@+.                                 
-           .%**=@@@@@@@@@@@@@@@@**@@@@@@@@@#+:......:+@@@@@+..+@#.                                  
-           .%@@%@%:=@@@@@@@@=@@*%@=:#@@@@@@@@@@@@@@@@@@%=*#:%@@@..                                  
-           .#@:%@@@@@:-@@@@@@.#@@@@*-+%@@@@@@@@@@@@@@@@@@@@@@@@:.                                   
-           .=.   -%@@@@%+@@@@@#*@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@:.                                    
-                  .=@@@@@@@@@@@@@@@@@@@@@@@@@@=%%@@@@@@@@@@*.                                       
-                     .:@@@@@@@@@@@@@@@@@@@@@@@@+%@%-#@@@@#.....     ....                            
-            .           .=@*@@@@@@@@@@@@@@@@@@@@@#*@@@@@:..  :@@#-.. ..:-.                          
-           ==   ....  ..%@@-@@.+@@@@@@@@@@@@@@@@@@@=@@@@@@%.. .@@@@@:%:..                           
-          .@%..:@:%@+#@@*-#@@@.+.+@-@@@%@@@:@@@@#-@@*@@@@%:#@+..*@@@@@@*:.                          
-          :%@@@%+--..+@@@@@@@@%:@+. :@@.@@%:.+@@@:.#@@@@@@@@#.-#-:@@@@@@@@@*.                       
-          %@@@@@@@@@@@@@@@-+@@@-@@%.+=:.:@.%@-.#@+::-@@@@@@=@@@@:..:@=+@@=#@@:.                     
-          .*@@@@@@@@@@@@@@@@@@@@@@@+.%@=...@@@%.=#.@=.#@@@@*+@@@@@@@@+:=-@@%:-%#..                  
-            .=@::....::..=@@@@@@@@@@.+@@@:*@@@@@+#.*@#.@@@@%.+@@@@@@@@@@@@@@@@=..+=.                
-                         .@@@@@@@@@#.%@@@@@@@@@@@+.*@@%@@@@#. -@@@@@@@@@@@@@@@@@:       .:          
-                         .@#@@@@@*@:=@@@@@@@@@@@*.-@@@@@@@@=....%@@@#*@@@@@=%%@@@@.. .*@=.          
-                         .%-@@@@@+.-@@@@@@@@-@@-.=@@@@@@@@@...#-.-@@@@@:.#@@@@@*-@@-.*-.            
-                          .+@@@@-.+@@@@@@@@-**.:@@@@@@@@@@:...#@#..*@@@@@#..#@@@@@@@:.              
-                          .#=@@@.%@@@@@@@@-..+@@@@@@@@@@@+@-..%@@@:..@@@@@@@-.-=@@@@@..             
-                          .:.@@@@@@@@@@@@-.%@@@@@@@@@@@@@:.%..@@@@@#..:@@@@@@@=..@@@@:.             
-                            .@@@@@@@@@@@=@@@@@@@@@@@@%:..%@#.:@@@@@@@. .@@@@+:@# .%@@-.             
-                            .@@@@@@@@@@%@@@@@@#@#+-...*@@@@..*@@@@@@@% .@@@+ .=-..@@:.              
-                            .@*@@@+@@@@@@@@@-=*...:@@@@@@@:..@@@@@@@@@. .*@@:     .#@.              
-                            .--@@+:@@@@@@@=.+..=@@@@%%@@@...*@@@@@@@@@. .*@+      .*=.              
-                              -@=.+@@@@@%...=@@@*:..=@@+.. -@@-%@@@@@:...@-.     ..*.               
-                              --. *@@@@=..+@@+.. ..#@%.   -@=.-@@@@@.. .=.        ..                
-                              .. .#@@@:.:@@..   .-@#..   ++...%@@@%..                               
-                                 .@@@:.:@:.   ..%=..  ..#.. .#@@@..                                 
-                                 .@@. .#.    .-.           .%@%..                                   
-                                .#*.  ..                 .+@=..                                     
-                                +.                    ..=+..                                        
-                 ██╗  ██╗███████╗██╗     ██╗     ██╗  ██╗ ██████╗ ██╗   ██╗███╗   ██╗██████╗ 
-                 ██║  ██║██╔════╝██║     ██║     ██║  ██║██╔═══██╗██║   ██║████╗  ██║██╔══██╗
-                 ███████║█████╗  ██║     ██║     ███████║██║   ██║██║   ██║██╔██╗ ██║██║  ██║
-                 ██╔══██║██╔══╝  ██║     ██║     ██╔══██║██║   ██║██║   ██║██║╚██╗██║██║  ██║
-                 ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
-                 ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝ 
-"""
-        # Initialise commands
+        # ── 3. Post-Animation Logic ───────────────────────────
         print(f"\n{Fore.WHITE}Type '{Fore.YELLOW}help{Fore.WHITE}' to view available commands.\n")
+        
+        # Give the thread a tiny bit more time if it's not finished
+        # (Though animation is 4.2s, so it should be done)
+        check_thread.join(timeout=0.5)
+
+        if self.update_available:
+            print(f"  {Fore.RED + Style.BRIGHT}[!] Update available: {Fore.WHITE}A newer version of Hellhound is ready.{Style.RESET_ALL}")
+            print(f"      {Fore.WHITE}Type '{Fore.YELLOW}upgrade{Fore.WHITE}' to install latest features and patches.{Style.RESET_ALL}\n")
+
+    def _check_for_updates(self):
+        """
+        Fast, lightweight check for framework updates.
+        Sets self.update_available if an update is found on origin.
+        Designed to be called in a background thread.
+        """
+        import subprocess
+        from pathlib import Path
+        try:
+            # Find project root
+            import hellhound
+            root = Path(hellhound.__file__).resolve().parent.parent
+            
+            # 1. Get current local SHA
+            local_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], 
+                cwd=root, 
+                stderr=subprocess.DEVNULL,
+                timeout=3
+            ).decode().strip()
+
+            # 2. Get remote SHA without full fetch (fast)
+            remote_output = subprocess.check_output(
+                ["git", "ls-remote", "origin", "HEAD"],
+                cwd=root,
+                stderr=subprocess.DEVNULL,
+                timeout=5
+            ).decode().strip()
+            
+            if not remote_output:
+                return
+                
+            remote_sha = remote_output.split()[0]
+            
+            if local_sha != remote_sha:
+                self.update_available = True
+                
+        except Exception:
+            # Silently fail on network error, no git repo, or timeout
+            pass
     
     # ============================
     # TAB COMPLETION
@@ -404,6 +417,39 @@ class HellhoundConsole(cmd.Cmd):
         """exit → Leave console"""
         print(Fore.RED + "[+] Exiting Hellhound console")
         return True
+
+    def do_upgrade(self, arg):
+        """upgrade → Pull latest updates and sync dependencies from within console"""
+        import subprocess
+        import os
+        from pathlib import Path
+
+        print(Fore.CYAN + "[*] Initializing framework upgrade...")
+        
+        # Find the project root
+        # Since this is installed via 'pip install -e .', we can use the package path
+        try:
+            import hellhound
+            project_root = Path(hellhound.__file__).resolve().parent.parent
+            update_script = project_root / "update.sh"
+
+            if not update_script.exists():
+                print(Fore.RED + f"[x] Error: Update script not found at {update_script}")
+                return
+
+            # Ensure it's executable
+            os.chmod(update_script, 0o755)
+
+            # Inform user
+            print(Fore.YELLOW + "[!] The console will temporarily suspend to run the update process.")
+            print(Fore.YELLOW + "[!] After update completes, please restart hellhound.")
+            time.sleep(1.5)
+
+            subprocess.run(["bash", str(update_script)], check=True)
+            
+            print(Fore.GREEN + "\n[✓] Upgrade complete. Please exit and restart hellhound to use the new version.")
+        except Exception as e:
+            print(Fore.RED + f"[x] Critical error during console upgrade: {e}")
 
     def do_debug(self, arg):
         """debug modules → Show list of modules that failed to load and the error reason"""
@@ -510,7 +556,7 @@ class HellhoundConsole(cmd.Cmd):
         category = self.modules[match].get("category", "unknown")
         description = self.modules[match].get("description", "")
 
-        print(Style.BRIGHT + Fore.GREEN + f"\n[✔] Module equipped: {match}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.GREEN + f"\n[+] Module equipped: {match}" + Style.RESET_ALL)
         print(Style.BRIGHT + Fore.WHITE + f"    Category    " + Style.RESET_ALL + f": {Style.BRIGHT + Fore.CYAN}{category}" + Style.RESET_ALL)
         print(Style.BRIGHT + Fore.WHITE + f"    Description " + Style.RESET_ALL + f": {Fore.WHITE}{description}" + Style.RESET_ALL)
 
@@ -1040,7 +1086,7 @@ class HellhoundConsole(cmd.Cmd):
 
         if result:
             self.results[self.active_module.lower()] = result
-            print(Style.BRIGHT + Fore.GREEN + f"\n[✔] Strike complete. Intel stored under '{self.active_module.lower()}'." + Style.RESET_ALL)
+            print(Style.BRIGHT + Fore.GREEN + f"\n[+] Strike complete. Intel stored under '{self.active_module.lower()}'." + Style.RESET_ALL)
             print(Fore.CYAN + "    Use 'loot' to view results, 'howl' for suggestions, or 'repro' to verify.\n" + Style.RESET_ALL)
         else:
             print(Style.BRIGHT + Fore.YELLOW + "[•] Module returned no results." + Style.RESET_ALL)
@@ -1641,26 +1687,26 @@ class HellhoundConsole(cmd.Cmd):
     # ============================
 
     def info(self, msg):
-        print(Style.BRIGHT + Fore.CYAN + f"[•] {msg}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.CYAN + f"[*] {msg}" + Style.RESET_ALL)
 
     def success(self, msg):
-        print(Style.BRIGHT + Fore.GREEN + f"[✔] {msg}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.GREEN + f"[+] {msg}" + Style.RESET_ALL)
 
     def warn(self, msg):
-        print(Style.BRIGHT + Fore.YELLOW + f"[•] {msg}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.YELLOW + f"[*] {msg}" + Style.RESET_ALL)
 
     def always_info(self, msg):
-        print(Style.BRIGHT + Fore.CYAN + f"[•] {msg}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.CYAN + f"[*] {msg}" + Style.RESET_ALL)
 
     def always_success(self, msg):
         if "Target:" in msg:
             msg = msg.replace("High:", Fore.RED + Style.BRIGHT + "High:" + Style.RESET_ALL + Fore.GREEN + Style.BRIGHT)
             msg = msg.replace("Secrets:", Fore.MAGENTA + Style.BRIGHT + "Secrets:" + Style.RESET_ALL + Fore.GREEN + Style.BRIGHT)
             msg = msg.replace("Param-Sensitive:", Fore.YELLOW + Style.BRIGHT + "Param-Sensitive:" + Style.RESET_ALL + Fore.GREEN + Style.BRIGHT)
-        print(Style.BRIGHT + Fore.GREEN + f"[✔] {msg}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.GREEN + f"[+] {msg}" + Style.RESET_ALL)
 
     def error(self, msg):
-        print(Style.BRIGHT + Fore.RED + f"[✖] {msg}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.RED + f"[x] {msg}" + Style.RESET_ALL)
 
     def section(self, title):
         print(Style.BRIGHT + Fore.MAGENTA + f"\n  ── {title} ──" + Style.RESET_ALL)

@@ -46,7 +46,7 @@ echo -e "${CYAN}[*] Installing HELLHOUND into venv...${RESET}"
 # ── 5. Install Playwright browsers ────────────────────
 echo -e "${CYAN}[*] Installing Playwright Chromium browser...${RESET}"
 if "$VENV_DIR/bin/python" -m playwright install chromium 2>/dev/null; then
-    echo -e "${GREEN}[✓] Playwright Chromium installed.${RESET}"
+    echo -e "${GREEN}[+] Playwright Chromium installed.${RESET}"
 else
     echo -e "${YELLOW}[!] Playwright browser install failed.${RESET}"
     echo -e "${YELLOW}    Fix: source $VENV_DIR/bin/activate && playwright install chromium${RESET}"
@@ -69,10 +69,26 @@ fi
 mkdir -p "$HOME/.local/bin"
 ln -sf "$VENV_DIR/bin/hellhound" "$HOME/.local/bin/hellhound"
 
-# ── 8. Done ───────────────────────────────────────────
-echo -e "\n${GREEN}[✓] HELLHOUND installed successfully.${RESET}"
+# ── 8. System-wide Symlink (Optional) ──────────────────
+if [ "$EUID" -eq 0 ]; then
+    echo -e "${CYAN}[*] Sudo detected. Creating system-wide symlink...${RESET}"
+    ln -sf "$VENV_DIR/bin/hellhound" "/usr/local/bin/hellhound"
+    echo -e "${GREEN}[+] System-wide symlink created: /usr/local/bin/hellhound${RESET}"
+fi
+
+# ── 9. Make scripts executable ────────────────────────
+chmod +x "$PROJECT_ROOT/update.sh"
+chmod +x "$PROJECT_ROOT/install.sh"
+
+# ── 10. Done ──────────────────────────────────────────
+echo -e "\n${GREEN}[+] HELLHOUND installed successfully.${RESET}"
 echo -e "${GREEN}    Venv    : $VENV_DIR${RESET}"
 echo -e "${GREEN}    Command : hellhound${RESET}"
+echo ""
+echo -e "${YELLOW}  To upgrade in the future, use:${RESET}"
+echo -e "    hellhound upgrade"
+echo -e "  Or from within the console:"
+echo -e "    hellhound > upgrade"
 echo ""
 echo -e "${YELLOW}  Activate now (current terminal):${RESET}"
 echo -e "    source $SHELL_RC"

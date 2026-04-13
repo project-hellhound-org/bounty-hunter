@@ -1,44 +1,84 @@
 <p align="center">
-  <img src="Images/hellhound.png" alt="Hellhound" width="600"/>
+  <img src="Images/hellhound.png" alt="Hellhound" width="100%"/>
 </p>
+
 <h1 align="center">HELLHOUND v12.5</h1>
 <h1 align="center">Apex-King Pentest Framework</h1>
+
 <p align="center">
-  High-performance modular web offensive framework with Zero-Config AI Intelligence.
+  <b>High-performance modular web offensive framework with Zero-Config AI Intelligence.</b>
 </p>
+
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white"/>
-  <img src="https://img.shields.io/badge/AI--Agnostic-OpenAI%20%7C%20Anthropic%20%7C%20Gemini-red?style=flat-square"/>
-  <img src="https://img.shields.io/badge/architecture-Modular%20%7C%20AI--Powered-green?style=flat-square"/>
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square"/>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.13-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
+  <a href="https://github.com/l4zz3rj0d/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.5.0-red?style=flat-square" alt="Release Version"/></a>
+  <img src="https://img.shields.io/badge/AI--Agnostic-OpenAI%20%7C%20Anthropic%20%7C%20Gemini-red?style=flat-square" alt="AI Support"/>
+  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License"/>
+  <a href="https://github.com/l4zz3rj0d/Hellhound-Pentest/stargazers"><img src="https://img.shields.io/github/stars/l4zz3rj0d/Hellhound-Pentest?style=flat-square&color=yellow" alt="Stars"/></a>
 </p>
 
 ---
 
 ## The Apex-King of Web Offense
 
-Hellhound is a professional-grade security framework designed for high-fidelity web application assessments. Engineered for speed and precision, version 12.5 integrates the **Apex-King AI Core**, enabling intelligent attack-chain correlation alongside a robust, rule-based hunting arsenal.
+**Hellhound** is a high-fidelity security framework engineered for professional web application assessments. Engineered for speed and surgical precision, version 12.5 introduces the **Apex-King AI Core**, enabling intelligent attack-chain correlation, automated context-aware verification, and a robust arsenal of modular security auditors.
+
+Whether you're performing surface reconnaissance or deep logical vulnerability analysis, Hellhound provides a unified console to manage your entire offensive pipeline.
 
 ---
 
-## Installation
+## Key Features
+
+- **Zero-Config AI Intelligence**: Instant integration with Gemini, OpenAI, and Anthropic for vulnerability confirmation and exploit generation.
+- **Asynchronous Native**: Built from the ground up on `aiohttp` and `playwright` for lightning-fast multi-target analysis.
+- **Modular Arsenal**: 30+ specialized modules covering Recon, Vuln, Intel, and Exploitation.
+- **Integrated OOB**: Built-in Out-of-Band (OOB) server support for detecting blind vulnerabilities (SSRF, XXE, SQLi).
+- **Universal Rendering Engine**: Full SPA/JavaScript support via Playwright-powered technology profiling and spidering.
+- **Seamless Upgrades**: Keep your framework updated with a single `hellhound upgrade` command.
+
+---
+
+## Installation & Setup
 
 ### Prerequisites
-- Python 3.10 or higher
-- Git
-- Internet connectivity (for initial browser and AI setup)
+- **Python 3.10+** (Recommended: 3.13)
+- **Git**
+- **Playwright Dependencies** (Automated during install)
 
 ### One-Step Automated Install
-Run the installation script from the project root. This will create a dedicated virtual environment and register the `hellhound` command alias.
-
 ```bash
+# Clone the repository
 git clone https://github.com/l4zz3rj0d/Hellhound-Pentest.git
 cd Hellhound-Pentest
+
+# Run the professional installer
 chmod +x install.sh
 ./install.sh
 ```
+*After installation, restart your terminal or run `source ~/.bashrc` to activate the `hellhound` command.*
 
-After installation, restart your terminal or run `source ~/.bashrc` (or `~/.zshrc`) to activate the command.
+### Keeping Hellhound Updated
+Hellhound features a professional self-update mechanism:
+```bash
+# From your terminal
+hellhound upgrade
+
+# Or from within the Hellhound console
+hellhound > upgrade
+```
+
+---
+
+## The Arsenal
+
+Hellhound's power lies in its modularity. Each module is optimized for high high-fidelity results with minimal false positives.
+
+| Category | Modules | Description |
+| :--- | :--- | :--- |
+| **Recon** | `Spider`, `SurfaceAuditor`, `WAFbuster`, `GraphQL`, `CORSbuster`, `FUZZhunter`, `JWTanalyzer` | Deep surface mapping and service discovery. |
+| **Vulnerability Audit** | `XSStrike`, `SQLIdetector`, `SSRFdetector`, `XXEdetector`, `IDORdetector`, `LFIauditor`, `RBAC` | Targeted vulnerability identification and logic auditing. |
+| **Intelligence** | `SecretScanner`, `TechProfiler`, `SourceAuditor`, `CloudScout`, `BlobUnpacker` | Harvesting sensitive data and infrastructure intelligence. |
+| **Analysis & Exploitation** | `Exmap`, `Hydra`, `CMDinj` | Universal exploitation matrix and parameter orchestration. |
 
 ---
 
@@ -50,22 +90,19 @@ hellhound
 ```
 
 ### Initial Configuration
-Before starting an assessment, it is recommended to configure your AI provider and Out-of-Band (OOB) listener.
-
+Setup your AI provider and OOB listener for maximum impact:
 ```bash
-# 1. Connect AI Intelligence (Gemini/OpenAI/Anthropic)
+# 1. Connect AI Intelligence (e.g. Gemini)
 hellhound > setg ai_key <your_api_key>
 
-# 2. Start OOB Listener (for blind detection)
+# 2. Start OOB Listener
 hellhound > oob start
 ```
 
 ### Core Operational Workflow
-Getting from target acquisition to actionable intel:
-
 ```bash
 # 1. Acquire Target
-hellhound > prey https://target-app.com
+hellhound > prey https://target-app.com --cookie "session=..."
 
 # 2. Map Attack Surface
 hellhound [Spider] > strike
@@ -81,12 +118,14 @@ hellhound > howl                   # AI Attack-Chain Correlation
 ---
 
 ## Documentation
-For detailed technical specifications, internal logic, and detection matrices, see the [Architecture Guide](ARCHITECTURE.md).
+For deep-dives into framework architecture, module logic, and detection signatures, visit:
+- [Architecture Guide](ARCHITECTURE.md)
+- [Module Scaffolding](scaffold_module.py)
 
 ---
 
 ## Compliance & Usage
-Hellhound is developed strictly for authorized security assessments. The developers assume no liability for misuse or damage caused by this tool. Usage must comply with local and international laws.
+Hellhound is developed strictly for **authorized security assessments**. The developers and contributors assume no liability for misuse, unauthorized access, or damage caused by this tool. Usage must comply with all applicable local, national, and international laws.
 
 **Developer**: [l4zz3rj0d](https://github.com/l4zz3rj0d)  
 **License**: MIT
