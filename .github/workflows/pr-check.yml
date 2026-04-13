@@ -1,0 +1,92 @@
+name: PR Verification
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Core Protection Audit
+        run: |
+          echo "Verifying file isolation..."
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            # Allowed files for standard contributors
+            if [[ "$file" == hellhound/modules/* ]] || [[ "$file" == requirements.txt ]] || [[ "$file" == README.md ]] || [[ "$file" == .github/* ]]; then
+              echo "  [v] $file (Allowed)"
+            else
+              echo "  [x] $file (CORE VIOLATION)"
+              echo "Error: Modification of core file '$file' detected."
+              echo "Contributors are only permitted to submit new modules or update dependencies."
+              exit 1
+            fi
+          done
+          echo "Isolation check passed."
+
+      - name: Metadata & Syntax Audit
+        run: |
+          python - << 'EOF'
+          import os, sys, subprocess
+          
+          # Only check files within hellhound/modules/ that were changed
+          changed_files = "${{ steps.changed-files.outputs.all_changed_files }}".split()
+          module_files = [f for f in changed_files if f.startswith("hellhound/modules/") and f.endswith(".py") and not os.path.basename(f).startswith("__")]
+          
+          if not module_files:
+              print("No new modules to audit.")
+              sys.exit(0)
+              
+          errors = []
+          for path in module_files:
+              # 1. Syntax Check
+              try:
+                  subprocess.check_output(["python", "-m", "py_compile", path], stderr=subprocess.STDOUT)
+                  print(f"  [v] {path}: Syntax OK")
+              except subprocess.CalledProcessError as e:
+                  errors.append(f"{path}: Syntax error\n{e.output.decode()}")
+                  continue
+              
+              # 2. Metadata Check
+              content = open(path).read()
+              missing = []
+              if "DESCRIPTION" not in content:
+                  missing.append("DESCRIPTION")
+              if "CATEGORY" not in content:
+                  missing.append("CATEGORY")
+              if "OPTIONS" not in content:
+                  missing.append("OPTIONS")
+              if "def run(" not in content:
+                  missing.append("run() entry-point")
+                  
+              if missing:
+                  errors.append(f"{path}: missing {', '.join(missing)}")
+              else:
+                  print(f"  [v] {path}: Metadata OK")
+                  
+          if errors:
+              print("\nAudit failed with the following errors:")
+              for e in errors:
+                  print(f"  x {e}")
+              sys.exit(1)
+          print("\nAll modules passed the high-fidelity audit.")
+          EOF
