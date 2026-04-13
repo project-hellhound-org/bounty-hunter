@@ -54,8 +54,8 @@ Use descriptive names:
 - `feature/xss-reflected`
 - `fix/stalk-timeout-bug`
 
-> [!IMPORTANT]
-> **Core Protection Enforcement**: All Pull Requests are automatically audited by our CI/CD pipeline. Any modification to files outside `hellhound/modules/`, `requirements.txt`, or `README.md` will be **categorically rejected** unless explicit authorization is granted for a core-level contribution.
+> [!WARNING]
+> **Protected Core Files**: Any modifications to `hellhound/core/`, `hellhound/console.py`, or root-level workflow/config files will trigger a **CORE-PROTECTION** failure in CI/CD. These changes require explicit discussion with the project lead before a PR is opened.
 
 ---
 
@@ -207,17 +207,9 @@ Every Pull Request automatically triggers the **Verify Modules** workflow. It wi
 
 ---
 
-## Governance & Professional Conduct
+## Code Style
 
-- **Atomic Contributions**: Keep your PRs focused. One new module per PR. If you have three modules to add, submit three separate PRs.
-- **Dependency Accountability**: If your module requires a new library, add it to `requirements.txt`. Ensure the library is reputable and doesn't conflict with existing dependencies.
-- **Collaborative Spirit**: Engage with reviewers. The Hellhound team (led by @l4zz3rj0d) provides high-fidelity feedback to ensure every module in the arsenal is production-ready.
-
----
-
-## Technical Support for Contributors
-
-If you need assistance with module development or logic correlation, you can launch your own **Antigravity AI Agent** within the repository. Antigravity is pre-trained on Hellhound's architecture and can help you:
-- Debug your `run()` function logic.
-- Verify your `intel` schema formatting.
-- Automatically generate your `PULL_REQUEST_TEMPLATE.md` details based on your code.
+- Follow existing module patterns (see `hellhound/modules/vuln/BACdetector.py` as a reference).
+- Keep the module focused on a **single vulnerability class**.
+- Use `try/except` to handle network errors gracefully — the framework should never crash due to a target being unreachable.
+- Do not use `print()` directly. Always use `emit()`.
