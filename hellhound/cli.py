@@ -1,4 +1,10 @@
 import sys
+import warnings
+
+# Suppress annoying requests/urllib3 dependency warnings before they trigger
+warnings.filterwarnings("ignore", message=".*urllib3.*match a supported version.*")
+warnings.filterwarnings("ignore", message=".*RequestsDependencyWarning.*")
+
 import click
 
 
@@ -33,6 +39,35 @@ def cli(ctx):
 def console():
     """Launch interactive console mode"""
     _launch_console()
+
+
+# -------------------------------------------------
+# Upgrade subcommand
+# -------------------------------------------------
+@cli.command()
+def upgrade():
+    """Pull latest updates and sync dependencies"""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    # Find the project root (where update.sh lives)
+    project_root = Path(__file__).resolve().parent.parent
+    update_script = project_root / "update.sh"
+
+    if not update_script.exists():
+        click.echo(click.style(f"[x] Error: Update script not found at {update_script}", fg="red"))
+        return
+
+    # Ensure it's executable
+    os.chmod(update_script, 0o755)
+
+    try:
+        subprocess.run(["bash", str(update_script)], check=True)
+    except subprocess.CalledProcessError:
+        click.echo(click.style("[!] Upgrade process encountered an error.", fg="yellow"))
+    except Exception as e:
+        click.echo(click.style(f"[x] Critical error during upgrade: {e}", fg="red"))
 
 
 # -------------------------------------------------
