@@ -17,7 +17,7 @@ import click
     invoke_without_command=True,
     context_settings=dict(help_option_names=["-h", "--help"])
 )
-@click.version_option("12.0", prog_name="HELLHOUND")
+@click.version_option("12.5.0", prog_name="HELLHOUND")
 @click.pass_context
 def cli(ctx):
     """
