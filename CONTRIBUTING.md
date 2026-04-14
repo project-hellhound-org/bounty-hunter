@@ -185,7 +185,14 @@ This creates `hellhound/modules/vuln/sqli_union.py` with the correct structure p
     git push origin feature/<your-module-name>
     ```
 
-3.  **Open a Pull Request** on GitHub against the `main` branch.
+3.  **Local Verification (MANDATORY)**:
+    Before pushing your changes, you must run the framework's local auditor to verify its compliance.
+    ```bash
+    python audit_module.py hellhound/modules/<category>/<your_module>.py
+    ```
+    If the audit fails, fix the errors and run it again until you receive the **RESULT: PASS** message.
+
+4.  **Open a Pull Request** on GitHub against the `main` branch.
 
 4.  **Fill in the PR template** with a description of what the module does and any test targets used.
 
