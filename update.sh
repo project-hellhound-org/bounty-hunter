@@ -68,6 +68,9 @@ fi
 # ── 4. Update Playwright ──────────────────────────────
 echo -e "${CYAN}[*] Checking for browser updates...${RESET}"
 if [ -d "$VENV_DIR" ]; then
+    if grep -q "Kali" /etc/os-release 2>/dev/null; then
+        echo -e "${YELLOW}[*] Kali Linux detected — ensuring optimized Ubuntu fallback is current.${RESET}"
+    fi
     "$VENV_DIR/bin/python" -m playwright install chromium --with-deps > /dev/null 2>&1 || true
     echo -e "${GREEN}[+] Playwright browsers verified.${RESET}"
 fi

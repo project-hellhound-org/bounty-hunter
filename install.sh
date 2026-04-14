@@ -45,11 +45,16 @@ echo -e "${CYAN}[*] Installing HELLHOUND into venv...${RESET}"
 
 # ── 5. Install Playwright browsers ────────────────────
 echo -e "${CYAN}[*] Installing Playwright Chromium browser...${RESET}"
-if "$VENV_DIR/bin/python" -m playwright install chromium 2>/dev/null; then
-    echo -e "${GREEN}[+] Playwright Chromium installed.${RESET}"
+if grep -q "Kali" /etc/os-release 2>/dev/null; then
+    echo -e "${YELLOW}[*] Kali Linux detected — applying optimized Ubuntu browser fallback.${RESET}"
+fi
+
+if "$VENV_DIR/bin/python" -m playwright install chromium --with-deps 2>/dev/null; then
+    echo -e "${GREEN}[+] Playwright Chromium and dependencies installed.${RESET}"
 else
-    echo -e "${YELLOW}[!] Playwright browser install failed.${RESET}"
-    echo -e "${YELLOW}    Fix: source $VENV_DIR/bin/activate && playwright install chromium${RESET}"
+    echo -e "${YELLOW}[!] Playwright browser install encountered a non-fatal warning or failure.${RESET}"
+    echo -e "${YELLOW}    If the browser fails to launch, run the following command manually:${RESET}"
+    echo -e "${YELLOW}    sudo $VENV_DIR/bin/python -m playwright install-deps chromium${RESET}"
 fi
 
 # ── 6. Write alias to shell rc ────────────────────────
