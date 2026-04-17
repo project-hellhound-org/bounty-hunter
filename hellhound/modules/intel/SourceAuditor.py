@@ -139,6 +139,78 @@ SIGNATURES = [
         "description": "Reference to an older, potentially vulnerable major version of a frontend framework/SDK via CDN.",
         "severity": 3,
         "type": "Dependency Vulnerability"
+    },
+    {
+        "id": "SA-017",
+        "name": "Debug Statement Found",
+        "pattern": r'console\.(log|debug|info|warn|error)\(|debugger;',
+        "description": "Debug or verbose logging statements left in production code can reveal internal state and logic.",
+        "severity": 3,
+        "type": "Logic Exposure"
+    },
+    {
+        "id": "SA-018",
+        "name": "Third-Party Library Exposure",
+        "pattern": r'node_modules/|bower_components/|vendor/',
+        "description": "Original third-party library source code is exposed. Useful for targeted CVE research.",
+        "severity": 2,
+        "type": "Information Disclosure"
+    },
+    {
+        "id": "SA-019",
+        "name": "Environment Variable Reference",
+        "pattern": r'process\.env\.[A-Z0-9_]+',
+        "description": "References to environment variables found. May indicate configuration hooks or internal logic targets.",
+        "severity": 4,
+        "type": "Configuration Analysis"
+    },
+    {
+        "id": "SA-020",
+        "name": "Third-Party Integration: Stripe",
+        "pattern": r'Stripe\s*\(\s*["\'](pk_(?:test|live)_[0-9a-zA-Z]{24,})',
+        "description": "Stripe payment integration found with public key. Useful for mapping payment transit and business logic.",
+        "severity": 4,
+        "type": "Third-Party SDK"
+    },
+    {
+        "id": "SA-018",
+        "name": "Third-Party Integration: Segment/Mixpanel",
+        "pattern": r'(?:analytics\.load|mixpanel\.init)\s*\(\s*["\']([0-9a-zA-Z]{32})',
+        "description": "Analytics SDK integration detected. Can be used to track user flows or exfiltrate session data if misconfigured.",
+        "severity": 3,
+        "type": "Third-Party SDK"
+    },
+    {
+        "id": "SA-019",
+        "name": "Third-Party Integration: Sentry DSN",
+        "pattern": r'https://[a-f0-9]{32}@[a-z0-9]+\.ingest\.sentry\.io/\d+',
+        "description": "Sentry DSN leak. Can reveal internal error logs and stack traces if the DSN has excessive permissions.",
+        "severity": 5,
+        "type": "Information Disclosure"
+    },
+    {
+        "id": "SA-020",
+        "name": "Sensitive Config Object",
+        "pattern": r'(?:window|globalConfig|appConfig|env)\.(?:api|url|endpoint|secret|key|auth)\s*=',
+        "description": "Application configuration object found with potentially sensitive keys or endpoints.",
+        "severity": 6,
+        "type": "Configuration Analysis"
+    },
+    {
+        "id": "SA-021",
+        "name": "Insecure postMessage Origin",
+        "pattern": r'\.addEventListener\s*\(\s*["\']message["\']\s*,\s*(?:\(\s*[a-zA-Z0-9_]+\s*\)|function\s*\(\s*[a-zA-Z0-9_]+\s*\))\s*{\s*(?![^}]*origin\s*==|[^}]*origin\s*===)',
+        "description": "postMessage listener without explicit origin validation detected. Vulnerable to XSS or data theft via cross-window messaging.",
+        "severity": 8,
+        "type": "Cross-Window Communication"
+    },
+    {
+        "id": "SA-022",
+        "name": "Cloud Metadata Service Access",
+        "pattern": r'169\.254\.169\.254|metadata\.google\.internal|instance-data',
+        "description": "Reference to Cloud Metadata services found. Indicates potential SSRF targets or internal environment logic.",
+        "severity": 7,
+        "type": "SSRF Pivot"
     }
 ]
 
@@ -149,6 +221,8 @@ class SourceAuditor:
             "vulnerabilities": [],
             "files_scanned": 0,
             "risk_score": 0,
+            "reconstructed_files": [],
+            "third_party_sdks": [],
             "ai_insights": []
         }
 
@@ -203,7 +277,55 @@ class SourceAuditor:
 
                 file_findings.append(finding)
                 self.loot["vulnerabilities"].append(finding)
+                
+                # Global Tracking for SDKs
+                if finding["type"] == "Third-Party SDK":
+                    self.loot["third_party_sdks"].append(finding["name"])
+        
+        
         return file_findings
+
+    def audit_headers(self, headers: dict):
+        """Analyze HTTP headers of source map responses for security weaknesses."""
+        url = headers.get("_target_url", "Unknown")
+        
+        # 1. Transport Security
+        if url.startswith("http://"):
+            self.loot["vulnerabilities"].append({
+                "id": "SA-H01",
+                "name": "Insecure Transport (HTTP)",
+                "description": "Source map served over unencrypted HTTP protocol.",
+                "severity": 3,
+                "type": "Transport Security",
+                "file": url,
+                "line": "N/A"
+            })
+
+        # 2. CORS Analysis
+        cors = headers.get("Access-Control-Allow-Origin")
+        if cors == "*":
+            self.loot["vulnerabilities"].append({
+                "id": "SA-H02",
+                "name": "Permissive CORS Policy",
+                "description": "Access-Control-Allow-Origin is set to *. Allows anyone to fetch the source map.",
+                "severity": 3,
+                "type": "Access Control",
+                "file": url,
+                "line": "N/A"
+            })
+
+        # 3. Cache Analysis
+        cache = headers.get("Cache-Control", "").lower()
+        if "max-age" in cache and any(x in cache for x in ["31536000", "86400"]): # Long cache
+            self.loot["vulnerabilities"].append({
+                "id": "SA-H03",
+                "name": "Long Cache Lifetime",
+                "description": "Source maps have long cache persistence, increasing exposure duration.",
+                "severity": 2,
+                "type": "Information Disclosure",
+                "file": url,
+                "line": "N/A"
+            })
 
 def run(target, emit, options=None):
     """Entry point for the Hellhound framework"""
@@ -238,36 +360,87 @@ def run(target, emit, options=None):
                         auditor.loot["files_scanned"] += 1
                 except:
                     pass
-    else:
-        blob_intel = options.get("blobunpacker_intel", {})
-        reconstructed_content = blob_intel.get("reconstructed_content", {})
-        minified_content = blob_intel.get("minified_content", {}) 
-        
-        if not reconstructed_content and minified_content:
-            emit.info(f"    [i] Auditing {len(minified_content)} minified files from memory (AI: {'ENABLED' if use_ai else 'OFF'})...")
-            for url, content in minified_content.items():
-                filename = url.split("/")[-1]
-                auditor.audit_file(content, filename, use_ai=use_ai, 
-                                 ai_key=ai_key, ai_provider=ai_provider,
-                                 ai_model=ai_model)
-                auditor.loot["files_scanned"] += 1
-        elif reconstructed_content:
-            emit.info(f"    [i] Auditing {len(reconstructed_content)} reconstructed files from memory (AI: {'ENABLED' if use_ai else 'OFF'})...")
-            for filename, content in reconstructed_content.items():
-                auditor.audit_file(content, filename, use_ai=use_ai, 
-                                 ai_key=ai_key, ai_provider=ai_provider,
-                                 ai_model=ai_model)
-                auditor.loot["files_scanned"] += 1
         else:
-            emit.warn("    [!] No source found (reconstructed or minified). Run 'BlobUnpacker' first.")
-            return {"raw": "No source files found for auditing.", "intel": {}, "risk_score": 0}
+            blob_intel = options.get("blobunpacker_intel", {})
+            reconstructed_content = blob_intel.get("reconstructed_content", {})
+            minified_content = blob_intel.get("minified_content", {}) 
+            
+            if not reconstructed_content and minified_content:
+                emit.info(f"    [i] Auditing {len(minified_content)} minified files from memory (AI: {'ENABLED' if use_ai else 'OFF'})...")
+                for url, content in minified_content.items():
+                    filename = url.split("/")[-1]
+                    auditor.audit_file(content, filename, use_ai=use_ai, 
+                                     ai_key=ai_key, ai_provider=ai_provider,
+                                     ai_model=ai_model)
+                    auditor.loot["files_scanned"] += 1
+            elif reconstructed_content:
+                auditor.loot["reconstructed_files"] = list(reconstructed_content.keys())
+                emit.info(f"    [i] Auditing {len(reconstructed_content)} reconstructed files from memory (AI: {'ENABLED' if use_ai else 'OFF'})...")
+                for filename, content in reconstructed_content.items():
+                    auditor.audit_file(content, filename, use_ai=use_ai, 
+                                     ai_key=ai_key, ai_provider=ai_provider,
+                                     ai_model=ai_model)
+                    auditor.loot["files_scanned"] += 1
+            else:
+                emit.warn("    [!] No source found (reconstructed or minified). Run 'BlobUnpacker' first.")
+                return {"raw": "No source files found for auditing.", "intel": {}, "risk_score": 0}
+
+    # Cross-Module Fix: Process headers from BlobUnpacker
+    blob_intel = options.get("blobunpacker_intel", {})
+    map_headers = blob_intel.get("map_headers", {})
+    if map_headers:
+        emit.info(f"    [i] Analyzing {len(map_headers)} source map transport headers...")
+        for url, headers in map_headers.items():
+            auditor.audit_headers(headers)
+
+    # Inherent Finding: Source Map Exposure (Risk Clarity Fix)
+    if auditor.loot["reconstructed_files"]:
+        auditor.loot["vulnerabilities"].append({
+            "id": "SA-X01",
+            "name": "Source Map Exposure",
+            "description": "Publicly accessible source maps detected. Enables full source code reconstruction and internal path disclosure.",
+            "severity": 3,
+            "type": "Information Disclosure",
+            "file": f"{len(auditor.loot['reconstructed_files'])} files recovered",
+            "line": "N/A"
+        })
+
+    # Extract comments from BlobUnpacker if available (Joe-Style Contextual Mining)
+    blob_intel = options.get("blobunpacker_intel", {})
+    if blob_intel.get("comments"):
+        emit.info(f"    [i] Auditing {len(blob_intel['comments'])} developer comments for logic leaks...")
+        for comment in blob_intel["comments"]:
+            # Simple keyword audit for comments
+            for keyword in ["admin", "todo", "fixme", "internal", "auth", "bypass", "temp"]:
+                if keyword in comment["content"].lower():
+                    finding = {
+                        "id": "SA-C01",
+                        "name": f"Sensitive Comment ({keyword})",
+                        "description": "Developer comment identifying potential logic flaws or internal secrets.",
+                        "severity": 4,
+                        "type": "Developer Artifact",
+                        "file": comment["source"],
+                        "line": "N/A",
+                        "context": comment["content"]
+                    }
+                    auditor.loot["vulnerabilities"].append(finding)
 
     # Calculate Risk Score
     max_severity = 0
     if auditor.loot["vulnerabilities"]:
-        max_severity = max([v["severity"] for v in auditor.loot["vulnerabilities"]])
-        # Total score is max severity * 10 (cap at 100)
-        risk_score = min(100, max_severity * 10)
+        # Risk Score Calibration (Weighted Model Fix)
+        # Weights: LOW=10, MEDIUM=30, HIGH/CRITICAL=60
+        score = 0
+        categories_found = set()
+        for v in auditor.loot["vulnerabilities"]:
+            sev = v.get("severity", 1)
+            if sev >= 8: score += 60
+            elif sev >= 5: score += 30
+            else: score += 10
+            categories_found.add(v.get("type"))
+        
+        # Cap at 100, baseline for map exposure is already factored via sev=3 finding
+        risk_score = min(100, score)
     else:
         risk_score = 0
 
@@ -285,7 +458,9 @@ def run(target, emit, options=None):
         "raw": f"Audited {auditor.loot['files_scanned']} files | Found {vuln_count} vulnerabilities",
         "intel": {
             "vulnerabilities": auditor.loot["vulnerabilities"],
+            "reconstructed_files": auditor.loot["reconstructed_files"],
             "files_scanned": auditor.loot["files_scanned"],
+            "third_party_sdks": list(set(auditor.loot["third_party_sdks"])),
             "risk_score": risk_score
         },
         "risk_score": risk_score
