@@ -79,9 +79,14 @@ def found(t): return label("IDOR",   t, C.BRED)
 def skp(t):   return label("SKIP",   t, C.DIM)
 
 _print_lock = threading.Lock()
+_global_emit = None
+
 def tprint(*a, **kw):
-    with _print_lock:
-        print(*a, **kw)
+    if _global_emit:
+        _global_emit.log(*a, **kw)
+    else:
+        with _print_lock:
+            print(*a, **kw)
 
 def section(title):
     bar = color("─" * 72, C.DIM + C.CYAN)
@@ -3613,7 +3618,8 @@ class IDORTester:
     def __init__(self, client_a, client_b, client_unauth,
                  targets, id_hints, child_urls=None,
                  threads=6, delay=0, test_unauth=True, write_probe=False,
-                 single_session=False):
+                 single_session=False, emit=None):
+        self.emit           = emit
         self.client_a       = client_a
         self.client_b       = client_b
         self.client_unauth  = client_unauth
@@ -4078,6 +4084,8 @@ class IDORTester:
             try:
                 for fut in as_completed(futs, timeout=_per_ep_budget * len(self.targets)):
                     done += 1
+                    if self.emit:
+                        self.emit.progress_update(done)
                     try:
                         fut.result(timeout=_per_ep_budget)
                     except TimeoutError:
@@ -4868,12 +4876,13 @@ class MockArgs:
             setattr(self, k, v)
 
 def run(target, emit, options):
-    global VERBOSE
+    global VERBOSE, _global_emit
     VERBOSE = options.get("verbose", False)
+    _global_emit = emit
 
     # Use emit for printing if available
     global tprint
-    if emit and hasattr(emit, "log"):
+    if emit:
         tprint = emit.log
 
     # Build args object from options (cast to types)
@@ -5204,6 +5213,7 @@ def run(target, emit, options):
         test_unauth    = not args.no_unauth,
         write_probe    = args.write_probe,
         single_session = not has_cookie_b and not has_creds_b,
+        emit           = emit,
     )
     findings = tester.run()
 

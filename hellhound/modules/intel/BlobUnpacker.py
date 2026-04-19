@@ -79,7 +79,7 @@ class BlobUnpacker:
         try:
             # 1. Handle Inline Base64 Maps (Format Handling Fix)
             if map_url.startswith("data:application/json;base64,"):
-                self.emit.info(f"    [✔] Blob: Successfully unpacked inline base64 map")
+                self.emit.success(f"Successfully unpacked inline base64 map")
                 raw_data = map_url.split(",", 1)[1]
                 map_content = base64.b64decode(raw_data).decode('utf-8')
                 data = json.loads(map_content)
@@ -87,7 +87,7 @@ class BlobUnpacker:
             else:
                 resp = requests.get(map_url, timeout=10, verify=False, allow_redirects=True)
                 if resp.status_code != 200:
-                    self.emit.error(f"    [x] Failed to fetch map: {map_url} (Status: {resp.status_code})")
+                    self.emit.error(f"Failed to fetch map: {display_name} (Status: {resp.status_code})")
                     return
                 
                 # Support for manual Gzip decompression if needed (Format Handling Fix)
@@ -111,10 +111,10 @@ class BlobUnpacker:
             if not isinstance(data, dict):
                 return
         except Exception as e:
-            self.emit.error(f"    [x] Error unpacking map {display_name}: {str(e)}")
+            self.emit.error(f"Error unpacking map {display_name}: {str(e)}")
             return
 
-        self.emit.info(f"    [✔] Blob: Successfully unpacked {display_name}")
+        self.emit.success(f"Successfully unpacked {display_name}")
 
         # 1. Metadata / Wordlist Mining
         sources = data.get("sources", [])
@@ -167,7 +167,7 @@ class BlobUnpacker:
                     self.loot["reconstructed_content"][filename] = content
                     self._mine_content(content, filename)
                 except Exception as e:
-                    self.emit.error(f"    [x] Failed to write reconstructed file {filename}: {str(e)}")
+                    self.emit.error(f"Failed to write reconstructed file {filename}: {str(e)}")
 
     def _mine_content(self, content: str, source_name: str):
         # Secret Scanning
@@ -194,7 +194,7 @@ class BlobUnpacker:
                             continue
                     
                     self.loot["secrets"].append({"type": label, "content": val, "source": source_name})
-                    self.emit.warn(f"    [!] Discovery: {label} found in {source_name.split('/')[-1]}")
+                    self.emit.warn(f"Discovery: {label} found in {source_name.split('/')[-1]}")
 
         # Endpoint / Route Discovery
         for pattern in ENDPOINT_PATTERNS:
@@ -256,7 +256,6 @@ class BlobUnpacker:
 
 def run(target, emit, options=None):
     """Entry point for the Hellhound framework"""
-    emit.info(f"[*] Blob Unpacker (Intelligence Mastery): {target}")
     
     opt = options or {}
     spider_intel = opt.get("spider_intel", {})
@@ -280,16 +279,23 @@ def run(target, emit, options=None):
     
     unpacker = BlobUnpacker(emit)
     
-    if js_files:
-        emit.info(f"    [i] Scanning {len(js_files)} JS files for hidden source maps...")
-        # Deduplicate and cap scan
-        for js in list(set(js_files))[:25]:
+    emit.progress_start("BlobUnpacker")
+    emit.info(f"Blob Unpacker (Intelligence Mastery): {target}")
+    if not js_files:
+        emit.info("No JS files found for analysis.")
+    else:
+        emit.info(f"Scanning {len(js_files)} JS files for hidden source maps...")
+        js_todo = list(set(js_files))[:25]
+        for i, js in enumerate(js_todo):
+            emit.progress_update(i, "BlobUnpacker")
             map_url = unpacker.scan_js_for_maps(js)
             if map_url:
                 maps.add(map_url)
 
     # 2. Extraction Phase: Unpack all discovered maps
-    for m_url in maps:
+    total_maps = len(maps)
+    for i, m_url in enumerate(maps):
+        emit.progress_update(i, "BlobUnpacker")
         unpacker.unpack_map(m_url)
 
     # Calculate Risk Score
@@ -300,6 +306,9 @@ def run(target, emit, options=None):
 
     if unpacked_count == 0 and not unpacker.loot["secrets"]:
         return {"raw": "No valid source maps recovered.", "intel": {}, "risk_score": 0}
+
+    # Cleanup animation
+    emit.progress_stop()
 
     return {
         "raw": f"Recovered {unpacked_count} files | {new_eps_count} endpoints | {len(unpacker.loot['secrets'])} secrets",

@@ -141,6 +141,18 @@ class ModuleEmit:
     def print_always(self, msg: str):
         self._base.info(_strip(msg))
 
+    def progress(self, label: str, current: int, total: int, start_time: float = None):
+        self._base.progress(label, current, total, start_time)
+
+    def progress_start(self, label: str, total: int = 0):
+        self._base.progress_start(label, total)
+
+    def progress_update(self, current: int, label: str = None):
+        self._base.progress_update(current, label)
+
+    def progress_stop(self):
+        self._base.progress_stop()
+
 
 # ══════════════════════════════════════════════════════════════════════
 # CONFIDENCE
@@ -935,30 +947,40 @@ class IntelligentProber:
         targets = sorted(targets, key=lambda e: e.get("confidence", 0), reverse=True)[:100]
 
         self.emit.always_info(f"Prober: {len(targets)} endpoints selected")
+        
+        # START PROBING ANIMATION
+        self.emit.progress_start("PROBING", total=len(targets))
+        
         n_sens = n_meth = 0
-        for ep in targets:
-            url = ep["url"]; method = ep["methods"][0]
-            s, hdrs, body = await fetch(self.session, method, url, self.rl)
-            if s is None: continue
-            self.store.record_status(url, method, s)
-            bh = hashlib.md5(body.encode(errors="ignore")).hexdigest()
-            ep["baseline"] = {"status": s, "hash": bh, "length": len(body)}
-            probe = url + ("&" if "?" in url else "?") + f"_hh={int(time.time())}"
-            s2, _, b2 = await fetch(self.session, method, probe, self.rl)
-            if s2 and b2:
-                h2 = hashlib.md5(b2.encode(errors="ignore")).hexdigest()
-                if h2 != bh or abs(len(b2) - len(body)) > 50:
-                    self.store.mark_sensitive(url, method)
-                    # Stored in intel — no output
-                    n_sens += 1
-            if self.cfg.enable_method_disc:
-                found = await self._methods(url, hdrs or {})
-                if found:
-                    self.store.update_methods(url, found)
-                    self.emit.info(f"[Methods] {url} -> {', '.join(found)}")
-                    n_meth += 1
-            if self.cfg.enable_cors:
-                await self._cors(url)
+        try:
+            for i, ep in enumerate(targets):
+                self.emit.progress_update(i + 1)
+                url = ep["url"]; method = ep["methods"][0]
+                s, hdrs, body = await fetch(self.session, method, url, self.rl)
+                
+                if s is None: continue
+                self.store.record_status(url, method, s)
+                bh = hashlib.md5(body.encode(errors="ignore")).hexdigest()
+                ep["baseline"] = {"status": s, "hash": bh, "length": len(body)}
+                probe = url + ("&" if "?" in url else "?") + f"_hh={int(time.time())}"
+                s2, _, b2 = await fetch(self.session, method, probe, self.rl)
+                if s2 and b2:
+                    h2 = hashlib.md5(b2.encode(errors="ignore")).hexdigest()
+                    if h2 != bh or abs(len(b2) - len(body)) > 50:
+                        self.store.mark_sensitive(url, method)
+                        # Stored in intel — no output
+                        n_sens += 1
+                if self.cfg.enable_method_disc:
+                    found = await self._methods(url, hdrs or {})
+                    if found:
+                        self.store.update_methods(url, found)
+                        self.emit.info(f"[Methods] {url} -> {', '.join(found)}")
+                        n_meth += 1
+                if self.cfg.enable_cors:
+                    await self._cors(url)
+        finally:
+            self.emit.progress_stop()
+            
         self.emit.always_success(f"Probing done — sensitive: {n_sens}, new methods: {n_meth}")
 
     async def _methods(self, url, base_hdrs):
@@ -1317,6 +1339,7 @@ class Spider:
         self.sem = asyncio.Semaphore(cfg.concurrency)
         self.rl = DomainRateLimiter()
         self._depth_cnt: Dict[int,int] = defaultdict(int)
+        self._start_time = time.time()
         self.queue.put_nowait((target, 0, "Seed"))
 
     def is_valid(self, url):
@@ -1548,6 +1571,12 @@ class Spider:
                     else:
                         self.visited.add(norm)
                         self._depth_cnt[depth] += 1
+                        
+                        # Premium Progress HUD (Background thread handles loop)
+                        # standalone style: label includes depth and queue size
+                        stats_label = f"CRAWLING D:{depth} Q:{self.queue.qsize()} IN:{len(self.visited)}"
+                        self.emit.progress_update(len(self.visited), label=stats_label)
+
                         s, hdrs, body = await fetch(session, "GET", url, self.rl,
                                                     max_retries=self.cfg.max_retries,
                                                     base_delay=self.cfg.retry_base_delay)
@@ -1732,11 +1761,17 @@ class Spider:
                 f"auth={'yes' if self.cookies or self.extra_headers else 'no'} | "
                 f"seed={self.queue.qsize()} URLs")
 
-            workers = [asyncio.create_task(self._worker(session, i, crawl_delay))
-                       for i in range(self.cfg.concurrency)]
-            await self.queue.join()
-            for w in workers: w.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+            # START CRAWL ANIMATION
+            self.emit.progress_start("CRAWLING", total=0) # Total is dynamic, will show current
+            
+            try:
+                workers = [asyncio.create_task(self._worker(session, i, crawl_delay))
+                           for i in range(self.cfg.concurrency)]
+                await self.queue.join()
+                for w in workers: w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+            finally:
+                self.emit.progress_stop()
 
             if self.cfg.enable_probing:
                 prober = IntelligentProber(session, self.store, self.emit, self.rl, self.cfg)

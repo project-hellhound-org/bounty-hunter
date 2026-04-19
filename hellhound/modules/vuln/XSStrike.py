@@ -134,11 +134,15 @@ async def run(target, emit, options=None):
 
     emit.info(f"    [i] Targeted audit on {len(targets)} surface(s)...")
 
+    # UPDATE ANIMATION FOR XSS
+    emit.progress_update(0, label="XSS-STRIKE")
+
     findings = []
     async with aiohttp.ClientSession() as session:
         auditor = XSSAuditor(emit, session, options or {})
         
-        for t in targets:
+        for i, t in enumerate(targets):
+            emit.progress_update(i + 1)
             url = t.get("url")
             method = t.get("method", "GET")
             pname = t.get("parameter")

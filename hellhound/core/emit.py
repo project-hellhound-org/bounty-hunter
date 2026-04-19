@@ -69,6 +69,26 @@ class PlainEmit:
     def print_always(self, msg):
         self._send(msg)
 
+    def log(self, *args, **kwargs):
+        msg = " ".join(map(str, args))
+        self._send(msg)
+
+    def progress(self, label, current, total, start_time=None):
+        """Legacy standalone call."""
+        pass
+
+    def progress_start(self, label, total=0):
+        """Start sticky animation."""
+        pass
+
+    def progress_update(self, current, label=None):
+        """Update sticky animation stats."""
+        pass
+
+    def progress_stop(self):
+        """Stop sticky animation."""
+        pass
+
     def _send(self, msg):
         print(msg)
         if self.socketio:
@@ -92,60 +112,92 @@ class ConsoleEmit(PlainEmit):
         super().__init__(socketio=socketio)
         self._console = console
 
+    def _w(self, method_name, *args, **kwargs):
+        """Clears progress line and prints while holding the terminal lock."""
+        with self._console.term_lock:
+            # 1. Clear the animation line
+            if hasattr(self._console, "clear_progress_unlocked"):
+                self._console.clear_progress_unlocked()
+            
+            # 2. Call the actual console printing method
+            method = getattr(self._console, method_name, None)
+            if method:
+                method(*args, **kwargs)
+            else:
+                # Fallback print if console method is missing
+                print(f"[{method_name}] {' '.join(map(str, args))}")
+            
+            # 3. No manual redraw here. 
+            # The background thread will take the lock and redraw in its next cycle.
+
     def info(self, msg):
-        self._console.info(msg)
+        self._w("info", msg)
 
     def warn(self, msg):
-        self._console.warn(msg)
+        self._w("warn", msg)
 
     def success(self, msg):
-        self._console.success(msg)
+        self._w("success", msg)
 
     def error(self, msg):
-        # console.py defines error()
-        if hasattr(self._console, "error"):
-            self._console.error(msg)
-        else:
-            print(Fore.RED + f"[✗] {msg}" + Style.RESET_ALL)
+        self._w("error", msg)
 
     def always_info(self, msg):
         if hasattr(self._console, "always_info"):
-            self._console.always_info(msg)
+            self._w("always_info", msg)
         else:
             self.info(msg)
 
     def always_success(self, msg):
         if hasattr(self._console, "always_success"):
-            self._console.always_success(msg)
+            self._w("always_success", msg)
         else:
             self.success(msg)
 
     def section(self, title):
-        self._console.section(title)
+        self._w("section", title)
 
     def row(self, key, value, **kwargs):
-        if hasattr(self._console, "row"):
-            self._console.row(key, value, **kwargs)
-        else:
-            print(f"{Fore.CYAN}{key}{Style.RESET_ALL}: {value}")
+        self._w("row", key, value, **kwargs)
 
     def finding(self, *args):
-        if hasattr(self._console, "finding"):
-            self._console.finding(*args)
-        else:
-            print(Fore.YELLOW + f"[!] {' '.join(map(str, args))}" + Style.RESET_ALL)
+        self._w("finding", *args)
 
     def endpoint_row(self, ep):
-        if hasattr(self._console, "endpoint_row"):
-            self._console.endpoint_row(ep)
-        else:
-            print(Fore.CYAN + ep.get("url", "") + Style.RESET_ALL)
+        self._w("endpoint_row", ep)
+
+    def print_always(self, msg):
+        self._w("print_always", msg)
+
+    def log(self, *args, **kwargs):
+        msg = " ".join(map(str, args))
+        self._w("print_always", msg)
 
     def print_always(self, msg):
         if hasattr(self._console, "print_always"):
             self._console.print_always(msg)
         else:
             print(msg)
+
+    def progress(self, label, current, total, start_time=None):
+        """Legacy / Direct Update."""
+        if hasattr(self._console, "progress"):
+            self._console.progress(label, current, total, start_time)
+
+    def progress_start(self, label, total=0):
+        """Start background sticky animation."""
+        if hasattr(self._console, "start_animation"):
+            self._console.start_animation(label, total)
+
+    def progress_update(self, current, label=None):
+        """Update current stats."""
+        if hasattr(self._console, "update_animation"):
+            self._console.update_animation(current, label)
+
+    def progress_stop(self):
+        """Stop and clear."""
+        if hasattr(self._console, "stop_animation"):
+            self._console.stop_animation()
 
 
 # ══════════════════════════════════════════════════════

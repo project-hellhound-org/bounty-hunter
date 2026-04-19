@@ -347,19 +347,24 @@ def run(target, emit, options=None):
         
     if os.path.exists(source_dir):
         emit.info(f"    [i] Auditing files in {source_dir} (AI: {'ENABLED' if use_ai else 'OFF'})...")
+        files_to_scan = []
         for root, _, files in os.walk(source_dir):
             for file in files:
-                filepath = os.path.join(root, file)
-                rel_path = os.path.relpath(filepath, source_dir)
-                try:
-                    with open(filepath, "r", encoding="utf-8") as f:
-                        content = f.read()
-                        auditor.audit_file(content, rel_path, use_ai=use_ai, 
-                                         ai_key=ai_key, ai_provider=ai_provider,
-                                         ai_model=ai_model)
-                        auditor.loot["files_scanned"] += 1
-                except:
-                    pass
+                files_to_scan.append(os.path.join(root, file))
+        
+        emit.progress_update(0, label="SOURCE-AUDIT")
+        for i, filepath in enumerate(files_to_scan):
+            emit.progress_update(i + 1)
+            rel_path = os.path.relpath(filepath, source_dir)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    auditor.audit_file(content, rel_path, use_ai=use_ai, 
+                                     ai_key=ai_key, ai_provider=ai_provider,
+                                     ai_model=ai_model)
+                    auditor.loot["files_scanned"] += 1
+            except:
+                pass
         else:
             blob_intel = options.get("blobunpacker_intel", {})
             reconstructed_content = blob_intel.get("reconstructed_content", {})
