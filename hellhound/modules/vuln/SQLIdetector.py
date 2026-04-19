@@ -159,16 +159,20 @@ async def run(target, emit, options=None):
         return {"raw": "No targets", "signals": []}
 
     emit.info(f"    [i] Targeted audit on {len(targets)} surface(s)...")
+    
+    # UPDATE ANIMATION FOR SQLI
+    emit.progress_update(0, label="SQL-INJECTION")
 
     findings = []
     async with aiohttp.ClientSession() as session:
         auditor = SQLIAuditor(emit, session, options or {})
         
-        for t in targets:
+        for i, t in enumerate(targets):
             url = t.get("url")
             method = t.get("method", "GET")
             pname = t.get("parameter")
             
+            emit.progress_update(i + 1)
             emit.info(f"    [*] Auditing {pname} on {url}...")
             
             # Error-based

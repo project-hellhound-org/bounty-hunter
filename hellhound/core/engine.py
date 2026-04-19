@@ -70,6 +70,9 @@ class HellhoundEngine:
             return ""
 
         try:
+            # AUTO-ANIMATION START
+            active_emit.progress_start(module_name.upper())
+
             # Check if run is a coroutine function or a regular function returning a coroutine
             result = module.run(target, active_emit, options=options)
             
@@ -78,18 +81,20 @@ class HellhoundEngine:
                 try:
                     loop = asyncio.get_event_loop()
                     if loop.is_running():
-                        # If loop is already running, we might need to handle it differently 
-                        # but in the sync console, this shouldn't happen.
-                        return loop.run_until_complete(result)
+                        res = loop.run_until_complete(result)
                     else:
-                        return asyncio.run(result)
+                        res = asyncio.run(result)
                 except RuntimeError:
-                    # No event loop exists in this thread
-                    return asyncio.run(result)
-            return result
+                    res = asyncio.run(result)
+            else:
+                res = result
+            return res
         except Exception as e:
             active_emit.warn(f"Module '{module_name}' crashed:\n{traceback.format_exc()}")
             return ""
+        finally:
+            # AUTO-ANIMATION STOP
+            active_emit.progress_stop()
 
     # =================================================
     # External Module Runner
@@ -106,6 +111,7 @@ class HellhoundEngine:
         args = meta["args"](target)
         cmd  = [binary] + args
 
+        self.emit.progress_start(name.upper())
         self.emit.info(f"Executing external tool: {' '.join(cmd)}")
 
         output  = ""
@@ -123,6 +129,7 @@ class HellhoundEngine:
                 output += line
 
         process.wait()
+        self.emit.progress_stop()
         self.emit.success(f"External module '{name}' completed")
         return output
 

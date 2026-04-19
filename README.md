@@ -29,6 +29,8 @@ Whether you're performing surface reconnaissance or deep logical vulnerability a
 
 ## Key Features
 
+- **Cinematic HUD**: Ultra-wide 60-character Braille-wave status dashboard with real-time pulsing case-waves.
+- **Technical Fidelity**: Automated terminal synchronization ensures clean logs even during high-volume vulnerability testing.
 - **Zero-Config AI Intelligence**: Instant integration with Gemini, OpenAI, and Anthropic for vulnerability confirmation and exploit generation.
 - **Asynchronous Native**: Built from the ground up on `aiohttp` and `playwright` for lightning-fast multi-target analysis.
 - **Modular Arsenal**: 30+ specialized modules covering Recon, Vuln, Intel, and Exploitation.

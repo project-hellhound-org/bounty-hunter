@@ -1,4 +1,5 @@
 import cmd
+import asyncio
 import threading
 import yaml
 import importlib.resources as pkg_resources
@@ -9,6 +10,7 @@ import random
 from datetime import datetime
 import json
 import re
+import math
 
 from colorama import Fore, Back, Style, init
 init(autoreset=True)
@@ -25,20 +27,26 @@ from hellhound.core.repro_engine import ReproEngine
 
 W          = 70           # Global Banner Width
 R          = Style.RESET_ALL
-C_BORDER   = Fore.RED     + Style.BRIGHT
-C_HEAD     = Fore.RED     + Style.BRIGHT
-C_CRITICAL = Fore.RED     + Style.BRIGHT
-C_HIGH     = Fore.YELLOW  + Style.BRIGHT
-C_MEDIUM   = Fore.CYAN    + Style.BRIGHT
-C_LOW      = Fore.WHITE
-C_CHAIN    = Fore.MAGENTA + Style.BRIGHT
+C_BORDER   = "\033[91;1m"  # VIBRANT RED
+C_HEAD     = "\033[91;1m"  # VIBRANT RED
+C_CRITICAL = "\033[38;5;196;1m" # DEEP RED
+C_HIGH     = "\033[38;5;208;1m" # VIBRANT ORANGE
+C_MEDIUM   = "\033[96;1m"       # NEON CYAN
+C_LOW      = "\033[97m"         # BRIGHT WHITE
+C_CHAIN    = "\033[38;5;201;1m" # BRIGHT PINK
 C_SKIP     = Fore.LIGHTBLACK_EX
-C_LABEL    = Fore.WHITE   + Style.BRIGHT
-C_DIM      = Fore.WHITE
-C_EVIDENCE = Fore.CYAN
-C_STEP     = Fore.RED     + Style.BRIGHT
-C_URL      = Fore.YELLOW
-C_OK       = Fore.GREEN   + Style.BRIGHT
+C_LABEL    = "\033[97;1m"       # BOLD WHITE
+C_DIM      = "\033[37m"         # DIM WHITE
+C_EVIDENCE = "\033[96m"         # HUD CYAN
+C_STEP     = "\033[91;1m"       # VIBRANT RED
+C_URL      = "\033[93m"         # VIBRANT YELLOW
+C_OK       = "\033[91;1m"       # VIBRANT RED (User wants more red/vibrant than green)
+
+# NEW ANIMATION PALETTE
+C_PRIMARY_RED = "\033[91;1m"
+C_DIM_RED     = "\033[31m"
+C_HUD_CYAN    = "\033[96m"
+C_WHITE       = "\033[97m"
 
 CONF_COLORS = {
     "confirmed": Fore.RED    + Style.BRIGHT,
@@ -104,39 +112,46 @@ def _boot_sequence():
     # 1. Clear & Initialise Animation
     os.system('clear' if os.name == 'posix' else 'clear')
     
-    text = "STARTING HELLHOUND FRAMEWORK CONSOLE"
-    duration = 4.2
-    WHITE = Fore.WHITE + Style.BRIGHT
-    RED = Fore.RED + Style.BRIGHT
-    RESET = Style.RESET_ALL
+    white = Fore.WHITE + Style.BRIGHT
+    red = Fore.RED + Style.BRIGHT
+    reset = Style.RESET_ALL
     
     braille_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
     pipe_frames = ['|', '/', '-', '\\']
     
+    # ENLARGED BOOT HUD (60 chars width)
+    duration = 4.2
     end_time = time.time() + duration
     frame = 0
     while time.time() < end_time:
-        prefix = f"{RED}{braille_frames[frame % 10]}{RESET}"
+        t = time.time() - (end_time - duration)
+        prefix = f"{red}{braille_frames[frame % 10]}{reset}"
         
-        # Wave Text
-        res = list(text.upper())
-        idx = frame % len(text)
-        line = ""
-        for i, char in enumerate(res):
-            if i == idx:
-                line += f"{RED}{char.lower()}{WHITE}"
-            elif i == (idx - 1) % len(text) or i == (idx + 1) % len(text):
-                line += f"{RED}{char}{WHITE}"
+        # Wave Text (Enlarged)
+        full_text = f"HELLHOUND FRAMEWORK CONSOLE IS STARTING"
+        wave_label = ""
+        for i, char in enumerate(full_text):
+            v = math.sin(t * 10 + i * 0.4)
+            if v > 0:
+                wave_label += f"{red}{Style.BRIGHT}{char.upper()}{reset}"
             else:
-                line += char
+                wave_label += f"{Fore.RED}{char.lower()}{reset}"
         
-        pipe = f"{RED}{pipe_frames[frame % 4]}{RESET}"
-        sys.stdout.write(f"\r {prefix}  {WHITE}{line}  {pipe}")
+        # ENORMOUS PROGRESS BAR (60 chars)
+        bar = ""
+        bframes = ["⡀", "⡄", "⡆", "⡇", "⣇", "⣧", "⣷", "⣿"]
+        for i in range(60):
+            idx = int((math.sin(t * 5 + i * 0.3) + 1) / 2 * 7)
+            bar += f"{red}{bframes[idx]}{reset}"
+
+        sys.stdout.write(f"\r {prefix}  {white}{wave_label}  {bar}")
         sys.stdout.flush()
         time.sleep(0.06)
         frame += 1
 
-    print("\n")
+    # CLEAR ANIMATION LINE BEFORE LOGO
+    sys.stdout.write("\r" + " " * 120 + "\r")
+    sys.stdout.flush()
     
     # 2. Smooth Reveal (Banner)
     for line in BANNER.split('\n'):
@@ -146,9 +161,7 @@ def _boot_sequence():
             time.sleep(0.012)
     
     time.sleep(0.3)
-    # The Prompt
-    print(f"\n" + Fore.LIGHTRED_EX + "hellhound" + Fore.WHITE + " > " + Style.RESET_ALL, end="", flush=True)
-    time.sleep(0.5)
+    time.sleep(0.3)
 
 
 # ----------------------------
@@ -240,6 +253,17 @@ class HellhoundConsole(cmd.Cmd):
         }
         self.update_available = False
 
+        # ANIMATOR STATE
+        self._anim_active  = False
+        self._anim_thread  = None
+        self._anim_stop_event = threading.Event()
+        self.term_lock     = threading.Lock() # SYNCHRONIZATION LOCK
+        self._anim_label   = ""
+        self._anim_total   = 0
+        self._anim_current = 0
+        self._last_anim_line = ""
+        self._anim_start_time = 0
+
         self.aliases = {
             "hunt": "prey",
             "run": "strike",
@@ -271,6 +295,137 @@ class HellhoundConsole(cmd.Cmd):
         except ImportError:
             pass
 
+    # ----------------------------
+    # ANIMATION HELPERS
+    # ----------------------------
+    def _get_case_wave(self, label: str, t: float) -> str:
+        """Pulsing case-wave logic: v = sin(t * 10 + i * 0.4)"""
+        res = ""
+        for i, char in enumerate(label):
+            if not char.isalpha():
+                res += char
+                continue
+            v = math.sin(t * 10 + i * 0.4)
+            if v > 0:
+                res += f"{C_PRIMARY_RED}{char.upper()}{Style.RESET_ALL}"
+            else:
+                res += f"{C_DIM_RED}{char.lower()}{Style.RESET_ALL}"
+        return res
+
+    def _get_braille_wave(self, t: float, width: int = 60) -> str:
+        """Braille-wave logic: idx = int((sin(t * 5 + i * 0.3) + 1) / 2 * 7)"""
+        frames = ["⡀", "⡄", "⡆", "⡇", "⣇", "⣧", "⣷", "⣿"]
+        res = ""
+        for i in range(width):
+            idx = int((math.sin(t * 5 + i * 0.3) + 1) / 2 * 7)
+            res += f"{C_PRIMARY_RED}{frames[idx]}{Style.RESET_ALL}"
+        return res
+
+    # ----------------------------
+    # NEW STICKY ANIMATOR API
+    # ----------------------------
+
+    def clear_progress_unlocked(self):
+        """Wipes the current animation line without acquiring the lock."""
+        if self._last_anim_line:
+            # Strip ANSI to get real length
+            clean_len = len(re.sub(r'\033\[[^m]*m', '', self._last_anim_line))
+            sys.stdout.write("\r" + " " * (clean_len + 5) + "\r")
+            sys.stdout.flush()
+
+    def clear_progress(self):
+        """Wipes the current animation line to allow clean log printing."""
+        with self.term_lock:
+            self.clear_progress_unlocked()
+
+    def start_animation(self, label: str, total: int = 0):
+        """Starts the background animation thread."""
+        self._anim_active = True
+        self._anim_label = label
+        self._anim_total = total
+        self._anim_current = 0
+        self._anim_start_time = time.time()
+        self._anim_stop_event.clear()
+        
+        if self._anim_thread and self._anim_thread.is_alive():
+            self.stop_animation()
+            
+        self._anim_thread = threading.Thread(target=self._animate_loop_thread, daemon=True)
+        self._anim_thread.start()
+
+    def progress_stop(self):
+        """Stop sticky animation."""
+        pass
+    
+    def stop_animation(self):
+        """Alias for progress_stop."""
+        self.progress_stop()
+        self._anim_active = False
+        self._anim_stop_event.set()
+        if self._anim_thread:
+            # We don't join to avoid blocking for too long, but we ensure it stops
+            self._anim_thread = None
+        self.clear_progress()
+        self._last_anim_line = ""
+
+    def update_animation(self, current: int, label: str = None):
+        """Updates the progress stats for the active animation."""
+        self._anim_current = current
+        if label:
+            self._anim_label = label
+
+    def _animate_loop_thread(self):
+        """Background thread that handles the actual rendering."""
+        while not self._anim_stop_event.is_set():
+            try:
+                t = time.time() - self._anim_start_time
+                
+                # Render components
+                full_label = f"HELLHOUND IS USING {self._anim_label.upper()}"
+                wave_label = ""
+                for i, char in enumerate(full_label):
+                    v = math.sin(t * 10 + i * 0.4)
+                    if v > 0:
+                        wave_label += f"{C_PRIMARY_RED}{Style.BRIGHT}{char.upper()}{Style.RESET_ALL}"
+                    else:
+                        wave_label += f"{C_DIM_RED}{char.lower()}{Style.RESET_ALL}"
+
+                bar = self._get_braille_wave(t)
+                line = f"   {wave_label}   {bar}"
+                self._last_anim_line = line
+                
+                with self.term_lock:
+                    sys.stdout.write("\r" + line)
+                    sys.stdout.flush()
+                
+                # Precise timing
+                time.sleep(0.06)
+            except Exception:
+                time.sleep(0.5)
+
+    def progress(self, label: str, current: int, total: int, start_time: float = None):
+        """Legacy sync bridge / direct call (if animator not used)."""
+        # Since we moved to background animator, this can either trigger it or 
+        # just do a one-off render. To maintain compatibility with existing 
+        # Spider integration, we'll make it update the animator if active.
+        if self._anim_active:
+            self.update_animation(current, label)
+        else:
+            # Fallback to the old one-off render logic if for some reason animator isn't used
+            t = time.time()
+            wave_label = self._get_case_wave(label, t)
+            bar = self._get_braille_wave(t)
+            if total > 0:
+                stats = f"{C_WHITE}{current}/{total}{Style.RESET_ALL} ({int(current/total*100)}%)"
+            else:
+                stats = f"{C_WHITE}{current}{Style.RESET_ALL}"
+            line = f" {C_HUD_CYAN}[*]{Style.RESET_ALL} {wave_label}  {bar} {stats}"
+            self._last_anim_line = line
+            sys.stdout.write(f"\r{line}")
+            sys.stdout.flush()
+
+    # ----------------------------
+
 
     # ----------------------------
     # Hackeristic Boot Sequence (UPGRADED)
@@ -287,7 +442,7 @@ class HellhoundConsole(cmd.Cmd):
         _boot_sequence()
 
         # ── 3. Post-Animation Logic ───────────────────────────
-        print(f"\n{Fore.WHITE}Type '{Fore.YELLOW}help{Fore.WHITE}' to view available commands.\n")
+        print(f"{Fore.WHITE}Type '{Fore.YELLOW}help{Fore.WHITE}' to view available commands.\n")
         
         # Give the thread a tiny bit more time if it's not finished
         # (Though animation is 4.2s, so it should be done)
@@ -1858,6 +2013,7 @@ class HellhoundConsole(cmd.Cmd):
 
         cmd = parts[0]
         args = " ".join(parts[1:])
+
 
         # Allow real commands always
         if hasattr(self, f"do_{cmd}"):
