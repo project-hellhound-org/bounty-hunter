@@ -13,7 +13,7 @@
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.13-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
   <a href="https://github.com/l4zz3rj0d/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.5.0-red?style=flat-square" alt="Release Version"/></a>
   <img src="https://img.shields.io/badge/AI--Agnostic-OpenAI%20%7C%20Anthropic%20%7C%20Gemini-red?style=flat-square" alt="AI Support"/>
-  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License"/>
+  <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License"/>
   <a href="https://github.com/l4zz3rj0d/Hellhound-Pentest/stargazers"><img src="https://img.shields.io/github/stars/l4zz3rj0d/Hellhound-Pentest?style=flat-square&color=yellow" alt="Stars"/></a>
 </p>
 
@@ -127,7 +127,7 @@ For deep-dives into framework architecture, module logic, and detection signatur
 ---
 
 ## Compliance & Usage
-Hellhound is developed strictly for **authorized security assessments**. The developers and contributors assume no liability for misuse, unauthorized access, or damage caused by this tool. Usage must comply with all applicable local, national, and international laws.
+Hellhound is developed strictly for **authorized security assessments**. This software is licensed under the **GNU General Public License v3 (GPLv3)**. Usage must comply with all applicable local, national, and international laws.
 
 **Developer**: [l4zz3rj0d](https://github.com/l4zz3rj0d)  
-**License**: MIT
+**License**: GPLv3
