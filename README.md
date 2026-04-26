@@ -14,7 +14,7 @@
   <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.5.0-red?style=flat-square" alt="Release Version"/></a>
   <img src="https://img.shields.io/badge/AI--Agnostic-OpenAI%20%7C%20Anthropic%20%7C%20Gemini-red?style=flat-square" alt="AI Support"/>
   <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License"/>
-  <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/stargazers"><img src="https://img.shields.io/github/stars/l4zz3rj0d/Hellhound-Pentest?style=flat-square&color=yellow" alt="Stars"/></a>
+  <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/stargazers"><img src="https://img.shields.io/github/stars/project-hellhound-org/Hellhound-Pentest?style=flat-square&color=yellow" alt="Stars"/></a>
 </p>
 
 ---
