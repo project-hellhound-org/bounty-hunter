@@ -11,10 +11,10 @@
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.13-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
-  <a href="https://github.com/l4zz3rj0d/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.5.0-red?style=flat-square" alt="Release Version"/></a>
+  <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.5.0-red?style=flat-square" alt="Release Version"/></a>
   <img src="https://img.shields.io/badge/AI--Agnostic-OpenAI%20%7C%20Anthropic%20%7C%20Gemini-red?style=flat-square" alt="AI Support"/>
   <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License"/>
-  <a href="https://github.com/l4zz3rj0d/Hellhound-Pentest/stargazers"><img src="https://img.shields.io/github/stars/l4zz3rj0d/Hellhound-Pentest?style=flat-square&color=yellow" alt="Stars"/></a>
+  <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/stargazers"><img src="https://img.shields.io/github/stars/l4zz3rj0d/Hellhound-Pentest?style=flat-square&color=yellow" alt="Stars"/></a>
 </p>
 
 ---
@@ -50,7 +50,7 @@ Whether you're performing surface reconnaissance or deep logical vulnerability a
 ### One-Step Automated Install
 ```bash
 # Clone the repository
-git clone https://github.com/l4zz3rj0d/Hellhound-Pentest.git
+git clone https://github.com/project-hellhound-org/Hellhound-Pentest.git
 cd Hellhound-Pentest
 
 # Run the professional installer
@@ -129,5 +129,14 @@ For deep-dives into framework architecture, module logic, and detection signatur
 ## Compliance & Usage
 Hellhound is developed strictly for **authorized security assessments**. This software is licensed under the **GNU General Public License v3 (GPLv3)**. Usage must comply with all applicable local, national, and international laws.
 
-**Developer**: [l4zz3rj0d](https://github.com/l4zz3rj0d)  
+**Developer**: [l4zz3rj0d](https://github.com/project-hellhound-org)  
 **License**: GPLv3
+
+
+## Author
+
+<div align="center">
+  <a href="https://l4zz3rj0d.github.io">
+    <img src="https://img.shields.io/badge/Founder-L4ZZ3RJ0D-c0392b?style=for-the-badge" alt="L4ZZ3RJ0D"/>
+  </a>
+</div>
