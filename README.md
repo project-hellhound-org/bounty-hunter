@@ -131,11 +131,11 @@ For deep-dives into framework architecture, module logic, and detection signatur
 
 ---
 
+---
+
 ## Compliance & Usage
 Hellhound is developed strictly for **authorized security assessments**. This software is licensed under the **GNU General Public License v3 (GPLv3)**. Usage must comply with all applicable local, national, and international laws.
 
-**Developer**: [l4zz3rj0d](https://github.com/project-hellhound-org)  
-**License**: GPLv3
 
 
 ## Author
