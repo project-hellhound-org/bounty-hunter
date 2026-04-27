@@ -1,31 +1,88 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════
-#  HELLHOUND — Install Script
+#  HELLHOUND — Install Script (Cinematic v12.6)
 #  Run once from the project root directory.
 #  After this, type `hellhound` from anywhere.
 # ══════════════════════════════════════════════════════
 
 set -e
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-RESET='\033[0m'
+RED='\033[91m'
+GRN='\033[92m'
+CYN='\033[96m'
+YLW='\033[93m'
+RST='\033[0m'
+BLD='\033[1m'
 
-VENV_DIR="$HOME/.hellhound-env"
+info()    { echo -e "${CYN}[*]${RST} $1"; }
+success() { echo -e "${GRN}${BLD}[✓]${RST} $1"; }
+warn()    { echo -e "${YLW}[!]${RST} $1"; }
+error()   { echo -e "${RED}[✗]${RST} $1"; stop_animation; exit 1; }
 
-echo -e "\n${RED}  HELLHOUND — Install${RESET}\n"
+# ── Animator Logic (Cinematic) ────────────────────────────────────────────────
+ANIM_PID=0
 
-# ── 1. Must be run from project root ──────────────────
+start_animation() {
+    local label="$1"
+    stop_animation
+    
+    # T31: Case-Wave for Label
+    # P33: Braille-Wave for Progress (Scaled to 'Ultra-Wide' 50 character bar)
+    python3 -c "
+import math, time, sys
+label = \"$label\"
+def wave(label, t):
+    res = ''
+    for i, c in enumerate(label):
+        if not c.isalpha(): res += c; continue
+        v = math.sin(t * 10 + i * 0.4)
+        if v > 0: res += f'\033[91m\033[1m{c.upper()}\033[0m'
+        else: res += f'\033[31m{c.lower()}\033[0m'
+    return res
+def braille(t):
+    chars = '⡀⡄⡆⡇⣇⣧⣷⣿'
+    bar = ''
+    for i in range(50):
+        idx = int((math.sin(t * 5 + i * 0.2) + 1) / 2 * (len(chars) - 1))
+        bar += f'\033[91m{chars[idx]}\033[0m'
+    return bar
+start = time.time()
+try:
+    while True:
+        t = time.time() - start
+        sys.stdout.write(f'\r  {wave(label, t):<35}  {braille(t)} ')
+        sys.stdout.flush()
+        time.sleep(0.06)
+except:
+    pass
+" &
+    ANIM_PID=$!
+}
+
+stop_animation() {
+    if [ "$ANIM_PID" -ne 0 ]; then
+        kill -9 "$ANIM_PID" &>/dev/null || true
+        wait "$ANIM_PID" 2>/dev/null || true
+        # Clean the line thoroughly
+        printf "\r\033[2K\r" 
+        ANIM_PID=0
+    fi
+}
+
+trap "stop_animation" EXIT INT TERM
+
+echo -e "\n${RED}${BLD}  HELLHOUND — Install${RST}\n"
+
+# ── 1. Preparation ────────────────────────────────────
 if [ ! -f "setup.py" ]; then
-    echo -e "${RED}[x] Run this script from the HELLHOUND project root (where setup.py is).${RESET}"
+    echo -e "${RED}[✗] Run this script from the HELLHOUND project root (where setup.py is).${RST}"
     exit 1
 fi
 
 PROJECT_ROOT="$(pwd)"
+VENV_DIR="$HOME/.hellhound-env"
 
-# ── 2. Detect shell rc file ───────────────────────────
+# Detect shell rc file
 if [ "$(basename "$SHELL")" = "zsh" ]; then
     SHELL_RC="$HOME/.zshrc"
 elif [ "$(basename "$SHELL")" = "bash" ]; then
@@ -34,67 +91,123 @@ else
     SHELL_RC="$HOME/.profile"
 fi
 
-# ── 3. Create venv ────────────────────────────────────
-echo -e "${CYAN}[*] Creating virtual environment at $VENV_DIR ...${RESET}"
-python3 -m venv "$VENV_DIR"
+# ── 2. Virtual Environment ────────────────────────────
+start_animation "ISOLATING CORE"
+python3 -m venv "$VENV_DIR" || error "Failed to create virtual environment."
+stop_animation
+success "Virtual environment ready at $VENV_DIR"
 
-# ── 4. Install hellhound as editable into venv ────────
-echo -e "${CYAN}[*] Installing HELLHOUND into venv...${RESET}"
+# ── 3. Core Engine ────────────────────────────────────
+start_animation "DECRYPTING DEPENDENCIES"
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
 "$VENV_DIR/bin/pip" install --quiet -e "$PROJECT_ROOT"
+stop_animation
+success "HELLHOUND core engine installed"
 
-# ── 5. Install Playwright browsers ────────────────────
-echo -e "${CYAN}[*] Installing Playwright Chromium browser...${RESET}"
+# ── 4. Playwright (Spider-style handling) ──────────────
+stop_animation
+info "Mounting SPA Engine..."
+
 if grep -q "Kali" /etc/os-release 2>/dev/null; then
-    echo -e "${YELLOW}[*] Kali Linux detected — applying optimized Ubuntu browser fallback.${RESET}"
+    info "Kali Linux detected — applying dependency patches..."
+    # Fix for Kali's t64 transition and missing Ubuntu font packages
+    DUMMY_DIR=$(mktemp -d)
+    
+    # 1. Dummy ttf-unifont -> fonts-unifont
+    mkdir -p "$DUMMY_DIR/ttf-unifont/DEBIAN"
+    cat <<EOF > "$DUMMY_DIR/ttf-unifont/DEBIAN/control"
+Package: ttf-unifont
+Version: 1:99.0
+Section: fonts
+Priority: optional
+Architecture: all
+Depends: fonts-unifont
+Description: Dummy package for ttf-unifont
+EOF
+    dpkg-deb --build "$DUMMY_DIR/ttf-unifont" "$DUMMY_DIR/ttf-unifont.deb" &>/dev/null
+    
+    # 2. Dummy libasound2 -> libasound2t64
+    mkdir -p "$DUMMY_DIR/libasound2/DEBIAN"
+    cat <<EOF > "$DUMMY_DIR/libasound2/DEBIAN/control"
+Package: libasound2
+Version: 1:99.0
+Section: libs
+Priority: optional
+Architecture: all
+Depends: libasound2t64
+Description: Dummy package for libasound2
+EOF
+    dpkg-deb --build "$DUMMY_DIR/libasound2" "$DUMMY_DIR/libasound2.deb" &>/dev/null
+
+    # 3. Dummy ttf-ubuntu-font-family -> fonts-liberation
+    mkdir -p "$DUMMY_DIR/ttf-ubuntu-font-family/DEBIAN"
+    cat <<EOF > "$DUMMY_DIR/ttf-ubuntu-font-family/DEBIAN/control"
+Package: ttf-ubuntu-font-family
+Version: 1:99.0
+Section: fonts
+Priority: optional
+Architecture: all
+Depends: fonts-liberation
+Description: Dummy package for ttf-ubuntu-font-family
+EOF
+    dpkg-deb --build "$DUMMY_DIR/ttf-ubuntu-font-family" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null
+    
+    if command -v sudo &>/dev/null; then
+        sudo dpkg -i "$DUMMY_DIR/ttf-unifont.deb" "$DUMMY_DIR/libasound2.deb" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null || true
+    else
+        dpkg -i "$DUMMY_DIR/ttf-unifont.deb" "$DUMMY_DIR/libasound2.deb" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null || true
+    fi
+    rm -rf "$DUMMY_DIR"
 fi
 
-if "$VENV_DIR/bin/python" -m playwright install chromium --with-deps 2>/dev/null; then
-    echo -e "${GREEN}[+] Playwright Chromium and dependencies installed.${RESET}"
+# Suppress redundant 'BEWARE' warnings on Kali to keep output clean
+info "Fetching Chromium (this may take a minute)..."
+"$VENV_DIR/bin/python" -m playwright install chromium 2>&1 | grep --line-buffered -vE "BEWARE|fallback" || true
+
+info "Hardening system dependencies..."
+if command -v sudo &>/dev/null && [ "$EUID" -ne 0 ]; then
+    sudo "$VENV_DIR/bin/python" -m playwright install-deps chromium 2>&1 | grep --line-buffered -vE "BEWARE|fallback" || true
 else
-    echo -e "${YELLOW}[!] Playwright browser install encountered a non-fatal warning or failure.${RESET}"
-    echo -e "${YELLOW}    If the browser fails to launch, run the following command manually:${RESET}"
-    echo -e "${YELLOW}    sudo $VENV_DIR/bin/python -m playwright install-deps chromium${RESET}"
+    "$VENV_DIR/bin/python" -m playwright install-deps chromium 2>&1 | grep --line-buffered -vE "BEWARE|fallback" || true
 fi
+success "SPA Engine mounted successfully"
 
-# ── 6. Write alias to shell rc ────────────────────────
+# ── 5. System Integration ──────────────────────────────
+start_animation "FINALIZING INTEGRATION"
+
+# Alias integration
 ALIAS_LINE="alias hellhound='$VENV_DIR/bin/hellhound'"
-
 if grep -qF "alias hellhound=" "$SHELL_RC" 2>/dev/null; then
     sed -i "s|alias hellhound=.*|$ALIAS_LINE|" "$SHELL_RC"
-    echo -e "${CYAN}[*] Updated existing hellhound alias in $SHELL_RC${RESET}"
 else
     echo "" >> "$SHELL_RC"
     echo "# HELLHOUND" >> "$SHELL_RC"
     echo "$ALIAS_LINE" >> "$SHELL_RC"
-    echo -e "${CYAN}[*] Added hellhound alias to $SHELL_RC${RESET}"
 fi
 
-# ── 7. Symlink into ~/.local/bin for new shell sessions ──
+# Local bin symlink
 mkdir -p "$HOME/.local/bin"
 ln -sf "$VENV_DIR/bin/hellhound" "$HOME/.local/bin/hellhound"
 
-# ── 8. System-wide Symlink (Optional) ──────────────────
+# Global bin symlink (if sudo available)
 if [ "$EUID" -eq 0 ]; then
-    echo -e "${CYAN}[*] Sudo detected. Creating system-wide symlink...${RESET}"
     ln -sf "$VENV_DIR/bin/hellhound" "/usr/local/bin/hellhound"
-    echo -e "${GREEN}[+] System-wide symlink created: /usr/local/bin/hellhound${RESET}"
+elif sudo -n true 2>/dev/null; then
+    sudo ln -sf "$VENV_DIR/bin/hellhound" "/usr/local/bin/hellhound" 2>/dev/null || true
 fi
 
-# ── 9. Make scripts executable ────────────────────────
 chmod +x "$PROJECT_ROOT/update.sh"
 chmod +x "$PROJECT_ROOT/install.sh"
 
-# ── 10. Done ──────────────────────────────────────────
-echo -e "\n${GREEN}[+] HELLHOUND installed successfully.${RESET}"
-echo -e "${GREEN}    Venv    : $VENV_DIR${RESET}"
-echo -e "${GREEN}    Command : hellhound${RESET}"
+stop_animation
+success "System integration complete"
+
+# ── 6. Done ──────────────────────────────────────────
 echo ""
-echo -e "${YELLOW}  To upgrade in the future, use:${RESET}"
-echo -e "    hellhound upgrade"
-echo -e "  Or from within the console:"
-echo -e "    hellhound > upgrade"
+echo -e "  ${GRN}${BLD}HELLHOUND installed successfully.${RST}"
+echo -e "  Venv    : ${CYN}$VENV_DIR${RST}"
+echo -e "  Command : ${CYN}hellhound${RST}"
 echo ""
-echo -e "${YELLOW}  Activate now (current terminal):${RESET}"
+echo -e "  ${YLW}Activate now:${RST}"
 echo -e "    source $SHELL_RC"
-echo -e "  Or just open a new terminal.\n"
+echo ""

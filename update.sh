@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-#  HELLHOUND — Updater v2.0 (Cinematic)
+#  HELLHOUND — Updater v12.5 (Cinematic)
 #  Pulls the latest changes from Git and refreshes the installation.
 # ─────────────────────────────────────────────────────────────────────
 
@@ -25,7 +25,8 @@ start_animation() {
     local label="$1"
     stop_animation
     
-    # Python-based Cinematic Animator (v2.0 - Flush-Hardened)
+    # T31: Case-Wave for Label
+    # P33: Braille-Wave for Progress (Scaled to 'Ultra-Wide' 50 character bar)
     python3 -c "
 import math, time, sys
 label = \"$label\"
@@ -40,7 +41,7 @@ def wave(label, t):
 def braille(t):
     chars = '⡀⡄⡆⡇⣇⣧⣷⣿'
     bar = ''
-    for i in range(40):
+    for i in range(50):
         idx = int((math.sin(t * 5 + i * 0.2) + 1) / 2 * (len(chars) - 1))
         bar += f'\033[91m{chars[idx]}\033[0m'
     return bar
@@ -48,9 +49,9 @@ start = time.time()
 try:
     while True:
         t = time.time() - start
-        sys.stdout.write(f'\r  {wave(label, t):<30} {braille(t)} ')
+        sys.stdout.write(f'\r  {wave(label, t):<35}  {braille(t)} ')
         sys.stdout.flush()
-        time.sleep(0.05)
+        time.sleep(0.06)
 except:
     pass
 " &
@@ -62,7 +63,8 @@ stop_animation() {
     if [ "$ANIM_PID" -ne 0 ]; then
         kill -9 "$ANIM_PID" &>/dev/null || true
         wait "$ANIM_PID" 2>/dev/null || true
-        printf "\r\b\b\033[K"
+        # Clean the line thoroughly
+        printf "\r\033[2K\r"
         ANIM_PID=0
     fi
 }
@@ -77,7 +79,6 @@ if [ ! -d ".git" ]; then
 fi
 
 # ── Remote Sync (Ensure Org URL) ──────────────────────────────────────────────
-# Automatically update remote to point to the official organization
 REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "")
 if [[ "$REMOTE_URL" == *"l4zz3rj0d"* ]]; then
     NEW_URL=$(echo "$REMOTE_URL" | sed "s/l4zz3rj0d/project-hellhound-org/g")
@@ -104,21 +105,20 @@ if git pull origin "$CURRENT_BRANCH"; then
 else
     warn "Standard pull failed — attempting emergency fetch/reset..."
     git fetch --all
-    git pull || warn "Could not pull latest changes. You may have uncommitted conflicts."
+    git reset --hard origin/"$CURRENT_BRANCH" || warn "Could not pull latest changes."
 fi
 
 if [ -n "$LOCAL_CHANGES" ]; then
     info "Restoring your local changes..."
-    git stash pop &>/dev/null || warn "Could not auto-apply local changes. Use \"git stash pop\" manually."
+    git stash pop &>/dev/null || warn "Could not auto-apply local changes."
 fi
 
 # ── Run installer ─────────────────────────────────────────────────────────────
-# IMPORTANT: Stop animation before calling installer to prevent duplicate text
 stop_animation 
 info "Synchronizing system configuration..."
 chmod +x install.sh
 if [ -f "install.sh" ]; then
-    ./install.sh --yes || ./install.sh
+    ./install.sh || true
 fi
 
 echo ""
