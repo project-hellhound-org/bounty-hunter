@@ -40,12 +40,17 @@ Whether you're performing surface reconnaissance or deep logical vulnerability a
 
 ---
 
-## Installation & Setup
+### System Compatibility
+Hellhound is engineered for high-performance offensive operations across multiple environments:
+
+*   **Linux (Native)**: Fully optimized for Kali Linux, Ubuntu, Debian, Arch, and Parrot OS. Version 12.6 introduces a hardened installer specifically for Kali's `t64` package architecture.
+*   **macOS (Native)**: Runs natively on Apple Silicon (M1/M2/M3) and Intel-based Macs.
+*   **Windows (via WSL2)**: Supported through Windows Subsystem for Linux (WSL2). This is the recommended way to run Hellhound on Windows to ensure full tool compatibility and performance.
 
 ### Prerequisites
 - **Python 3.10+** (Recommended: 3.13)
 - **Git**
-- **Playwright Dependencies** (Automated during install)
+- **Playwright Dependencies** (Automated via `install.sh`)
 
 ### One-Step Automated Install
 ```bash
@@ -57,7 +62,7 @@ cd Hellhound-Pentest
 chmod +x install.sh
 ./install.sh
 ```
-*After installation, restart your terminal or run `source ~/.bashrc` to activate the `hellhound` command.*
+*After installation, restart your terminal or run `source ~/.bashrc` to activate the `hellhound` command. Windows users should run these commands within their WSL2 terminal.*
 
 ### Keeping Hellhound Updated
 Hellhound features a professional self-update mechanism:
