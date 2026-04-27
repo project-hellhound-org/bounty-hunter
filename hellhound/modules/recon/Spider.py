@@ -2861,16 +2861,23 @@ def diff_crawls(old_json: str, new_json: str) -> dict:
             "summary": {"added": len(added), "removed": len(removed), "changed": len(changed)}}
 
 # ══════════════════════════════════════════════════════════════════════
-# AUTO-SAVE  — always writes JSON; optional extra format file
+# REPORT SAVING
 # ══════════════════════════════════════════════════════════════════════
 
-def _auto_save(store: Store, target: str, out_path: Optional[str],
-               fmt: str, emit: Emit) -> str:
-    """Always saves a .json report. Returns the path saved."""
+def _save_report(store: Store, target: str, out_path: str,
+                 fmt: str, emit: Emit) -> str:
+    """Saves the scan results to the specified path and format."""
+    if not out_path:
+        return ""
+        
     domain    = re.sub(r'[^a-zA-Z0-9_\-]', '_', urlparse(target).netloc)
     ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_path = out_path if (out_path and out_path.endswith(".json")) \
-                else f"hellhound_{domain}_{ts}.json"
+    
+    # If out_path is a directory or doesn't have a json extension when needed
+    if out_path.endswith("/") or Path(out_path).is_dir():
+        json_path = str(Path(out_path) / f"hellhound_{domain}_{ts}.json")
+    else:
+        json_path = out_path if out_path.endswith(".json") else f"{out_path}.json"
 
     try:
         Path(json_path).write_text(store.export(target, fmt="json"))
@@ -2879,11 +2886,13 @@ def _auto_save(store: Store, target: str, out_path: Optional[str],
         emit.warn(f"[Report] JSON save failed: {e}")
         json_path = ""
 
-    # If extra format requested with an explicit path, save it too
-    if out_path and fmt != "json":
+    # If extra format requested
+    if fmt and fmt != "json":
+        # If out_path was used for json, we might need a different path for the extra format
+        extra_path = out_path if not out_path.endswith(".json") else out_path.rsplit(".", 1)[0] + f".{fmt}"
         try:
-            Path(out_path).write_text(store.export(target, fmt=fmt))
-            emit.always_info(f"[Report] {fmt.upper()} saved → {out_path}")
+            Path(extra_path).write_text(store.export(target, fmt=fmt))
+            emit.always_info(f"[Report] {fmt.upper()} saved → {extra_path}")
         except Exception as e:
             emit.warn(f"[Report] {fmt.upper()} save failed: {e}")
 
@@ -2921,6 +2930,8 @@ def run(target, framework_emit, options=None):
         enable_openapi      = not bool(options.get("no_openapi", False)),
         enable_extraction   = bool(options.get("extract", False)),
         enable_screenshots  = bool(options.get("screenshot", False)),
+        output_file         = options.get("output"),
+        output_format       = options.get("format", "json"),
     )
     
     # 3. Handle credentials
@@ -2988,11 +2999,11 @@ def _do_run(target: str, cfg: Config, emit,
 
     elapsed = time.time() - start
 
-    # Auto-save JSON (unless silent)
+    # Save report if output file is specified
     json_path = ""
-    if not silent:
-        json_path = _auto_save(spider.store, target, cfg.output_file,
-                               cfg.output_format, emit)
+    if cfg.output_file:
+        json_path = _save_report(spider.store, target, cfg.output_file,
+                                 cfg.output_format, emit)
 
     intel  = json.loads(spider.store.export(target, fmt="json"))
     result = {"raw": "", "intel": intel}
@@ -3028,7 +3039,7 @@ def _build_parser() -> argparse.ArgumentParser:
             f"  spider https://target.com --format csv --out report.csv\n"
             f"  spider https://target.com --no-playwright\n"
             f"  spider https://target.com --diff old.json\n"
-            f"\n  JSON report is always auto-saved even without --out.{C.RST}\n"
+            f"{C.RST}\n"
         ),
     )
 
