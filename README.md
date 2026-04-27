@@ -82,10 +82,19 @@ Hellhound's power lies in its modularity. Each module is optimized for high high
 
 | Category | Modules | Description |
 | :--- | :--- | :--- |
-| **Recon** | `Spider`, `SurfaceAuditor`, `WAFbuster`, `GraphQL`, `CORSbuster`, `FUZZhunter`, `JWTanalyzer` | Deep surface mapping and service discovery. |
+| **Recon** | `Spider`, `SurfaceAuditor`, `TransportAuditor`, `WAFbuster`, `GraphQL`, `CORSbuster`, `FUZZhunter` | Deep surface mapping and service discovery. |
 | **Vulnerability Audit** | `XSStrike`, `SQLIdetector`, `SSRFdetector`, `XXEdetector`, `IDORdetector`, `LFIauditor`, `RBAC` | Targeted vulnerability identification and logic auditing. |
 | **Intelligence** | `SecretScanner`, `TechProfiler`, `SourceAuditor`, `CloudScout`, `BlobUnpacker` | Harvesting sensitive data and infrastructure intelligence. |
 | **Analysis & Exploitation** | `Exmap`, `Hydra`, `CMDinj` | Universal exploitation matrix and parameter orchestration. |
+
+---
+
+## ◓ Recent Updates (v12.5.1)
+
+- **Consolidated Transport Security**: `CookieAuditor` and `HeaderAuditor` have been merged into the new **`TransportAuditor`** for unified SSL/TLS, HSTS, and session security analysis.
+- **Spider v12.3**: Integrated high-fidelity standalone recon engine with full SPA support, suppressed CLI noise for cleaner console operations, and automated risk scoring.
+- **Improved Scoping**: `Stalk` and legacy auditors have been deprecated in favor of the enhanced `Spider` + `SurfaceAuditor` reconnaissance pipeline.
+- **Hardened Dependencies**: Automated fallback for BeautifulSoup parsers (`lxml` -> `html.parser`) to ensure stability across all environments.
 
 ---
 
@@ -141,5 +150,5 @@ Hellhound is developed strictly for **authorized security assessments**. This so
 ## Author
 
 <a href="https://l4zz3rj0d.github.io">
-  <img src="https://img.shields.io/badge/Founder-L4ZZ3RJ0D-c0392b?style=for-the-badge" alt="L4ZZ3RJ0D"/>
+  <img src="https://img.shields.io/badge/Founder-Sree%20Danush%20S%20(L4ZZ3RJ0D)-c0392b?style=for-the-badge" alt="Sree Danush S (L4ZZ3RJ0D)"/>
 </a>
