@@ -210,3 +210,4 @@ __marimo__/
 hellhound/storage/*
 !hellhound/storage/.gitkeep
 run_diff.py
+*.json

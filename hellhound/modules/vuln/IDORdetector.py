@@ -59,23 +59,19 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 # ANSI COLORS
 # ─────────────────────────────────────────────────────────────────────────────
 class C:
-    RESET    = "\033[0m";  BOLD    = "\033[1m"; DIM     = "\033[2m"
-    RED      = "\033[31m"; GREEN   = "\033[32m"; YELLOW  = "\033[33m"
-    BLUE     = "\033[34m"; MAGENTA = "\033[35m"; CYAN    = "\033[36m"
-    WHITE    = "\033[37m"
-    BRED     = "\033[91m"; BGREEN  = "\033[92m"; BYELLOW = "\033[93m"
-    BBLUE    = "\033[94m"; BMAGENTA= "\033[95m"; BCYAN   = "\033[96m"
-    BWHITE   = "\033[97m"
+    W   = '\033[97m'; G   = '\033[92m'; R   = '\033[91m'; Y   = '\033[93m'; B   = '\033[94m'
+    M   = '\033[95m'; CY  = '\033[96m'; GR  = '\033[90m'; RST = '\033[0m'; BLD = '\033[1m'
+    DIM = '\033[2m'; ITL = '\033[3m'; UND = '\033[4m'; INV = '\033[7m'
 
-def color(text, *styles): return "".join(styles) + str(text) + C.RESET
-def label(tag, text, tc=C.BBLUE):
-    return f"{color('[',C.DIM)}{color(tag,tc,C.BOLD)}{color(']',C.DIM)} {text}"
+def color(text, *styles): return "".join(styles) + str(text) + C.RST
+def label(tag, text, tc=C.CY):
+    return f"{C.DIM}[{C.RST}{C.BLD}{tc}{tag}{C.RST}{C.DIM}]{C.RST} {text}"
 
-def ok(t):    return label("+",      t, C.BGREEN)
-def warn(t):  return label("!",      t, C.BYELLOW)
-def err(t):   return label("-",      t, C.BRED)
-def info(t):  return label("*",      t, C.BCYAN)
-def found(t): return label("IDOR",   t, C.BRED)
+def ok(t):    return label("+",      t, C.G)
+def warn(t):  return label("!",      t, C.Y)
+def err(t):   return label("-",      t, C.R)
+def info(t):  return label("*",      t, C.CY)
+def found(t): return label("IDOR",   t, C.R)
 def skp(t):   return label("SKIP",   t, C.DIM)
 
 _print_lock = threading.Lock()

@@ -109,8 +109,7 @@ def _boot_sequence():
                  ██║  ██║███████╗███████╗███████╗██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
                  ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝ 
 """
-    # 1. Clear & Initialise Animation
-    os.system('clear' if os.name == 'posix' else 'clear')
+    # 1. Initialise Animation (Preserving terminal history)
     
     white = Fore.WHITE + Style.BRIGHT
     red = Fore.RED + Style.BRIGHT
@@ -431,8 +430,6 @@ class HellhoundConsole(cmd.Cmd):
     # Hackeristic Boot Sequence (UPGRADED)
     # ----------------------------
     def preloop(self):
-        os.system('cls' if os.name == 'nt' else 'clear')
-
         # ── 1. Start background update check ──────────────────
         # Runs during the boot animation to save time.
         check_thread = threading.Thread(target=self._check_for_updates, daemon=True)
@@ -1842,16 +1839,17 @@ class HellhoundConsole(cmd.Cmd):
     # ============================
 
     def info(self, msg):
-        print(Style.BRIGHT + Fore.CYAN + f"[*] {msg}" + Style.RESET_ALL)
+        # Use subtle HUD Cyan for the marker, keep the message as-is (respecting internal colors)
+        print(f" {C_HUD_CYAN}[*]{R} {msg}")
 
     def success(self, msg):
-        print(Style.BRIGHT + Fore.GREEN + f"[+] {msg}" + Style.RESET_ALL)
+        print(f" {Fore.GREEN}[+]{R} {msg}")
 
     def warn(self, msg):
-        print(Style.BRIGHT + Fore.YELLOW + f"[*] {msg}" + Style.RESET_ALL)
+        print(f" {Fore.YELLOW}[*]{R} {msg}")
 
     def always_info(self, msg):
-        print(Style.BRIGHT + Fore.CYAN + f"[*] {msg}" + Style.RESET_ALL)
+        print(f" {C_HUD_CYAN}[*]{R} {msg}")
 
     def always_success(self, msg):
         if "Target:" in msg:
