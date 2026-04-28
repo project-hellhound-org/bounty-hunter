@@ -50,10 +50,29 @@ def test_cors(url, origin, session=None):
             return None
             
         acac = r.headers.get("Access-Control-Allow-Credentials", "false").lower() == "true"
-        return {"origin": origin, "acao": acao, "credentials": acac}
+        acam = r.headers.get("Access-Control-Allow-Methods", "")
+        acah = r.headers.get("Access-Control-Allow-Headers", "")
+        aceh = r.headers.get("Access-Control-Expose-Headers", "")
+        
+        # Risk multipliers for dangerous methods/headers
+        dangerous_methods = [m.strip().upper() for m in acam.split(",") if m.strip().upper() in ("PUT", "DELETE", "PATCH")]
+        sensitive_headers = [h.strip().lower() for h in acah.split(",") if h.strip().lower() in ("authorization", "x-api-key", "cookie")]
+        exposed_headers = [h.strip().lower() for h in aceh.split(",") if h.strip().lower() in ("authorization", "set-cookie", "x-auth-token")]
+        
+        return {
+            "origin": origin,
+            "acao": acao,
+            "credentials": acac,
+            "allowed_methods": acam,
+            "allowed_headers": acah,
+            "dangerous_methods": dangerous_methods,
+            "sensitive_headers": sensitive_headers,
+            "exposed_headers": exposed_headers,
+        }
     except Exception:
         pass
     return None
+
 
 def run(target, emit, options=None):
     emit.info(f"[*] CORS Buster: Analyzing Origins for {target}")

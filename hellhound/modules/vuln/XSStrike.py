@@ -124,9 +124,16 @@ async def run(target, emit, options=None):
     if not targets and endpoints:
         for ep in endpoints:
             params = ep.get("params", {})
-            for p_items in params.values():
-                for p in p_items:
-                    targets.append({"url": ep.get("url"), "method": ep.get("method", "GET"), "parameter": p})
+            # Self-healing parameter iteration
+            all_params = []
+            if isinstance(params, dict):
+                for bucket in params.values():
+                    if isinstance(bucket, list): all_params.extend(bucket)
+            elif isinstance(params, list):
+                all_params = params
+
+            for p in all_params:
+                targets.append({"url": ep.get("url"), "method": ep.get("method", "GET"), "parameter": p})
 
     if not targets:
         emit.warn("[!] No injection surfaces identified for XSS testing.")

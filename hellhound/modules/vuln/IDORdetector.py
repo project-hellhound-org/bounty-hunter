@@ -58,10 +58,23 @@ _SSL_CTX.verify_mode    = ssl.CERT_NONE
 # ─────────────────────────────────────────────────────────────────────────────
 # ANSI COLORS
 # ─────────────────────────────────────────────────────────────────────────────
+from colorama import Fore, Style, init
+init(autoreset=True)
+
 class C:
-    W   = '\033[97m'; G   = '\033[92m'; R   = '\033[91m'; Y   = '\033[93m'; B   = '\033[94m'
-    M   = '\033[95m'; CY  = '\033[96m'; GR  = '\033[90m'; RST = '\033[0m'; BLD = '\033[1m'
-    DIM = '\033[2m'; ITL = '\033[3m'; UND = '\033[4m'; INV = '\033[7m'
+    W   = Fore.WHITE; G   = Fore.GREEN; R   = Fore.RED; Y   = Fore.YELLOW; B   = Fore.BLUE
+    M   = Fore.MAGENTA; CY  = Fore.CYAN; GR  = Fore.LIGHTBLACK_EX; RST = Style.RESET_ALL; BLD = Style.BRIGHT
+    DIM = Style.DIM; ITL = ""; UND = ""; INV = ""
+    # Bold variants
+    BRED    = Fore.RED + Style.BRIGHT
+    BGREEN  = Fore.GREEN + Style.BRIGHT
+    BYELLOW = Fore.YELLOW + Style.BRIGHT
+    BBLUE   = Fore.BLUE + Style.BRIGHT
+    BMAGENTA= Fore.MAGENTA + Style.BRIGHT
+    BCYAN   = Fore.CYAN + Style.BRIGHT
+    BWHITE  = Fore.WHITE + Style.BRIGHT
+    BOLD    = Style.BRIGHT
+    CYAN    = Fore.CYAN
 
 def color(text, *styles): return "".join(styles) + str(text) + C.RST
 def label(tag, text, tc=C.CY):
@@ -2879,7 +2892,24 @@ class IDORSurfaceAnalyser:
         """Extract IDOR targets from param dict. Deduped by param_name."""
         seen    = set()
         targets = []
-        for pname, pval in params.items():
+        
+        # Robust parameter extraction (handles legacy list and new dict formats)
+        param_dict = {}
+        if isinstance(params, dict):
+            # Check if it's bucketed (values are lists) or flat (values are strings)
+            is_bucketed = any(isinstance(v, list) for v in params.values())
+            if is_bucketed:
+                for bucket, names in params.items():
+                    if isinstance(names, list):
+                        for name in names: param_dict[name] = "1"
+            else:
+                # Flat dict from SpiderBridge
+                for pk, pv in params.items():
+                    param_dict[pk] = pv
+        elif isinstance(params, list):
+            for name in params: param_dict[name] = "1"
+
+        for pname, pval in param_dict.items():
             if pname in seen:
                 continue
             # Skip pagination / control params — they carry numbers but not object IDs
@@ -4169,6 +4199,13 @@ class IDORTester:
                     if is_likely_public else
                     "no_auth_required | sensitive_data_in_response"
                 )
+                _poc_label, _poc_cmd, _poc_browser = self._build_poc_curl(
+                    t_url, method,
+                    params=t_params if loc != "path" else None,
+                    param_name=pname if loc != "path" else None,
+                    tampered_id=tampered_id if loc != "path" else None,
+                    unauth=True
+                )
                 finding = {
                     "method":       method,
                     "url":          t_url,
@@ -4183,6 +4220,9 @@ class IDORTester:
                     "body_snippet": body[:300],
                     "source":       ep.get("source", ""),
                     "session":      "unauthenticated",
+                    "poc_curl":          _poc_cmd,
+                    "poc_browser":       _poc_browser,
+                    "poc_session_label": _poc_label,
                 }
                 if self._record_finding(finding):
                     tprint(f"\n  {found(color(f'[UNAUTH][{unauth_confidence}]  {method} {t_url}', C.BRED, C.BOLD))}")
@@ -4534,12 +4574,14 @@ class SpiderBridge:
                             # Harvest live ID value if it looks real
                             pv_str = str(pv) if pv else ""
                             if _NUMERIC_RE.match(pv_str) or _UUID_RE.match(pv_str):
-                                id_hints_ep.append({
+                                hint = {
                                     "id_val":     pv_str,
                                     "id_type":    "numeric" if _NUMERIC_RE.match(pv_str) else "uuid",
                                     "id_source":  f"spider:param:{pk}",
                                     "context_url": ep_url,
-                                })
+                                }
+                                id_hints_ep.append(hint)
+                                self.id_hints_ep.append(hint)
 
             elif isinstance(raw_params, list):
                 # List of param names
@@ -4600,12 +4642,14 @@ class SpiderBridge:
                 pv_str = pvlist[0] if pvlist else ""
                 if _IDOR_PARAM_NAME_RE.match(pk) and (
                         _NUMERIC_RE.match(pv_str) or _UUID_RE.match(pv_str)):
-                    id_hints_ep.append({
+                    hint = {
                         "id_val":     pv_str,
                         "id_type":    "numeric" if _NUMERIC_RE.match(pv_str) else "uuid",
                         "id_source":  f"spider:qs:{pk}",
                         "context_url": ep_url,
-                    })
+                    }
+                    id_hints_ep.append(hint)
+                    self.id_hints_ep.append(hint)
             # Strip QS from URL (absorbed into params)
             ep_url = urllib.parse.urlunparse(
                 ep_parsed_qs._replace(query="", fragment=""))
@@ -4616,20 +4660,24 @@ class SpiderBridge:
             ep_path = urllib.parse.urlparse(ep_url).path
             for m in _PATH_NUMERIC_RE.finditer(ep_path):
                 val = m.group(1)
-                id_hints_ep.append({
+                hint = {
                     "id_val":     val,
                     "id_type":    "numeric",
                     "id_source":  "spider:path_segment",
                     "context_url": ep_url,
-                })
+                }
+                id_hints_ep.append(hint)
+                self.id_hints_ep.append(hint)
             for m in _PATH_UUID_RE.finditer(ep_path):
                 val = m.group(1).lower()
-                id_hints_ep.append({
+                hint = {
                     "id_val":     val,
                     "id_type":    "uuid",
                     "id_source":  "spider:path_segment",
                     "context_url": ep_url,
-                })
+                }
+                id_hints_ep.append(hint)
+                self.id_hints_ep.append(hint)
 
             # Fallback: path-hint params if nothing found
             if not params:

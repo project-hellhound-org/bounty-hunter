@@ -71,9 +71,17 @@ async def run(target, emit, options=None):
     # Priority: params flagged as SSTI_POTENTIAL or reflecting input
     surfaces = []
     for ep in endpoints:
-        for p_items in ep.get("params", {}).values():
-            for p in p_items:
-                surfaces.append({"url": ep.get("url"), "method": ep.get("method", "GET"), "parameter": p})
+        params = ep.get("params", {})
+        # Self-healing parameter iteration
+        all_params = []
+        if isinstance(params, dict):
+            for bucket in params.values():
+                if isinstance(bucket, list): all_params.extend(bucket)
+        elif isinstance(params, list):
+            all_params = params
+            
+        for p in all_params:
+            surfaces.append({"url": ep.get("url"), "method": ep.get("method", "GET"), "parameter": p})
 
     if not surfaces:
         emit.warn("[!] No injection surfaces identified for SSTI testing.")

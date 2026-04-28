@@ -2,7 +2,7 @@ NAME = "SourceAuditor"
 DESCRIPTION = "Automated Static Analysis of Recovered Source Code"
 CATEGORY    = "intel"
 OPTIONS = [
-    {"name": "use_ai", "type": bool, "default": False, "help": "Use AI (LLM) to verify findings and reduce false positives"},
+    {"name": "use_ai", "type": bool, "default": True, "help": "Use AI (LLM) to verify findings and reduce false positives"},
 ]
 
 import os
@@ -252,28 +252,22 @@ class SourceAuditor:
                     }
                 }
                 
-                # Perform Deep AI Audit if requested, high severity, and unique finding
-                # (We only AI-audit the FIRST occurrence of a signature in a file to save tokens/time)
+                # Flag high-severity findings for user-triggered AI analysis
                 is_first_of_type = not any(f["id"] == sig["id"] for f in file_findings)
-                
-                if use_ai and ai_key and sig["severity"] >= 7 and is_first_of_type:
-                    # Extract larger context (1000 chars)
-                    start = max(0, match.start() - 500)
-                    end = min(len(content), match.end() + 500)
-                    snippet = content[start:end]
-                    
-                    self.emit.info(f"      [AI] Deep auditing {sig['id']} in {filename} (line {line_no})...")
-                    prompt = ai_utils.format_audit_prompt(snippet, sig["name"])
-                    ai_result = ai_utils.call_ai(prompt, ai_provider, ai_key, model=ai_model, system_prompt=ai_utils.AUDIT_PERSONA)
-                    
-                    if ai_result:
-                        finding["ai_insight"] = ai_result
-                        if "TRUE POSITIVE" in ai_result.upper():
+                if sig["severity"] >= 7 and is_first_of_type:
+                    finding["needs_ai_verification"] = True
+                    if use_ai and ai_key:
+                        prompt = (
+                            f"Analyze this potential security finding in the source code of '{filename}':\n\n"
+                            f"Vulnerability: {sig['name']}\n"
+                            f"Context:\n```{content[max(0, match.start()-100):min(len(content), match.end()+100)]}```\n\n"
+                            f"Is this a true positive? Answer with a brief verification or explain why it's a false positive."
+                        )
+                        insight = ai_utils.call_ai(prompt, ai_provider, ai_key, model=ai_model)
+                        if insight and not str(insight).startswith("Error"):
                             finding["ai_verified"] = True
-                            self.emit.success(f"      [AI] confirmed TRUE POSITIVE for {sig['id']}")
-                        elif "FALSE POSITIVE" in ai_result.upper():
-                            finding["severity"] = 1 # Downgrade
-                            self.emit.warn(f"      [AI] flagged FALSE POSITIVE for {sig['id']}")
+                            finding["ai_insight"] = insight
+                            self.loot["ai_insights"].append({"file": filename, "finding": sig["name"], "insight": insight})
 
                 file_findings.append(finding)
                 self.loot["vulnerabilities"].append(finding)

@@ -6,13 +6,13 @@
 <h1 align="center">Apex-King Pentest Framework</h1>
 
 <p align="center">
-  <b>High-performance modular web offensive framework with Zero-Config AI Intelligence.</b>
+  <b>High-performance modular web offensive framework with integrated AI Intelligence.</b>
 </p>
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.13-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
   <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.5.0-red?style=flat-square" alt="Release Version"/></a>
-  <img src="https://img.shields.io/badge/AI--Agnostic-OpenAI%20%7C%20Anthropic%20%7C%20Gemini-red?style=flat-square" alt="AI Support"/>
+  <img src="https://img.shields.io/badge/AI--Powered-Gemini%20%7C%20OpenAI%20%7C%20Gemma--2b-red?style=flat-square" alt="AI Support"/>
   <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License"/>
   <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/stargazers"><img src="https://img.shields.io/github/stars/project-hellhound-org/Hellhound-Pentest?style=flat-square&color=yellow" alt="Stars"/></a>
 </p>
@@ -30,10 +30,10 @@ Whether you're performing surface reconnaissance or deep logical vulnerability a
 ## Key Features
 
 - **Cinematic HUD**: Ultra-wide 60-character Braille-wave status dashboard with real-time pulsing case-waves.
-- **Technical Fidelity**: Automated terminal synchronization ensures clean logs even during high-volume vulnerability testing.
-- **Zero-Config AI Intelligence**: Instant integration with Gemini, OpenAI, and Anthropic for vulnerability confirmation and exploit generation.
+- **Neural Intelligence**: Native support for **Local SLMs (Gemma-2b)** and Cloud LLMs (Gemini, OpenAI) for high-fidelity vulnerability verification.
+- **Howl Engine**: Professional AI-powered attack chain correlation. Automatically synthesizes findings from multiple modules to map complex exploit paths.
 - **Asynchronous Native**: Built from the ground up on `aiohttp` and `playwright` for lightning-fast multi-target analysis.
-- **Modular Arsenal**: 30+ specialized modules covering Recon, Vuln, Intel, and Exploitation.
+- **Modular Arsenal**: 39+ specialized modules covering Recon, Vuln, Intel, and Exploitation.
 - **Integrated OOB**: Built-in Out-of-Band (OOB) server support for detecting blind vulnerabilities (SSRF, XXE, SQLi).
 - **Universal Rendering Engine**: Full SPA/JavaScript support via Playwright-powered technology profiling and spidering.
 - **Seamless Upgrades**: Keep your framework updated with a single `hellhound upgrade` command.
@@ -43,7 +43,7 @@ Whether you're performing surface reconnaissance or deep logical vulnerability a
 ### System Compatibility
 Hellhound is engineered for high-performance offensive operations across multiple environments:
 
-*   **Linux (Native)**: Fully optimized for Kali Linux, Ubuntu, Debian, Arch, and Parrot OS. Version 12.6 introduces a hardened installer specifically for Kali's `t64` package architecture.
+*   **Linux (Native)**: Fully optimized for Kali Linux, Ubuntu, Debian, Arch, and Parrot OS.
 *   **macOS (Native)**: Runs natively on Apple Silicon (M1/M2/M3) and Intel-based Macs.
 *   **Windows (via WSL2)**: Supported through Windows Subsystem for Linux (WSL2). This is the recommended way to run Hellhound on Windows to ensure full tool compatibility and performance.
 
@@ -51,6 +51,7 @@ Hellhound is engineered for high-performance offensive operations across multipl
 - **Python 3.10+** (Recommended: 3.13)
 - **Git**
 - **Playwright Dependencies** (Automated via `install.sh`)
+- **Ollama** (Required for Local SLM support)
 
 ### One-Step Automated Install
 ```bash
@@ -62,17 +63,7 @@ cd Hellhound-Pentest
 chmod +x install.sh
 ./install.sh
 ```
-*After installation, restart your terminal or run `source ~/.bashrc` to activate the `hellhound` command. Windows users should run these commands within their WSL2 terminal.*
-
-### Keeping Hellhound Updated
-Hellhound features a professional self-update mechanism:
-```bash
-# From your terminal
-hellhound upgrade
-
-# Or from within the Hellhound console
-hellhound > upgrade
-```
+*After installation, restart your terminal or run `source ~/.bashrc` to activate the `hellhound` command.*
 
 ---
 
@@ -83,18 +74,18 @@ Hellhound's power lies in its modularity. Each module is optimized for high high
 | Category | Modules | Description |
 | :--- | :--- | :--- |
 | **Recon** | `Spider`, `SurfaceAuditor`, `TransportAuditor`, `WAFbuster`, `GraphQL`, `CORSbuster`, `FUZZhunter` | Deep surface mapping and service discovery. |
-| **Vulnerability Audit** | `XSStrike`, `SQLIdetector`, `SSRFdetector`, `XXEdetector`, `IDORdetector`, `LFIauditor`, `RBAC` | Targeted vulnerability identification and logic auditing. |
-| **Intelligence** | `SecretScanner`, `TechProfiler`, `SourceAuditor`, `CloudScout`, `BlobUnpacker` | Harvesting sensitive data and infrastructure intelligence. |
+| **Vulnerability Audit** | `XSStrike`, `SQLIdetector`, `SSRFdetector`, `XXEdetector`, `IDORdetector`, `PATHtraveller`, `RBAC` | Targeted vulnerability identification and logic auditing. |
+| **Intelligence** | `SecretScanner`, `TechProfiler`, `SourceAuditor`, `CloudScout`, `BlobUnpacker`, `JWTanalyzer` | Harvesting sensitive data and infrastructure intelligence. |
 | **Analysis & Exploitation** | `Exmap`, `Hydra`, `CMDinj` | Universal exploitation matrix and parameter orchestration. |
 
 ---
 
 ## ◓ Recent Updates (v12.5.1)
 
-- **Consolidated Transport Security**: `CookieAuditor` and `HeaderAuditor` have been merged into the new **`TransportAuditor`** for unified SSL/TLS, HSTS, and session security analysis.
-- **Spider v12.3**: Integrated high-fidelity standalone recon engine with full SPA support, suppressed CLI noise for cleaner console operations, and automated risk scoring.
-- **Improved Scoping**: `Stalk` and legacy auditors have been deprecated in favor of the enhanced `Spider` + `SurfaceAuditor` reconnaissance pipeline.
-- **Hardened Dependencies**: Automated fallback for BeautifulSoup parsers (`lxml` -> `html.parser`) to ensure stability across all environments.
+- **Neural Core Activation**: Added `activate hellhound` command for seamless local SLM (Gemma-2b) integration via Ollama.
+- **Hybrid AI Provider**: Optimized `setg ai` logic to auto-detect and configure Gemini/OpenAI keys or local environments.
+- **Spider v12.3**: Integrated high-fidelity standalone recon engine with full SPA support and automated risk scoring.
+- **Module Hardening**: Comprehensive stability updates for `JWTanalyzer` and `PATHtraveller` reconnaissance pipelines.
 
 ---
 
@@ -108,10 +99,13 @@ hellhound
 ### Initial Configuration
 Setup your AI provider and OOB listener for maximum impact:
 ```bash
-# 1. Connect AI Intelligence (e.g. Gemini)
-hellhound > setg ai_key <your_api_key>
+# 1. Connect Cloud AI (Gemini or OpenAI)
+hellhound > setg ai <your_api_key>
 
-# 2. Start OOB Listener
+# 2. Or Launch Local SLM (Requires Ollama + gemma:2b)
+hellhound > activate hellhound
+
+# 3. Start OOB Listener
 hellhound > oob start
 ```
 
@@ -140,12 +134,8 @@ For deep-dives into framework architecture, module logic, and detection signatur
 
 ---
 
----
-
 ## Compliance & Usage
 Hellhound is developed strictly for **authorized security assessments**. This software is licensed under the **GNU General Public License v3 (GPLv3)**. Usage must comply with all applicable local, national, and international laws.
-
-
 
 ## Author
 

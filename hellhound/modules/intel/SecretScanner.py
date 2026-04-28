@@ -47,6 +47,18 @@ SIGNATURES = [
     (r'key-[0-9a-zA-Z]{32}',                                            "Mailgun_API_Key", 8),
     (r'SG\.[0-9A-Za-z\-_]{22}\.[0-9A-Za-z\-_]{43}',                    "SendGrid_API_Key", 9),
 
+    # --- Modern SaaS (Expanded) ---
+    (r'SK[a-f0-9]{32}',                                                  "Twilio_API_Key", 9),
+    (r'AC[a-f0-9]{32}',                                                  "Twilio_Account_SID", 8),
+    (r'00[a-zA-Z0-9_-]{40}',                                            "Okta_API_Token", 9),
+    (r'shpat_[a-fA-F0-9]{32}',                                          "Shopify_Private_App_Token", 9),
+    (r'shpss_[a-fA-F0-9]{32}',                                          "Shopify_Shared_Secret", 9),
+    (r'[a-f0-9]{32}\.atlasv2',                                          "MongoDB_Atlas_Key", 9),
+    (r'ya29\.[0-9A-Za-z\-_]+',                                          "Google_OAuth_Token", 9),
+    (r'glpat-[0-9A-Za-z\-_]{20,}',                                      "GitLab_PAT", 10),
+    (r'npm_[A-Za-z0-9]{36}',                                            "NPM_Token", 9),
+    (r'pypi-[A-Za-z0-9]{16,}',                                          "PyPI_Token", 9),
+
     # --- PII & Identity ---
     (r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',            "Email_Address", 2),
     (r'\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',   "Phone_Number", 2),

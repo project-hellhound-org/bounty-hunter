@@ -1,125 +1,82 @@
 #!/usr/bin/env python3
 """
-scaffold_module.py — Hellhound Module Generator
-
-Generates a correctly structured Hellhound module boilerplate.
-
-Usage:
-    python scaffold_module.py <module_name> [category]
-
-Examples:
-    python scaffold_module.py sqli_union vuln
-    python scaffold_module.py xss_reflected vuln
-    python scaffold_module.py js_recon recon
+HELLHOUND — Module Scaffolding Template
+Use this to create new reconnaissance or vulnerability modules.
 """
 
-import os
 import sys
+import argparse
+import asyncio
+import json
+from hellhound.core.emit import Emit
 
-VALID_CATEGORIES = ["recon", "analysis", "vuln", "exploit", "intel"]
+# ─────────────────────────────────────────────────────────────────────────────
+# ANSI COLORS (Hellhound Standard)
+# ─────────────────────────────────────────────────────────────────────────────
+from colorama import Fore, Style, init
+init(autoreset=True)
 
+class C:
+    W   = Fore.WHITE; G   = Fore.GREEN; R   = Fore.RED; Y   = Fore.YELLOW; B   = Fore.BLUE
+    M   = Fore.MAGENTA; CY  = Fore.CYAN; GR  = Fore.LIGHTBLACK_EX; RST = Style.RESET_ALL; BLD = Style.BRIGHT
+    BCYAN = Fore.CYAN + Style.BRIGHT
+    BRED  = Fore.RED + Style.BRIGHT
 
-def scaffold(module_name: str, category: str):
-    """Generate a new module file from the template."""
-    if category not in VALID_CATEGORIES:
-        print(f"[!] Invalid category '{category}'. Choose from: {', '.join(VALID_CATEGORIES)}")
-        sys.exit(1)
+class HellhoundModule:
+    """Base template for all Hellhound offensive modules."""
+    
+    def __init__(self, emit: Emit = None):
+        self.emit = emit or Emit()
+        self.findings = []
+        self.risk_score = 0
 
-    class_name  = "".join(word.capitalize() for word in module_name.split("_"))
-    description = f"{class_name} — {category.capitalize()} module"
+    def log(self, message, type="info"):
+        """Centralized logging via Emit."""
+        if type == "info":    self.emit.info(message)
+        elif type == "success": self.emit.success(message)
+        elif type == "warn":    self.emit.warn(message)
+        elif type == "error":   self.emit.error(message)
+        elif type == "found":   self.emit.found(message)
 
-    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hellhound", "modules", category)
-    os.makedirs(base, exist_ok=True)
-    target = os.path.join(base, f"{module_name}.py")
+    async def run(self, target: str, args: argparse.Namespace):
+        """
+        Main execution logic for the module.
+        Implement your scanning/exploitation logic here.
+        """
+        self.log(f"Starting Scaffolding Module on {C.BCYAN}{target}{C.RST}")
+        
+        # Example Finding Structure
+        finding = {
+            "type": "Template_Finding",
+            "url": target,
+            "severity": "LOW",
+            "description": "This is a placeholder finding from the scaffold template.",
+            "evidence": "Scaffold execution triggered."
+        }
+        
+        self.findings.append(finding)
+        self.risk_score = 10
+        
+        return {
+            "risk_score": self.risk_score,
+            "intel": {
+                "vulnerabilities": self.findings,
+                "summary": {"total": len(self.findings)}
+            }
+        }
 
-    if os.path.exists(target):
-        print(f"[!] Module already exists: {target}")
-        sys.exit(1)
+def main():
+    parser = argparse.ArgumentParser(description="Hellhound Module Scaffolder")
+    parser.add_argument("--target", required=True, help="Target URL or Host")
+    parser.add_argument("--json", action="store_true", help="Output raw JSON")
+    args = parser.parse_args()
 
-    # Build the file content
-    lines = [
-        "# " + "─" * 69,
-        f"#  Hellhound — {class_name}",
-        f"#  Category : {category}",
-        "# " + "─" * 69,
-        "",
-        "import asyncio",
-        "import aiohttp",
-        "",
-        "# ── Mandatory Module Metadata ─────────────────────────────────────────",
-        f'DESCRIPTION = "{description}"',
-        f'CATEGORY    = "{category}"',
-        "",
-        "# ── Options ───────────────────────────────────────────────────────────",
-        "OPTIONS = [",
-        "    {",
-        '        "name": "target",',
-        '        "type": str,',
-        '        "default": None,',
-        '        "required": True,',
-        '        "help": "Target URL (e.g. https://example.com/endpoint)"',
-        "    },",
-        "    {",
-        '        "name": "verbose",',
-        '        "type": bool,',
-        '        "default": False,',
-        '        "required": False,',
-        '        "help": "Enable verbose output"',
-        "    },",
-        "]",
-        "",
-        "",
-        "# ── Core Logic ────────────────────────────────────────────────────────",
-        "async def run(target: str, emit, options: dict = None):",
-        '    """',
-        "    Place your async scanning logic here.",
-        '    Use emit.info() | .success() | .warn() | .error() for output.',
-        '    """',
-        '    emit.info(f"Starting {class_name} on {target}")',
-        "",
-        "    findings = []",
-        "",
-        "    # ── TODO: Implement your module logic here ────────────────────────",
-        "    # Example:",
-        "    # if \"vuln\" in target:",
-        "    #     findings.append({",
-        '    #         "url": target,',
-        '    #         "severity": "HIGH",',
-        '    #         "type": "MOCK_VULN",',
-        '    #         "evidence": "Found string vuln in URL"',
-        "    #     })",
-        "    # ─────────────────────────────────────────────────────────────────",
-        "",
-        "    if findings:",
-        '        emit.success(f"Found {len(findings)} vulnerabilities!")',
-        "    else:",
-        '        emit.info("No findings detected.")',
-        "",
-        "    return {",
-        '        "raw": f"Audited {target}",',
-        '        "intel": {"vulnerabilities": findings},',
-        '        "signals": ["VULN_FOUND" if findings else "NO_VULN"]',
-        "    }",
-    ]
+    module = HellhoundModule()
+    loop = asyncio.get_event_loop()
+    result = loop.run_until_complete(module.run(args.target, args))
 
-    content = "\n".join(lines) + "\n"
-
-    with open(target, "w") as f:
-        f.write(content)
-
-    print(f"\n  [✓] Module scaffolded successfully!\n")
-    print(f"  File     : {target}")
-    print(f"  Category : {category}")
-    print(f"  Next     : Open the file and implement your logic in run()")
-    print(f"\n  To test  : hellhound > equip {module_name}")
-    print()
-
+    if args.json:
+        print(json.dumps(result, indent=2))
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
-
-    name = sys.argv[1].lower().replace("-", "_").replace(" ", "_")
-    cat  = sys.argv[2].lower() if len(sys.argv) >= 3 else "vuln"
-    scaffold(name, cat)
+    main()

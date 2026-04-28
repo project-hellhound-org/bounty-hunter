@@ -11,6 +11,10 @@ from datetime import datetime
 import json
 import re
 import math
+from rich.console import Console
+
+# Initialize Rich Console for cinematic UI
+console = Console()
 
 from colorama import Fore, Back, Style, init
 init(autoreset=True)
@@ -20,6 +24,7 @@ from hellhound.core.engine import HellhoundEngine
 from hellhound.core.suggest import suggest_actions, suggest_report
 from hellhound.core import ai_utils
 from hellhound.core.repro_engine import ReproEngine
+from hellhound.core.loot import render_loot, process_framework_results
 
 # ----------------------------
 # UI / COLOR CONSTANTS
@@ -152,14 +157,22 @@ def _boot_sequence():
     sys.stdout.write("\r" + " " * 120 + "\r")
     sys.stdout.flush()
     
-    # 2. Smooth Reveal (Banner)
-    for line in BANNER.split('\n'):
-        if line.strip():
-            sys.stdout.write(Fore.RED + line + Style.RESET_ALL + "\n")
-            sys.stdout.flush()
-            time.sleep(0.012)
+    # 2. Reveal Banner (Classic Centered)
+    import shutil
+    w = shutil.get_terminal_size((120, 24)).columns
+    AUTHOR_META = "[ Created by L4ZZ3RJ0D — @l4zz3rj0d ]"
+
+    lines = [l.rstrip() for l in BANNER.split('\n') if l.strip()]
+    if lines:
+        max_line_w = max(len(l) for l in lines)
+        offset = max(0, (w - max_line_w) // 2)
+        # Print full logo block instantly to avoid terminal scroll clutter
+        full_logo = "\n".join([( " " * offset ) + line for line in lines])
+        sys.stdout.write(Fore.RED + full_logo + Style.RESET_ALL + "\n")
+        sys.stdout.flush()
     
-    time.sleep(0.3)
+    # Author Metadata (Centered)
+    print(f"\033[37m{AUTHOR_META:^{w}}\033[0m\n")
     time.sleep(0.3)
 
 
@@ -439,7 +452,8 @@ class HellhoundConsole(cmd.Cmd):
         _boot_sequence()
 
         # ── 3. Post-Animation Logic ───────────────────────────
-        print(f"{Fore.WHITE}Type '{Fore.YELLOW}help{Fore.WHITE}' to view available commands.\n")
+        print(f"{Fore.WHITE}Type '{Fore.YELLOW}help{Fore.WHITE}' to view available commands.")
+        print(f"{Fore.WHITE}Type '{Fore.CYAN}activate hellhound{Fore.WHITE}' to launch the AI intelligence core.\n")
         
         # Give the thread a tiny bit more time if it's not finished
         # (Though animation is 4.2s, so it should be done)
@@ -557,7 +571,7 @@ class HellhoundConsole(cmd.Cmd):
         self.target_context["cookies"] = cookies
         self.target_context["headers"] = headers
 
-        print(Fore.GREEN + f"[+] Web target acquired: {domain}")
+        print(Fore.CYAN + f"[+] Web target acquired: {domain}")
 
         if cookies:
             print(Fore.CYAN + "[*] Session cookie loaded")
@@ -708,7 +722,7 @@ class HellhoundConsole(cmd.Cmd):
         category = self.modules[match].get("category", "unknown")
         description = self.modules[match].get("description", "")
 
-        print(Style.BRIGHT + Fore.GREEN + f"\n[+] Module equipped: {match}" + Style.RESET_ALL)
+        print(Style.BRIGHT + Fore.CYAN + f"\n[+] Module equipped: {match}" + Style.RESET_ALL)
         print(Style.BRIGHT + Fore.WHITE + f"    Category    " + Style.RESET_ALL + f": {Style.BRIGHT + Fore.CYAN}{category}" + Style.RESET_ALL)
         print(Style.BRIGHT + Fore.WHITE + f"    Description " + Style.RESET_ALL + f": {Fore.WHITE}{description}" + Style.RESET_ALL)
 
@@ -849,25 +863,32 @@ class HellhoundConsole(cmd.Cmd):
         # OOB
         oob = self.target_context.get("oob_url", "")
         self._print_opt_line("oob", oob, False, "Global OOB URL for blind detection", C_NAME, C_VAL, C_REQ)
+        # AI in global options table
+        ai_k = self.target_context.get("ai_key", "")
+        if ai_k and ai_k != "local":
+            ai_disp = f"{ai_k[:4]}...{ai_k[-4:] if len(ai_k)>8 else ''}"
+        elif ai_k == "local":
+            ai_disp = "LOCAL (Ollama)"
+        else:
+            ai_disp = ""
+        self._print_opt_line("ai", ai_disp, False, "AI engine: 'setg ai local' or 'setg ai <api_key>'", C_NAME, C_VAL, C_REQ)
         print()
 
-        # ── 3. AI Intelligence (Professional Block) ────────────────
-        print(f"  {Fore.MAGENTA + Style.BRIGHT}╔══════════════════════════════════════╗")
-        print(f"  ║         {Fore.WHITE}HELLHOUND — INTELLIGENCE     {Fore.MAGENTA}║")
-        print(f"  ╚══════════════════════════════════════╝{Style.RESET_ALL}\n")
+        # ── 3. AI Intelligence (Tag Style) ────────────────
+        BG_RED = "\033[41;97;1m"
+        RST_ANSI = "\033[0m"
         
         ai_label = self.target_context.get("ai_status_label", "NOT CONNECTED")
-        st_color = Fore.GREEN if "CONNECTED" in ai_label else Fore.RED
+        ai_provider = self.target_context.get("ai_provider", "")
+        ai_model = self.target_context.get("ai_model", "")
+        is_connected = ai_label.startswith("CONNECTED")
         
-        print(f"   Status     : {st_color}{ai_label}{Style.RESET_ALL}")
-        
-        ai_k = self.target_context.get("ai_key", "")
-        if ai_k:
-            masked = f"{ai_k[:4]}...{ai_k[-4:] if len(ai_k)>8 else ''}"
-            print(f"   Key        : {Fore.WHITE}{masked}{Style.RESET_ALL}")
+        if is_connected:
+            print(f"  {BG_RED} AI {RST_ANSI} \033[91;1mINTELLIGENCE\033[0m  \033[92;1m● ONLINE\033[0m  \033[96m{ai_provider.upper()} / {ai_model}\033[0m")
+            print(f"  \033[37m     ask  ·  analyze  ·  howl\033[0m")
         else:
-            print(f"   Key        : {Fore.RED}NOT SET{Style.RESET_ALL}")
-        
+            print(f"  {BG_RED} AI {RST_ANSI} \033[91;1mINTELLIGENCE\033[0m  \033[31m○ OFFLINE\033[0m")
+            print(f"  \033[37m     setg ai local  ·  setg ai <api_key>\033[0m")
         print()
 
     def do_show(self, arg):
@@ -906,8 +927,8 @@ class HellhoundConsole(cmd.Cmd):
         key, raw_value = parts[0].strip().lower(), parts[1].strip()
 
         # Catch Global AI settings for Zero-Config experience
-        if key in ("ai_key", "aikey"):
-            return self.do_setg(f"ai_key {raw_value}")
+        if key in ("ai_key", "aikey", "ai"):
+            return self.do_setg(f"ai {raw_value}")
 
         mod_obj = self._load_module(self.active_module)
         options_def = getattr(mod_obj, "OPTIONS", []) if mod_obj else []
@@ -992,19 +1013,30 @@ class HellhoundConsole(cmd.Cmd):
         elif key == "oob":
             self.target_context["oob_url"] = raw_value
             print(Fore.GREEN + f"[✓] Global OOB URL set: {raw_value}" + Style.RESET_ALL)
-        elif key in ("ai_key", "key"):
-            self.target_context["ai_key"] = raw_value
-            print(Fore.GREEN + f"[✓] Global AI Key => {raw_value[:4]}...{raw_value[-4:] if len(raw_value)>8 else ''}")
+        elif key in ("ai_key", "key", "ai"):
+            # Simplified AI setup:
+            #   setg ai local       → Ollama/gemma2:2b (no key needed)
+            #   setg ai AIzaXXXX    → Gemini (auto-detected)
+            #   setg ai sk-XXXX     → OpenAI (auto-detected)
             
-            # Universal Handshake (Professional Discovery)
-            print(f"[*] Starting Intelligence discovery handshake...")
-            result = ai_utils.universal_handshake(raw_value)
+            if raw_value.lower() in ("local", "ollama"):
+                # Local SLM mode
+                self.target_context["ai_key"] = "local"
+                with console.status("[bold white]INITIALIZING NEURAL CORE...[/]", spinner="earth"):
+                    result = ai_utils.universal_handshake("ollama")
+            else:
+                self.target_context["ai_key"] = raw_value
+                masked = f"{raw_value[:4]}...{raw_value[-4:] if len(raw_value)>8 else ''}"
+                print(Fore.GREEN + f"[✓] AI Key => {masked}")
+                with console.status("[bold white]ESTABLISHING QUANTUM LINK...[/]", spinner="bouncingBall"):
+                    result = ai_utils.universal_handshake(raw_value)
             
             if result["success"]:
                 self.target_context["ai_provider"] = result["provider"]
                 self.target_context["ai_model"] = result["model"]
                 self.target_context["ai_status_label"] = f"CONNECTED: {result['label']}"
-                print(Fore.GREEN + f"[✓] Intelligence Connected: {Style.BRIGHT}{result['label']}")
+                print(Fore.CYAN + f"[✓] Intelligence Connected: {Style.BRIGHT}{result['label']}")
+                print(Fore.WHITE + f"    Use 'ask' for Q&A | 'analyze' for finding analysis | 'howl' for attack chains" + Style.RESET_ALL)
             else:
                 self.target_context["ai_status_label"] = "FAILED (Key Rejected)"
                 print(Fore.RED + f"[x] Intelligence Discovery Failed: {result['message']}")
@@ -1029,6 +1061,7 @@ class HellhoundConsole(cmd.Cmd):
                 print(Fore.GREEN + f"[✓] Global Proxy Mode => {mode.upper()}")
             else:
                 print(Fore.RED + f"[x] Unsupported proxy mode: {mode}. Use all | repro_only | none")
+
         else:
             # Custom global header
             if ":" in arg:
@@ -1037,6 +1070,20 @@ class HellhoundConsole(cmd.Cmd):
                 print(Fore.GREEN + f"[✓] Global Header => {k.strip()}: {v.strip()}")
             else:
                 print(Fore.RED + f"[x] Unknown global option: {key}. Supported: proxy, bugbounty, wafbypass, oob, ai_key, key" + Style.RESET_ALL)
+
+    def do_activate(self, arg):
+        """activate hellhound → Launch and connect the local AI engine (Ollama)"""
+        if arg.lower() != "hellhound":
+            print(Fore.YELLOW + "[!] Use 'activate hellhound' to launch the AI core.")
+            return
+        
+        # High-contrast activation banner
+        print(f"\n{Fore.RED}{Style.BRIGHT}╔══════════════════════════════════════╗")
+        print(f"{Fore.RED}{Style.BRIGHT}║       HELLHOUND — AI ACTIVATION      ║")
+        print(f"{Fore.RED}{Style.BRIGHT}╚══════════════════════════════════════╝{Style.RESET_ALL}")
+        
+        # Trigger the local AI connection
+        self.do_setg("ai local")
 
     def do_oob(self, arg):
         """oob <start|stop|status> → Manage the global Out-of-Band (OOB) listener"""
@@ -1320,7 +1367,7 @@ class HellhoundConsole(cmd.Cmd):
 
         def _risk_color(level):
             return {
-                "LOW":      Fore.GREEN,
+                "LOW":      Fore.WHITE,
                 "MEDIUM":   Fore.YELLOW,
                 "HIGH":     Fore.RED,
                 "CRITICAL": Fore.MAGENTA,
@@ -1381,366 +1428,21 @@ class HellhoundConsole(cmd.Cmd):
                         f"Modules Run: {len(self.results)}\n"
                         f"Risk Score: {total_risk}\n"
                         f"Vulnerabilities Identified: {total_vulns}\n")
-            print(Fore.GREEN + f"[✓] Report exported.")
-            print(Fore.GREEN + f"    JSON    : {json_path}")
-            print(Fore.GREEN + f"    Summary : {summary_path}")
+            print(Fore.CYAN + f"[✓] Report exported.")
+            print(Fore.CYAN + f"    JSON    : {json_path}")
+            print(Fore.CYAN + f"    Summary : {summary_path}")
             return
 
-        # ──────────────────────────────────────────────────────
-        # DEFAULT: full detail view
-        # Each module is rendered via:
-        #   1. Its own LOOT_SECTIONS if defined (module-declared renderer)
-        #   2. Generic fallback for any intel shape (no console changes needed)
-        # ──────────────────────────────────────────────────────
-        total_risk, total_vulns, breakdown = self._calculate_global_risk()
-        level = _risk_level(total_risk)
-        lc    = _risk_color(level)
+        # DEFAULT: detail view using the new recursive 'Hellhound Signature' UI
+        if not self.results:
+            print(Fore.YELLOW + "[!] No intelligence collected in this session to render.")
+            return
 
-        print(Fore.RED + Style.BRIGHT + "\n╔══════════════════════════════════════╗")
-        print(Fore.RED + Style.BRIGHT + "║         HELLHOUND — LOOT             ║")
-        print(Fore.RED + Style.BRIGHT + "╚══════════════════════════════════════╝" + Style.RESET_ALL)
-        print(f"  Target : {Fore.WHITE}{self.target}{Style.RESET_ALL}   "
-              f"Risk : {lc}{total_risk} ({level}){Style.RESET_ALL}   "
-              f"Issues : {Fore.WHITE}{total_vulns}{Style.RESET_ALL}\n")
+        render_loot(self.target, self.results)
 
-        printed_keys = set()
-
-        for mod, output in self.results.items():
-            mod_clean = mod.lower()
-            if mod_clean in printed_keys:
-                continue
-            printed_keys.add(mod_clean)
-
-            if not isinstance(output, dict):
-                continue
-
-            intel      = output.get("intel", {})
-            file_reads = intel.get("file_reads", [])
-            raw_stats  = output.get("raw", "")
-            mod_score = breakdown.get(mod_clean, 0)
-            sc        = _risk_color(_risk_level(mod_score))
-
-            # Module header
-            print(Fore.RED + "  ┌─────────────────────────────────────")
-            print(Fore.RED + f"  │ " + Fore.WHITE + Style.BRIGHT + f"{mod_clean.upper()}" +
-                  Style.RESET_ALL + Fore.WHITE + f"  risk={sc}{mod_score}{Style.RESET_ALL}")
-            print(Fore.RED + "  └─────────────────────────────────────" + Style.RESET_ALL)
-
-            if raw_stats:
-                print(Fore.WHITE + f"  {raw_stats}" + Style.RESET_ALL)
-            print()
-
-            # ── Shared helpers ────────────────────────────────────
-            def _sev_color(sev):
-                s = str(sev).upper()
-                if s == "CRITICAL": return Fore.MAGENTA + Style.BRIGHT
-                if s == "HIGH":     return Fore.RED     + Style.BRIGHT
-                if s == "MEDIUM":   return Fore.YELLOW  + Style.BRIGHT
-                return Fore.WHITE
-
-            def _render_findings(findings, label="Vulnerabilities"):
-                if not findings:
-                    return
-                sev_w = {"critical":0,"high":1,"medium":2,"low":3,"info":4,"confirmed":1}
-                sf = sorted([f for f in findings if isinstance(f, dict)],
-                            key=lambda x: sev_w.get(str(x.get("severity", x.get("confidence", "info"))).lower(), 99))
-                if not sf:
-                    return
-                print(Fore.MAGENTA + Style.BRIGHT + f"  [ {label} — {len(sf)} ]" + Style.RESET_ALL)
-                for f in sf:
-                    sev   = str(f.get("severity", f.get("confidence", "info"))).upper()
-                    name  = str(f.get("type", f.get("vulnerability", f.get("finding_type", f.get("name","Finding")))))
-                    url   = f.get("url",  f.get("endpoint",""))
-                    proof = f.get("proof",f.get("evidence",""))
-                    sc2   = _sev_color(sev)
-                    
-                    # Format title nicely
-                    name = name.replace("_", " ").title()
-                    print(f"    {Style.BRIGHT}[{sc2}{sev}{Style.RESET_ALL}] {Fore.WHITE}{name}")
-                    if url:
-                        print(f"       {Fore.WHITE}url   : {Fore.CYAN}{url}{Style.RESET_ALL}")
-                    if proof:
-                        ps = str(proof)
-                        print(f"       {Fore.WHITE}proof : {Fore.WHITE}{ps[:120]}{'...' if len(ps)>120 else ''}{Style.RESET_ALL}")
-                    if f.get("poc_curl"):
-                        print(f"       {Fore.WHITE}curl  : {Fore.YELLOW}{f['poc_curl']}{Style.RESET_ALL}")
-                    if f.get("poc_browser"):
-                        print(f"       {Fore.WHITE}open  : {Fore.CYAN}{f['poc_browser']}{Style.RESET_ALL}")
-                        
-                    # Universal dynamic extraction of leftover metadata keys for cleaner structure
-                    handled_keys = {"severity", "confidence", "type", "vulnerability", "finding_type", 
-                                    "name", "url", "endpoint", "proof", "evidence", "poc_curl", "poc_browser", "poc_html"}
-                    
-                    for k, v in f.items():
-                        if k in handled_keys or not v:
-                            continue
-                        # format key beautifully
-                        k_nice = k.replace("_", " ")
-                        if isinstance(v, dict):
-                            # Stringify dict values cleanly instead of raw JSON
-                            v_clean = " ".join([f"{dk}={dv}" for dk, dv in v.items() if dv])
-                            if not v_clean: v_clean = str(v)
-                        elif isinstance(v, list):
-                            v_clean = ", ".join(str(i) for i in v)
-                        else:
-                            v_clean = str(v)
-                            
-                        # Wrap long values
-                        if len(v_clean) > 130:
-                            v_clean = v_clean[:127] + "..."
-                        print(f"       {Fore.LIGHTBLACK_EX}{k_nice:<5} : {Fore.WHITE}{v_clean}{Style.RESET_ALL}")
-                    print()
-
-            # ── Module-specific renderers ─────────────────────────
-            # Only load the module for THIS key — never fall back to
-            # self.active_module which contaminates other modules' output.
-            mod_obj       = self._load_module(mod_clean)
-            loot_sections = getattr(mod_obj, "LOOT_SECTIONS", None) if mod_obj else None
-
-            # ── Dynamic Module UI Hook ──────────────────────────────
-            if hasattr(mod_obj, "render_header") and callable(mod_obj.render_header):
-                try:
-                    mod_obj.render_header(intel)
-                except Exception as e:
-                    print(Fore.RED + f"  [!] Custom renderer failed: {e}" + Style.RESET_ALL)
-            
-            rendered_anything = False
-
-            # 1. Attempt to extract findings from standard top-level 'results'
-            top_findings = output.get("results", [])
-            if isinstance(top_findings, list) and top_findings:
-                if not rendered_anything:
-                    print()
-                    rendered_anything = True
-                _render_findings(top_findings, "Identified Findings")
-
-            # 2. Iteratively process intelligence keys for maximum module support
-            if isinstance(intel, dict):
-                # Sort keys to ensure 'vulnerabilities' or main findings appear first if present
-                priority_keys = ["vulnerabilities", "cors_vulnerabilities", "sqli_vulnerabilities"]
-                sorted_keys = sorted(intel.keys(), key=lambda k: (0 if k in priority_keys else 1, k))
-
-                for key in sorted_keys:
-                    val = intel[key]
-                    
-                    # Handle duplicates: skip Spider's 'cors_issues' if CORSbuster is operating in the framework
-                    if key == "cors_issues" and any(k.lower() == "corsbuster" for k in self.results.keys()):
-                        continue
-                        
-                    # Skip empty elements or raw stats, as well as redundant internal metadata
-                    if not val or key in ("status", "raw", "summary_stats", "file_reads", "meta", "summary", "risk_score", "tech_stack", "comments"):
-                        continue
-
-                    # Format title (e.g. "cors_vulnerabilities" -> "Cors Vulnerabilities")
-                    title = str(key).replace("_", " ").title()
-
-                    if isinstance(val, list):
-                        if not rendered_anything:
-                            print(); rendered_anything = True
-                        
-                        if val and isinstance(val[0], dict):
-                            # Treat lists as findings if they contain core definitive structural vulnerability keys
-                            is_security_item = any(k in item for item in val[:5] for k in ["severity", "vulnerability", "finding_type"])
-                            is_security_title = title.lower() in ("vulnerabilities", "cors vulnerabilities", "sqli vulnerabilities", "findings")
-                            
-                            if is_security_item or is_security_title:
-                                _render_findings(val, title)
-                            else:
-                                # Fallback list-of-dicts dynamic renderer
-                                print(Fore.MAGENTA + Style.BRIGHT + f"  [ {title} — {len(val)} ]" + Style.RESET_ALL)
-                                for item in val:
-                                    # Primary anchor key deduction
-                                    p_keys = ("url", "origin", "file", "endpoint", "path", "name", "type", "asset")
-                                    primary_val = None
-                                    primary_k = None
-                                    
-                                    for pk in p_keys:
-                                        if pk in item and item[pk]:
-                                            primary_val = item[pk]
-                                            primary_k = pk
-                                            break
-                                            
-                                    print(f"    {Style.BRIGHT}{Fore.WHITE}•{Style.RESET_ALL}", end="")
-                                    if primary_val:
-                                        print(f" {Fore.CYAN + Style.BRIGHT}{primary_val}{Style.RESET_ALL}")
-                                    else:
-                                        print()
-                                        
-                                    clean_extras = []
-                                    long_content = None
-                                    for k, v in item.items():
-                                        # Silence universally noisy keys from bullet metadata
-                                        if k in (primary_k, "poc_html", "cluster", "baseline", "confidence", "hash", "source") or not v: 
-                                            continue
-                                            
-                                        if k == "content":
-                                            long_content = str(v)
-                                            continue
-                                        if isinstance(v, dict):
-                                            subitems = [f"{dk}: {dv}" for dk, dv in v.items() if dv]
-                                            if subitems: clean_extras.append(f"{k}: [{' | '.join(subitems)}]")
-                                        elif isinstance(v, list) and not v:
-                                            continue
-                                        else:
-                                            clean_extras.append(f"{k}: {v}")
-                                            
-                                    if clean_extras:
-                                        extra_str = " | ".join(clean_extras)
-                                        # Use standard visible WHITE instead of blue/gray to distinct layout from URL
-                                        print(f"       {Fore.WHITE}↳ {extra_str}{Style.RESET_ALL}")
-                                        
-                                    # Print multiline raw content dynamically for deeper visibility (e.g., well_known files)
-                                    if long_content:
-                                        lines = long_content.strip().splitlines()
-                                        for line in lines[:8]:
-                                            print(f"         {Fore.LIGHTGREEN_EX}{line.strip()[:140]}{Style.RESET_ALL}")
-                                        if len(lines) > 8:
-                                            print(f"         {Fore.LIGHTGREEN_EX}... (truncated){Style.RESET_ALL}")
-                                    
-                                    # Visual separator between items if long content was printed
-                                    if long_content:
-                                        print()
-                                print()
-                        elif val:
-                            # Render flat list
-                            print(Fore.MAGENTA + Style.BRIGHT + f"  [ {title} — {len(val)} ]" + Style.RESET_ALL)
-                            for item in list(val):
-                                print(f"    {Fore.WHITE}• {item}{Style.RESET_ALL}")
-                            print()
-
-                    elif isinstance(val, dict):
-                        if not rendered_anything:
-                            print(); rendered_anything = True
-                        print(Fore.MAGENTA + Style.BRIGHT + f"  [ {title} ]" + Style.RESET_ALL)
-                        for sub_k, sub_v in list(val.items())[:15]:
-                            print(f"    {Fore.WHITE}{str(sub_k):<20}:{Style.RESET_ALL} {Fore.CYAN}{sub_v}{Style.RESET_ALL}")
-                        print()
-                        
-                    elif isinstance(val, (str, int, float, bool)):
-                        if not rendered_anything:
-                            print(); rendered_anything = True
-                        print(f"  {Fore.MAGENTA + Style.BRIGHT}[ {title} ]{Style.RESET_ALL} {Fore.CYAN}{val}{Style.RESET_ALL}")
-
-            # 3. Special case for file_reads (common across many modules, outside intel)
-            if isinstance(file_reads, list) and file_reads:
-                if not rendered_anything:
-                    print(); rendered_anything = True
-                print(Fore.MAGENTA + Style.BRIGHT + f"  [ Disclosed Files — {len(file_reads)} ]" + Style.RESET_ALL)
-                for fr in file_reads:
-                    fpath = fr.get("file", "unknown_file")
-                    print(f"    {Fore.RED + Style.BRIGHT}✗ {fpath}{Style.RESET_ALL}")
-                    if fr.get("content"):
-                        content = str(fr["content"]).strip().splitlines()
-                        for line in content[:5]:
-                            print(f"       {Fore.GREEN}{line.strip()}{Style.RESET_ALL}")
-                        if len(content) > 5:
-                            print(f"       {Fore.LIGHTBLACK_EX}... (truncated){Style.RESET_ALL}")
-                    print()
-
-            # 4. Fallback: if absolutely nothing got rendered, dump the raw keys
-            if not rendered_anything:
-                keys = [k for k in output.keys() if k not in ("results", "intel", "raw", "status")]
-                if keys:
-                    print(Fore.LIGHTBLACK_EX + f"  [ Metadata: {', '.join(keys)} ]" + Style.RESET_ALL)
-                    for k in keys:
-                        val = str(output[k])
-                        print(f"    {Fore.WHITE}{k:<12}: {val[:80]}{'...' if len(val) > 80 else ''}")
-                    print()
-                else:
-                    print(Fore.LIGHTBLACK_EX + "  (No parsable findings identified)" + Style.RESET_ALL)
-                    print()
-
-
-
-            # ── Generic LOOT_SECTIONS path (module-defined sections) ───
-            if loot_sections:
-                for section in loot_sections:
-                    title    = section.get("title","")
-                    key      = section.get("key","")
-                    renderer = section.get("type","list")
-                    data     = intel.get(key)
-                    if not data:
-                        continue
-                    print(Fore.MAGENTA + f"  [{title}]" + Style.RESET_ALL)
-                    if renderer == "findings":
-                        _render_findings(data if isinstance(data, list) else [], title)
-                        continue
-                    elif renderer == "table":
-                        for row in (data if isinstance(data, list) else []):
-                            if isinstance(row, dict):
-                                for k, v in row.items():
-                                    print(f"    {Fore.CYAN}{k:<16}{Style.RESET_ALL} {v}")
-                                print()
-                            else:
-                                print(f"    {Fore.WHITE}{row}")
-                    elif renderer == "kv":
-                        if isinstance(data, dict):
-                            for k, v in data.items():
-                                print(f"    {Fore.CYAN}{k:<20}{Style.RESET_ALL} {v}")
-                        print()
-                    else:
-                        for item in (data if isinstance(data, list) else [data]):
-                            if isinstance(item, dict):
-                                url = item.get("url", item.get("path", str(item)))
-                                print(f"    {Fore.WHITE}• {url}")
-                            else:
-                                print(f"    {Fore.WHITE}• {item}")
-                        print()
-
-
-        # ── High value targets across all modules ─────────────
-        high_value = []
-        hvt_keywords = ["admin", "api", "login", "upload", "password", "env", "config", "token", "ftp", "secret", "auth", "graphql", "swagger", "openapi", "backup"]
-        
-        # Gather URLs that have active vulnerabilities to prioritize them
-        vuln_urls = set()
-        for mod, output in self.results.items():
-            if not isinstance(output, dict): continue
-            intel = output.get("intel", {})
-            for key in ["vulnerabilities", "cors_vulnerabilities", "sqli_vulnerabilities"]:
-                for vuln in intel.get(key, []):
-                    if isinstance(vuln, dict):
-                        sev = str(vuln.get("severity", vuln.get("confidence", "info"))).upper()
-                        if sev in ("CRITICAL", "HIGH", "MEDIUM") and vuln.get("url"):
-                            vuln_urls.add(vuln.get("url"))
-
-        for mod, output in self.results.items():
-            if not isinstance(output, dict): continue
-            for ep in output.get("intel", {}).get("endpoints", []):
-                url = ep.get("url", "")
-                
-                is_vuln = url in vuln_urls
-                has_params = bool(ep.get("parameter_sensitive"))
-                has_auth = bool(ep.get("auth_required"))
-                is_confirmed = ep.get("confidence_label") in ("HIGH", "CONFIRMED")
-                has_keyword = any(kw in url.lower() for kw in hvt_keywords)
-                
-                # Sophisticated True-Positive High Value Target Selection
-                if is_vuln or (has_params and has_auth) or (is_confirmed and has_keyword) or (has_params and is_confirmed):
-                    high_value.append(ep)
-
-        if high_value:
-            # Deduplicate by URL
-            unique_hvts = {}
-            for ep in high_value:
-                unique_hvts[ep.get("url")] = ep
-            high_value = list(unique_hvts.values())
-            
-            high_value = sorted(high_value,
-                key=lambda e: (e.get("url") in vuln_urls,
-                               bool(e.get("parameter_sensitive")),
-                               bool(e.get("auth_required"))), reverse=True)
-            print(Fore.RED + Style.BRIGHT + "  ── HIGH VALUE TARGETS ──" + Style.RESET_ALL)
-            for ep in high_value[:15]:
-                conf_color = Fore.RED if ep.get("url") in vuln_urls else Fore.YELLOW
-                label = "VULNERABLE" if ep.get("url") in vuln_urls else ep.get("confidence_label", "CONFIRMED")
-                print(f"  {Fore.CYAN}{ep.get('url','')} "
-                      f"{conf_color}[{label}]{Style.RESET_ALL}")
-            print()
-
-        print(Fore.RED + "  " + "─" * 38 + Style.RESET_ALL + "\n")
+        return
     def do_howl(self, arg):
-        """howl → Correlated intelligent attack suggestions"""
+        """howl → AI-powered attack chain correlation"""
 
         if not self.results:
             print(Fore.YELLOW + Style.BRIGHT + "[!] No intelligence collected yet — run Spider first." + Style.RESET_ALL)
@@ -1751,42 +1453,215 @@ class HellhoundConsole(cmd.Cmd):
         ai_provider = self.target_context.get("ai_provider", "gemini")
         model = self.target_context.get("ai_model", "gemini-1.5-flash")
         
-        if ai_key:
-            print(Fore.MAGENTA + Style.BRIGHT + f"\n[ Howl — AI Correlation Engine ({ai_provider.upper()}) ]")
-            print(Fore.WHITE + f"  Asking Hellhound Intelligence for attack chains ({model})...\n" + Style.RESET_ALL)
-            
-            prompt = ai_utils.format_howl_prompt(self.results)
-            ai_response = ai_utils.call_ai(prompt, ai_provider, ai_key, model=model, system_prompt=ai_utils.CORRELATION_PERSONA)
-            
-            if not ai_response or ai_response.startswith("Error"):
-                print(Fore.RED + f"  [x] AI analysis failed: {ai_response}")
-            else:
-                # Professional High-Fidelity AI Renderer
-                for line in ai_response.split('\n'):
-                    line = line.strip()
-                    if not line: continue
-                    
-                    # Transform Markdown Headers into Professional Terminal Headers
-                    if line.startswith("###") or line.startswith("##") or line.startswith("#"):
-                        clean_header = line.lstrip("#").strip().upper()
-                        print(f"\n  {Fore.MAGENTA}{Style.BRIGHT}{clean_header}{Style.RESET_ALL}")
-                    # Transform Bold markers into Bright White
-                    elif "**" in line:
-                        parts = line.split("**")
-                        # Basic bold replacement (first pair only for simplicity/fidelity)
-                        if len(parts) >= 3:
-                            processed = f"{parts[0]}{Style.BRIGHT}{parts[1]}{Style.NORMAL}{parts[2]}"
-                            print(f"  {Fore.CYAN}{processed}{Style.RESET_ALL}")
-                        else:
-                            print(f"  {Fore.CYAN}{line.replace('**', '')}{Style.RESET_ALL}")
-                    # Bullet points
-                    elif line.startswith("*") or line.startswith("-"):
-                        print(f"  {Fore.WHITE}• {Fore.CYAN}{line.lstrip('*-').strip()}{Style.RESET_ALL}")
-                    else:
-                        print(f"  {Fore.CYAN}{line}{Style.RESET_ALL}")
-            print()
+        if not ai_key:
+            print(Fore.YELLOW + "[!] AI Not Configured. Run 'setg ai local' or 'setg ai <api_key>' first." + Style.RESET_ALL)
+            return
+
+        # Build findings summary for the tree root
+        findings_lines = []
+        for mod, output in self.results.items():
+            intel = output.get("intel", {}) if isinstance(output, dict) else {}
+            vulns = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", [])
+            if vulns:
+                for v in vulns[:5]:
+                    vtype = v.get("type", v.get("id", "unknown"))
+                    sev = v.get("severity", "UNKNOWN")
+                    ep = v.get("endpoint", v.get("url", ""))
+                    findings_lines.append(f"{sev:8}  {vtype}  {ep}")
+        
+        findings_summary = "\n".join(findings_lines) if findings_lines else ""
+
+        prompt = ai_utils.format_howl_prompt(self.results)
+        anim_thread, anim_stop = ai_utils.thinking_animation("CORRELATING ATTACK CHAINS")
+        ai_response = ai_utils.call_ai(prompt, ai_provider, ai_key, model=model, system_prompt=ai_utils.CORRELATION_PERSONA)
+        anim_stop.set()
+        anim_thread.join()
+        
+        if not ai_response or str(ai_response).startswith("Error"):
+            print(Fore.RED + f"  [x] AI analysis failed: {ai_response}")
         else:
-            print(Fore.YELLOW + "[!] AI Not Configured. Run 'setg ai_key <your_key>' to enable Howl attack chaining." + Style.RESET_ALL)
+            ai_utils.render_howl_box(ai_response, findings_summary)
+
+    # ============================
+    # ASK — Interactive AI Q&A
+    # ============================
+
+    def do_ask(self, arg):
+        """ask [question] → Interactive AI chat for bug bounty questions"""
+        ai_key = self.target_context.get("ai_key")
+        ai_provider = self.target_context.get("ai_provider", "gemini")
+        model = self.target_context.get("ai_model", "gemini-1.5-flash")
+
+        if not ai_key:
+            print(Fore.YELLOW + "[!] AI not configured. Run 'setg ai local' or 'setg ai <api_key>' first." + Style.RESET_ALL)
+            return
+
+        # One-shot mode: ask <question>
+        if arg.strip():
+            ai_utils.render_session_header()
+            self._ask_ai(arg.strip(), ai_provider, ai_key, model)
+            ai_utils.render_session_footer()
+            return
+
+        # Interactive session — everything inside one frame
+        ai_utils.render_session_header()
+
+        first_turn = True
+        while True:
+            try:
+                question = input(f"\033[38;5;46m$\033[0m \033[97;1m")
+                print("\033[0m", end="")  # reset after bold input
+            except (EOFError, KeyboardInterrupt):
+                print("\033[0m")
+                break
+            
+            if not question.strip():
+                continue
+            if question.strip().lower() in ("exit", "quit", "q", "back"):
+                break
+
+            self._ask_ai(question.strip(), ai_provider, ai_key, model)
+            ai_utils.render_session_divider()
+
+        ai_utils.render_session_footer()
+
+    def _ask_ai(self, question, provider, key, model):
+        """Send a question to AI and render the response inside the session frame."""
+        # Build context from existing scan results if available
+        context = ""
+        if self.results:
+            context = f"\n\nCONTEXT — Current scan results available for {self.target or 'unknown target'}:\n"
+            for mod, output in self.results.items():
+                intel = output.get("intel", {}) if isinstance(output, dict) else {}
+                vulns = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", [])
+                if vulns:
+                    context += f"  {mod}: {len(vulns)} finding(s)\n"
+                    for v in vulns[:3]:
+                        vtype = v.get("type", v.get("id", "unknown"))
+                        sev = v.get("severity", "")
+                        context += f"    - {vtype} {sev}\n"
+        
+        prompt = f"{question}{context}"
+        
+        print()
+        # Cinematic thinking animation
+        anim_thread, anim_stop = ai_utils.thinking_animation("HELLHOUND IS THINKING")
+        response = ai_utils.call_ai(prompt, provider, key, model=model, system_prompt=ai_utils.ASK_PERSONA)
+        anim_stop.set()
+        anim_thread.join()
+        
+        if response:
+            ai_utils.render_ai_box(response)
+        else:
+            print(Fore.RED + "  [x] AI returned no response. Check connectivity." + Style.RESET_ALL)
+
+    # ============================
+    # ANALYZE — On-Demand AI Analysis
+    # ============================
+
+    def do_analyze(self, arg):
+        """analyze → AI-powered analysis of scan findings (on-demand, no auto-trigger)"""
+        ai_key = self.target_context.get("ai_key")
+        ai_provider = self.target_context.get("ai_provider", "gemini")
+        model = self.target_context.get("ai_model", "gemini-1.5-flash")
+
+        if not ai_key:
+            print(Fore.YELLOW + "[!] AI not configured. Run 'setg ai local' or 'setg ai <api_key>' first." + Style.RESET_ALL)
+            return
+
+        if not self.results:
+            print(Fore.YELLOW + "[!] No scan results to analyze. Run some modules first." + Style.RESET_ALL)
+            return
+
+        # Collect all findings across modules
+        all_findings = []
+        for mod, output in self.results.items():
+            if not isinstance(output, dict):
+                continue
+            intel = output.get("intel", {})
+            
+            # Gather vulnerabilities from various module output shapes
+            vulns = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", [])
+            cors = intel.get("cors_vulnerabilities", [])
+            
+            for v in vulns:
+                v["_source_module"] = mod
+                all_findings.append(v)
+            for c in cors:
+                c["_source_module"] = mod
+                all_findings.append(c)
+
+        if not all_findings:
+            print(Fore.YELLOW + "[!] No specific findings to analyze. Modules returned no vulnerabilities." + Style.RESET_ALL)
+            return
+
+        # Display menu
+        print(Fore.RED + Style.BRIGHT + "\n[ ANALYZE — Select findings for AI analysis ]\n" + Style.RESET_ALL)
+
+        for i, f in enumerate(all_findings, 1):
+            ftype = f.get("type", f.get("id", "Unknown"))
+            sev = f.get("severity", "")
+            url = f.get("url", "")
+            mod = f.get("_source_module", "")
+            sev_color = Fore.RED if sev in ("CRITICAL", "HIGH") else Fore.YELLOW if sev == "MEDIUM" else Fore.WHITE
+            needs_ai = " ⚡" if f.get("needs_ai_verification") else ""
+            print(f"  {Fore.WHITE}[{i}]{Style.RESET_ALL} {sev_color}{ftype}{Style.RESET_ALL} ({sev}) on {Fore.CYAN}{url}{Style.RESET_ALL} [{mod}]{needs_ai}")
+
+        print(f"\n  {Fore.WHITE}[A]{Style.RESET_ALL} Analyze ALL findings")
+        print(f"  {Fore.WHITE}[X]{Style.RESET_ALL} Cancel\n")
+
+        try:
+            choice = input(f"  {Fore.WHITE + Style.BRIGHT}> {Style.RESET_ALL}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if choice.upper() == "X" or not choice:
+            return
+
+        # Determine which findings to analyze
+        if choice.upper() == "A":
+            selected = all_findings
+        else:
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(all_findings):
+                    selected = [all_findings[idx]]
+                else:
+                    print(Fore.RED + "[x] Invalid selection." + Style.RESET_ALL)
+                    return
+            except ValueError:
+                print(Fore.RED + "[x] Invalid selection." + Style.RESET_ALL)
+                return
+
+        # Analyze each selected finding
+        for f in selected:
+            ftype = f.get("type", f.get("id", "Unknown"))
+            sev = f.get("severity", "")
+            url = f.get("url", "")
+            param = f.get("parameter", "")
+            evidence = f.get("evidence", f.get("payload", ""))
+            
+            prompt = (
+                f"Vulnerability: {ftype}\n"
+                f"Severity: {sev}\n"
+                f"URL: {url}\n"
+                f"Parameter: {param}\n"
+                f"Evidence: {str(evidence)[:500]}\n"
+                f"Target: {self.target}\n\n"
+                f"Analyze this finding for bug bounty impact and escalation potential."
+            )
+            
+            anim_thread, anim_stop = ai_utils.thinking_animation(f"ANALYZING {ftype.upper()[:20]}")
+            response = ai_utils.call_ai(prompt, ai_provider, ai_key, model=model, system_prompt=ai_utils.IMPACT_ADVISOR_PERSONA)
+            anim_stop.set()
+            anim_thread.join()
+            
+            if response:
+                ai_utils.render_ai_box(response)
+            else:
+                print(Fore.RED + f"  [x] AI analysis failed for {ftype}." + Style.RESET_ALL)
+
 
     def do_repro(self, arg):
         """repro → Alias for reproduce"""
@@ -1977,6 +1852,11 @@ class HellhoundConsole(cmd.Cmd):
                 ("sessions",             "List saved sessions"),
                 ("clear",                "Clear the screen"),
                 ("exit",                 "Exit console"),
+            ]),
+            ("AI CORE", [
+                ("activate hellhound",   "Quick-launch local intelligence engine (Ollama)"),
+                ("ask <question>",       "Interactive Q&A with Hellhound AI"),
+                ("analyze",              "Analyze current findings for deep impact"),
             ]),
             ("ALIASES", [
                 ("hunt → prey",          ""),

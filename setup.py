@@ -14,6 +14,7 @@ setup(
         "playwright==1.56.0",
         "pyyaml",
         "requests",
+        "rich",
     ],
     entry_points={
         "console_scripts": [
