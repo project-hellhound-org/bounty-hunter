@@ -52,10 +52,18 @@ async def run(target, emit, options=None):
     
     surfaces = []
     for ep in endpoints:
-        for p_items in ep.get("params", {}).values():
-            for p in p_items:
-                if any(x in p.lower() for x in ["url", "redirect", "next", "dest", "to", "out", "view", "link"]):
-                    surfaces.append({"url": ep.get("url"), "method": ep.get("method", "GET"), "parameter": p})
+        params = ep.get("params", {})
+        # Robust parameter extraction
+        all_params = []
+        if isinstance(params, dict):
+            for bucket in params.values():
+                if isinstance(bucket, list): all_params.extend(bucket)
+        elif isinstance(params, list):
+            all_params = params
+
+        for p in all_params:
+            if any(x in str(p).lower() for x in ["url", "redirect", "next", "dest", "to", "out", "view", "link"]):
+                surfaces.append({"url": ep.get("url"), "method": ep.get("method", "GET"), "parameter": p})
 
     if not surfaces:
         emit.warn("[!] No redirection-likely parameters identified.")

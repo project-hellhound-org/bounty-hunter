@@ -143,8 +143,14 @@ class HydraEngine:
         global_params = {}
         for ep in endpoints:
             params = ep.get("params", {})
-            for bucket, names in params.items():
-                for name in names:
+            # Self-healing parameter iteration
+            if isinstance(params, dict):
+                for bucket, names in params.items():
+                    if isinstance(names, list):
+                        for name in names:
+                            global_params.setdefault(name, []).append(ep.get("url"))
+            elif isinstance(params, list):
+                for name in params:
                     global_params.setdefault(name, []).append(ep.get("url"))
 
         logic_findings = []

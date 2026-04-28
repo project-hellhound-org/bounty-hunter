@@ -4,3 +4,5 @@ flask-socketio==5.3.6
 reportlab==4.2.0
 pyyaml
 colorama
+aiohttp
+rich

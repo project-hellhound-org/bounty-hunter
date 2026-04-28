@@ -366,7 +366,7 @@ class Emit:
 
         if extra:
             for ex in extra:
-                self._w(f"       {C.GR}{ex}{C.RST}")
+                self._w(f"       {C.BL}{ex}{C.RST}")
 
     def live_crawl(self, url: str):
         """Minimalist live-feed line for the discovery queue."""
@@ -632,7 +632,7 @@ def print_results(intel: dict, target: str, elapsed: float,
             emit.section(f"PARAMETER MAP  ({len(interesting)} endpoints)", orbital=True)
             for ep in interesting:
                 url = ep.get("url","")
-                all_p = ep.get("params", [])
+                all_p = ep.get("params_list", [])
                 if not all_p: continue
 
                 method = ep.get("method", "GET")
@@ -1223,8 +1223,8 @@ class Store:
                 "confidence": cl,
                 "confidence_score": c,
                 "observed_status": e["observed_status"],
-                "params": sorted(all_params),
-                "params_detail": e["params"],
+                "params": e["params"],
+                "params_list": sorted(all_params),
                 "auth_required": e["auth_required"],
                 "source": e["source"],
                 "admin_panel": e.get("admin_panel", False),
@@ -2591,6 +2591,23 @@ class Spider:
             if tag.string:
                 for m in re.finditer(r'"(?:url|@id|contentUrl|embedUrl)"\s*:\s*"([^"]+)"', tag.string):
                     self._discover_url(m.group(1), depth+1, "JSONLD", show_feed=True)
+
+    async def _check_sourcemap(self, session, url):
+        """Active discovery of JavaScript SourceMaps."""
+        # 1. Direct suffix check
+        map_url = url + ".map"
+        s, hdrs, body = await fetch(session, "GET", map_url, self.rl)
+        if s == 200 and body and '"sources"' in body:
+            self.store.add_sourcemap(map_url, url)
+            self.emit.warn(f"[SourceMap] Found → {map_url}")
+            return
+            
+        # 2. Header hint (SourceMap or X-SourceMap)
+        sm_hdr = (hdrs or {}).get("SourceMap") or (hdrs or {}).get("X-SourceMap")
+        if sm_hdr:
+            full_sm = urljoin(url, sm_hdr)
+            self.store.add_sourcemap(full_sm, url)
+            self.emit.warn(f"[SourceMap] Header hint → {full_sm}")
 
     async def _process_js(self, url, text, session):
         ep_count = 0
