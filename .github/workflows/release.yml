@@ -67,5 +67,3 @@ jobs:
             README.md
             requirements.txt
             LICENSE
-            scaffold_module.py
-            CONTRIBUTING.md
