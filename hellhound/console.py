@@ -121,12 +121,12 @@ def _boot_sequence():
     reset = Style.RESET_ALL
     
     braille_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-    pipe_frames = ['|', '/', '-', '\\']
     
     # ENLARGED BOOT HUD (60 chars width)
     duration = 4.2
     end_time = time.time() + duration
     frame = 0
+    import shutil
     while time.time() < end_time:
         t = time.time() - (end_time - duration)
         prefix = f"{red}{braille_frames[frame % 10]}{reset}"
@@ -141,20 +141,24 @@ def _boot_sequence():
             else:
                 wave_label += f"{Fore.RED}{char.lower()}{reset}"
         
-        # ENORMOUS PROGRESS BAR (60 chars)
+        # DYNAMIC PROGRESS BAR (Fills terminal)
+        cols = shutil.get_terminal_size((80, 24)).columns
+        prefix_len = len(full_text) + 10
+        bar_len = max(10, cols - prefix_len)
+        
         bar = ""
         bframes = ["⡀", "⡄", "⡆", "⡇", "⣇", "⣧", "⣷", "⣿"]
-        for i in range(60):
+        for i in range(bar_len):
             idx = int((math.sin(t * 5 + i * 0.3) + 1) / 2 * 7)
             bar += f"{red}{bframes[idx]}{reset}"
-
-        sys.stdout.write(f"\r {prefix}  {white}{wave_label}  {bar}")
+        
+        sys.stdout.write(f"\r {prefix}  {wave_label}  {bar}")
         sys.stdout.flush()
         time.sleep(0.06)
         frame += 1
 
     # CLEAR ANIMATION LINE BEFORE LOGO
-    sys.stdout.write("\r" + " " * 120 + "\r")
+    sys.stdout.write("\033[2K\r")
     sys.stdout.flush()
     
     # 2. Reveal Banner (Classic Centered)
@@ -1014,32 +1018,7 @@ class HellhoundConsole(cmd.Cmd):
             self.target_context["oob_url"] = raw_value
             print(Fore.GREEN + f"[✓] Global OOB URL set: {raw_value}" + Style.RESET_ALL)
         elif key in ("ai_key", "key", "ai"):
-            # Simplified AI setup:
-            #   setg ai local       → Ollama/gemma2:2b (no key needed)
-            #   setg ai AIzaXXXX    → Gemini (auto-detected)
-            #   setg ai sk-XXXX     → OpenAI (auto-detected)
-            
-            if raw_value.lower() in ("local", "ollama"):
-                # Local SLM mode
-                self.target_context["ai_key"] = "local"
-                with console.status("[bold white]INITIALIZING NEURAL CORE...[/]", spinner="earth"):
-                    result = ai_utils.universal_handshake("ollama")
-            else:
-                self.target_context["ai_key"] = raw_value
-                masked = f"{raw_value[:4]}...{raw_value[-4:] if len(raw_value)>8 else ''}"
-                print(Fore.GREEN + f"[✓] AI Key => {masked}")
-                with console.status("[bold white]ESTABLISHING QUANTUM LINK...[/]", spinner="bouncingBall"):
-                    result = ai_utils.universal_handshake(raw_value)
-            
-            if result["success"]:
-                self.target_context["ai_provider"] = result["provider"]
-                self.target_context["ai_model"] = result["model"]
-                self.target_context["ai_status_label"] = f"CONNECTED: {result['label']}"
-                print(Fore.CYAN + f"[✓] Intelligence Connected: {Style.BRIGHT}{result['label']}")
-                print(Fore.WHITE + f"    Use 'ask' for Q&A | 'analyze' for finding analysis | 'howl' for attack chains" + Style.RESET_ALL)
-            else:
-                self.target_context["ai_status_label"] = "FAILED (Key Rejected)"
-                print(Fore.RED + f"[x] Intelligence Discovery Failed: {result['message']}")
+            self._activate_ai(raw_value)
 
         elif key in ("ai_provider", "aiprovider"):
             # Still allow manual override if needed, but mark as manual
@@ -1073,17 +1052,60 @@ class HellhoundConsole(cmd.Cmd):
 
     def do_activate(self, arg):
         """activate hellhound → Launch and connect the local AI engine (Ollama)"""
-        if arg.lower() != "hellhound":
+        target = arg.lower().strip()
+        if target != "hellhound":
             print(Fore.YELLOW + "[!] Use 'activate hellhound' to launch the AI core.")
             return
         
-        # High-contrast activation banner
-        print(f"\n{Fore.RED}{Style.BRIGHT}╔══════════════════════════════════════╗")
-        print(f"{Fore.RED}{Style.BRIGHT}║       HELLHOUND — AI ACTIVATION      ║")
-        print(f"{Fore.RED}{Style.BRIGHT}╚══════════════════════════════════════╝{Style.RESET_ALL}")
+        # Connect silently
+        result = self._activate_ai("local", silent=True)
         
-        # Trigger the local AI connection
-        self.do_setg("ai local")
+        if result and result.get("success"):
+            print(Fore.RED + Style.BRIGHT + "Hellhound is activated")
+            if not result.get("pulled", True):
+                print(Fore.YELLOW + "    [!] Note: Model is being pulled in the background. First response may be slow.")
+        else:
+            print(Fore.RED + f"[x] Failed to activate Hellhound engine: {result.get('message', 'Unknown error')}")
+            print(Fore.YELLOW + "    Ensure Ollama is running (ollama serve) and accessible at http://localhost:11434")
+
+    def complete_activate(self, text, line, begidx, endidx):
+        """TAB completion for: activate hellhound"""
+        options = ["hellhound"]
+        return [o for o in options if o.startswith(text.lower())]
+
+    def _activate_ai(self, raw_value, silent=False):
+        """Private helper to handle AI handshake and context updates."""
+        if raw_value.lower() in ("local", "ollama"):
+            # Local SLM mode
+            self.target_context["ai_key"] = "local"
+            if not silent:
+                with console.status("[bold white]INITIALIZING NEURAL CORE...[/]", spinner="earth"):
+                    result = ai_utils.universal_handshake("ollama")
+            else:
+                result = ai_utils.universal_handshake("ollama")
+        else:
+            self.target_context["ai_key"] = raw_value
+            masked = f"{raw_value[:4]}...{raw_value[-4:] if len(raw_value)>8 else ''}"
+            if not silent:
+                print(Fore.GREEN + f"[✓] AI Key => {masked}")
+                with console.status("[bold white]ESTABLISHING QUANTUM LINK...[/]", spinner="bouncingBall"):
+                    result = ai_utils.universal_handshake(raw_value)
+            else:
+                result = ai_utils.universal_handshake(raw_value)
+        
+        if result["success"]:
+            self.target_context["ai_provider"] = result["provider"]
+            self.target_context["ai_model"] = result["model"]
+            self.target_context["ai_status_label"] = f"CONNECTED: {result['label']}"
+            if not silent:
+                print(Fore.CYAN + f"[✓] Intelligence Connected: {Style.BRIGHT}{result['label']}")
+                print(Fore.WHITE + f"    Use 'ask' for Q&A | 'analyze' for finding analysis | 'howl' for attack chains" + Style.RESET_ALL)
+        else:
+            self.target_context["ai_status_label"] = "FAILED (Key Rejected)"
+            if not silent:
+                print(Fore.RED + f"[x] Intelligence Discovery Failed: {result['message']}")
+        
+        return result
 
     def do_oob(self, arg):
         """oob <start|stop|status> → Manage the global Out-of-Band (OOB) listener"""
@@ -1496,6 +1518,10 @@ class HellhoundConsole(cmd.Cmd):
             print(Fore.YELLOW + "[!] AI not configured. Run 'setg ai local' or 'setg ai <api_key>' first." + Style.RESET_ALL)
             return
 
+        # Initialize history once per session if not already present
+        if not hasattr(self, '_ask_history'):
+            self._ask_history = []
+
         # One-shot mode: ask <question>
         if arg.strip():
             ai_utils.render_session_header()
@@ -1506,7 +1532,6 @@ class HellhoundConsole(cmd.Cmd):
         # Interactive session — everything inside one frame
         ai_utils.render_session_header()
 
-        first_turn = True
         while True:
             try:
                 question = input(f"\033[38;5;46m$\033[0m \033[97;1m")
@@ -1527,9 +1552,12 @@ class HellhoundConsole(cmd.Cmd):
 
     def _ask_ai(self, question, provider, key, model):
         """Send a question to AI and render the response inside the session frame."""
-        # Build context from existing scan results if available
+        # Pick SLM-optimized persona if on ollama
+        persona = ai_utils.ASK_PERSONA_SLM if provider == "ollama" else ai_utils.ASK_PERSONA
+        
+        # Build context from existing scan results if available (Only for first turn or if requested)
         context = ""
-        if self.results:
+        if not self._ask_history and self.results:
             context = f"\n\nCONTEXT — Current scan results available for {self.target or 'unknown target'}:\n"
             for mod, output in self.results.items():
                 intel = output.get("intel", {}) if isinstance(output, dict) else {}
@@ -1543,14 +1571,29 @@ class HellhoundConsole(cmd.Cmd):
         
         prompt = f"{question}{context}"
         
+        # Fast health check for Ollama
+        if provider == "ollama":
+            if not ai_utils.ping_ollama(model):
+                print(f"  \033[91m[!] Ollama not running or model '{model}' not pulled.\033[0m")
+                print(f"      \033[90mRun: ollama pull {model}\033[0m")
+                return
+
         print()
         # Cinematic thinking animation
         anim_thread, anim_stop = ai_utils.thinking_animation("HELLHOUND IS THINKING")
-        response = ai_utils.call_ai(prompt, provider, key, model=model, system_prompt=ai_utils.ASK_PERSONA)
+        response = ai_utils.call_ai(prompt, provider, key, model=model, system_prompt=persona, history=self._ask_history)
         anim_stop.set()
         anim_thread.join()
         
         if response:
+            # Append this turn to history
+            self._ask_history.append({"role": "user", "content": question})
+            self._ask_history.append({"role": "assistant", "content": response})
+            
+            # Cap history to last 10 turns (20 messages) to avoid blowing context window
+            if len(self._ask_history) > 20:
+                self._ask_history = self._ask_history[-20:]
+                
             ai_utils.render_ai_box(response)
         else:
             print(Fore.RED + "  [x] AI returned no response. Check connectivity." + Style.RESET_ALL)
@@ -1573,8 +1616,10 @@ class HellhoundConsole(cmd.Cmd):
             print(Fore.YELLOW + "[!] No scan results to analyze. Run some modules first." + Style.RESET_ALL)
             return
 
-        # Collect all findings across modules
+        # Collect all findings across modules with deduplication
         all_findings = []
+        seen_keys = set()
+        
         for mod, output in self.results.items():
             if not isinstance(output, dict):
                 continue
@@ -1584,12 +1629,17 @@ class HellhoundConsole(cmd.Cmd):
             vulns = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", [])
             cors = intel.get("cors_vulnerabilities", [])
             
-            for v in vulns:
-                v["_source_module"] = mod
-                all_findings.append(v)
-            for c in cors:
-                c["_source_module"] = mod
-                all_findings.append(c)
+            for v in vulns + cors:
+                # Create a unique key for deduplication
+                ftype = v.get("type", v.get("id", "Unknown"))
+                url = v.get("url", "")
+                method = v.get("method", "GET")
+                key = (ftype, url, method, mod)
+                
+                if key not in seen_keys:
+                    v["_source_module"] = mod
+                    all_findings.append(v)
+                    seen_keys.add(key)
 
         if not all_findings:
             print(Fore.YELLOW + "[!] No specific findings to analyze. Modules returned no vulnerabilities." + Style.RESET_ALL)

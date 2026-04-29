@@ -29,7 +29,7 @@ start_animation() {
     # T31: Case-Wave for Label
     # P33: Braille-Wave for Progress (Scaled to 'Ultra-Wide' 50 character bar)
     python3 -c "
-import math, time, sys
+import math, time, sys, shutil
 label = \"$label\"
 def wave(label, t):
     res = ''
@@ -39,18 +39,21 @@ def wave(label, t):
         if v > 0: res += f'\033[91m\033[1m{c.upper()}\033[0m'
         else: res += f'\033[31m{c.lower()}\033[0m'
     return res
-def braille(t):
+def braille(t, cols):
     chars = '⡀⡄⡆⡇⣇⣧⣷⣿'
     bar = ''
-    for i in range(50):
+    prefix_len = len(label) + 4
+    bar_len = max(10, cols - prefix_len - 10)
+    for i in range(bar_len):
         idx = int((math.sin(t * 5 + i * 0.2) + 1) / 2 * (len(chars) - 1))
         bar += f'\033[91m{chars[idx]}\033[0m'
     return bar
 start = time.time()
 try:
     while True:
+        cols = shutil.get_terminal_size((80, 24)).columns
         t = time.time() - start
-        sys.stdout.write(f'\r  {wave(label, t):<35}  {braille(t)} ')
+        sys.stdout.write(f'\r  {wave(label, t)}  {braille(t, cols)} ')
         sys.stdout.flush()
         time.sleep(0.06)
 except:

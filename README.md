@@ -125,12 +125,28 @@ hellhound [IDORdetector] > strike  # Logical scoping audit
 hellhound > howl                   # AI Attack-Chain Correlation
 ```
 
+## Neural Core Experience
+
+<p align="center">
+  <img src="Images/Ask_interface.png" alt="Ask Interface" width="100%"/>
+  <br><i>The Neural Core "Ask" interface — expert-level security guidance.</i>
+</p>
+
+<p align="center">
+  <img src="Images/Analyze_interface.png" alt="Analyze Interface" width="100%"/>
+  <br><i>Strategic "Analyze" mode — high-fidelity vulnerability triage.</i>
+</p>
+
+<p align="center">
+  <img src="Images/howl_interface.png" alt="Howl Interface" width="100%"/>
+  <br><i>"Howl" Attack-Chain Correlation — synthesizing complex exploit paths.</i>
+</p>
+
 ---
 
 ## Documentation
 For deep-dives into framework architecture, module logic, and detection signatures, visit:
 - [Architecture Guide](ARCHITECTURE.md)
-- [Module Scaffolding](scaffold_module.py)
 
 ---
 
@@ -139,6 +155,6 @@ Hellhound is developed strictly for **authorized security assessments**. This so
 
 ## Author
 
-<a href="https://l4zz3rj0d.github.io">
+<p align="center">
   <img src="https://img.shields.io/badge/Founder-Sree%20Danush%20S%20(L4ZZ3RJ0D)-c0392b?style=for-the-badge" alt="Sree Danush S (L4ZZ3RJ0D)"/>
-</a>
+</p>
