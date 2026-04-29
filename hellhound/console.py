@@ -66,7 +66,7 @@ CONF_COLORS = {
 
 def _boot_sequence():
     """
-    HELLHOUND v12.5 Apex-King Boot Sequence.
+    HELLHOUND v12.5.1 Apex-King Boot Sequence.
     Features: Red Braille Prefix, Case-Wave Technical Text, Red Pipe Suffix, Smooth Logo Reveal.
     """
     BANNER = r"""

@@ -2,7 +2,7 @@
   <img src="Images/hellhound.png" alt="Hellhound" width="100%"/>
 </p>
 
-<h1 align="center">HELLHOUND v12.5</h1>
+<h1 align="center">HELLHOUND v12.5.1</h1>
 <h1 align="center">Apex-King Pentest Framework</h1>
 
 <p align="center">
@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.13-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
-  <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.5.0-red?style=flat-square" alt="Release Version"/></a>
+  <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.5.1-red?style=flat-square" alt="Release Version"/></a>
   <img src="https://img.shields.io/badge/AI--Powered-Gemini%20%7C%20OpenAI%20%7C%20Gemma--2b-red?style=flat-square" alt="AI Support"/>
   <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License"/>
   <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/stargazers"><img src="https://img.shields.io/github/stars/project-hellhound-org/Hellhound-Pentest?style=flat-square&color=yellow" alt="Stars"/></a>
@@ -155,6 +155,8 @@ Hellhound is developed strictly for **authorized security assessments**. This so
 
 ## Author
 
-<a href="https://l4zz3rj0d.github.io">
-  <img src="https://img.shields.io/badge/Founder-L4ZZ3RJ0D-c0392b?style=for-the-badge" alt="L4ZZ3RJ0D"/>
-</a>
+<p align="center">
+  <a href="https://l4zz3rj0d.github.io">
+    <img src="https://img.shields.io/badge/Founder-L4ZZ3RJ0D-c0392b?style=for-the-badge" alt="L4ZZ3RJ0D"/>
+  </a>
+</p>
