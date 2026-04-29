@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="hellhound",
-    version="12.5.0",
+    version="12.5.1",
     description="HELLHOUND — Modular Web Offensive Framework",
     packages=find_packages(),
     include_package_data=True,
