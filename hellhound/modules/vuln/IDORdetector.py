@@ -3911,6 +3911,8 @@ class IDORTester:
                     finding = {
                         "url":               t_url,
                         "method":            method,
+                        "type":              "IDOR (Path-Based)" if loc == "path" else "IDOR (Parameter-Based)",
+                        "severity":          "HIGH" if conf == "HIGH" else "MEDIUM",
                         "location":          loc,
                         "param_name":        pname,
                         "original_id":       orig_val,
@@ -3996,6 +3998,8 @@ class IDORTester:
                     finding = {
                         "url":               t_url,
                         "method":            method,
+                        "type":              "IDOR (Path-Based)",
+                        "severity":          "HIGH" if conf == "HIGH" else "MEDIUM",
                         "location":          "path",
                         "param_name":        None,
                         "original_id":       id_val,
