@@ -1943,6 +1943,9 @@ class HellhoundConsole(cmd.Cmd):
                         "    Clear the terminal screen.",
             "sessions": "sessions\n"
                         "    List previously saved session directories.",
+            "upgrade":  "upgrade\n"
+                        "    Pull latest updates and sync dependencies from within console.\n"
+                        "    Executes the framework's internal update logic.",
             "exit":     "exit\n"
                         "    Exit the Hellhound console.",
         }
@@ -1976,6 +1979,7 @@ class HellhoundConsole(cmd.Cmd):
             ("SYSTEM", [
                 ("status",               "Show framework state"),
                 ("sessions",             "List saved sessions"),
+                ("upgrade",              "Pull latest framework updates"),
                 ("clear",                "Clear the screen"),
                 ("exit",                 "Exit console"),
             ]),
