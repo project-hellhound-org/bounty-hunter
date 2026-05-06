@@ -32,6 +32,12 @@ Whether you're performing surface reconnaissance or deep logical vulnerability a
 
 ---
 
+> [!NOTE]
+> **The Hellhound Advantage:**
+> *"Traditional security tools are like generic metal detectors—they beep at everything, and you have to dig manually to find out if it's a treasure or a soda can. **Hellhound is like a surgical robot with an AI brain.** It doesn't just 'detect'; it 'understands' the logic of the application to find hidden flaws that standard tools miss."*
+
+---
+
 ## Key Features
 
 - **Cinematic HUD**: Ultra-wide 60-character Braille-wave status dashboard with real-time pulsing case-waves.
