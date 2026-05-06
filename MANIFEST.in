@@ -1,5 +1,0 @@
-recursive-include hellhound *.yaml
-recursive-include hellhound/scripts *.sh
-recursive-include hellhound/wordlists *.txt
-recursive-include hellhound/web/templates *.html
-recursive-include hellhound/modules *

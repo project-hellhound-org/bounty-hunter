@@ -97,10 +97,20 @@ def tprint(*a, **kw):
         with _print_lock:
             print(*a, **kw)
 
+import shutil as _shutil
+
+def _term_width():
+    try:
+        return _shutil.get_terminal_size((120, 40)).columns
+    except Exception:
+        return 120
+
 def section(title):
-    bar = color("─" * 72, C.DIM + C.CYAN)
+    w   = _term_width()
+    bar = color("═" * w, C.DIM + C.CYAN)
+    pad = max(0, (w - len(title) - 4) // 2)
     tprint(f"\n{bar}")
-    tprint(f"  {color('  ' + title + '  ', C.BOLD + C.BCYAN)}")
+    tprint(f"{'':>{pad}}  {color(title, C.BOLD + C.BCYAN)}  ")
     tprint(f"{bar}")
 
 VERBOSE = False
@@ -271,13 +281,28 @@ class HTTPClient:
         }
         if cookie:
             cookie = cookie.strip()
+            # Strip leading "Cookie:" label if someone pastes from browser devtools
             if cookie.lower().startswith("cookie:"):
                 cookie = cookie[len("cookie:"):].strip()
-            if re.match(r"(?:Bearer|Basic|Token)\s+\S", cookie, re.I):
+
+            # ── Token type auto-detection ────────────────────────────────────
+            # Priority order: explicit header format → JWT raw → named custom header → cookie string
+
+            # 1. "HeaderName: value" format — e.g. "X-Auth-Token: abc" or "Authorization: Bearer xyz"
+            _hdr_colon = re.match(r'^([A-Za-z][A-Za-z0-9\-_]+)\s*:\s*(.+)$', cookie)
+            if _hdr_colon:
+                _hk, _hv = _hdr_colon.group(1).strip(), _hdr_colon.group(2).strip()
+                self.headers[_hk] = _hv
+
+            # 2. "Bearer/Basic/Token VALUE" — standard Authorization header values
+            elif re.match(r"(?:Bearer|Basic|Token)\s+\S", cookie, re.I):
                 self.headers["Authorization"] = cookie
+
+            # 3. Raw JWT (eyJ...) — auto-wrap as Bearer
             elif re.match(r"eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+", cookie):
-                # Raw JWT — auto-wrap as Bearer token
                 self.headers["Authorization"] = f"Bearer {cookie}"
+
+            # 4. Anything else — treat as Cookie string (handles PHPSESSID=x, session=y, multi-cookies)
             else:
                 self.headers["Cookie"] = cookie
         if extra_header:
@@ -3273,6 +3298,84 @@ class ResponseAnalyser:
         )
         return True, confidence, " | ".join(evidence)
 
+    # ── UUID helpers ──────────────────────────────────────────────────────────
+
+    _UUID_BARE_RE = re.compile(
+        r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+        re.I
+    )
+
+    @staticmethod
+    def _uuid_version(uuid_str):
+        """
+        Return UUID version integer (1-5) or 0 if unknown.
+        The version nibble is the 13th hex char (index 14 with dashes).
+        UUID format: xxxxxxxx-xxxx-Vxxx-xxxx-xxxxxxxxxxxx
+                     0        9    14
+        """
+        try:
+            clean = uuid_str.replace("-", "")
+            v = int(clean[12], 16)
+            return v if 1 <= v <= 5 else 0
+        except Exception:
+            return 0
+
+    def extract_uuids_from_body(self, body, context_url="", owner="unknown"):
+        """
+        Extract all UUIDs from a response body.
+        Returns list of hint dicts compatible with the id_hints pool.
+        Also flags UUID v1 (timestamp-based, partially predictable).
+        """
+        hints = []
+        seen  = set()
+        if not body:
+            return hints
+        for m in self._UUID_BARE_RE.finditer(body[:32000]):
+            val = m.group(0).lower()
+            if val in seen:
+                continue
+            seen.add(val)
+            ver = self._uuid_version(val)
+            hint = {
+                "id_val":      val,
+                "id_type":     "uuid",
+                "id_source":   f"body_extract:{context_url}",
+                "context_url": context_url,
+                "owner":       owner,
+            }
+            if ver == 1:
+                hint["uuid_v1"] = True   # flag for report — partially predictable
+            hints.append(hint)
+        return hints
+
+    def is_list_endpoint(self, body):
+        """
+        True if the response body looks like a collection endpoint
+        (returns an array of objects rather than a single object).
+        These are the endpoints where cross-user UUID leaks happen.
+        """
+        if not body:
+            return False
+        stripped = body.strip()
+        # Top-level array
+        if stripped.startswith("["):
+            return True
+        # JSON object with a list-valued key (data, results, items, records, etc.)
+        try:
+            obj = json.loads(stripped[:4000])
+            if isinstance(obj, list):
+                return True
+            if isinstance(obj, dict):
+                _LIST_KEYS = {"data", "results", "items", "records", "users",
+                              "orders", "messages", "entries", "rows", "list",
+                              "content", "payload", "response", "collection"}
+                for k, v in obj.items():
+                    if k.lower() in _LIST_KEYS and isinstance(v, list) and len(v) > 0:
+                        return True
+        except Exception:
+            pass
+        return False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ID HARVEST PASS
 # After surface analysis, fetch every IDOR-candidate endpoint as User A
@@ -3639,21 +3742,432 @@ class IDHarvestPass:
 # ─────────────────────────────────────────────────────────────────────────────
 # IDOR TESTER
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CROSS-SESSION LEAK DETECTOR
+#
+# The core insight: UUIDs are NOT a security control — they're just long IDs.
+# The real bug is always a missing ownership check on the server.
+# UUIDs can't be guessed, but they CAN be harvested from responses.
+#
+# This class runs a targeted dual-session pass against list endpoints:
+#   1. Fetch each list/collection endpoint as BOTH User A and User B
+#   2. Extract all UUIDs from both responses
+#   3. Diff: any UUID in User B's response that belongs to User A is a LEAK
+#   4. Replay those leaked UUIDs in User B's session against resource endpoints
+#   5. If User B gets User A's data back → confirmed UUID IDOR
+#
+# Why this catches real bugs that the main tester misses:
+#   Main tester generates candidate IDs by neighbour-walking (±1, scrambling).
+#   That never works for UUID v4. This class doesn't guess — it harvests from
+#   the app's own responses, exactly like a human tester would.
+# ─────────────────────────────────────────────────────────────────────────────
+class CrossSessionLeakDetector:
+
+    # Endpoint path patterns that are almost certainly list/collection endpoints
+    _LIST_PATH_RE = re.compile(
+        r'/(users|accounts|orders|messages|tickets|records|documents|files'
+        r'|invoices|transactions|payments|projects|tasks|items|products'
+        r'|customers|clients|employees|members|posts|articles|comments'
+        r'|notifications|reports|logs|events|sessions|devices|addresses'
+        r'|subscriptions|plans|billings|contacts|leads|deals|cases'
+        r'|channels|groups|teams|roles|permissions|audit)(?:/?\??|$)',
+        re.I
+    )
+
+    def __init__(self, client_a, client_b, targets, endpoints,
+                 threads=6, delay=0.0, timeout=10):
+        self.client_a  = client_a
+        self.client_b  = client_b
+        self.targets   = targets     # scored IDOR surface targets
+        self.endpoints = endpoints   # full endpoint list from discovery
+        self.threads   = threads
+        self.delay     = delay
+        self.timeout   = timeout
+        self._analyser = ResponseAnalyser()
+        self._lock     = threading.Lock()
+
+        # Results
+        self.leaked_uuids   = []   # list of {uuid, leak_url, owner_session, uuid_v1}
+        self.resource_urls  = []   # child URLs to probe: {url, uuid, source_leak_url}
+
+    def _sleep(self):
+        if self.delay:
+            time.sleep(self.delay)
+
+    def _fetch(self, client, url):
+        self._sleep()
+        try:
+            ep = {"url": url, "method": "GET", "params": {}}
+            return client.get(url, {})
+        except Exception:
+            return {"status": 0, "body": "", "headers": {}}
+
+    # ── Step 1: identify list endpoints ──────────────────────────────────────
+
+    def _candidate_list_endpoints(self):
+        """
+        From the discovered endpoints, pick ones that look like collections.
+        Two signals: path pattern match OR prior response was a list body.
+        We also probe URL-only (no params) to avoid filtering effects.
+        """
+        candidates = []
+        seen       = set()
+        for _, ep, _ in self.targets:
+            url = ep["url"].split("?")[0]   # strip params — we want the raw collection
+            if url in seen:
+                continue
+            # Signal 1: path name looks like a plural collection
+            if self._LIST_PATH_RE.search(url):
+                seen.add(url)
+                candidates.append(url)
+                continue
+            # Signal 2: endpoint has no path ID (not /users/123 — we want /users)
+            parsed = urllib.parse.urlparse(url)
+            segs   = [s for s in parsed.path.split("/") if s]
+            if segs and not re.match(r'^\d+$|^[0-9a-f\-]{36}$', segs[-1]):
+                seen.add(url)
+                candidates.append(url)
+
+        # Also sweep the full endpoint list for list-pattern URLs not in IDOR surface
+        for ep in self.endpoints:
+            url = ep.get("url", "").split("?")[0]
+            if url and url not in seen and self._LIST_PATH_RE.search(url):
+                seen.add(url)
+                candidates.append(url)
+
+        return candidates
+
+    # ── Step 2: harvest UUIDs from both sessions ──────────────────────────────
+
+    def _harvest_session(self, url, client, session_label):
+        """Fetch url, return list of UUID hint dicts if response is a list endpoint."""
+        resp = self._fetch(client, url)
+        if resp.get("status", 0) not in range(200, 210):
+            return []
+        body = resp.get("body", "") or ""
+        if not self._analyser.is_list_endpoint(body):
+            return []
+        hints = self._analyser.extract_uuids_from_body(body, context_url=url, owner=session_label)
+        return hints
+
+    def _diff_and_leak(self, url):
+        """
+        Fetch url as both sessions, diff UUID sets.
+        Any UUID in User B's set that User A also has → leaked to wrong session.
+        Any UUID in User A's set not in User B's set → candidate for replay.
+        Returns list of leaked UUID hint dicts.
+        """
+        a_hints = self._harvest_session(url, self.client_a, "user_a")
+        b_hints = self._harvest_session(url, self.client_b, "user_b")
+
+        if not a_hints and not b_hints:
+            return []
+
+        a_uuids = {h["id_val"] for h in a_hints}
+        b_uuids = {h["id_val"] for h in b_hints}
+
+        leaked = []
+
+        # Case 1: UUIDs from User A's response also visible in User B's response
+        # This IS the leak — B can enumerate A's object IDs from the list
+        cross_visible = a_uuids & b_uuids
+        for h in a_hints:
+            if h["id_val"] in cross_visible:
+                leak = {**h,
+                        "leak_url":     url,
+                        "leak_type":    "cross_session_visible",
+                        "leak_detail":  "User A UUID visible in User B list response",
+                        "uuid_v1":      h.get("uuid_v1", False)}
+                leaked.append(leak)
+
+        # Case 2: UUIDs ONLY in User A's response — B can't list them, but
+        # we still try to access them directly as B (ownership check missing?)
+        a_only = a_uuids - b_uuids
+        for h in a_hints:
+            if h["id_val"] in a_only:
+                leak = {**h,
+                        "leak_url":    url,
+                        "leak_type":   "a_only_replay",
+                        "leak_detail": "UUID from User A list — testing if User B can access directly",
+                        "uuid_v1":     h.get("uuid_v1", False)}
+                leaked.append(leak)
+
+        # Dedup by uuid value
+        seen   = set()
+        deduped = []
+        for l in leaked:
+            if l["id_val"] not in seen:
+                seen.add(l["id_val"])
+                deduped.append(l)
+
+        return deduped
+
+    # ── Step 3: build resource URLs to probe ──────────────────────────────────
+
+    def _build_resource_urls(self, leak_url, uuid):
+        """
+        Given a list endpoint and a UUID, build candidate resource URLs.
+        Strategy: try appending UUID to the base path (REST convention).
+        Also try any existing path-ID endpoints that match the same base.
+        """
+        urls  = []
+        base  = leak_url.rstrip("/")
+        # Primary: /collection/{uuid}
+        urls.append(f"{base}/{uuid}")
+        # Secondary: look for existing endpoints in IDOR surface that contain
+        # a numeric/uuid segment — swap that segment with our UUID
+        parsed_base = urllib.parse.urlparse(base).path
+        for _, ep, _ in self.targets:
+            ep_url    = ep["url"]
+            ep_parsed = urllib.parse.urlparse(ep_url)
+            ep_path   = ep_parsed.path
+            # If the endpoint path starts with the same base path and has an extra segment
+            if (ep_path.startswith(parsed_base) and
+                    ep_path != parsed_base and
+                    re.search(r'/(\d+|[0-9a-f\-]{36})(?:/|$)', ep_path)):
+                # Substitute the ID segment with our UUID
+                new_path = re.sub(
+                    r'/(\d+|[0-9a-f\-]{36})(?=/|$)',
+                    f'/{uuid}',
+                    ep_path, count=1
+                )
+                if new_path != ep_path:
+                    new_url = ep_parsed._replace(path=new_path).geturl()
+                    if new_url not in urls:
+                        urls.append(new_url)
+        return urls
+
+    # ── Step 4: replay leaked UUIDs in User B's session ──────────────────────
+
+    def _probe_resource(self, resource_url, leaked_uuid_hint):
+        """
+        Fetch resource_url as User B, compare against User A.
+        Returns a finding dict or None.
+        """
+        uuid     = leaked_uuid_hint["id_val"]
+        leak_url = leaked_uuid_hint["leak_url"]
+        leak_type= leaked_uuid_hint["leak_type"]
+        is_v1    = leaked_uuid_hint.get("uuid_v1", False)
+
+        ep = {"url": resource_url, "method": "GET", "params": {}}
+
+        try:
+            a_resp = self._fetch(self.client_a, resource_url)
+            b_resp = self._fetch(self.client_b, resource_url)
+        except Exception:
+            return None
+
+        b_status = b_resp.get("status", 0)
+        if b_status not in range(200, 210):
+            return None
+
+        if self._analyser.is_access_denied(b_resp):
+            return None
+
+        b_body = b_resp.get("body", "") or ""
+        if not b_body or not self._analyser.has_sensitive_data(b_body):
+            return None
+
+        is_idor, conf, evidence = self._analyser.compare(a_resp, {}, b_resp)
+        if not is_idor:
+            # Still flag if B got a non-empty sensitive response with the UUID
+            # even without a User A baseline (A might 404 on same resource)
+            if self._analyser.has_sensitive_data(b_body) and len(b_body.strip()) > 50:
+                is_idor = True
+                conf    = "MEDIUM"
+                evidence = "sensitive_data_in_uuid_replay | no_user_a_baseline"
+
+        if not is_idor:
+            return None
+
+        # Build evidence string with UUID context
+        uuid_ctx = []
+        uuid_ctx.append(f"uuid_harvested_from_list:{leak_url}")
+        uuid_ctx.append(f"leak_type:{leak_type}")
+        if is_v1:
+            uuid_ctx.append("uuid_v1_timestamp_based:partially_predictable")
+        if leaked_uuid_hint.get("leak_type") == "cross_session_visible":
+            uuid_ctx.append("uuid_visible_in_user_b_list_response")
+        full_evidence = evidence + " | " + " | ".join(uuid_ctx)
+
+        # Build PoC curl using User B headers
+        auth_part = ""
+        try:
+            hdrs = getattr(self.client_b, "headers", {}) or {}
+            if hdrs.get("Cookie"):
+                auth_part = f" -H 'Cookie: {hdrs['Cookie']}'"
+            elif hdrs.get("Authorization"):
+                auth_part = f" -H 'Authorization: {hdrs['Authorization']}'"
+        except Exception:
+            auth_part = " -H 'Cookie: <user-b-token>'"
+
+        poc_curl   = f"curl -sk{auth_part} '{resource_url}'"
+        snip       = b_body[:300].replace("\n", " ")
+
+        finding = {
+            "url":               resource_url,
+            "method":            "GET",
+            "type":              "IDOR (UUID — Cross-Session Leak)",
+            "severity":          "HIGH" if conf == "HIGH" else "MEDIUM",
+            "location":          "path",
+            "param_name":        None,
+            "original_id":       uuid,
+            "tampered_id":       uuid,
+            "id_type":           "uuid",
+            "finding_type":      "uuid_idor",
+            "confidence":        conf,
+            "evidence":          full_evidence,
+            "status":            b_status,
+            "body_snippet":      snip,
+            "source":            f"cross_session_leak:{leak_url}",
+            "session":           "User B",
+            "poc_curl":          poc_curl,
+            "poc_browser":       resource_url,
+            "poc_session_label": "User B",
+            "uuid_leak_url":     leak_url,
+            "uuid_v1":           is_v1,
+            "repro_data": {
+                "url":     resource_url,
+                "method":  "GET",
+                "headers": dict(getattr(self.client_b, "headers", {})),
+                "body":    None,
+            }
+        }
+        return finding
+
+    # ── Public run() ──────────────────────────────────────────────────────────
+
+    def run(self):
+        """
+        Full cross-session UUID leak detection pass.
+        Returns list of finding dicts.
+        """
+        candidates = self._candidate_list_endpoints()
+        if not candidates:
+            tprint(f"  {info('No list endpoints found for cross-session UUID leak pass.')}")
+            return []
+
+        tprint(f"  {ok(f'Cross-session UUID leak pass: {len(candidates)} list endpoint(s) to probe')}")
+
+        # Phase A: harvest UUIDs from both sessions across all list endpoints
+        all_leaked = []
+        with ThreadPoolExecutor(max_workers=self.threads) as pool:
+            futs = {pool.submit(self._diff_and_leak, url): url for url in candidates}
+            for fut in as_completed(futs):
+                url = futs[fut]
+                try:
+                    leaked = fut.result(timeout=30)
+                    if leaked:
+                        tprint(f"  {ok(f'UUID leak: {len(leaked)} UUID(s) from {url}')}")
+                        all_leaked.extend(leaked)
+                except Exception as ex:
+                    vprint(f"  {warn(f'UUID harvest error on {url}: {ex}')}")
+
+        with self._lock:
+            self.leaked_uuids = all_leaked
+
+        if not all_leaked:
+            tprint(f"  {info('No cross-session UUID leaks found in list responses.')}")
+            return []
+
+        # Report v1 UUIDs found
+        v1_found = [l for l in all_leaked if l.get("uuid_v1")]
+        if v1_found:
+            tprint(f"  {warn(f'{len(v1_found)} UUID v1 (timestamp-based) detected — partially predictable')}")
+
+        tprint(f"  {ok(f'Total leaked UUIDs to replay: {len(all_leaked)}')}")
+
+        # Phase B: build resource URLs for each leaked UUID
+        probe_jobs = []   # (resource_url, leaked_hint)
+        seen_urls  = set()
+        for hint in all_leaked:
+            for ep_url in self._build_resource_urls(hint["leak_url"], hint["id_val"]):
+                key = (ep_url, hint["id_val"])
+                if key not in seen_urls:
+                    seen_urls.add(key)
+                    probe_jobs.append((ep_url, hint))
+
+        tprint(f"  {info(f'Probing {len(probe_jobs)} resource URL(s) with leaked UUIDs...')}")
+
+        # Phase C: replay — test each resource URL as User B
+        findings   = []
+        seen_finds = set()
+        with ThreadPoolExecutor(max_workers=self.threads) as pool:
+            futs = {
+                pool.submit(self._probe_resource, ep_url, hint): (ep_url, hint["id_val"])
+                for ep_url, hint in probe_jobs
+            }
+            for fut in as_completed(futs):
+                ep_url, uuid = futs[fut]
+                try:
+                    finding = fut.result(timeout=30)
+                    if finding:
+                        fkey = (finding["url"], finding["original_id"])
+                        if fkey not in seen_finds:
+                            seen_finds.add(fkey)
+                            findings.append(finding)
+                            self._print_uuid_hit(finding)
+                except Exception as ex:
+                    vprint(f"  {warn(f'UUID probe error {ep_url}: {ex}')}")
+
+        return findings
+
+    def _print_uuid_hit(self, f):
+        w       = _term_width()
+        conf    = f["confidence"]
+        url     = f["url"]
+        uuid    = f["original_id"]
+        ev      = f.get("evidence", "")
+        status  = f.get("status", "?")
+        snip    = (f.get("body_snippet") or "").replace("\n", " ").strip()[:w - 16]
+        is_v1   = f.get("uuid_v1", False)
+        leak_url= f.get("uuid_leak_url", "")
+        conf_col= C.BRED if conf == "HIGH" else C.BYELLOW
+        divider = color("─" * w, C.DIM)
+
+        tprint(f"\n{divider}")
+        tprint(
+            f"  {color('▶ UUID-IDOR', C.BRED, C.BOLD)}  "
+            f"{color(f'[{conf}]', conf_col, C.BOLD)}  "
+            f"{color('[PATH]', C.BCYAN)}  "
+            f"{color('GET', C.BYELLOW, C.BOLD)}  "
+            f"{color(url, C.BWHITE)}"
+        )
+        tprint(
+            f"  {color('UUID:', C.DIM)}  {color(uuid, C.BRED, C.BOLD)}"
+            + (f"  {color('[v1 — timestamp-based]', C.BYELLOW)}" if is_v1 else "")
+        )
+        tprint(f"  {color('Leaked from:', C.DIM)}  {color(leak_url, C.CYAN)}")
+        tprint(f"  {color('HTTP:', C.DIM)} {color(str(status), C.BGREEN)}   "
+               f"{color('Session:', C.DIM)} {color('User B', C.CYAN)}")
+        ev_parts = [e.strip() for e in ev.split("|")]
+        ev_line  = "  ".join(color(p, C.DIM) for p in ev_parts if p)
+        tprint(f"  {color('Evidence:', C.DIM)}  {ev_line}")
+        if snip:
+            tprint(f"  {color('Snippet:', C.DIM)}  {color(snip, C.GR)}")
+        poc = f.get("poc_curl", "")
+        if poc:
+            tprint(f"  {color('PoC:', C.BRED, C.BOLD)}  {color(poc, C.BYELLOW)}")
+        tprint(divider)
+
+
 class IDORTester:
 
     def __init__(self, client_a, client_b, client_unauth,
                  targets, id_hints, child_urls=None,
                  threads=6, delay=0, test_unauth=True, write_probe=False,
-                 single_session=False, emit=None):
+                 single_session=False, emit=None, endpoints=None, timeout=10):
         self.emit           = emit
         self.client_a       = client_a
         self.client_b       = client_b
         self.client_unauth  = client_unauth
         self.targets        = targets
+        self.endpoints      = endpoints or []   # full endpoint list for UUID leak pass
         self.id_hints       = id_hints
         self.child_urls     = child_urls or []
         self.threads        = threads
         self.delay          = delay
+        self.timeout        = timeout
         self.test_unauth    = test_unauth
         self.write_probe    = write_probe
         self.single_session = single_session  # True = no User B, BAC scan only
@@ -3872,21 +4386,25 @@ class IDORTester:
                 if is_idor:
                     is_synthetic = bool(ep.get("synthetic_params"))
 
-                    # For synthetic params: verify server actually uses the param.
-                    # If response without param == response with param,
-                    # the server ignores it — this is BAC not param IDOR.
+                    # Always verify server actually uses the param — not just for synthetic params.
+                    # If response without param == response with param the server ignores it entirely.
+                    # This eliminates false positives like ?user_id=admin on endpoints that dump
+                    # ALL users regardless of any param (BAC, not IDOR).
                     _evidence = evidence
-                    if is_synthetic and pname:
-                        # Skip effectiveness check if endpoint is unreachable
+                    if loc == "param" and pname:
                         if b_tampered.get("status", 0) == 0:
                             param_effective = False
                         else:
                             param_effective = self._param_is_effective(
                                 self.client_b, ep, pname, b_tampered
                             )
-                        _evidence = evidence + " | [param_not_observed:synthetic_spider_hint]"
                         if not param_effective:
-                            _evidence += " | [param_ignored_by_server:session_level_bac]"
+                            # Server ignores the param — this is session-level BAC, not param IDOR.
+                            # Downgrade confidence and relabel so the report is honest.
+                            _evidence = evidence + " | [param_ignored_by_server:session_level_bac]"
+                            conf = "MEDIUM"
+                        elif is_synthetic:
+                            _evidence = evidence + " | [param_not_observed:synthetic_spider_hint]"
                     else:
                         param_effective = True
 
@@ -4045,25 +4563,26 @@ class IDORTester:
         except Exception:
             return True
 
-    def _build_poc_curl(self, url, method, params=None, param_name=None, tampered_id=None):
+    def _build_poc_curl(self, url, method, params=None, param_name=None, tampered_id=None, unauth=False):
         """
         Build a PoC curl command for the finding.
         Single-session mode: uses User A's token.
         Dual-session mode:   uses User B's token.
         Reads from client.headers — where HTTPClient stores all auth.
         """
-        auth_client   = self.client_a if self.single_session else self.client_b
-        session_label = "User A" if self.single_session else "User B"
+        auth_client   = self.client_unauth if unauth else (self.client_a if self.single_session else self.client_b)
+        session_label = "Unauthenticated" if unauth else ("User A" if self.single_session else "User B")
 
         auth_part = ""
-        try:
-            hdrs = getattr(auth_client, "headers", {}) or {}
-            if hdrs.get("Cookie"):
-                auth_part = f" -H 'Cookie: {hdrs['Cookie']}'"
-            elif hdrs.get("Authorization"):
-                auth_part = f" -H 'Authorization: {hdrs['Authorization']}'"
-        except Exception:
-            auth_part = f" -H 'Cookie: <paste-{session_label.lower().replace(' ','-')}-token>'"
+        if not unauth:
+            try:
+                hdrs = getattr(auth_client, "headers", {}) or {}
+                if hdrs.get("Cookie"):
+                    auth_part = f" -H 'Cookie: {hdrs['Cookie']}'"
+                elif hdrs.get("Authorization"):
+                    auth_part = f" -H 'Authorization: {hdrs['Authorization']}'"
+            except Exception:
+                auth_part = f" -H 'Cookie: <paste-{session_label.lower().replace(' ','-')}-token>'"
 
         if params and param_name and tampered_id:
             sep = "&" if "?" in url else "?"
@@ -4075,21 +4594,50 @@ class IDORTester:
         return session_label, f"curl -sk{method_part}{auth_part} '{test_url}'", test_url
 
     def _print_hit(self, f):
-        conf_col = C.BRED if f["confidence"] == "HIGH" else C.BYELLOW
-        _conf = f["confidence"]; _meth = f["method"]; _url = f["url"]
+        w        = _term_width()
+        conf     = f["confidence"]
+        meth     = f["method"]
+        url      = f["url"]
+        loc      = f["location"].upper()
+        pname    = f.get("param_name") or "(path segment)"
+        orig     = f["original_id"]
+        tamp     = f["tampered_id"]
+        ev       = f.get("evidence", "")
+        session  = f.get("session", "User B")
+        status   = f.get("status", "?")
+        ftype    = f.get("finding_type", "")
+        snip     = (f.get("body_snippet") or "").replace("\n", " ").strip()[:w - 16]
+
+        conf_col = C.BRED if conf == "HIGH" else C.BYELLOW
+        divider  = color("─" * w, C.DIM)
+
+        tprint(f"\n{divider}")
         tprint(
-            f"\n  {found(color(f'[{_conf}]  {_meth} {_url}', conf_col, C.BOLD))}"
+            f"  {color('▶ IDOR', C.BRED, C.BOLD)}  "
+            f"{color(f'[{conf}]', conf_col, C.BOLD)}  "
+            f"{color(f'[{loc}]', C.BCYAN)}  "
+            f"{color(meth, C.BYELLOW, C.BOLD)}  "
+            f"{color(url, C.BWHITE)}"
         )
         tprint(
-            f"    {color('Location:', C.BYELLOW)} {f['location']}  "
-            f"{color('Param:', C.BYELLOW)} {f['param_name'] or '(path segment)'}  "
-            f"{color('Original:', C.BYELLOW)} {f['original_id']}  "
-            f"{color('Tampered:', C.BRED)} {f['tampered_id']}"
+            f"  {color('Param:', C.DIM)}  {color(pname, C.BWHITE)}   "
+            f"{color('Orig:', C.DIM)} {color(orig, C.BYELLOW)}  "
+            f"{color('→', C.BRED, C.BOLD)}  "
+            f"{color('Tampered:', C.DIM)} {color(tamp, C.BRED, C.BOLD)}   "
+            f"{color('HTTP:', C.DIM)} {color(str(status), C.BGREEN)}   "
+            f"{color('Session:', C.DIM)} {color(session, C.CYAN)}"
         )
-        tprint(f"    {color('Evidence:', C.BYELLOW)} {f['evidence']}")
-        snippet = (f.get("body_snippet") or "").replace("\n", " ")[:200]
-        if snippet:
-            tprint(f"    {color('Snippet:', C.DIM)} {snippet}")
+        # Evidence — wrap cleanly
+        ev_parts = [e.strip() for e in ev.split("|")]
+        ev_line  = "  ".join(color(p, C.DIM) for p in ev_parts if p)
+        tprint(f"  {color('Evidence:', C.DIM)}  {ev_line}")
+        if snip:
+            tprint(f"  {color('Snippet:', C.DIM)}  {color(snip, C.GR)}")
+        poc = f.get("poc_curl", "")
+        poc_label = f.get("poc_session_label", "User B")
+        if poc:
+            tprint(f"  {color('PoC:', C.BRED, C.BOLD)}  {color(poc, C.BYELLOW)}")
+        tprint(divider)
 
     def run(self):
         if not self.targets:
@@ -4099,8 +4647,11 @@ class IDORTester:
         total = len(self.targets)
         tprint(f"\n  {info(f'Testing {total} IDOR-candidate endpoints...')}\n")
         if self.single_session:
-            tprint(f"  {warn('Single-session mode — comparing User A vs unauthenticated baseline.')}")
-            tprint(f"  {info('Findings indicate BAC/data-exposure; add --cookie-b for full IDOR testing.')}\n")
+            tprint(f"  {warn('Single-session mode — testing with User A vs unauthenticated baseline.')}")
+            tprint(f"  {info('Findings: endpoints returning sensitive data without ownership verification.')}")
+            tprint(f"  {color('CTF tip:', C.BCYAN, C.BOLD)} Single-session finds BAC and missing auth checks.")
+            tprint(f"  {color('        ', C.DIM)} For horizontal IDOR (user-A accessing user-B records),")
+            tprint(f"  {color('        ', C.DIM)} add --cookie-b <second_session_token>.\n")
 
         with ThreadPoolExecutor(max_workers=self.threads) as pool:
             futs = {
@@ -4167,6 +4718,32 @@ class IDORTester:
                     pass
         # Test ownership-based child URLs from POST creation harvest
         self._test_child_urls()
+
+        # ── Cross-session UUID leak pass ──────────────────────────────────────
+        # Only runs in dual-session mode — needs both sessions to diff UUID sets.
+        # Skipped in single-session mode (no User B to replay against).
+        if not self.single_session:
+            tprint(f"\n  {info('Cross-session UUID leak pass...')}")
+            uuid_detector = CrossSessionLeakDetector(
+                client_a  = self.client_a,
+                client_b  = self.client_b,
+                targets   = self.targets,
+                endpoints = self.endpoints,
+                threads   = self.threads,
+                delay     = self.delay,
+                timeout   = self.timeout,
+            )
+            uuid_findings = uuid_detector.run()
+            for f in uuid_findings:
+                # Dedup against existing findings by (url, tampered_id)
+                fkey = (f["url"], f.get("original_id"))
+                with self._lock:
+                    if fkey not in self._seen_findings:
+                        self._seen_findings.add(fkey)
+                        self.findings.append(f)
+        else:
+            tprint(f"  {info('UUID leak pass skipped — single-session mode (add --cookie-b to enable)')}")
+
         return self.findings
 
     def _unauth_one(self, score, ep, idor_targets):
@@ -4275,23 +4852,24 @@ class IDORTester:
 # REPORT
 # ─────────────────────────────────────────────────────────────────────────────
 def print_report(findings, target, stats, single_session=False):
+    w = _term_width()
     section("IDOR DETECTION REPORT")
-    tprint(f"  {color('Target:',         C.BYELLOW)} {target}")
-    tprint(f"  {color('Timestamp:',      C.BYELLOW)} {stats.get('timestamp', '?')}")
-    tprint(f"  {color('Pages crawled:',  C.BYELLOW)} {stats.get('pages', '?')}"
-           f"  {color('JS files:',       C.BYELLOW)} {stats.get('js_files', '?')}"
-           f"  {color('Endpoints:',      C.BYELLOW)} {stats.get('endpoints', '?')}")
-    tprint(f"  {color('IDOR surface:',   C.BYELLOW)} {stats.get('idor_surface', '?')}"
-           f"  {color('ID hints:',       C.BYELLOW)} {stats.get('id_hints', '?')}")
+    tprint(f"  {color('Target:',       C.BYELLOW)} {target}")
+    tprint(f"  {color('Timestamp:',    C.BYELLOW)} {stats.get('timestamp', '?')}")
+    tprint(f"  {color('Pages:',        C.BYELLOW)} {stats.get('pages', '?')}   "
+           f"{color('JS:',            C.BYELLOW)} {stats.get('js_files', '?')}   "
+           f"{color('Endpoints:',     C.BYELLOW)} {stats.get('endpoints', '?')}   "
+           f"{color('IDOR Surface:',  C.BYELLOW)} {stats.get('idor_surface', '?')}   "
+           f"{color('ID Hints:',      C.BYELLOW)} {stats.get('id_hints', '?')}")
     tprint()
 
     if not findings:
         tprint(f"  {ok('No IDOR vulnerabilities confirmed.')}")
-        tprint(f"  {color('NOTE:', C.BYELLOW)} This does not guarantee absence.")
+        tprint(f"  {color('NOTE:', C.BYELLOW)} Absence of findings ≠ absence of vulnerability.")
         tprint(f"  {color('TIP:', C.BYELLOW)}  Try --depth 3+, supply both user sessions, or pass a direct API URL.")
         return
 
-# Dedup findings to one per (url, param_name) — keep highest confidence
+    # Dedup findings to one per (url, param_name) — keep highest confidence
     seen_ep = {}
     for f in findings:
         key = (f["url"].split("?")[0], f.get("param_name"), f.get("location"))
@@ -4303,12 +4881,19 @@ def print_report(findings, target, stats, single_session=False):
                 seen_ep[key] = f
     findings = list(seen_ep.values())
 
-    # Split by session type for ordering
-    user_b  = [f for f in findings if f.get("session", "User B") != "unauthenticated"]
+    user_b  = [f for f in findings if f.get("session", "User B") != "unauthenticated"
+               and f.get("finding_type") != "uuid_idor"]
+    uuid_f  = [f for f in findings if f.get("finding_type") == "uuid_idor"]
     unauth  = [f for f in findings if f.get("session") == "unauthenticated"]
 
-    tprint(f"  {color(f'CONFIRMED IDOR FINDINGS', C.BRED, C.BOLD)}"
-           f"  {color(f'[User B: {len(user_b)}  Unauthenticated: {len(unauth)}]', C.DIM)}\n")
+    bar = color("═" * w, C.DIM)
+
+    tprint(bar)
+    tprint(f"  {color('CONFIRMED FINDINGS', C.BRED, C.BOLD)}   "
+           f"{color(f'User-B/BAC: {len(user_b)}', C.BYELLOW)}   "
+           f"{color(f'UUID-IDOR: {len(uuid_f)}', C.BCYAN if uuid_f else C.DIM)}   "
+           f"{color(f'Unauthenticated: {len(unauth)}', C.BRED if unauth else C.DIM)}")
+    tprint(bar)
 
     def _print_group(group, label_prefix):
         by_conf = {"HIGH": [], "MEDIUM": [], "LOW": []}
@@ -4317,48 +4902,83 @@ def print_report(findings, target, stats, single_session=False):
         idx = 1
         for level in ("HIGH", "MEDIUM", "LOW"):
             for f in by_conf[level]:
-                cc = C.BRED if level == "HIGH" else C.BYELLOW if level == "MEDIUM" else C.DIM
-                tprint(f"  {color(f'[{idx}]', C.BOLD, C.BWHITE)} "
-                       f"{color(f'[{level}]', cc, C.BOLD)} "
-                       f"{color(label_prefix, C.DIM)}")
-                tprint(f"      {color('Endpoint:', C.BYELLOW)} {f['method']} {f['url']}")
-                tprint(f"      {color('Location:', C.BYELLOW)} {f['location']}"
-                       f"  {color('Param:', C.BYELLOW)} {f.get('param_name') or '(path segment)'}")
-                tprint(f"      {color('ID Type:', C.BYELLOW)} {f['id_type']}"
-                       f"  {color('Original:', C.BYELLOW)} {f['original_id']}"
-                       f"  {color('Tampered:', C.BRED, C.BOLD)} {f['tampered_id']}")
-                tprint(f"      {color('HTTP Status:', C.BYELLOW)} {f.get('status', '?')}")
-                tprint(f"      {color('Evidence:', C.BYELLOW)} {f['evidence']}")
-                tprint(f"      {color('Source:', C.DIM)} {f.get('source', '')}")
-                snip = (f.get("body_snippet") or "").replace("\n", " ")[:180]
-                if snip:
-                    tprint(f"      {color('Snippet:', C.DIM)} {snip}")
-                # PoC curl — colored, labeled with correct session
-                poc       = f.get("poc_curl", "")
+                cc   = C.BRED if level == "HIGH" else C.BYELLOW if level == "MEDIUM" else C.DIM
+                meth = f["method"]
+                url  = f["url"]
+                loc  = f["location"].upper()
+                pname= f.get("param_name") or "(path segment)"
+                tamp = f["tampered_id"]
+                ev   = f.get("evidence", "")
+                poc  = f.get("poc_curl", "")
                 poc_label = f.get("poc_session_label", "User B")
+                snip = (f.get("body_snippet") or "").replace("\n", " ").strip()[:w - 16]
+
+                tprint(f"\n  {color(f'[{idx}]', C.BOLD, C.BWHITE)} "
+                       f"{color(f'[{level}]', cc, C.BOLD)} "
+                       f"{color(f'[{loc}]', C.BCYAN)} "
+                       f"{color(meth, C.BYELLOW, C.BOLD)} {color(url, C.BWHITE)}")
+                tprint(f"      {color('ID Context:', C.DIM)}   "
+                       f"{f.get('original_id','?')} → {color(tamp, C.BRED, C.BOLD)} "
+                       f"({f.get('id_type','?')})")
+                tprint(f"      {color('Parameter:', C.DIM)}   {color(pname, C.BWHITE)}")
+                tprint(f"      {color('Evidence:', C.DIM)}    {ev}")
                 if poc:
-                    tprint(f"      {color(f'PoC ({poc_label}):', C.BRED, C.BOLD)} "
-                           f"{color(poc, C.BYELLOW)}")
-                    tprint(f"      {color(f'↑ Paste and run to reproduce — uses {poc_label} session', C.DIM)}")
-                tprint()
+                    tprint(f"      {color('PoC:', C.BRED, C.BOLD)}        {color(poc, C.BYELLOW)}")
+                    tprint(f"      {color('Status:', C.DIM)}     "
+                           f"{f.get('status','?')}  {color(f'| Session: {poc_label}', C.DIM)}")
+                if snip:
+                    tprint(f"      {color('Snippet:', C.DIM)}    {color(snip, C.GR)}")
                 idx += 1
 
     if user_b:
         label = "Single-session BAC Findings" if single_session else "User B Session Findings"
-        tprint(color(f"  ── {label} ──", C.BYELLOW, C.BOLD))
-        group_label = "User A (single-session BAC)" if single_session else "User B session"
-        _print_group(user_b, group_label)
+        tprint(f"\n  {color(f'── {label} ──', C.BYELLOW, C.BOLD)}")
+        _print_group(user_b, "User B session")
+
+    if uuid_f:
+        tprint(f"\n  {color('── UUID IDOR Findings (Cross-Session Leak) ──', C.BCYAN, C.BOLD)}")
+        def _print_uuid_group(group):
+            idx = 1
+            for f in sorted(group, key=lambda x: 0 if x.get("confidence")=="HIGH" else 1):
+                cc      = C.BRED if f.get("confidence") == "HIGH" else C.BYELLOW
+                conf    = f.get("confidence", "?")
+                url     = f["url"]
+                uuid    = f["original_id"]
+                leak_url= f.get("uuid_leak_url", "?")
+                is_v1   = f.get("uuid_v1", False)
+                ev      = f.get("evidence", "")
+                poc     = f.get("poc_curl", "")
+                snip    = (f.get("body_snippet") or "").replace("\n", " ").strip()[:w - 16]
+
+                tprint(f"\n  {color(f'[{idx}]', C.BOLD, C.BWHITE)} "
+                       f"{color(f'[{conf}]', cc, C.BOLD)} "
+                       f"{color('[UUID-IDOR]', C.BCYAN)} "
+                       f"{color('GET', C.BYELLOW, C.BOLD)} {color(url, C.BWHITE)}")
+                tprint(f"      {color('UUID:', C.DIM)}        {color(uuid, C.BRED, C.BOLD)}"
+                       + (f"  {color('[v1 — timestamp-based — partially predictable]', C.BYELLOW)}" if is_v1 else ""))
+                tprint(f"      {color('Leaked from:', C.DIM)} {color(leak_url, C.CYAN)}")
+                tprint(f"      {color('Evidence:', C.DIM)}    {ev}")
+                if poc:
+                    tprint(f"      {color('PoC:', C.BRED, C.BOLD)}        {color(poc, C.BYELLOW)}")
+                    tprint(f"      {color('Status:', C.DIM)}     {f.get('status','?')}  "
+                           f"{color('| Session: User B', C.DIM)}")
+                if snip:
+                    tprint(f"      {color('Snippet:', C.DIM)}    {color(snip, C.GR)}")
+                idx += 1
+        _print_uuid_group(uuid_f)
+
     if unauth:
-        tprint(color("  ── Unauthenticated Findings (Critical) ──", C.BRED, C.BOLD))
+        tprint(f"\n  {color('── Unauthenticated Findings (Critical) ──', C.BRED, C.BOLD)}")
         _print_group(unauth, "No session (public access)")
 
-    tprint(color("  REMEDIATION", C.BOLD + C.BYELLOW))
-    tprint(f"  {color('─'*68, C.DIM)}")
+    tprint(f"\n{color('─'*w, C.DIM)}")
+    tprint(f"  {color('REMEDIATION', C.BOLD + C.BYELLOW)}")
+    tprint(f"  {'─'*60}")
     tprint("  • Enforce server-side authorization on EVERY object access request.")
-    tprint("  • Validate ownership: authenticated user must own (or be granted")
-    tprint("    access to) the specific object ID before returning any data.")
+    tprint("  • Validate ownership: the authenticated user must own (or be explicitly")
+    tprint("    granted access to) the specific object ID before returning any data.")
     tprint("  • Use cryptographically random, non-sequential object identifiers.")
-    tprint("  • Apply row-level security at the data layer — not just at the API.")
+    tprint("  • Apply row-level security at the data layer — not just at the API layer.")
     tprint()
     return findings
 
@@ -5262,6 +5882,8 @@ def run(target, emit, options):
         write_probe    = args.write_probe,
         single_session = not has_cookie_b and not has_creds_b,
         emit           = emit,
+        endpoints      = endpoints,
+        timeout        = args.timeout,
     )
     findings = tester.run()
 

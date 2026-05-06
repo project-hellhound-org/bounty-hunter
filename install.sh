@@ -111,14 +111,14 @@ success "HELLHOUND core engine installed"
 stop_animation
 info "Mounting SPA Engine..."
 
-if grep -q "Kali" /etc/os-release 2>/dev/null; then
-    info "Kali Linux detected — applying dependency patches..."
-    # Fix for Kali's t64 transition and missing Ubuntu font packages
-    DUMMY_DIR=$(mktemp -d)
-    
-    # 1. Dummy ttf-unifont -> fonts-unifont
-    mkdir -p "$DUMMY_DIR/ttf-unifont/DEBIAN"
-    cat <<EOF > "$DUMMY_DIR/ttf-unifont/DEBIAN/control"
+    if [ -f /etc/debian_version ] || grep -q "Kali" /etc/os-release 2>/dev/null; then
+        info "Debian/Kali detected — applying dependency patches..."
+        # Fix for Kali's t64 transition and missing Ubuntu font packages
+        DUMMY_DIR=$(mktemp -d)
+        
+        # 1. Dummy ttf-unifont -> fonts-unifont
+        mkdir -p "$DUMMY_DIR/ttf-unifont/DEBIAN"
+        cat <<EOF > "$DUMMY_DIR/ttf-unifont/DEBIAN/control"
 Package: ttf-unifont
 Version: 1:99.0
 Section: fonts
@@ -127,11 +127,11 @@ Architecture: all
 Depends: fonts-unifont
 Description: Dummy package for ttf-unifont
 EOF
-    dpkg-deb --build "$DUMMY_DIR/ttf-unifont" "$DUMMY_DIR/ttf-unifont.deb" &>/dev/null
-    
-    # 2. Dummy libasound2 -> libasound2t64
-    mkdir -p "$DUMMY_DIR/libasound2/DEBIAN"
-    cat <<EOF > "$DUMMY_DIR/libasound2/DEBIAN/control"
+        dpkg-deb --build "$DUMMY_DIR/ttf-unifont" "$DUMMY_DIR/ttf-unifont.deb" &>/dev/null
+        
+        # 2. Dummy libasound2 -> libasound2t64
+        mkdir -p "$DUMMY_DIR/libasound2/DEBIAN"
+        cat <<EOF > "$DUMMY_DIR/libasound2/DEBIAN/control"
 Package: libasound2
 Version: 1:99.0
 Section: libs
@@ -140,11 +140,11 @@ Architecture: all
 Depends: libasound2t64
 Description: Dummy package for libasound2
 EOF
-    dpkg-deb --build "$DUMMY_DIR/libasound2" "$DUMMY_DIR/libasound2.deb" &>/dev/null
+        dpkg-deb --build "$DUMMY_DIR/libasound2" "$DUMMY_DIR/libasound2.deb" &>/dev/null
 
-    # 3. Dummy ttf-ubuntu-font-family -> fonts-liberation
-    mkdir -p "$DUMMY_DIR/ttf-ubuntu-font-family/DEBIAN"
-    cat <<EOF > "$DUMMY_DIR/ttf-ubuntu-font-family/DEBIAN/control"
+        # 3. Dummy ttf-ubuntu-font-family -> fonts-liberation
+        mkdir -p "$DUMMY_DIR/ttf-ubuntu-font-family/DEBIAN"
+        cat <<EOF > "$DUMMY_DIR/ttf-ubuntu-font-family/DEBIAN/control"
 Package: ttf-ubuntu-font-family
 Version: 1:99.0
 Section: fonts
@@ -153,15 +153,15 @@ Architecture: all
 Depends: fonts-liberation
 Description: Dummy package for ttf-ubuntu-font-family
 EOF
-    dpkg-deb --build "$DUMMY_DIR/ttf-ubuntu-font-family" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null
-    
-    if command -v sudo &>/dev/null; then
-        sudo dpkg -i "$DUMMY_DIR/ttf-unifont.deb" "$DUMMY_DIR/libasound2.deb" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null || true
-    else
-        dpkg -i "$DUMMY_DIR/ttf-unifont.deb" "$DUMMY_DIR/libasound2.deb" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null || true
+        dpkg-deb --build "$DUMMY_DIR/ttf-ubuntu-font-family" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null
+        
+        if command -v sudo &>/dev/null; then
+            sudo dpkg -i "$DUMMY_DIR/ttf-unifont.deb" "$DUMMY_DIR/libasound2.deb" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null || true
+        else
+            dpkg -i "$DUMMY_DIR/ttf-unifont.deb" "$DUMMY_DIR/libasound2.deb" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null || true
+        fi
+        rm -rf "$DUMMY_DIR"
     fi
-    rm -rf "$DUMMY_DIR"
-fi
 
 # Suppress redundant 'BEWARE' warnings on Kali to keep output clean
 info "Fetching Chromium (this may take a minute)..."
@@ -246,11 +246,72 @@ else
     fi
 fi
 
-# ── 7. Done ──────────────────────────────────────────
+# ── 7. System GUI (Electron HUD) ──────────────────────
+# The high-fidelity desktop HUD for the Apex-King release.
+echo ""
+info "Configuring Hellhound Apex-King HUD (System GUI)..."
+
+# Ensure logo.png is the source of truth
+if [ -f "$PROJECT_ROOT/Images/logo.png" ]; then
+    ICON_SRC="$PROJECT_ROOT/Images/logo.png"
+else
+    ICON_SRC="$PROJECT_ROOT/Images/hellhound.png"
+fi
+
+if command -v npm &>/dev/null; then
+    start_animation "INITIALIZING HUD"
+    cd "$PROJECT_ROOT/gui" && npm install --quiet &>/dev/null || warn "Failed to install Electron dependencies. Manual fix: 'cd gui && npm install'"
+    cd "$PROJECT_ROOT"
+    stop_animation
+    success "GUI dependencies installed"
+    
+    chmod +x "$PROJECT_ROOT/gui/hellhound-gui.sh"
+
+    # Register Icon for System (Universal Linux Path)
+    mkdir -p "$HOME/.local/share/icons"
+    cp "$ICON_SRC" "$HOME/.local/share/icons/hellhound.png"
+
+    # Create Desktop Entry (Searchable in App Menu)
+    DESKTOP_FILE="$HOME/.local/share/applications/hellhound.desktop"
+    mkdir -p "$(dirname "$DESKTOP_FILE")"
+    
+    cat <<EOF > "$DESKTOP_FILE"
+[Desktop Entry]
+Name=Hellhound Apex-King
+Comment=Offensive Intelligence HUD
+Exec=$PROJECT_ROOT/gui/hellhound-gui.sh
+Icon=hellhound
+Terminal=false
+Type=Application
+Categories=Network;Security;
+Keywords=pentest;ai;hellhound;
+EOF
+    
+    # Update system desktop database for app menu visibility
+    if command -v update-desktop-database &>/dev/null; then
+        update-desktop-database "$HOME/.local/share/applications/" &>/dev/null || true
+    fi
+    
+    # Update system alias
+    GUI_ALIAS="alias hellhound-gui='$PROJECT_ROOT/gui/hellhound-gui.sh'"
+    if grep -qF "alias hellhound-gui=" "$SHELL_RC" 2>/dev/null; then
+        sed -i "s|alias hellhound-gui=.*|$GUI_ALIAS|" "$SHELL_RC"
+    else
+        echo "$GUI_ALIAS" >> "$SHELL_RC"
+    fi
+    
+    success "GUI Integrated: You can now launch 'Hellhound' from your system menu."
+else
+    warn "NPM/Node.js not found. Skipping GUI setup."
+    warn "To use the HUD, install Node.js and run 'npm install' in this directory."
+fi
+
+# ── 8. Done ──────────────────────────────────────────
 echo ""
 echo -e "  ${GRN}${BLD}HELLHOUND installed successfully.${RST}"
 echo -e "  Venv    : ${CYN}$VENV_DIR${RST}"
 echo -e "  Command : ${CYN}hellhound${RST}"
+echo -e "  GUI HUD : ${CYN}hellhound-gui${RST}"
 if command -v ollama &>/dev/null; then
     echo -e "  Local AI: ${CYN}Ollama (gemma2:2b)${RST} — use ${YLW}set api_key ollama${RST} in console"
 else

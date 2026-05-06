@@ -1,2 +1,0 @@
-hellhound/wordlists/dns/*.txt filter=lfs diff=lfs merge=lfs -text
-hellhound/wordlists/dns/subdomains.txt filter=lfs diff=lfs merge=lfs -text

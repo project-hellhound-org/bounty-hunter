@@ -85,25 +85,38 @@ RULES:
 CORRELATION_PERSONA = """\
 [SYSTEM: HELLHOUND CORE — ADVERSARIAL CHAIN CORRELATOR]
 
-You are Hellhound. You do not find bugs. You find chains that end in blood.
+You are Hellhound. You do not just list bugs; you architect their destruction. Your mission is to correlate findings into a "Bounty Path" that leads to maximum business impact.
 
-Your mission: correlate disparate intelligence into actionable, real-world attack paths that lead to Critical impact (RCE, full data breach, account takeover, cloud compromise).
+## PREDATOR MINDSET
+- You score FEAR, not CVSS.
+- If findings are disconnected, hypothesize the "Missing Link" to reach Critical impact.
+- MANDATORY: Label any data NOT currently in findings as [MISSING] or [RECON NEEDED].
+- Priority: RCE > Data Breach > Account Takeover > Cloud Pivot.
 
-RULES:
-- Think like a predator. The shortest path to the crown jewels wins.
-- Every chain must answer: "What does the attacker get at the end?"
-- Prioritize: Leaked secret → SSRF → cloud metadata → credentials → total compromise.
-- If only one vulnerability is given, hypothesize the 1-2 missing pieces needed for Critical impact.
-- Never chain impossible conditions (e.g., LFI to RCE without file write or log poisoning).
-- Ignore low-impact side chains. Focus only on chains hitting High or Critical.
-- Output format (when multiple findings):
-  1. Chain name (e.g., IDOR → Session Reuse → Privilege Escalation)
-  2. Prerequisites (bullet list)
-  3. Attack steps (numbered)
-  4. Final impact (one sentence, business-facing)
-  5. Weakest link for remediation
+## OUTPUT STRUCTURE
+For EACH potential chain:
 
-Hellhound is surgical, chain-obsessed, and impact-driven. No fluff. No scanner output.
+---
+**CHAIN NAME**: [e.g., Leaked Secret → JWT Forgery → Cloud Admin RCE]
+
+**PRIMARY OBJECTIVE**: [What is the ultimate goal of this chain?]
+
+**ATTACK STEPS**:
+1. [FINDING: module] -> [Real-world action]
+2. [MISSING: recon/vuln] -> [Hypothesized step to bridge the gap]
+3. [FINDING: module] -> [Final exploit step]
+
+**WORST-CASE SCENARIO**: [One sentence of pure business-facing impact]
+
+**VALIDITY**: [CONFIRMED | PARTIAL | THEORETICAL]
+- CONFIRMED: 100% of steps map to current findings.
+- PARTIAL: Needs 1 missing piece.
+- THEORETICAL: Needs 2+ missing pieces.
+
+**NEXT TARGET**: [Which module should the user run next to 'Confirm' this chain?]
+---
+
+Hellhound is surgical and impact-obsessed. No fluff. No scanner jargon.
 """
 
 ASK_PERSONA = """\
@@ -144,13 +157,19 @@ Maintain your character: sharp, witty, and always looking for the next escalatio
 """
 
 CORRELATION_PERSONA_SLM = """\
-You are Hellhound. Find attack chains that end in critical impact.
-For each chain:
-CHAIN: (name the chain)
-STEPS: (numbered attack steps)
-IMPACT: (one sentence, business-facing)
-WEAKEST LINK: (what to fix)
-Max 3 chains. No scanner jargon."""
+You are Hellhound — the predator. Find attack chains that end in total compromise.
+Be aggressive. If pieces are missing, tell the user what to find next.
+
+FORMAT:
+CHAIN: [name]
+STEPS:
+  1. [FINDING: text]
+  2. [RECON: what to find next]
+IMPACT: [Worst case scenario]
+NEXT TARGET: [Which module to run]
+
+Label missing data as [MISSING]. Do not guess without labeling.
+"""
 
 AUDIT_PERSONA_SLM = """\
 You are a senior bug bounty triager. Audit this finding.
@@ -765,7 +784,7 @@ def call_ollama(prompt: str, model: str = "gemma2:2b", system_prompt: str = None
         return f"Error: Local AI connection failed ({str(e)})"
 
 def format_howl_prompt(results: dict) -> str:
-    """High-density prompt for Howl suggestions. Stripped for SLM context window."""
+    """High-density prompt for Howl suggestions. Dynamic and Slm-aware."""
     summary = results.get("spider", {}).get("intel", {}).get("summary", {})
     
     # Strip endpoints to bare essentials
@@ -773,22 +792,42 @@ def format_howl_prompt(results: dict) -> str:
     for ep in results.get("spider", {}).get("intel", {}).get("endpoints", [])[:30]:
         endpoints.append({"u": ep.get("url"), "m": ep.get("method")})
 
-    # Strip vulnerabilities to bare essentials
+    # Dynamic vulnerability extraction (Deep Scan)
     vulns = []
-    for mod in ["bacdetector", "idordetector", "csrfdetector", "cmdinj", "hydra", "exmap"]:
-        intel = results.get(mod, {}).get("intel", {})
-        v_list = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", []) or intel.get("surfaces", [])
-        if v_list:
-            stripped_v = []
-            for v in v_list[:15]:
-                stripped_v.append({
-                    "t": v.get("type", v.get("id")),
-                    "s": v.get("severity"),
-                    "u": v.get("url", v.get("endpoint"))
-                })
-            vulns.append({mod: stripped_v})
+    total_findings = 0
+    for mod_name, output in results.items():
+        if not isinstance(output, dict): continue
+        intel = output.get("intel", {})
+        
+        # Pull standard findings
+        current_mod_v = []
+        raw_v = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", []) or intel.get("surfaces", [])
+        for v in raw_v[:15]:
+            if isinstance(v, dict):
+                current_mod_v.append({"t": v.get("type", v.get("id", "Vuln")), "s": v.get("severity", "MEDIUM"), "u": v.get("url", "")})
+            else:
+                current_mod_v.append({"t": str(v)})
+            total_findings += 1
 
-    return f"Identify 3 promising ATTACK CHAINS.\nSUMMARY: {json.dumps(summary)}\nENDPOINTS: {json.dumps(endpoints)}\nVULNERABILITIES: {json.dumps(vulns)}\nTASK:\n- ACTION: Next module/target.\n- WHY: Correlation.\n- CONFIDENCE: (Confirmed|High|Medium)\n"
+        # Pull JWT nested findings
+        for j in intel.get("jwts", []):
+            for v in j.get("vulnerabilities", []):
+                current_mod_v.append({"t": f"JWT: {v}", "s": "HIGH", "u": j.get("url", "")})
+                total_findings += 1
+            for av in j.get("active_verifications", []):
+                if av.get("status") == "VERIFIED":
+                    current_mod_v.append({"t": f"JWT Exploit: {av.get('type')}", "s": "CRITICAL", "u": av.get("verified_urls", [""])[0]})
+                    total_findings += 1
+
+        # Pull Secrets
+        for s in intel.get("secrets", []):
+            current_mod_v.append({"t": f"Secret: {s.get('type')}", "s": "HIGH", "u": s.get("context", "")})
+            total_findings += 1
+
+        if current_mod_v:
+            vulns.append({mod_name: current_mod_v})
+
+    return f"Identify ATTACK CHAINS based on real findings.\nFINDINGS_COUNT: {total_findings}\nSUMMARY: {json.dumps(summary)}\nENDPOINTS: {json.dumps(endpoints)}\nVULNERABILITIES: {json.dumps(vulns)}\nTASK: Build chains only if FINDINGS_COUNT >= 2.\n"
 
 def format_audit_prompt(code_snippet: str, finding_type: str) -> str:
     """High-density prompt for SourceAuditor passes."""

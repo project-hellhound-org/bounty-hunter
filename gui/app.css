@@ -1,0 +1,133 @@
+:root {
+    --primary: #ff2244;
+    --background: #020204;
+    --surface: #0e0e13;
+}
+
+/* ── HUD ANIMATIONS ─────────────────────────────────────────────────── */
+
+@keyframes scanline {
+    0% { transform: translateY(-100%); }
+    100% { transform: translateY(100%); }
+}
+
+.scanline {
+    width: 100%;
+    height: 100px;
+    background: linear-gradient(0deg, transparent, var(--primary), transparent);
+    animation: scanline 8s linear infinite;
+}
+
+@keyframes logo-pulse {
+    0%, 100% { filter: drop-shadow(0 0 5px rgba(255, 34, 68, 0.2)); opacity: 0.8; }
+    50% { filter: drop-shadow(0 0 20px rgba(255, 34, 68, 0.6)); opacity: 1; }
+}
+
+.logo-pulse {
+    animation: logo-pulse 3s ease-in-out infinite;
+}
+
+@keyframes dash {
+    to { stroke-dashoffset: -100; }
+}
+
+.animate-dash {
+    animation: dash 10s linear infinite;
+}
+
+@keyframes fade-in {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+    animation: fade-in 0.5s ease-out forwards;
+}
+
+/* ── COMPONENT STYLES ──────────────────────────────────────────────── */
+
+.panel {
+    position: relative;
+    backdrop-filter: blur(20px);
+}
+
+.panel::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0;
+    width: 10px; height: 10px;
+    border-top: 1px solid var(--primary);
+    border-left: 1px solid var(--primary);
+}
+
+.panel::after {
+    content: '';
+    position: absolute;
+    bottom: 0; right: 0;
+    width: 10px; height: 10px;
+    border-bottom: 1px solid var(--primary);
+    border-right: 1px solid var(--primary);
+}
+
+.term-input {
+    background: rgba(255, 255, 255, 0.03);
+    border: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 0.75rem 0;
+    font-family: 'Space Grotesk', monospace;
+    font-size: 13px;
+    color: white;
+    transition: all 0.3s;
+}
+
+.term-input:focus {
+    outline: none;
+    border-bottom-color: var(--primary);
+    background: rgba(255, 34, 68, 0.05);
+}
+
+/* Custom Scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+    width: 2px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+    background: var(--primary);
+    box-shadow: 0 0 10px var(--primary);
+}
+
+/* UI Elements */
+.ai-msg {
+    padding: 1rem;
+    border-left: 2px solid transparent;
+}
+
+.ai-msg.bot {
+    border-left-color: var(--primary);
+    background: linear-gradient(90deg, rgba(255, 34, 68, 0.05), transparent);
+}
+
+.ai-msg.user {
+    border-right: 2px solid rgba(255, 255, 255, 0.2);
+    text-align: right;
+}
+
+.ai-tab.active {
+    color: var(--primary);
+    border-bottom-color: var(--primary);
+    background: linear-gradient(0deg, rgba(255, 34, 68, 0.1), transparent);
+}
+
+/* Map Pins */
+#operatorPin, #targetPin {
+    transition: all 1s ease-in-out;
+}
+
+/* Responsive Webview */
+webview {
+    background: white;
+}

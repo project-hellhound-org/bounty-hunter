@@ -35,7 +35,6 @@ def _box_header(title):
     print(f"\n{CR}{'=' * w}")
     print(f"{CR}||{CW}{title:^{inner}}{CR}||")
     print(f"{CR}{'=' * w}{R}")
-    print(f"{CDM}{AUTHOR_META:^{w}}{R}")
 
 def _section(title, icon=">>"):
     """Print a section header."""
@@ -229,17 +228,31 @@ def _render_vulns(module_name, intel):
 def _render_jwt(intel):
     jwts = intel.get("jwts", [])
     if not jwts: return
-    _section(f"JWTanalyzer — JWT Analysis ({len(jwts)})")
+    _section(f"JWTdetector — JWT Analysis ({len(jwts)})")
     for j in jwts:
         print(f"\n      {CY}[JWT]{R} {CW}Source: {j.get('source', 'unknown')}{R}")
+        
+        # TOP: Original Token Data
+        for key in ("original_header", "original_payload"):
+            if j.get(key):
+                print(f"        {CC}{key.title().replace('_', ' ')}:{R}")
+                print(_pretty_data(j[key], indent=12))
+
+        # MIDDLE: Vulnerabilities Found
         if j.get("vulnerabilities"):
             print(f"        {CR}Vulnerabilities:{R}")
             for v in j["vulnerabilities"]: _bullet(v, indent=10, color=CR)
         
-        for key in ("header", "payload"):
-            if j.get(key):
-                print(f"        {CC}{key.title()}:{R}")
-                print(_pretty_data(j[key], indent=12))
+        # PROOF: Active Exploits
+        if j.get("active_verifications"):
+             print(f"        {CC}Active Verifications (Exploits):{R}")
+             print(_pretty_data(j["active_verifications"], indent=12))
+
+        # END: Sensitive Information
+        if j.get("sensitive_claims"):
+            print(f"        {CY}Sensitive Claims Discovery:{R}")
+            print(_pretty_data(j["sensitive_claims"], indent=12))
+
     _render_remaining_intel(intel, ["jwts"])
 
 def _render_blob(intel):
@@ -298,7 +311,7 @@ MODULE_RENDERERS = {
     "openredirect":     lambda intel, rs: _render_vulns("OpenRedirect", intel),
     "xxedetector":      lambda intel, rs: _render_vulns("XXEdetector", intel),
     "idordetector":     lambda intel, rs: _render_idor(intel),
-    "jwtanalyzer":      lambda intel, rs: _render_jwt(intel),
+    "jwtdetector":      lambda intel, rs: _render_jwt(intel),
     "sourceauditor":    lambda intel, rs: _render_source_auditor(intel),
     "blobunpacker":     lambda intel, rs: _render_blob(intel),
 }

@@ -720,8 +720,8 @@ class HellhoundConsole(cmd.Cmd):
         self.active_module = match
 
         # Load default options from module OPTIONS definition
-        options_def = getattr(mod_obj, "OPTIONS", [])
-        self.module_options = {opt["name"]: opt["default"] for opt in options_def}
+        options_def = self._get_normalized_options(mod_obj)
+        self.module_options = {opt.get("name"): opt.get("default") for opt in options_def if isinstance(opt, dict)}
 
         category = self.modules[match].get("category", "unknown")
         description = self.modules[match].get("description", "")
@@ -820,7 +820,7 @@ class HellhoundConsole(cmd.Cmd):
         # ── 1. Module Options ─────────────────────────────────────
         if self.active_module:
             mod_obj = self._load_module(self.active_module)
-            options_def = getattr(mod_obj, "OPTIONS", []) if mod_obj else []
+            options_def = self._get_normalized_options(mod_obj) if mod_obj else []
             cat = self.modules.get(self.active_module, {}).get("category", "module")
             
             print(f"\n  Module options ({Fore.CYAN + Style.BRIGHT}{cat}/{self.active_module}{Style.RESET_ALL}):\n")
@@ -935,7 +935,7 @@ class HellhoundConsole(cmd.Cmd):
             return self.do_setg(f"ai {raw_value}")
 
         mod_obj = self._load_module(self.active_module)
-        options_def = getattr(mod_obj, "OPTIONS", []) if mod_obj else []
+        options_def = self._get_normalized_options(mod_obj) if mod_obj else []
 
         # Find the option definition to enforce correct type
         opt_def = next((o for o in options_def if o["name"] == key), None)
@@ -1194,7 +1194,7 @@ class HellhoundConsole(cmd.Cmd):
         mod_obj = self._load_module(self.active_module)
         if not mod_obj:
             return []
-        options_def = getattr(mod_obj, "OPTIONS", [])
+        options_def = self._get_normalized_options(mod_obj) if mod_obj else []
         names = [o["name"] for o in options_def]
         return [n for n in names if n.lower().startswith(text.lower())]
 
@@ -1221,7 +1221,7 @@ class HellhoundConsole(cmd.Cmd):
             print(Fore.RED + f"[x] Failed to load module '{self.active_module}'." + Style.RESET_ALL)
             return
 
-        options_def = getattr(mod_obj, "OPTIONS", [])
+        options_def = self._get_normalized_options(mod_obj) if mod_obj else []
         missing = []
         for opt in options_def:
             if opt.get("required") and self.module_options.get(opt["name"]) in (None, ""):
@@ -1323,6 +1323,22 @@ class HellhoundConsole(cmd.Cmd):
             except ImportError:
                 continue
         return None
+
+    def _get_normalized_options(self, mod_obj):
+        """Standardizes module OPTIONS (converts dict to list of dicts if needed)."""
+        options_def = getattr(mod_obj, "OPTIONS", [])
+        if isinstance(options_def, dict):
+            # Convert legacy dict-based OPTIONS to standard list-of-dicts
+            normalized = []
+            for k, v in options_def.items():
+                opt = {"name": k}
+                if isinstance(v, dict):
+                    opt.update(v)
+                    if "description" in v and "help" not in v:
+                        opt["help"] = v["description"]
+                normalized.append(opt)
+            return normalized
+        return options_def
 
     def _calculate_global_risk(self):
         total_risk = 0
@@ -1479,23 +1495,52 @@ class HellhoundConsole(cmd.Cmd):
             print(Fore.YELLOW + "[!] AI Not Configured. Run 'setg ai local' or 'setg ai <api_key>' first." + Style.RESET_ALL)
             return
 
-        # Build findings summary for the tree root
+        # Build findings summary and perform local Reality Check (Pre-flight)
         findings_lines = []
+        total_findings = 0
         for mod, output in self.results.items():
             intel = output.get("intel", {}) if isinstance(output, dict) else {}
-            vulns = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", [])
-            if vulns:
-                for v in vulns[:5]:
-                    vtype = v.get("type", v.get("id", "unknown"))
-                    sev = v.get("severity", "UNKNOWN")
-                    ep = v.get("endpoint", v.get("url", ""))
-                    findings_lines.append(f"{sev:8}  {vtype}  {ep}")
+            
+            # 1. Standard
+            vulns = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", []) or intel.get("surfaces", [])
+            for v in vulns:
+                vtype = v.get("type", v.get("id", "unknown")) if isinstance(v, dict) else str(v)
+                sev = v.get("severity", "UNKNOWN") if isinstance(v, dict) else "INFO"
+                findings_lines.append(f"{sev:8}  {vtype}")
+                total_findings += 1
+            
+            # 2. JWT (Deep)
+            for j in intel.get("jwts", []):
+                for v in j.get("vulnerabilities", []):
+                    findings_lines.append(f"HIGH      JWT: {v[:30]}")
+                    total_findings += 1
+                for av in j.get("active_verifications", []):
+                    if av.get("status") == "VERIFIED":
+                        findings_lines.append(f"CRITICAL  JWT Exploit: {av.get('type')}")
+                        total_findings += 1
+
+            # 3. Secrets
+            for s in intel.get("secrets", []):
+                findings_lines.append(f"HIGH      Secret: {s.get('type')}")
+                total_findings += 1
         
-        findings_summary = "\n".join(findings_lines) if findings_lines else ""
+        # Reality Check: Hard stop if insufficient data
+        if total_findings < 2:
+            print(Fore.RED + Style.BRIGHT + "\n[!] INSUFFICIENT FINDINGS FOR CHAINING" + Style.RESET_ALL)
+            print(f"    Findings received: {total_findings}")
+            print("    Required: At least 2 findings from different modules or endpoints")
+            print("    Recommendation: Run additional modules (recon + vuln scans) before chaining\n")
+            return
+
+        findings_summary = "\n".join(findings_lines[:15]) # Cap the tree root display for the UI
 
         prompt = ai_utils.format_howl_prompt(self.results)
         anim_thread, anim_stop = ai_utils.thinking_animation("CORRELATING ATTACK CHAINS")
-        ai_response = ai_utils.call_ai(prompt, ai_provider, ai_key, model=model, system_prompt=ai_utils.CORRELATION_PERSONA)
+        
+        # Select persona based on provider
+        persona = ai_utils.CORRELATION_PERSONA_SLM if ai_provider == "ollama" else ai_utils.CORRELATION_PERSONA
+        
+        ai_response = ai_utils.call_ai(prompt, ai_provider, ai_key, model=model, system_prompt=persona)
         anim_stop.set()
         anim_thread.join()
         
@@ -1625,12 +1670,44 @@ class HellhoundConsole(cmd.Cmd):
                 continue
             intel = output.get("intel", {})
             
-            # Gather vulnerabilities from various module output shapes
-            vulns = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", [])
+            # 1. Standard vulnerabilities (top-level)
+            raw_v = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", []) or []
             cors = intel.get("cors_vulnerabilities", [])
             
-            for v in vulns + cors:
-                # Create a unique key for deduplication
+            # 2. JWT Deep-Scan (Nested findings)
+            jwt_v = []
+            for j in intel.get("jwts", []):
+                # Pull general JWT vulnerabilities
+                for v in j.get("vulnerabilities", []):
+                    jwt_v.append({
+                        "type": f"JWT: {v.split(':')[0] if ':' in v else 'Vuln'}",
+                        "severity": "HIGH" if "HIGH" in v else "CRITICAL" if "CRITICAL" in v else "MEDIUM",
+                        "url": j.get("url", j.get("source", "")),
+                        "evidence": v
+                    })
+                # Pull active verification exploits
+                for av in j.get("active_verifications", []):
+                    if av.get("status") == "VERIFIED":
+                        jwt_v.append({
+                            "type": f"JWT Exploit: {av.get('type')}",
+                            "severity": "CRITICAL",
+                            "url": av.get("verified_urls", [""])[0] if av.get("verified_urls") else j.get("url", ""),
+                            "payload": av.get("forged_token", ""),
+                            "evidence": f"Escalated Claims: {json.dumps(av.get('forged_payload'))}"
+                        })
+
+            # 3. Secrets (Leaked addresses/keys)
+            secrets_v = []
+            for s in intel.get("secrets", []):
+                secrets_v.append({
+                    "type": f"Secret: {s.get('type', 'Leaked Data')}",
+                    "severity": "HIGH",
+                    "url": s.get("context", s.get("source", "")),
+                    "evidence": s.get("value", "")
+                })
+
+            # Merge and deduplicate
+            for v in raw_v + cors + jwt_v + secrets_v:
                 ftype = v.get("type", v.get("id", "Unknown"))
                 url = v.get("url", "")
                 method = v.get("method", "GET")
@@ -1650,12 +1727,11 @@ class HellhoundConsole(cmd.Cmd):
 
         for i, f in enumerate(all_findings, 1):
             ftype = f.get("type", f.get("id", "Unknown"))
-            sev = f.get("severity", "")
+            sev = f.get("severity", "UNKNOWN")
             url = f.get("url", "")
             mod = f.get("_source_module", "")
-            sev_color = Fore.RED if sev in ("CRITICAL", "HIGH") else Fore.YELLOW if sev == "MEDIUM" else Fore.WHITE
-            needs_ai = " ⚡" if f.get("needs_ai_verification") else ""
-            print(f"  {Fore.WHITE}[{i}]{Style.RESET_ALL} {sev_color}{ftype}{Style.RESET_ALL} ({sev}) on {Fore.CYAN}{url}{Style.RESET_ALL} [{mod}]{needs_ai}")
+            sev_color = Fore.MAGENTA if sev == "CRITICAL" else Fore.RED if sev == "HIGH" else Fore.YELLOW if sev == "MEDIUM" else Fore.WHITE
+            print(f"  {Fore.WHITE}[{i}]{Style.RESET_ALL} {sev_color}{ftype}{Style.RESET_ALL} ({sev}) on {Fore.CYAN}{url}{Style.RESET_ALL} [{mod}]")
 
         print(f"\n  {Fore.WHITE}[A]{Style.RESET_ALL} Analyze ALL findings")
         print(f"  {Fore.WHITE}[X]{Style.RESET_ALL} Cancel\n")

@@ -10,12 +10,12 @@ DESCRIPTION = "Infrastructure surface checks: default configs, CDN, port scan, O
 CATEGORY    = "recon"
 
 OPTIONS = [
-    {"name": "check_defaults",    "type": bool, "default": True,  "help": "Detect default server config/admin pages"},
-    {"name": "check_cdn",         "type": bool, "default": True,  "help": "Analyze CDN configuration and origin leaks"},
-    {"name": "check_ports",       "type": bool, "default": True,  "help": "Scan common service ports (firewall check)"},
-    {"name": "check_os",          "type": bool, "default": True,  "help": "Fingerprint OS and banner from response headers"},
-    {"name": "check_dependencies", "type": bool, "default": True, "help": "Parse dependency manifests for outdated packages"},
-    {"name": "ports",             "type": str,  "default": None,  "help": "Custom port list (comma-separated) e.g. 21,22,25,3306"},
+    {"name": "check_defaults",     "type": "bool", "default": True,  "help": "Detect default server config/admin pages"},
+    {"name": "check_cdn",          "type": "bool", "default": True,  "help": "Analyze CDN configuration and origin leaks"},
+    {"name": "check_ports",        "type": "bool", "default": True,  "help": "Scan common service ports (firewall check)"},
+    {"name": "check_os",           "type": "bool", "default": True,  "help": "Fingerprint OS and banner from response headers"},
+    {"name": "check_dependencies", "type": "bool", "default": True,  "help": "Parse dependency manifests for outdated packages"},
+    {"name": "ports",              "type": "str",  "default": None,  "help": "Custom port list (comma-separated) e.g. 21,22,25,3306"},
 ]
 
 # ══════════════════════════════════════════════════════════════════════

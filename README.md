@@ -7,6 +7,11 @@
 
 <p align="center">
   <b>High-performance modular web offensive framework with integrated AI Intelligence.</b>
+  <br>
+  <br>
+  <code style="color: #ff2244; font-weight: bold;">[ UNDER DEVELOPMENT ]</code>
+  <br>
+  <i>Expect architectural shifts and potential false positives as we constantly optimize for high-fidelity detection.</i>
 </p>
 
 <p align="center">

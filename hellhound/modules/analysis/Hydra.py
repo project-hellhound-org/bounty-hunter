@@ -12,10 +12,10 @@ CATEGORY = "analysis"
 DESCRIPTION = "Universal Attack Surface & Parameter Logic Auditor (Geryon/Lailaps/Cerberus Engine)"
 
 OPTIONS = [
-    {"name": "concurrency", "type": int, "default": 10, "help": "Concurrent probing threads"},
-    {"name": "timeout", "type": int, "default": 10, "help": "Probing timeout (seconds)"},
-    {"name": "probe_intensity", "type": str, "default": "standard", "help": "light | standard | deep"},
-    {"name": "enable_probing", "type": bool, "default": True, "help": "Enable differential response analysis"},
+    {"name": "concurrency",     "type": "int",  "default": 10,         "help": "Concurrent probing threads"},
+    {"name": "timeout",         "type": "int",  "default": 10,         "help": "Probing timeout (seconds)"},
+    {"name": "probe_intensity", "type": "str",  "default": "standard", "help": "light | standard | deep"},
+    {"name": "enable_probing",  "type": "bool", "default": True,       "help": "Enable differential response analysis"},
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
