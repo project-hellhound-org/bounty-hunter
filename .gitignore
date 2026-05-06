@@ -211,3 +211,14 @@ hellhound/storage/*
 !hellhound/storage/.gitkeep
 run_diff.py
 *.json
+
+# JavaScript / Node
+node_modules/
+gui/node_modules/
+package-lock.json
+
+# Local / OS leftovers
+.DS_Store
+target_history.json
+*.local
+.env
