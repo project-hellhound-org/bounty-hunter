@@ -108,8 +108,118 @@ function showSection(id, el) {
     const target = document.getElementById(id);
     if (target) {
         target.classList.remove('hidden');
-        target.classList.add(id === 'arsenal' || id === 'ops' ? 'flex' : 'block');
+        target.classList.add(id === 'arsenal' || id === 'ops' || id === 'intel' ? 'flex' : 'block');
     }
+    if (id === 'intel') refreshIntel();
+}
+
+// ── INTEL CENTER LOGIC ────────────────────────────────────────────────
+let selectedIntelTargets = new Set();
+
+function refreshIntel() {
+    document.getElementById('intelGrid').classList.add('hidden');
+    document.getElementById('intelEmpty').classList.add('hidden');
+    document.getElementById('intelLoading').classList.remove('hidden');
+    selectedIntelTargets.clear();
+    updateAnalyzeBtn();
+    
+    // Request target list from AI analyze
+    ipcRenderer.send('ai-analyze', 'LIST');
+}
+
+ipcRenderer.on('intel-target-list', (event, targets) => {
+    renderIntelSelection(targets);
+});
+
+function renderIntelSelection(targets) {
+    const grid = document.getElementById('intelGrid');
+    const loading = document.getElementById('intelLoading');
+    const empty = document.getElementById('intelEmpty');
+    
+    loading.classList.add('hidden');
+    if (!targets || targets.length === 0) {
+        empty.classList.remove('hidden');
+        grid.classList.add('hidden');
+        return;
+    }
+
+    grid.innerHTML = '';
+    grid.classList.remove('hidden');
+    empty.classList.add('hidden');
+
+    targets.forEach(t => {
+        const card = document.createElement('div');
+        const isSelected = selectedIntelTargets.has(t.id);
+        
+        const sevColors = {
+            'CRITICAL': 'text-purple-400',
+            'HIGH':     'text-primary',
+            'MEDIUM':   'text-yellow-400',
+            'LOW':      'text-white/40'
+        };
+        const color = sevColors[t.severity.toUpperCase()] || 'text-white';
+
+        card.className = `intel-card p-6 bg-white/5 border border-white/10 rounded-lg cursor-pointer ${isSelected ? 'selected' : ''}`;
+        card.innerHTML = `
+            <div class="neon-indicator"></div>
+            <div class="flex flex-col h-full justify-between">
+                <div>
+                    <div class="flex items-center gap-2 mb-3">
+                        <span class="font-label-surgical text-[8px] px-2 py-0.5 border border-white/10 text-white/40 uppercase tracking-widest">${t.module}</span>
+                        <span class="font-label-surgical text-[8px] font-bold ${color} uppercase tracking-widest">${t.severity}</span>
+                    </div>
+                    <h3 class="font-h2-tactical text-[12px] text-white uppercase tracking-wider mb-2">${t.type}</h3>
+                    <p class="font-data-mono text-[10px] text-white/30 truncate mb-4">${t.url}</p>
+                </div>
+                <div class="flex items-center justify-between pt-4 border-t border-white/5">
+                    <span class="font-label-surgical text-[8px] text-white/20 uppercase tracking-tighter">ID: ${t.id}</span>
+                    <span class="material-symbols-outlined text-[16px] text-white/10">${isSelected ? 'check_circle' : 'circle'}</span>
+                </div>
+            </div>
+        `;
+
+        card.onclick = () => {
+            if (selectedIntelTargets.has(t.id)) {
+                selectedIntelTargets.delete(t.id);
+                card.classList.remove('selected');
+                card.querySelector('.material-symbols-outlined').innerText = 'circle';
+            } else {
+                selectedIntelTargets.add(t.id);
+                card.classList.add('selected');
+                card.querySelector('.material-symbols-outlined').innerText = 'check_circle';
+            }
+            updateAnalyzeBtn();
+        };
+
+        grid.appendChild(card);
+    });
+}
+
+function updateAnalyzeBtn() {
+    const btn = document.getElementById('analyzeSelectedBtn');
+    btn.disabled = selectedIntelTargets.size === 0;
+    btn.innerText = selectedIntelTargets.size > 0 ? `ANALYZE_${selectedIntelTargets.size}_SELECTED` : 'ANALYZE_SELECTION';
+}
+
+function runHowl() {
+    toggleAI();
+    pushActivity('Initiating full attack-chain correlation (HOWL)', 'intel');
+    ipcRenderer.send('ai-howl');
+}
+
+function analyzeSelectedTargets() {
+    if (selectedIntelTargets.size === 0) return;
+    
+    const selection = Array.from(selectedIntelTargets).join(',');
+    ipcRenderer.send('intel-selection-confirmed', selection);
+    
+    // Switch to AI sidebar to see results? 
+    // Or stay here and show a modal?
+    // User wants "Full-Screen Analysis", so maybe we should show the results in the Intel Center?
+    // But the user proposed "A new top-level navigation panel (id="intel") to replace the old tab-switching logic."
+    // Let's open the AI sidebar for now as the "Results" panel.
+    toggleAI();
+    pushActivity(`Analyzing ${selectedIntelTargets.size} findings in Intel Center`, 'intel');
 }
 
 // ── REPRO SHELL (Universal Resizing) ───────────────────────────────────
@@ -401,6 +511,7 @@ function confirmStrike() {
     setMissionState('running', displayName, activeTarget);
 
     ipcRenderer.send('strike-confirmed');
+    setEngineDot('ops', 'busy');
     pushActivity(`Strike confirmed: ${displayName} @ ${activeTarget}`, 'strike');
     pendingStrikeArgs = null;
 }
@@ -587,10 +698,10 @@ const enginesReady = new Set();
 
 ipcRenderer.on('console-ready', (event, { engine }) => {
     enginesReady.add(engine);
+    setEngineDot(engine, 'online');
     pushActivity(`Hellhound ${engine} engine ready`, 'ok');
 
     if (engine === 'ops') {
-        // Apply saved settings to both engines via ops trigger
         const saved = localStorage.getItem('hh_global_settings');
         if (saved) {
             try { ipcRenderer.send('sync-settings-to-console', JSON.parse(saved)); } catch (_) {}
@@ -637,6 +748,8 @@ ipcRenderer.on('telemetry-event', (event, { line, severity }) => {
 ipcRenderer.on('proc-exit', (event, { pid, code }) => {
     const displayName = normalizeName(modules[selectedModuleKey]?.name || selectedModuleKey);
     setMissionState(code === 0 ? 'complete' : 'error', displayName, activeTarget);
+    setEngineDot('ops', 'online');
+    updateLastModule(displayName, code === 0 ? 'COMPLETE' : 'ERROR');
     pushActivity(`Mission complete: ${displayName} (exit ${code})`, code === 0 ? 'ok' : 'warn');
     pollLoot();
 });
@@ -669,6 +782,7 @@ function sendAI() {
     appendHellhoundMessage('user', msg);
     input.value = '';
     aiThinking = true;
+    setEngineDot('intel', 'busy');
 
     const container = document.getElementById('ask-history');
     const thinking = document.createElement('div');
@@ -780,6 +894,7 @@ function setAIStatus(state, message) {
 // ai-response handler updates status too
 ipcRenderer.on('ai-response', (event, data) => {
     aiThinking = false;
+    setEngineDot('intel', 'online');
     const thinking = document.querySelector('[id^="ai-thinking-"]');
     if (thinking) thinking.remove();
 
@@ -1062,20 +1177,21 @@ function pollLoot() {
 }
 
 ipcRenderer.on('loot-data', (event, lootMap) => {
-    let totalFindings = 0;
-    let endpoints = new Set();
+    const totalFindings = Object.values(lootMap).reduce((s, l) => s + l.length, 0);
+    const endpoints = new Set();
     const categoryTotals = {};
+    let criticals = 0;
+    const topFindings = [];
 
     Object.keys(lootMap).forEach(file => {
         const lines = lootMap[file];
-        totalFindings += lines.length;
+        const fname = file.toLowerCase();
 
-        if (file.toLowerCase().includes('spider') || file.toLowerCase().includes('recon')) {
-            lines.forEach(l => endpoints.add(l.trim()));
+        if (fname.includes('spider') || fname.includes('recon')) {
+            lines.forEach(l => { if (l.includes('http')) endpoints.add(l.trim()); });
         }
 
-        const fname = file.toLowerCase().replace('.json', '').replace('.txt', '');
-        let cat = 'other';
+        let cat = 'Other';
         if (fname.includes('sqli') || fname.includes('sql')) cat = 'SQLi';
         else if (fname.includes('cmdi') || fname.includes('cmd')) cat = 'CMDi';
         else if (fname.includes('idor')) cat = 'IDOR';
@@ -1084,21 +1200,164 @@ ipcRenderer.on('loot-data', (event, lootMap) => {
         else if (fname.includes('spider') || fname.includes('recon')) cat = 'Recon';
         else if (fname.includes('path') || fname.includes('traversal')) cat = 'Path Trav';
         else if (fname.includes('bac') || fname.includes('access')) cat = 'BAC';
-        else cat = normalizeName(fname).substring(0, 10);
+        else if (fname.includes('secret') || fname.includes('source')) cat = 'Secrets';
+        else cat = normalizeName(fname.split(/[/\\]/).pop()).substring(0, 12);
 
         categoryTotals[cat] = (categoryTotals[cat] || 0) + lines.length;
+
+        // Collect top findings (high severity lines)
+        lines.forEach(l => {
+            const lower = l.toLowerCase();
+            if (lower.includes('[critical]') || lower.includes('[high]') || lower.includes('[secret]') || lower.includes('[vuln]')) {
+                criticals++;
+                if (topFindings.length < 5) topFindings.push({ text: l.trim(), severity: lower.includes('[critical]') ? 'critical' : 'high' });
+            }
+        });
     });
 
-    document.getElementById('findingCount').innerText = totalFindings;
-    document.getElementById('endpointCount').innerText = endpoints.size || totalFindings;
+    // Update stat counters with animation
+    animateCounter('endpointCount', endpoints.size || Object.values(lootMap).reduce((s,l)=>s+l.length,0));
+    animateCounter('findingCount', totalFindings);
+    animateCounter('criticalCount', criticals);
+
+    // Update top findings panel
+    updateTopFindings(topFindings);
+
+    // Update kill-chain based on what categories exist
+    updateKillChain(categoryTotals);
 
     if (totalFindings > 0) {
         hasRealData = true;
         renderFindingsChart(categoryTotals, totalFindings, true);
         renderSessionLog(lootMap);
-        pushActivity(`Loot updated: ${totalFindings} total findings`, 'loot');
+        pushActivity(`Loot updated: ${totalFindings} findings across ${Object.keys(lootMap).length} files`, 'loot');
+
+        // Update dashboard subtitle
+        const sub = document.getElementById('dashSubtitle');
+        if (sub) sub.innerText = `Active Session — ${totalFindings} findings · ${endpoints.size} endpoints`;
     }
 });
+
+// ── DASHBOARD UPGRADE FUNCTIONS ───────────────────────────────────────────
+
+// Smooth counter animation
+function animateCounter(id, target) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const start = parseInt(el.innerText) || 0;
+    if (start === target) return;
+    const duration = 600;
+    const startTime = Date.now();
+    const tick = () => {
+        const progress = Math.min((Date.now() - startTime) / duration, 1);
+        const ease = 1 - Math.pow(1 - progress, 3);
+        el.innerText = Math.round(start + (target - start) * ease);
+        if (progress < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+}
+
+// Module phase → kill-chain phase mapping
+const PHASE_MAP = {
+    'Recon': 'RECON', 'Secrets': 'RECON',
+    'SQLi': 'VULN', 'XSS': 'VULN', 'IDOR': 'VULN', 'NoSQLi': 'VULN', 'Path Trav': 'VULN', 'BAC': 'VULN',
+    'CMDi': 'EXPLOIT', 'Other': 'VULN'
+};
+let sessionPhasesReached = new Set();
+let modulesRunThisSession = 0;
+
+function updateKillChain(categoryTotals) {
+    // Determine which phases have data
+    Object.keys(categoryTotals).forEach(cat => {
+        const phase = PHASE_MAP[cat] || 'VULN';
+        if (categoryTotals[cat] > 0) sessionPhasesReached.add(phase);
+    });
+
+    // If we have vuln or exploit data, recon is implied
+    if (sessionPhasesReached.has('VULN') || sessionPhasesReached.has('EXPLOIT')) {
+        sessionPhasesReached.add('RECON');
+    }
+
+    // Render phases
+    PHASE_ORDER.forEach((phase, idx) => {
+        const node = document.querySelector(`.kill-phase[data-phase="${phase}"] .kill-node`);
+        const line = document.querySelector(`.kill-line[data-after="${phase}"]`);
+
+        if (!node) return;
+        node.classList.remove('done', 'active');
+
+        if (sessionPhasesReached.has(phase)) {
+            node.classList.add('done');
+            if (line) line.classList.add('done');
+        }
+    });
+
+    // Update detail text
+    const detail = document.getElementById('killChainDetail');
+    const phaseLabel = document.getElementById('killChainPhaseLabel');
+    if (detail && sessionPhasesReached.size > 0) {
+        const reached = PHASE_ORDER.filter(p => sessionPhasesReached.has(p));
+        detail.innerText = `Completed: ${reached.join(' → ')}`;
+        if (phaseLabel) phaseLabel.innerText = reached[reached.length - 1] || 'STANDBY';
+    }
+}
+
+// Called when a module completes — update last module indicator and kill-chain
+function updateLastModule(moduleName, status = 'COMPLETE') {
+    modulesRunThisSession++;
+    animateCounter('modulesRunCount', modulesRunThisSession);
+
+    const dot = document.getElementById('lastModuleDot');
+    const label = document.getElementById('lastModuleLabel');
+    const statusEl = document.getElementById('lastModuleStatus');
+
+    if (dot) dot.className = `w-1.5 h-1.5 rounded-full flex-shrink-0 ${status === 'COMPLETE' ? 'bg-green-500' : 'bg-red-500'}`;
+    if (label) label.innerText = moduleName || 'UNKNOWN';
+    if (statusEl) {
+        statusEl.innerText = status;
+        statusEl.className = `font-label-surgical text-[7px] uppercase tracking-widest ${status === 'COMPLETE' ? 'text-green-400' : 'text-red-400'}`;
+    }
+
+    // Mark analysis phase reachable if AI has been used
+    const sub = document.getElementById('dashSubtitle');
+    if (sub && modulesRunThisSession > 0) {
+        sub.innerText = `Active Session — ${modulesRunThisSession} module${modulesRunThisSession !== 1 ? 's' : ''} executed`;
+    }
+}
+
+// Top findings panel — shows 5 most critical findings on dashboard
+function updateTopFindings(findings) {
+    const container = document.getElementById('topFindingsList');
+    if (!container) return;
+
+    if (!findings || findings.length === 0) {
+        container.innerHTML = `<div class="font-label-surgical text-[9px] text-white/15 uppercase tracking-widest text-center py-4">No high-severity findings yet</div>`;
+        return;
+    }
+
+    container.innerHTML = '';
+    findings.forEach(({ text, severity }) => {
+        const colors = { critical: 'border-red-500 text-red-400', high: 'border-primary text-primary/80' };
+        const div = document.createElement('div');
+        div.className = `p-2 border-l-2 ${colors[severity] || colors.high} bg-white/2 font-data-mono text-[10px] leading-relaxed break-all hover:bg-white/5 transition-colors select-text`;
+        div.style.userSelect = 'text';
+        div.textContent = text.length > 80 ? text.substring(0, 80) + '…' : text;
+        container.appendChild(div);
+    });
+}
+
+// Engine status dot updater
+function setEngineDot(engine, state) {
+    const id = engine === 'ops' ? 'opsEngineDot' : 'intelEngineDot';
+    const dot = document.getElementById(id);
+    if (!dot) return;
+    const states = {
+        offline: 'w-2 h-2 rounded-full bg-white/15',
+        online:  'w-2 h-2 rounded-full bg-green-500 shadow-[0_0_6px_#22c55e]',
+        busy:    'w-2 h-2 rounded-full bg-primary shadow-[0_0_6px_#ff2244] animate-pulse',
+    };
+    dot.className = states[state] || states.offline;
+}
 
 function renderFindingsChart(data, total, isReal = false) {
     const container = document.getElementById('findingsChart');
@@ -1118,7 +1377,7 @@ function renderFindingsChart(data, total, isReal = false) {
     const maxVal = Math.max(...Object.values(data));
 
     const titleRow = document.createElement('div');
-    titleRow.className = 'flex items-center justify-between mb-5';
+    titleRow.className = 'flex items-center justify-between mb-4';
     titleRow.innerHTML = `
         <span class="font-label-surgical text-[9px] text-white/30 uppercase tracking-widest">Category breakdown</span>
         <span class="font-data-mono text-[11px] text-white/50">${total} finding${total !== 1 ? 's' : ''}</span>
@@ -1126,18 +1385,19 @@ function renderFindingsChart(data, total, isReal = false) {
     container.appendChild(titleRow);
 
     const chart = document.createElement('div');
-    chart.className = 'space-y-4 flex-1';
+    chart.className = 'space-y-3 overflow-y-auto flex-1';
+    chart.style.minHeight = '0';
 
-    keys.forEach(cat => {
+    keys.sort((a, b) => data[b] - data[a]).forEach(cat => {
         const val = data[cat];
         const pct = maxVal > 0 ? (val / maxVal * 100) : 0;
-
-        let barColor = 'bg-primary/70';
-        if (cat === 'CMDi' || cat === 'SQLi') barColor = 'bg-red-500';
-        else if (cat === 'IDOR' || cat === 'NoSQLi') barColor = 'bg-orange-500';
-        else if (cat === 'XSS' || cat === 'Path Trav') barColor = 'bg-yellow-500';
-        else if (cat === 'Recon') barColor = 'bg-blue-400';
-        else if (cat === 'BAC') barColor = 'bg-purple-400';
+        const BAR_COLORS = {
+            'CMDi': 'bg-red-500', 'SQLi': 'bg-red-500',
+            'IDOR': 'bg-orange-500', 'NoSQLi': 'bg-orange-500',
+            'XSS': 'bg-yellow-500', 'Path Trav': 'bg-yellow-500',
+            'Recon': 'bg-blue-400', 'BAC': 'bg-purple-400', 'Secrets': 'bg-pink-400',
+        };
+        const barColor = BAR_COLORS[cat] || 'bg-primary/70';
 
         const row = document.createElement('div');
         row.className = 'space-y-1';
@@ -1147,13 +1407,21 @@ function renderFindingsChart(data, total, isReal = false) {
                 <span class="font-data-mono text-[11px] text-white font-bold">${val}</span>
             </div>
             <div class="w-full h-2 bg-white/5 rounded-full overflow-hidden">
-                <div class="${barColor} h-full rounded-full transition-all duration-700" style="width: ${pct}%"></div>
+                <div class="${barColor} h-full rounded-full transition-all duration-700" style="width:0%"
+                     data-target="${pct}"></div>
             </div>
         `;
         chart.appendChild(row);
     });
 
     container.appendChild(chart);
+
+    // Animate bars in after render
+    requestAnimationFrame(() => {
+        chart.querySelectorAll('[data-target]').forEach(bar => {
+            bar.style.width = bar.dataset.target + '%';
+        });
+    });
 }
 
 // ── INIT ─────────────────────────────────────────────────────────────
@@ -1168,7 +1436,6 @@ window.onload = () => {
     pollLoot();
     setInterval(pollLoot, 10000);
     pushActivity('Hellhound Apex-King HUD online', 'info');
-    // Show sample chart on startup — real data replaces it after first strike
     const sampleTotal = Object.values(SAMPLE_CHART_DATA).reduce((a, b) => a + b, 0);
     renderFindingsChart(SAMPLE_CHART_DATA, sampleTotal, false);
 };

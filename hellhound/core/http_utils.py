@@ -33,7 +33,12 @@ def apply_proxy_to_session(session, proxy_url: str):
         "http": proxy_url,
         "https": proxy_url
     }
-    session.proxies.update(proxies)
+    if hasattr(session, "proxies"):
+        session.proxies.update(proxies)
+    else:
+        # aiohttp sessions don't have a proxies attribute; 
+        # proxy is usually handled per-request or in connector
+        pass
 
 def apply_session_config(session, options: dict):
     """
@@ -48,7 +53,13 @@ def apply_session_config(session, options: dict):
     # 2. Merge Headers
     options["global_headers"] = options.get("global_headers", {})
     headers = merge_global_context(options, session.headers.copy())
-    session.headers.update(headers)
+    if hasattr(session, "_default_headers"):
+        session._default_headers.update(headers)
+    elif hasattr(session, "headers"):
+        try:
+            session.headers.update(headers)
+        except (AttributeError, TypeError):
+            pass # Immutable headers (like aiohttp) should be handled by the caller or during creation
     
     # 3. Security configurations
     session.verify = False # Modules typically handle internal/self-signed certs

@@ -60,6 +60,49 @@
         body.theme-light .nav-item { color: #444 !important; }
         body.theme-light .nav-item.active { color: var(--primary) !important; }
         body.theme-light #activityFeed span { color: #555; }
+        /* Kill-chain phase states */
+        .kill-node.done { border-color: var(--primary); background: rgba(255,34,68,0.15); }
+        .kill-node.done span { color: var(--primary); }
+        .kill-node.active { border-color: var(--primary); background: rgba(255,34,68,0.1); animation: kill-pulse 1.5s ease-in-out infinite; }
+        .kill-node.active span { color: var(--primary); }
+        .kill-line.done { background: var(--primary); box-shadow: 0 0 6px rgba(255,34,68,0.4); }
+        @keyframes kill-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,34,68,0); } 50% { box-shadow: 0 0 0 6px rgba(255,34,68,0.2); } }
+        /* Engine status dots */
+        .engine-online { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+        .engine-busy { background: var(--primary); box-shadow: 0 0 8px var(--primary); animation: pulse 1s ease-in-out infinite; }
+
+        /* ── INTEL CENTER STYLES ─────────────────────────────────────────── */
+        .intel-card {
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+        }
+        .intel-card:hover {
+            transform: scale(1.02) translateY(-4px);
+            filter: brightness(1.15);
+            box-shadow: 0 0 25px rgba(255, 34, 68, 0.2), inset 0 0 10px rgba(255, 34, 68, 0.1);
+            border-color: rgba(255, 34, 68, 0.4) !important;
+        }
+        .intel-card.selected {
+            border-color: var(--primary) !important;
+            background: rgba(255, 34, 68, 0.05) !important;
+            box-shadow: 0 0 30px rgba(255, 34, 68, 0.15);
+        }
+        .intel-card.selected .neon-indicator {
+            opacity: 1;
+        }
+        .neon-indicator {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            width: 8px;
+            height: 8px;
+            background: var(--primary);
+            border-radius: 50%;
+            box-shadow: 0 0 10px var(--primary);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
     </style>
 </head>
 <body class="bg-background text-on-surface font-body-standard overflow-hidden select-none">
@@ -99,6 +142,10 @@
                 <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('monitor', this)">
                     <span class="material-symbols-outlined">visibility</span>
                     <span class="font-label-surgical text-[10px] tracking-widest uppercase">Monitor</span>
+                </div>
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('intel', this)">
+                    <span class="material-symbols-outlined">hub</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Intel Center</span>
                 </div>
                 <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('settings', this)">
                     <span class="material-symbols-outlined">settings_suggest</span>
@@ -180,22 +227,27 @@
         
         <!-- DASHBOARD -->
         <section id="dashboard" class="content-area block h-full animate-fade-in pointer-events-auto">
-            <div class="grid grid-cols-12 gap-8 h-full">
-                <!-- LEFT: Hero + Sample Chart -->
-                <div class="col-span-8 flex flex-col gap-6 h-full">
+            <div class="grid grid-cols-12 gap-6 h-full">
 
-                    <!-- Hero — clean, lets background breathe -->
-                    <div class="panel relative bg-black/40 border border-white/5 p-8 shadow-xl overflow-hidden flex items-center justify-between" style="min-height: 90px;">
+                <!-- LEFT col: Kill-chain + Findings chart -->
+                <div class="col-span-8 flex flex-col gap-6" style="min-height:0;">
+
+                    <!-- Hero bar -->
+                    <div class="panel bg-black/40 border border-white/5 px-8 py-5 flex items-center justify-between" style="flex-shrink:0;">
                         <div>
-                            <h1 class="font-h1-visor text-[20px] tracking-[0.5em] text-white uppercase">HELLHOUND</h1>
-                            <p class="font-label-surgical text-[9px] text-white/30 uppercase tracking-[0.4em] mt-1">Apex-King Operative — Ready</p>
+                            <h1 class="font-h1-visor text-[18px] tracking-[0.5em] text-white uppercase">HELLHOUND</h1>
+                            <p id="dashSubtitle" class="font-label-surgical text-[9px] text-white/30 uppercase tracking-[0.4em] mt-1">Apex-King Operative — Standby</p>
                         </div>
                         <div class="flex items-center gap-6">
-                            <div class="text-right">
-                                <span class="font-label-surgical text-[8px] text-white/20 uppercase block tracking-widest">Operator</span>
-                                <div class="flex items-center gap-2 justify-end">
-                                    <span class="material-symbols-outlined text-[12px] text-green-500">my_location</span>
-                                    <span id="opLocation" class="font-data-mono text-[10px] text-white font-bold uppercase">INDIA</span>
+                            <!-- Engine status indicators -->
+                            <div class="flex items-center gap-3">
+                                <div class="flex items-center gap-2">
+                                    <div id="opsEngineDot" class="w-2 h-2 rounded-full bg-white/15"></div>
+                                    <span class="font-label-surgical text-[8px] text-white/30 uppercase tracking-widest">OPS</span>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <div id="intelEngineDot" class="w-2 h-2 rounded-full bg-white/15"></div>
+                                    <span class="font-label-surgical text-[8px] text-white/30 uppercase tracking-widest">INTEL</span>
                                 </div>
                             </div>
                             <div class="h-6 w-px bg-white/10"></div>
@@ -209,47 +261,114 @@
                         </div>
                     </div>
 
-                    <!-- Findings Chart Panel -->
-                    <div class="panel flex-1 bg-black/60 border border-white/10 p-8 shadow-2xl flex flex-col overflow-hidden">
-                        <div class="flex items-center justify-between mb-6">
+                    <!-- Kill-chain tracker -->
+                    <div class="panel bg-black/60 border border-white/10 px-8 py-6" style="flex-shrink:0;">
+                        <div class="flex items-center justify-between mb-5">
+                            <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em]">Mission_Kill_Chain</span>
+                            <span id="killChainPhaseLabel" class="font-label-surgical text-[9px] text-white/20 uppercase tracking-widest">STANDBY</span>
+                        </div>
+                        <div class="flex items-center gap-0">
+                            <!-- Phase nodes -->
+                            <div class="kill-phase flex-1 flex flex-col items-center gap-2" data-phase="RECON">
+                                <div class="kill-node w-8 h-8 rounded-full border-2 border-white/15 bg-black flex items-center justify-center transition-all duration-500">
+                                    <span class="material-symbols-outlined text-[14px] text-white/20">radar</span>
+                                </div>
+                                <span class="font-label-surgical text-[8px] text-white/25 uppercase tracking-widest">Recon</span>
+                            </div>
+                            <div class="kill-line flex-1 h-px bg-white/10 transition-all duration-700" data-after="RECON"></div>
+                            <div class="kill-phase flex-1 flex flex-col items-center gap-2" data-phase="VULN">
+                                <div class="kill-node w-8 h-8 rounded-full border-2 border-white/15 bg-black flex items-center justify-center transition-all duration-500">
+                                    <span class="material-symbols-outlined text-[14px] text-white/20">bug_report</span>
+                                </div>
+                                <span class="font-label-surgical text-[8px] text-white/25 uppercase tracking-widest">Vuln</span>
+                            </div>
+                            <div class="kill-line flex-1 h-px bg-white/10 transition-all duration-700" data-after="VULN"></div>
+                            <div class="kill-phase flex-1 flex flex-col items-center gap-2" data-phase="EXPLOIT">
+                                <div class="kill-node w-8 h-8 rounded-full border-2 border-white/15 bg-black flex items-center justify-center transition-all duration-500">
+                                    <span class="material-symbols-outlined text-[14px] text-white/20">bolt</span>
+                                </div>
+                                <span class="font-label-surgical text-[8px] text-white/25 uppercase tracking-widest">Exploit</span>
+                            </div>
+                            <div class="kill-line flex-1 h-px bg-white/10 transition-all duration-700" data-after="EXPLOIT"></div>
+                            <div class="kill-phase flex-1 flex flex-col items-center gap-2" data-phase="ANALYSIS">
+                                <div class="kill-node w-8 h-8 rounded-full border-2 border-white/15 bg-black flex items-center justify-center transition-all duration-500">
+                                    <span class="material-symbols-outlined text-[14px] text-white/20">psychology</span>
+                                </div>
+                                <span class="font-label-surgical text-[8px] text-white/25 uppercase tracking-widest">Analysis</span>
+                            </div>
+                        </div>
+                        <!-- Phase detail -->
+                        <div id="killChainDetail" class="mt-4 font-label-surgical text-[8px] text-white/20 uppercase tracking-widest text-center">No modules executed this session</div>
+                    </div>
+
+                    <!-- Findings chart -->
+                    <div class="panel flex-1 bg-black/60 border border-white/10 p-8 flex flex-col" style="min-height:0; overflow:hidden;">
+                        <div class="flex items-center justify-between mb-5" style="flex-shrink:0;">
                             <div class="flex items-center gap-3">
                                 <div class="w-2 h-2 rounded-full bg-primary animate-pulse shadow-[0_0_10px_#ff2244]"></div>
                                 <span class="font-label-surgical text-[10px] tracking-[0.3em] text-white font-bold uppercase">Intel_Findings_Overview</span>
                             </div>
                             <span id="chartStatusBadge" class="font-label-surgical text-[8px] text-white/20 uppercase tracking-widest border border-white/10 px-3 py-1">SAMPLE DATA</span>
                         </div>
-
-                        <!-- Chart area populated by JS (sample on load, real data after strike) -->
-                        <div id="findingsChart" class="flex-1 flex flex-col justify-center overflow-hidden"></div>
-
-                        <!-- Disclaimer shown until real data arrives -->
-                        <div id="chartDisclaimer" class="mt-6 pt-4 border-t border-white/5">
+                        <div id="findingsChart" class="flex-1 flex flex-col justify-center" style="min-height:0; overflow:hidden;"></div>
+                        <div id="chartDisclaimer" class="mt-4 pt-3 border-t border-white/5" style="flex-shrink:0;">
                             <p class="font-label-surgical text-[9px] text-white/20 uppercase tracking-widest text-center">
-                                ↑ Sample data for illustration — real findings will populate here after your first strike
+                                ↑ Sample data — real findings populate after first strike
                             </p>
                         </div>
                     </div>
                 </div>
 
-                <!-- RIGHT: Mission Status + Activity Feed -->
-                <div class="col-span-4 flex flex-col gap-6 h-full">
-                    <div class="panel bg-black/80 border border-white/10 p-7 shadow-xl">
-                        <h3 class="font-label-surgical text-[10px] text-primary font-bold tracking-[0.4em] uppercase mb-6">Mission_Status</h3>
-                        <div class="grid grid-cols-2 gap-5">
-                            <div class="bg-white/5 p-5 border-l-2 border-primary">
-                                <span class="font-label-surgical text-[9px] text-white/40 block mb-2 uppercase tracking-widest">Endpoints</span>
-                                <span id="endpointCount" class="font-data-mono text-3xl text-white font-bold">0</span>
+                <!-- RIGHT col: Stats + Activity -->
+                <div class="col-span-4 flex flex-col gap-6" style="min-height:0;">
+
+                    <!-- Live stats grid -->
+                    <div class="panel bg-black/80 border border-white/10 p-6" style="flex-shrink:0;">
+                        <h3 class="font-label-surgical text-[10px] text-primary font-bold tracking-[0.4em] uppercase mb-5">Mission_Status</h3>
+                        <div class="grid grid-cols-2 gap-4 mb-4">
+                            <div class="bg-white/5 p-4 border-l-2 border-blue-400">
+                                <span class="font-label-surgical text-[8px] text-white/40 block mb-1 uppercase tracking-widest">Endpoints</span>
+                                <span id="endpointCount" class="font-data-mono text-2xl text-white font-bold">0</span>
                             </div>
-                            <div class="bg-white/5 p-5 border-l-2 border-primary">
-                                <span class="font-label-surgical text-[9px] text-white/40 block mb-2 uppercase tracking-widest">Criticals</span>
-                                <span id="findingCount" class="font-data-mono text-3xl text-primary font-bold">0</span>
+                            <div class="bg-white/5 p-4 border-l-2 border-primary">
+                                <span class="font-label-surgical text-[8px] text-white/40 block mb-1 uppercase tracking-widest">Findings</span>
+                                <span id="findingCount" class="font-data-mono text-2xl text-primary font-bold">0</span>
                             </div>
+                            <div class="bg-white/5 p-4 border-l-2 border-red-500">
+                                <span class="font-label-surgical text-[8px] text-white/40 block mb-1 uppercase tracking-widest">Criticals</span>
+                                <span id="criticalCount" class="font-data-mono text-2xl text-red-400 font-bold">0</span>
+                            </div>
+                            <div class="bg-white/5 p-4 border-l-2 border-yellow-500">
+                                <span class="font-label-surgical text-[8px] text-white/40 block mb-1 uppercase tracking-widest">Modules Run</span>
+                                <span id="modulesRunCount" class="font-data-mono text-2xl text-yellow-400 font-bold">0</span>
+                            </div>
+                        </div>
+                        <!-- Last module run indicator -->
+                        <div class="bg-white/3 border border-white/5 p-3 flex items-center gap-3">
+                            <div id="lastModuleDot" class="w-1.5 h-1.5 rounded-full bg-white/20 flex-shrink-0"></div>
+                            <div class="flex-1 min-w-0">
+                                <span class="font-label-surgical text-[7px] text-white/20 uppercase tracking-widest block">Last Module</span>
+                                <span id="lastModuleLabel" class="font-data-mono text-[10px] text-white/50 truncate block">NONE</span>
+                            </div>
+                            <span id="lastModuleStatus" class="font-label-surgical text-[7px] uppercase tracking-widest text-white/20">IDLE</span>
                         </div>
                     </div>
 
-                    <div class="panel flex-1 bg-black/90 border border-white/10 p-7 flex flex-col shadow-xl overflow-hidden">
-                        <h3 class="font-label-surgical text-[10px] text-white font-bold tracking-[0.4em] uppercase mb-6">Live_Activity</h3>
-                        <div id="activityFeed" class="flex-1 space-y-4 overflow-y-auto custom-scrollbar pr-3"></div>
+                    <!-- Secrets/highlights panel -->
+                    <div class="panel bg-black/80 border border-white/10 p-6" style="flex-shrink:0;">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="font-label-surgical text-[10px] text-white font-bold tracking-[0.4em] uppercase">Top_Findings</h3>
+                            <button onclick="showSection('ops')" class="font-label-surgical text-[8px] text-white/20 hover:text-white/60 uppercase tracking-widest transition-colors">VIEW ALL →</button>
+                        </div>
+                        <div id="topFindingsList" class="space-y-2">
+                            <div class="font-label-surgical text-[9px] text-white/15 uppercase tracking-widest text-center py-4">No findings yet</div>
+                        </div>
+                    </div>
+
+                    <!-- Activity feed -->
+                    <div class="panel flex-1 bg-black/90 border border-white/10 p-6 flex flex-col" style="min-height:0;">
+                        <h3 class="font-label-surgical text-[10px] text-white font-bold tracking-[0.4em] uppercase mb-5" style="flex-shrink:0;">Live_Activity</h3>
+                        <div id="activityFeed" class="flex-1 space-y-3 overflow-y-auto custom-scrollbar pr-2" style="min-height:0;"></div>
                     </div>
                 </div>
             </div>
@@ -392,6 +511,41 @@
             </div>
         </section>
 
+        <!-- INTEL CENTER (FULL SCREEN CORRELATION) -->
+        <section id="intel" class="content-area hidden h-full flex flex-col gap-8 animate-fade-in pointer-events-auto">
+            <div class="flex items-center justify-between">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase">Intel_Center</h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Correlation Matrix // Target Selection HUD</p>
+                </div>
+                <div class="flex items-center gap-4">
+                    <button onclick="runHowl()" class="px-6 py-3 border border-primary/20 bg-primary/5 text-primary font-label-surgical text-[9px] uppercase tracking-widest hover:bg-primary/10 transition-all">✧ INITIATE_HOWL</button>
+                    <button onclick="refreshIntel()" class="px-6 py-3 border border-white/10 hover:border-primary/40 text-white/40 hover:text-white font-label-surgical text-[9px] uppercase tracking-widest transition-all">↻ REFRESH_SCAN_DATA</button>
+                    <button id="analyzeSelectedBtn" onclick="analyzeSelectedTargets()" class="px-10 py-3 bg-primary text-background font-h1-visor text-[10px] tracking-[0.3em] font-bold shadow-[0_0_20px_rgba(255,34,68,0.3)] hover:brightness-110 transition-all disabled:opacity-30" disabled>ANALYZE_SELECTION</button>
+                </div>
+            </div>
+
+            <!-- Selection Grid -->
+            <div class="flex-1 panel bg-black/40 border border-white/5 p-10 overflow-y-auto custom-scrollbar">
+                <div id="intelLoading" class="hidden flex flex-col items-center justify-center h-full space-y-4">
+                    <div class="w-12 h-12 border-2 border-primary/20 border-t-primary rounded-full animate-spin"></div>
+                    <span class="font-label-surgical text-[10px] text-white/20 uppercase tracking-[0.4em]">Parsing_Neural_Pathways...</span>
+                </div>
+                
+                <div id="intelEmpty" class="flex flex-col items-center justify-center h-full space-y-6">
+                    <span class="material-symbols-outlined text-[64px] text-white/5">hub</span>
+                    <div class="text-center">
+                        <p class="font-label-surgical text-[11px] text-white/40 uppercase tracking-[0.3em]">No target findings detected</p>
+                        <p class="font-body-standard text-[13px] text-white/20 mt-2">Run modules in the Arsenal to populate the correlation matrix.</p>
+                    </div>
+                </div>
+
+                <div id="intelGrid" class="hidden grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+                    <!-- Target cards will be injected here -->
+                </div>
+            </div>
+        </section>
+
         <!-- SETTINGS (ALL SETTINGS RESTORED) -->
         <section id="settings" class="content-area hidden h-full max-w-5xl mx-auto animate-fade-in pointer-events-auto">
             <div class="panel bg-black/98 border border-white/20 p-16 shadow-2xl overflow-y-auto max-h-full custom-scrollbar">
@@ -525,9 +679,7 @@
 
             <!-- AI TABS -->
             <div class="flex border-b border-white/10 mb-8">
-                <button onclick="setAIMethod('ask', this)" class="ai-tab active flex-1 py-4 font-label-surgical text-[10px] tracking-widest text-primary border-b-2 border-primary uppercase">Ask</button>
-                <button onclick="setAIMethod('analyze', this)" class="ai-tab flex-1 py-4 font-label-surgical text-[10px] tracking-widest text-white/30 uppercase">Analyze</button>
-                <button onclick="setAIMethod('howl', this)" class="ai-tab flex-1 py-4 font-label-surgical text-[10px] tracking-widest text-white/30 uppercase">Howl</button>
+                <button class="flex-1 py-4 font-label-surgical text-[10px] tracking-widest text-primary border-b-2 border-primary uppercase">Neural_Assistant</button>
             </div>
 
             <button onclick="initializeNeuralHandshake()" class="w-full py-4 border border-primary/20 bg-primary/5 text-primary font-label-surgical text-[11px] tracking-widest uppercase mb-8 logo-pulse">INITIALIZE NEURAL HANDSHAKE</button>

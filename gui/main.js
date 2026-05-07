@@ -487,15 +487,65 @@ ipcMain.on('ai-ask', (event, question) => {
 });
 
 ipcMain.on('ai-analyze', (event, target) => {
+    // If target is "LIST", we just run 'analyze' to get the menu
     const lines = [];
-    if (target) lines.push(`prey ${target}`);
+    if (target && target !== 'LIST') lines.push(`prey ${target}`);
     lines.push('analyze');
+
     intelEngine.enqueue({
         lines,
         promptsExpected: lines.length,
         streaming: false,
-        onDone: (out) => event.reply('ai-response', out || `Analysis of ${target} complete.`)
+        onDone: (out) => {
+            // Check if output contains a menu [1], [2], etc.
+            const menuMatches = out.match(/\[\d+\]/g);
+            if (menuMatches && menuMatches.length > 0) {
+                // Parse the menu into structured data
+                const targets = [];
+                const lines = out.split('\n');
+                lines.forEach(line => {
+                    const match = line.match(/^\s*\[(\d+)\]\s+(.*?)\s+\((.*?)\)\s+on\s+(.*?)\s+\[(.*?)\]/i);
+                    if (match) {
+                        targets.push({
+                            id: match[1],
+                            type: match[2].trim(),
+                            severity: match[3].trim(),
+                            url: match[4].trim(),
+                            module: match[5].trim()
+                        });
+                    }
+                });
+                if (targets.length > 0) {
+                    safeSend('intel-target-list', targets);
+                    return;
+                }
+            }
+            event.reply('ai-response', out || `Analysis of ${target} complete.`);
+        }
     });
+});
+
+ipcMain.on('intel-selection-confirmed', (event, selection) => {
+    // selection is a string like "1,2,5" or just "1"
+    // Since we are already in the middle of a command (analyze),
+    // we just write to stdin and wait for the prompt.
+    
+    // We can hijack the 'onLine' of intelEngine temporarily if we want,
+    // but better to just use a one-off capture.
+    intelEngine.captureBuffer = '';
+    intelEngine.promptsSeen = 0;
+    
+    // We need to tell the engine that it's now waiting for a prompt again
+    intelEngine.busy = true;
+    intelEngine.current = {
+        streaming: false,
+        promptsExpected: 1,
+        onDone: (out) => {
+            safeSend('ai-response', out || 'Analysis complete.');
+        }
+    };
+    
+    intelEngine.write(selection);
 });
 
 ipcMain.on('ai-howl', (event) => {
