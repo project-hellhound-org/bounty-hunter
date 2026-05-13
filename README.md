@@ -39,6 +39,7 @@ Whether you're performing surface reconnaissance or deep logical vulnerability a
 
 ## Key Features
 
+- **Obsidian 3D Attack Graph**: Professional, physics-based neural network visualization. Maps threat clusters using force-directed 3D layouts with interactive node deep-dives.
 - **Cinematic HUD**: Ultra-wide 60-character Braille-wave status dashboard with real-time pulsing case-waves.
 - **Neural Intelligence**: Native support for **Local SLMs (Gemma-2b)** and Cloud LLMs (Gemini, OpenAI) for high-fidelity vulnerability verification.
 - **Howl Engine**: Professional AI-powered attack chain correlation. Automatically synthesizes findings from multiple modules to map complex exploit paths.
@@ -92,6 +93,7 @@ Hellhound's power lies in its modularity. Each module is optimized for high high
 
 ## ◓ Recent Updates (v12.5.1)
 
+- **Obsidian 3D Engine**: Replaced legacy 2D graphing with a high-fidelity 3D force-directed neural map. Optimized for enterprise threat clustering and organic attack-chain visualization.
 - **Neural Core Activation**: Added `activate hellhound` command for seamless local SLM (Gemma-2b) integration via Ollama.
 - **Hybrid AI Provider**: Optimized `setg ai` logic to auto-detect and configure Gemini/OpenAI keys or local environments.
 - **Spider v12.3**: Integrated high-fidelity standalone recon engine with full SPA support and automated risk scoring.

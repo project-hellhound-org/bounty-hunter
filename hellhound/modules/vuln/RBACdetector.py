@@ -41,6 +41,7 @@ class RBACAuditor:
         self.semaphore = asyncio.Semaphore(options.get("concurrency", 10))
         self.mode = "guest_only"
         self.skip_patterns = [p.strip().lower() for p in options.get("skip_patterns", "").split(",") if p.strip()]
+        self.token_roles = set()  # Track which roles use token-based auth
 
     async def setup_sessions(self):
         has_admin = any(self.options.get(x) for x in ["cookie_a", "token_a"])
@@ -64,6 +65,7 @@ class RBACAuditor:
                 if token:
                     auth = token if any(x in token for x in ["Bearer ", "Basic "]) else f"Bearer {token}"
                     session._default_headers["Authorization"] = auth
+                    self.token_roles.add(role.lower())
                 
                 if cookie_str:
                     c_dict = {}
@@ -186,11 +188,19 @@ class RBACAuditor:
         
         session = self.sessions[role.lower()][0]
         headers = dict(getattr(session, "_default_headers", {}))
-        cookies = [f"{c.key}={c.value}" for c in session.cookie_jar]
         
-        auth_h = f" -H 'Authorization: {headers['Authorization']}'" if headers.get("Authorization") else ""
-        cook_h = f" -H 'Cookie: {'; '.join(cookies)}'" if cookies else ""
-        poc_curl = f"curl -sk -X {method}{auth_h}{cook_h} '{url}'"
+        poc_parts = ["curl", "-sk", "-X", method]
+        
+        # Priority: If token was provided, use ONLY Authorization. Else use Cookies.
+        if role.lower() in self.token_roles and headers.get("Authorization"):
+            poc_parts.append(f"-H 'Authorization: {headers['Authorization']}'")
+        else:
+            cookies = [f"{c.key}={c.value}" for c in session.cookie_jar]
+            if cookies:
+                poc_parts.append(f"-H 'Cookie: {'; '.join(cookies)}'")
+        
+        poc_parts.append(f"'{url}'")
+        poc_curl = " ".join(poc_parts)
         
         c_sev = Fore.RED + Style.BRIGHT if severity == "CRITICAL" else Fore.YELLOW + Style.BRIGHT
         c_url = Fore.CYAN + Style.BRIGHT

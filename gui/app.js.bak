@@ -6,6 +6,75 @@ const path = require('path');
 let activeTarget = '';
 let currentAIMode = 'ask';
 let modules = {};
+let currentGraph = null;
+let cy = null;
+
+const sampleAttackGraph = {
+    "nodes": [
+        {"id": 0, "label": "HELLHOUND_FRAMEWORK", "type": "module", "description": "Core penetration testing engine", "status": "idle", "icon": "⚙️"},
+        {"id": 1, "label": "NO_ACTIVE_SESSION", "type": "info", "description": "No target engaged", "severity": "info", "icon": "⛔"},
+        {"id": 2, "label": "TARGET_NOT_SET", "type": "instruction", "description": "Click 'Set Target' to begin assessment", "action": "set_target", "icon": "🎯"},
+        {"id": 3, "label": "EXPECTED_FLOW", "type": "instruction", "description": "Reconnaissance → Vulnerability Detection → Exploitation → Analysis", "icon": "🔄"},
+        {"id": 10, "label": "juice-shop.herokuapp.com", "type": "url", "description": "Example target (OWASP Juice Shop)", "example": true, "icon": "🌐"},
+        {"id": 11, "label": "/rest/user/authentication-details", "type": "url", "description": "User authentication endpoint", "example": true, "icon": "🔐"},
+        {"id": 12, "label": "/api/Users", "type": "url", "description": "User management API", "example": true, "icon": "👥"},
+        {"id": 13, "label": "/ftp/quarantine", "type": "url", "description": "Sensitive file directory", "example": true, "icon": "📁"},
+        {"id": 14, "label": "/graphql", "type": "url", "description": "GraphQL endpoint", "example": true, "icon": "📊"},
+        {"id": 15, "label": "/socket.io", "type": "url", "description": "WebSocket endpoint", "example": true, "icon": "🔌"},
+        {"id": 20, "label": "id", "type": "parameter", "description": "Numeric identifier - IDOR candidate", "risk": "high", "icon": "🔢"},
+        {"id": 21, "label": "userId", "type": "parameter", "description": "User identifier - Privilege escalation vector", "risk": "critical", "icon": "👤"},
+        {"id": 22, "label": "token", "type": "parameter", "description": "JWT token - Possible replay attack", "risk": "high", "icon": "🔑"},
+        {"id": 23, "label": "redirect", "type": "parameter", "description": "Open redirect parameter", "risk": "medium", "icon": "↪️"},
+        {"id": 24, "label": "file", "type": "parameter", "description": "File path - Path traversal candidate", "risk": "high", "icon": "📄"},
+        {"id": 30, "label": "JWT_SECRET_KEY", "type": "secret", "description": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...", "severity": "critical", "icon": "🔑"},
+        {"id": 31, "label": "AWS_ACCESS_KEY", "type": "secret", "description": "AKIAIOSFODNN7EXAMPLE", "severity": "critical", "icon": "☁️"},
+        {"id": 32, "label": "DATABASE_PASSWORD", "type": "secret", "description": "Hardcoded credentials in source", "severity": "high", "icon": "💾"},
+        {"id": 33, "label": "API_BEARER_TOKEN", "type": "secret", "description": "Long-lived access token", "severity": "high", "icon": "🔐"},
+        {"id": 40, "label": "CRITICAL: IDOR Vulnerability", "type": "vulnerability", "severity": "critical", "description": "Insecure Direct Object Reference", "cwe": "CWE-639", "cvss_score": 7.5, "icon": "⚠️"},
+        {"id": 41, "label": "HIGH: SQL Injection", "type": "vulnerability", "severity": "high", "description": "Time-based blind SQLi in search", "cwe": "CWE-89", "cvss_score": 8.5, "icon": "🗄️"},
+        {"id": 42, "label": "HIGH: Broken Access Control", "type": "vulnerability", "severity": "high", "description": "Vertical privilege escalation", "cwe": "CWE-284", "cvss_score": 8.1, "icon": "🚪"},
+        {"id": 43, "label": "MEDIUM: XSS", "type": "vulnerability", "severity": "medium", "description": "Reflected XSS in query", "cwe": "CWE-79", "cvss_score": 6.1, "icon": "📝"},
+        {"id": 44, "label": "MEDIUM: GraphQL Introspection", "type": "vulnerability", "severity": "medium", "description": "GraphQL schema exposed", "cwe": "CWE-200", "cvss_score": 5.3, "icon": "🔍"},
+        {"id": 45, "label": "LOW: Information Disclosure", "type": "vulnerability", "severity": "low", "description": "Server version exposed", "cwe": "CWE-200", "cvss_score": 3.1, "icon": "ℹ️"},
+        {"id": 50, "label": "Node.js/Express", "type": "technology", "description": "Backend framework", "version": "4.18.2", "icon": "🟢"},
+        {"id": 51, "label": "Angular", "type": "technology", "description": "Frontend framework", "version": "15.0.0", "icon": "🅰️"},
+        {"id": 52, "label": "SQLite", "type": "technology", "description": "Database engine", "version": "3.39.4", "icon": "🗄️"},
+        {"id": 53, "label": "Helmet.js", "type": "technology", "description": "Security headers", "version": "6.0.0", "icon": "🛡️"},
+        {"id": 60, "label": "post_exploitation", "type": "attack_chain", "description": "Session hijacking → Exfiltration", "phase": "exploit", "icon": "⚡"},
+        {"id": 61, "label": "lateral_movement", "type": "attack_chain", "description": "Token reuse → Admin access", "phase": "post_exploit", "icon": "🔄"}
+    ],
+    "edges": [
+        {"from": 0, "to": 1, "label": "status"},
+        {"from": 1, "to": 2, "label": "requires"},
+        {"from": 2, "to": 3, "label": "triggers"},
+        {"from": 10, "to": 11, "label": "discovers"},
+        {"from": 10, "to": 12, "label": "discovers"},
+        {"from": 10, "to": 13, "label": "discovers"},
+        {"from": 10, "to": 14, "label": "discovers"},
+        {"from": 10, "to": 15, "label": "discovers"},
+        {"from": 11, "to": 20, "label": "accepts"},
+        {"from": 12, "to": 21, "label": "accepts"},
+        {"from": 11, "to": 22, "label": "accepts"},
+        {"from": 11, "to": 23, "label": "accepts"},
+        {"from": 13, "to": 24, "label": "accepts"},
+        {"from": 11, "to": 30, "label": "leaks"},
+        {"from": 12, "to": 31, "label": "leaks"},
+        {"from": 14, "to": 33, "label": "exposes"},
+        {"from": 20, "to": 40, "label": "enables"},
+        {"from": 21, "to": 42, "label": "enables"},
+        {"from": 22, "to": 40, "label": "enables"},
+        {"from": 23, "to": 45, "label": "enables"},
+        {"from": 24, "to": 41, "label": "enables"},
+        {"from": 14, "to": 44, "label": "exposes"},
+        {"from": 10, "to": 50, "label": "runs_on"},
+        {"from": 10, "to": 51, "label": "runs_on"},
+        {"from": 10, "to": 52, "label": "runs_on"},
+        {"from": 10, "to": 53, "label": "uses"},
+        {"from": 40, "to": 60, "label": "leads_to"},
+        {"from": 41, "to": 61, "label": "leads_to"},
+        {"from": 42, "to": 61, "label": "leads_to"}
+    ]
+};
 const PROJECT_ROOT = path.join(__dirname, '..');
 
 // ── BACKGROUND PARTICLES ────────────────────────────────────────────────
@@ -49,13 +118,10 @@ sidebar.onmouseleave = () => { sidebar.classList.add('-translate-x-full'); sideb
 // FIX: Track whether user manually closed so hover doesn't reopen it
 let aiManuallyOpen = false;
 
-aiTrigger.onclick = () => toggleAI();
-
 aiTrigger.onmouseenter = () => {
     if (!aiManuallyOpen) {
         aiContainer.classList.remove('translate-x-full');
         aiContainer.classList.add('translate-x-0');
-        aiContainer.style.pointerEvents = 'auto';
     }
 };
 
@@ -64,12 +130,10 @@ function toggleAI() {
     if (isHidden) {
         aiContainer.classList.remove('translate-x-full');
         aiContainer.classList.add('translate-x-0');
-        aiContainer.style.pointerEvents = 'auto';
         aiManuallyOpen = true;
     } else {
         aiContainer.classList.add('translate-x-full');
         aiContainer.classList.remove('translate-x-0');
-        aiContainer.style.pointerEvents = 'none';
         aiManuallyOpen = false;
     }
 }
@@ -79,7 +143,6 @@ function toggleAI() {
 function closeAI() {
     aiContainer.classList.add('translate-x-full');
     aiContainer.classList.remove('translate-x-0');
-    aiContainer.style.pointerEvents = 'none';
     aiManuallyOpen = false;
 }
 
@@ -117,16 +180,15 @@ function showSection(id, el) {
         target.classList.add(id === 'arsenal' || id === 'ops' || id === 'intel' || id === 'loot' || id === 'repro' || id === 'graph' ? 'flex' : 'block');
     }
     
-    if (id === 'intel') {
+    if (id === 'graph') {
+        setTimeout(initializeAttackGraph, 100);
+    }
         // Default to HOWL tab
         const howlBtn = document.querySelector('.intel-tab');
         if (howlBtn) switchIntelTab('howl', howlBtn);
         ipcRenderer.send('get-intel-targets'); 
     }
     if (id === 'loot') pollLoot();
-    if (id === 'graph') {
-        setTimeout(initAttackGraph, 100);
-    }
 }
 
 function switchIntelTab(tabId, el) {
@@ -140,7 +202,6 @@ function switchIntelTab(tabId, el) {
     el.classList.add('text-primary', 'border-primary', 'border-b-2');
     el.classList.remove('text-white/30');
     
-    const subtitle = document.getElementById('intelSubtitle');
     if (subtitle) {
         subtitle.innerText = tabId === 'howl' ? 'Correlation Matrix // NEURAL HOWL' : 'Correlation Matrix // SURGICAL ANALYZE';
     }
@@ -952,7 +1013,7 @@ function appendReproCommand(cmd, severity) {
     if (empty) empty.remove();
 
     const div = document.createElement('div');
-    div.className = 'poc-item group p-4 bg-white/5 border border-white/5 cursor-pointer';
+    div.className = 'poc-item group p-4 bg-white/5 border border-white/5 hover:border-primary/40 transition-all flex flex-col gap-3 animate-fade-in cursor-pointer';
     div.onclick = () => selectPoC(cmd, div);
     
     div.innerHTML = `
@@ -1180,535 +1241,65 @@ function copyAllChat() {
     });
 }
 
-// ── NEURAL ATTACK GRAPH ────────────────────────────────────────────────
-let obsidianGraph = null;
-let isPhysicsEnabled = true;
-let currentLayout = 'cose';
-let graphStyle = 'maltego'; // 'maltego' or 'obsidian'
+// ── ATTACK GRAPH (CYTOSCAPE.JS) ──────────────────────────────────────────
 
-const SAMPLE_ATTACK_GRAPH = {
-    "nodes": [
-        { "id": 0, "label": "HELLHOUND_CORE", "type": "engine", "layer": "core", "description": "Central Intelligence & Orchestration Engine.", "recommendation": "Maintain core encryption and isolation." },
-        
-        // PERIMETER
-        { "id": 1, "label": "CORP_FW_01", "type": "system", "layer": "external", "description": "Primary Enterprise Firewall.", "recommendation": "Audit egress rules for anomalies." },
-        { "id": 2, "label": "WAF_CLOUDFLARE", "type": "system", "layer": "external", "description": "Edge Application Firewall.", "recommendation": "Tune WAF rules for GraphQL introspection protection." },
-        { "id": 3, "label": "WORKFLOW_RECON", "type": "workflow", "layer": "external", "description": "Automated Reconnaissance Pipeline.", "recommendation": "Rotate recon API keys periodically." },
-        { "id": 4, "label": "IDS_SNORT", "type": "system", "layer": "external", "description": "Intrusion Detection System.", "recommendation": "Update signature database for latest CVEs." },
-        
-        // TARGET ASSETS
-        { "id": 5, "label": "api.corporate.com", "type": "url_root", "layer": "target", "description": "Production API Gateway.", "recommendation": "Enforce strict rate limiting." },
-        { "id": 6, "label": "/graphql", "type": "endpoint_graphql", "layer": "target", "description": "Unified Data Endpoint.", "recommendation": "Disable introspection in production.", "found_in": "api.corporate.com" },
-        { "id": 7, "label": "/admin/dashboard", "type": "endpoint_admin", "layer": "target", "description": "Internal Admin Interface.", "recommendation": "Enforce Multi-Factor Authentication (MFA).", "found_in": "api.corporate.com" },
-        { "id": 8, "label": "/rest/user/profile", "type": "endpoint_rest", "layer": "target", "description": "User Profile Management.", "recommendation": "Validate user session fidelity.", "found_in": "api.corporate.com" },
-        { "id": 9, "label": "/ftp/backup", "type": "endpoint_sensitive", "layer": "target", "description": "Unprotected Backup Storage.", "recommendation": "Secure directory listing and encrypt backups.", "found_in": "dev.internal.corp" },
-        { "id": 10, "label": "/oauth/token", "type": "endpoint_auth", "layer": "target", "description": "Identity Provider Endpoint.", "recommendation": "Rotate RSA signing keys.", "found_in": "api.corporate.com" },
-        { "id": 11, "label": "dev.internal.corp", "type": "url_root", "layer": "target", "description": "Development Staging Server.", "recommendation": "Isolate from production network." },
-        
-        // INTELLIGENCE / SECRETS
-        { "id": 12, "label": "AWS_PROD_KEY", "type": "secret_aws", "layer": "intel", "severity": "critical", "risk": "critical", "description": "Compromised AWS Access Key.", "recommendation": "Revoke IAM user and rotate keys.", "found_in": "/ftp/backup/config.json" },
-        { "id": 13, "label": "JWT_SECRET", "type": "secret_jwt", "layer": "intel", "severity": "high", "risk": "high", "description": "Hardcoded JWT HMAC Secret.", "recommendation": "Move to HashiCorp Vault.", "found_in": "/rest/user/profile (Leaked in source)" },
-        { "id": 14, "label": "DB_CREDENTIALS", "type": "secret_db", "layer": "intel", "severity": "high", "risk": "high", "description": "Production Database Password.", "recommendation": "Implement DB user rotation.", "found_in": "/ftp/backup/db_dump.sql" },
-        { "id": 15, "label": "SLACK_WEBHOOK", "type": "secret_token", "layer": "intel", "severity": "medium", "risk": "medium", "description": "Exposed Slack Incoming Webhook.", "recommendation": "Deactivate webhook URL.", "found_in": "api.corporate.com JS bundle" },
-        { "id": 16, "label": "SSH_PRIVATE_KEY", "type": "secret_ssh", "layer": "intel", "severity": "critical", "risk": "critical", "description": "Root SSH Key for Dev Server.", "recommendation": "Cycle SSH keys and enforce passphrase.", "found_in": "/ftp/backup/.ssh/id_rsa" },
-        { "id": 17, "label": "STRIPE_KEY", "type": "secret_payment", "layer": "intel", "severity": "high", "risk": "high", "description": "Stripe Live API Key.", "recommendation": "Restrict key permissions to specific IPs.", "found_in": "/rest/user/profile logs" },
-        { "id": 18, "label": "GITHUB_TOKEN", "type": "secret_token", "layer": "intel", "severity": "high", "risk": "high", "description": "Personal Access Token with Repo Access.", "recommendation": "Revoke and use fine-grained tokens.", "found_in": "dev.internal.corp .env" },
-        { "id": 19, "label": "DOCKER_CONFIG", "type": "secret_token", "layer": "intel", "severity": "medium", "risk": "medium", "description": "Registry Authentication Token.", "recommendation": "Use short-lived auth tokens.", "found_in": "dev.internal.corp logs" },
-        
-        // VULNERABILITIES
-        { "id": 20, "label": "LOG4J_RCE", "type": "vuln_log4j", "layer": "vulnerabilities", "severity": "critical", "risk": "critical", "cwe": "CWE-94", "cvss_score": "10.0", "description": "RCE via JNDI injection in dev server.", "recommendation": "Update Log4j and set formatMsgNoLookups=true." },
-        { "id": 21, "label": "SQL_INJECTION", "type": "vuln_sqli", "layer": "vulnerabilities", "severity": "critical", "risk": "critical", "cwe": "CWE-89", "cvss_score": "9.8", "description": "Unfiltered input in search parameter.", "recommendation": "Use parameterized queries." },
-        { "id": 22, "label": "IDOR_USER_DATA", "type": "vuln_idor", "layer": "vulnerabilities", "severity": "high", "risk": "high", "cwe": "CWE-639", "cvss_score": "7.5", "description": "Can access any user profile via ID manipulation.", "recommendation": "Implement attribute-based access control." },
-        { "id": 23, "label": "XSS_STORED", "type": "vuln_xss", "layer": "vulnerabilities", "severity": "medium", "risk": "medium", "cwe": "CWE-79", "cvss_score": "5.4", "description": "Stored XSS in user comments section.", "recommendation": "Sanitize HTML input and use CSP." },
-        { "id": 24, "label": "BAC_ADMIN_PANEL", "type": "vuln_broken_access", "layer": "vulnerabilities", "severity": "high", "risk": "high", "cwe": "CWE-285", "cvss_score": "8.1", "description": "Admin dashboard accessible without proper role check.", "recommendation": "Validate user role on every request." },
-        { "id": 25, "label": "GRAPHQL_INTRO", "type": "vuln_graphql", "layer": "vulnerabilities", "severity": "medium", "risk": "medium", "cwe": "CWE-200", "cvss_score": "5.0", "description": "Introspection enabled, leaking schema details.", "recommendation": "Disable introspection in production." },
-        { "id": 26, "label": "SSRF_METADATA", "type": "vuln_ssrf", "layer": "vulnerabilities", "severity": "high", "risk": "high", "cwe": "CWE-918", "cvss_score": "8.3", "description": "Can reach cloud metadata service via webhook proxy.", "recommendation": "Validate destination URLs and block internal IPs." },
-        { "id": 27, "label": "OPEN_REDIRECT", "type": "vuln_open_redirect", "layer": "vulnerabilities", "severity": "low", "risk": "low", "cwe": "CWE-601", "cvss_score": "3.5", "description": "Unvalidated redirect in logout parameter.", "recommendation": "Use a whitelist of allowed domains." },
-        { "id": 28, "label": "JWT_NONE_ALGO", "type": "vuln_broken_access", "layer": "vulnerabilities", "severity": "high", "risk": "high", "cwe": "CWE-287", "cvss_score": "7.8", "description": "JWT accepting 'none' algorithm for auth bypass.", "recommendation": "Enforce specific signing algorithms." },
-        { "id": 29, "label": "S3_BUCKET_PUBLIC", "type": "vuln_broken_access", "layer": "vulnerabilities", "severity": "high", "risk": "high", "cwe": "CWE-284", "cvss_score": "7.2", "description": "Publicly readable backup bucket.", "recommendation": "Restrict S3 bucket permissions." },
-        
-        // TECHNOLOGY
-        { "id": 30, "label": "NODEJS_EXPRESS", "type": "tech_backend", "layer": "target", "description": "Core application runtime." },
-        { "id": 31, "label": "REACT_FRONTEND", "type": "tech_frontend", "layer": "target", "description": "Client-side SPA framework." },
-        { "id": 32, "label": "POSTGRESQL", "type": "tech_database", "layer": "target", "description": "Primary relational database." },
-        { "id": 33, "label": "DOCKER_CONTAINER", "type": "tech_container", "layer": "target", "description": "Microservice isolation layer." },
-        { "id": 34, "label": "CLOUDFRONT_CDN", "type": "tech_cdn", "layer": "target", "description": "Content delivery and caching." },
-        
-        // ATTACK CHAINS
-        { "id": 35, "label": "CHAIN_PRIV_ESC", "type": "attack_chain", "layer": "post_exploit", "severity": "high", "impact": "Full takeover of dev server environment." },
-        { "id": 36, "label": "CHAIN_DATA_EXFIL", "type": "attack_chain", "layer": "post_exploit", "severity": "critical", "impact": "Exporting production database via leaked AWS keys." },
-        { "id": 37, "label": "CHAIN_LATERAL_MOVE", "type": "attack_chain", "layer": "post_exploit", "severity": "high", "impact": "Pivoting from dev server to production gateway." },
-        { "id": 38, "label": "CHAIN_PERSISTENCE", "type": "attack_chain", "layer": "post_exploit", "severity": "high", "impact": "Maintaining access via SSH key injection." },
-        { "id": 39, "label": "CHAIN_ACC_TAKEOVER", "type": "attack_chain", "layer": "post_exploit", "severity": "critical", "impact": "Bypassing auth via JWT manipulation to hijack admins." }
-    ],
-    "edges": [
-        { "from": 0, "to": 1 }, { "from": 0, "to": 2 }, { "from": 0, "to": 3 }, { "from": 0, "to": 4 },
-        { "from": 1, "to": 5 }, { "from": 2, "to": 5 }, { "from": 3, "to": 5 }, { "from": 4, "to": 11 }, { "from": 1, "to": 11 },
-        { "from": 5, "to": 6 }, { "from": 5, "to": 7 }, { "from": 5, "to": 8 }, { "from": 5, "to": 10 }, { "from": 11, "to": 9 },
-        { "from": 6, "to": 13 }, { "from": 8, "to": 13 }, { "from": 9, "to": 12 }, { "from": 9, "to": 14 }, { "from": 9, "to": 16 }, 
-        { "from": 5, "to": 15 }, { "from": 11, "to": 18 }, { "from": 11, "to": 19 }, { "from": 8, "to": 17 },
-        { "from": 6, "to": 25 }, { "from": 7, "to": 24 }, { "from": 8, "to": 22 }, { "from": 10, "to": 28 }, 
-        { "from": 5, "to": 23 }, { "from": 11, "to": 20 }, { "from": 11, "to": 26 }, { "from": 5, "to": 21 }, 
-        { "from": 5, "to": 27 }, { "from": 12, "to": 29 }, { "from": 13, "to": 28 }, { "from": 14, "to": 21 },
-        { "from": 20, "to": 35 }, { "from": 21, "to": 36 }, { "from": 22, "to": 39 }, { "from": 24, "to": 38 }, 
-        { "from": 26, "to": 37 }, { "from": 28, "to": 39 }, { "from": 16, "to": 37 }, { "from": 12, "to": 36 },
-        { "from": 37, "to": 11 }, { "from": 35, "to": 7 }, { "from": 39, "to": 7 }, { "from": 36, "to": 1 },
-        { "from": 30, "to": 5 }, { "from": 31, "to": 5 }, { "from": 32, "to": 14 }, { "from": 33, "to": 19 }, { "from": 34, "to": 2 },
-        { "from": 5, "to": 30 }, { "from": 11, "to": 33 }, { "from": 14, "to": 32 }, { "from": 10, "to": 31 }
-    ]
-};
-
-function convertToCytoFormat(json) {
-    const elements = [];
-    (json.nodes || []).forEach(n => {
-        elements.push({
-            data: {
-                id: String(n.id),
-                label: n.label,
-                type: n.type || n.layer || 'default',
-                color: n.color,
-                metadata: n.metadata || {},
-                // copy all top-level fields too
-                description: n.metadata?.description || n.description || '',
-                severity: n.metadata?.severity || n.severity || '',
-                risk: n.metadata?.risk || n.risk || '',
-                cvss: n.metadata?.cvss || n.cvss_score || '',
-                cwe: n.metadata?.cwe || n.cwe || '',
-                version: n.metadata?.version || n.version || '',
-                layer: n.layer || ''
-            }
-        });
-    });
-    (json.edges || []).forEach((e, i) => {
-        elements.push({
-            data: {
-                id: `e_${i}`,
-                source: String(e.from),
-                target: String(e.to),
-                label: e.label || '',
-                edgeType: e.label || ''
-            }
-        });
-    });
-    return elements;
-}
-
-const TYPE_COLORS = {
-    'module': '#ff2244',
-    'info': '#4488ff',
-    'instruction': '#00ffff',
-    'url': '#22c55e',
-    'parameter': '#eab308',
-    'secret': '#ec4899',
-    'vulnerability': '#ef4444',
-    'technology': '#a855f7',
-    'attack_chain': '#f97316'
-};
-
-function hideNodeInfo() {
-    const panel = document.getElementById('graphNodeInfo');
-    if (panel) panel.style.display = 'none';
-}
-
-function showNodeInfo(data) {
-    const panel = document.getElementById('graphNodeInfo');
-    const label = document.getElementById('infoLabel');
-    const icon = document.getElementById('infoIcon');
-    const desc = document.getElementById('infoDesc');
-    const meta = document.getElementById('infoMeta');
-
-    if (!panel) return;
-
-    icon.innerHTML = `<span class="material-symbols-outlined text-[32px]" style="color:${TYPE_COLORS[data.type] || '#ff2244'}">${data.icon || 'circle'}</span>`;
-    label.innerText = data.label || 'NODE_DETAILS';
-    label.style.color = TYPE_COLORS[data.type] || '#ff2244';
-    desc.innerText = data.description || 'No additional metadata available for this node.';
-    
-    // Build meta items
-    let metaHtml = `
-        <div class="info-row">
-            <span class="info-label">Type</span>
-            <span class="info-value" style="color:${TYPE_COLORS[data.type]}">${data.type.toUpperCase()}</span>
-        </div>
-    `;
-
-    if (data.severity) {
-        const sevColor = data.severity === 'critical' ? 'bg-red-600' : data.severity === 'high' ? 'bg-red-500' : data.severity === 'medium' ? 'bg-yellow-500' : 'bg-blue-500';
-        metaHtml += `
-            <div class="info-row">
-                <span class="info-label">Severity</span>
-                <span class="severity-badge ${sevColor}">${data.severity}</span>
-            </div>
-        `;
-    }
-
-    if (data.risk) {
-        const riskColor = data.risk === 'critical' ? 'text-red-500' : data.risk === 'high' ? 'text-orange-500' : 'text-yellow-500';
-        metaHtml += `
-            <div class="info-row">
-                <span class="info-label">Risk</span>
-                <span class="info-value ${riskColor}">${data.risk.toUpperCase()}</span>
-            </div>
-        `;
-    }
-
-    if (data.cwe) {
-        metaHtml += `
-            <div class="info-row">
-                <span class="info-label">CWE</span>
-                <span class="info-value text-primary">${data.cwe}</span>
-            </div>
-        `;
-    }
-
-    if (data.cvss_score) {
-        metaHtml += `
-            <div class="info-row">
-                <span class="info-label">CVSS</span>
-                <span class="info-value">${data.cvss_score}</span>
-            </div>
-        `;
-    }
-
-    if (data.version) {
-        metaHtml += `
-            <div class="info-row">
-                <span class="info-label">Version</span>
-                <span class="info-value">${data.version}</span>
-            </div>
-        `;
-    }
-
-    if (data.recommendation) {
-        metaHtml += `
-            <div class="mt-4 pt-4 border-t border-white/10">
-                <span class="font-label-surgical text-[8px] text-white/40 uppercase tracking-widest block mb-2">Surgical Recommendation</span>
-                <p class="font-data-mono text-[10px] text-primary italic">${data.recommendation}</p>
-            </div>
-        `;
-    }
-
-    meta.innerHTML = metaHtml;
-    panel.style.display = 'block';
-}
-
-
-
-function getNodeIcon(type) {
-    const icons = {
-        'url_root': 'hub', 'url': 'language', 'endpoint_rest': 'api', 'endpoint_graphql': 'settings_input_component',
-        'endpoint_admin': 'admin_panel_settings', 'endpoint_sensitive': 'folder_shared', 'endpoint_websocket': 'electrical_services',
-        'secret_aws': 'cloud', 'secret_jwt': 'key', 'secret_db': 'storage', 'secret': 'lock',
-        'vuln_idor': 'error', 'vuln_sqli': 'colorize', 'vuln_bac': 'door_open', 'vulnerability': 'warning',
-        'tech_backend': 'terminal', 'technology': 'settings',
-        'attack_chain': 'bolt', 'engine': 'local_fire_department', 'workflow': 'sync_alt',
-        'parameter': 'list', 'module': 'extension', 'instruction': 'assignment', 'system': 'dns'
-    };
-    return icons[type] || 'circle';
-}
-
-function getNodeColor(type, data) {
-    if (data && data.color) return data.color;
-    const map = {
-        'url_root': '#00b4d8', 'url': '#00b4d8',
-        'endpoint_rest': '#48cae4', 'endpoint_graphql': '#90e0ef',
-        'endpoint_admin': '#e63946', 'endpoint_sensitive': '#f4a261',
-        'endpoint_websocket': '#0077b6',
-        'secret_aws': '#f4a261', 'secret_jwt': '#e76f51', 'secret_db': '#f4a261', 'secret': '#ec4899',
-        'vuln_idor': '#dc2626', 'vuln_sqli': '#ef4444', 'vuln_bac': '#ef4444', 'vulnerability': '#ff2244',
-        'tech_backend': '#2a9d8f', 'technology': '#a855f7',
-        'attack_chain': '#9b5de5',
-        'engine': '#ffffff', 'workflow': '#00b4d8',
-        'parameter': '#eab308', 'module': '#ff2244',
-        'instruction': '#ffc107', 'system': '#6c757d'
-    };
-    return map[type] || '#aaaaaa';
-}
-
-function getCytoStylesheet() {
-    return [
-        {
-            selector: 'node',
-            style: {
-                'background-color': (ele) => getNodeColor(ele.data('type'), ele.data()),
-                'width': (ele) => ele.data('layer') === 'core' ? 24 : 8,
-                'height': (ele) => ele.data('layer') === 'core' ? 24 : 8,
-                'label': '', 
-                'opacity': 0.8,
-                'overlay-opacity': 0,
-                'transition-property': 'width, height, background-color, opacity',
-                'transition-duration': '0.15s',
-                'shadow-blur': (ele) => ele.data('layer') === 'core' ? 25 : 10,
-                'shadow-color': (ele) => getNodeColor(ele.data('type'), ele.data()),
-                'shadow-opacity': 0.8
-            }
-        },
-        {
-            selector: 'node.hovered, node.highlighted',
-            style: {
-                'label': 'data(label)',
-                'width': (ele) => ele.data('layer') === 'core' ? 32 : 16,
-                'height': (ele) => ele.data('layer') === 'core' ? 32 : 16,
-                'opacity': 1,
-                'color': '#ffffff',
-                'font-size': 10,
-                'font-family': 'Space Grotesk, monospace',
-                'text-margin-y': 4,
-                'text-valign': 'bottom',
-                'text-halign': 'center',
-                'text-outline-width': 2,
-                'text-outline-color': '#000000',
-                'z-index': 999,
-                'shadow-blur': 25,
-                'shadow-color': (ele) => getNodeColor(ele.data('type'), ele.data()),
-                'shadow-opacity': 1
-            }
-        },
-        {
-            selector: 'edge',
-            style: {
-                'width': 0.8,
-                'line-color': 'rgba(255,255,255,0.08)',
-                'curve-style': 'haystack',
-                'overlay-opacity': 0,
-                'opacity': 0.4
-            }
-        },
-        {
-            selector: 'edge.highlighted',
-            style: {
-                'width': 2,
-                'line-color': '#ffffff',
-                'opacity': 0.8,
-                'z-index': 500
-            }
-        },
-        {
-            selector: 'node.faded',
-            style: { 'opacity': 0.05 }
-        },
-        {
-            selector: 'edge.flowing',
-            style: {
-                'line-style': 'dashed',
-                'line-dash-pattern': [6, 3],
-                'line-dash-offset': 'data(offset)'
-            }
-        }
-    ];
-}
-
-function getCytoLayout(name) {
-    const layouts = {
-        'cose': { name: 'cose', animate: true, nodeOverlap: 20, componentSpacing: 100, nodeRepulsion: 4000, edgeElasticity: 100, nestingFactor: 5 },
-        'circle': { name: 'circle', animate: true, spacingFactor: 0.8 },
-        'grid': { name: 'grid', animate: true, rows: 3 },
-        'breadthfirst': { name: 'breadthfirst', animate: true, directed: true, padding: 30 },
-        'concentric': { 
-            name: 'concentric', 
-            animate: true,
-            concentric: function(node) {
-                const layer = node.data('layer') || '';
-                if (layer.includes('vulnerabilities') || layer.includes('core')) return 10;
-                if (layer.includes('intel')) return 7;
-                if (layer.includes('recon') || layer.includes('target')) return 4;
-                return 1;
-            },
-            levelWidth: () => 1
-        },
-        'sphere': {
-            name: 'preset',
-            animate: true,
-            animationDuration: 1000,
-            positions: function(node) {
-                const layer = node.data('layer') || '';
-                let r = 300;
-                if (layer.includes('vulnerabilities') || layer.includes('core')) r = 50;
-                else if (layer.includes('intel')) r = 150;
-                else if (layer.includes('recon') || layer.includes('target')) r = 250;
-                
-                const id = parseInt(node.id()) || 0;
-                const theta = (id * 137.5) * (Math.PI / 180); // Fibonacci spiral
-                const phi = Math.acos(1 - 2 * (id % 50) / 50);
-                
-                // 3D to 2D projection (simple sphere mapping)
-                return {
-                    x: r * Math.sin(phi) * Math.cos(theta),
-                    y: r * Math.sin(phi) * Math.sin(theta)
-                };
-            }
-        }
-    };
-    return layouts[name] || layouts['cose'];
-}
-let edgeAnimFrame = null;
-let rotationAngle = 0;
-let mouseX = 0;
-let mouseY = 0;
+let cy = null;
 
 function initAttackGraph() {
     const container = document.getElementById('attackGraph');
     if (!container) return;
 
-    // Clean up old instance
-    if (obsidianGraph) {
-        obsidianGraph._destructor(); 
-        obsidianGraph = null;
-    }
-    
-    if (typeof ForceGraph3D === 'undefined') {
-        console.error('ForceGraph3D not loaded');
-        container.innerHTML = '<div class="h-full flex items-center justify-center text-primary font-data-mono">ERR: NEURAL_ENGINE_NOT_LOADED</div>';
-        return;
-    }
-
-    const gData = {
-        nodes: SAMPLE_ATTACK_GRAPH.nodes.map(n => ({ ...n })),
-        links: SAMPLE_ATTACK_GRAPH.edges.map(e => ({ source: e.from, target: e.to }))
-    };
-
-    container.innerHTML = '';
-    try {
-        obsidianGraph = ForceGraph3D()(container)
-        .backgroundColor('#0a0a0f')
-        .graphData(gData)
-        .showNavInfo(false)
-        .nodeRelSize(4)
-        .nodeOpacity(0.9)
-        .linkOpacity(0.3)
-        .linkColor(() => 'rgba(100, 150, 255, 0.3)')
-        .linkCurvature(0.2)
-        .linkWidth(0.5)
-        .nodeThreeObject(node => {
-            const size = node.severity === 'critical' ? 6 : (node.severity === 'high' ? 5 : 4);
-            const color = getNodeColor(node.type, node);
-            
-            const geometry = new THREE.SphereGeometry(size);
-            const material = new THREE.MeshStandardMaterial({ 
-                color: color,
-                emissive: color,
-                emissiveIntensity: node.severity === 'critical' ? 2 : 0.5,
-                transparent: true,
-                opacity: 0.9
-            });
-            return new THREE.Mesh(geometry, material);
-        })
-        .onNodeHover((node, prevNode) => {
-            if (prevNode) {
-                prevNode.__threeObj.scale.set(1, 1, 1);
-                prevNode.__threeObj.material.emissiveIntensity = prevNode.severity === 'critical' ? 2 : 0.5;
+    cy = cytoscape({
+        container: container,
+        style: [
+            {
+                selector: 'node',
+                style: {
+                    'background-color': '#ff2244',
+                    'label': 'data(label)',
+                    'color': '#ffffff',
+                    'font-size': '10px',
+                    'font-family': 'Michroma',
+                    'text-valign': 'center',
+                    'text-halign': 'center',
+                    'width': '40px',
+                    'height': '40px',
+                    'border-width': 2,
+                    'border-color': '#ffffff'
+                }
+            },
+            {
+                selector: 'node[type="target"]',
+                style: { 'background-color': '#00ffff', 'width': '60px', 'height': '60px', 'font-size': '12px' }
+            },
+            {
+                selector: 'edge',
+                style: {
+                    'width': 2,
+                    'line-color': 'rgba(255,255,255,0.2)',
+                    'target-arrow-color': 'rgba(255,255,255,0.2)',
+                    'target-arrow-shape': 'triangle',
+                    'curve-style': 'bezier'
+                }
             }
-            if (node) {
-                node.__threeObj.scale.set(1.5, 1.5, 1.5);
-                node.__threeObj.material.emissiveIntensity = 5;
-                
-                // Show tooltip logic (minimal)
-                const tooltip = document.createElement('div');
-                tooltip.className = 'obsidian-tooltip';
-                tooltip.innerHTML = `
-                    <div class="flex items-center gap-2">
-                        <span class="material-symbols-outlined text-[12px]" style="color:${getNodeColor(node.type, node)}">${getNodeIcon(node.type)}</span>
-                        <span class="font-label-surgical text-[10px] tracking-widest text-white uppercase">${node.label}</span>
-                    </div>
-                `;
-                // 3d-force-graph has built-in nodeLabel, but user wants custom
-            }
-            
-            // Edge highlighting
-            obsidianGraph.linkDirectionalParticles(node ? 2 : 0);
-            obsidianGraph.linkDirectionalParticleWidth(1);
-        })
-        .onNodeClick(node => {
-            showNodeInfo({
-                label: node.label,
-                type: node.type,
-                icon: getNodeIcon(node.type),
-                description: node.description,
-                severity: node.severity,
-                risk: node.risk,
-                cwe: node.cwe,
-                cvss_score: node.cvss_score,
-                version: node.version,
-                recommendation: node.recommendation
-            });
-            
-            // Aim at node
-            const distance = 100;
-            const distRatio = 1 + distance/Math.hypot(node.x, node.y, node.z);
-            obsidianGraph.cameraPosition(
-                { x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio },
-                node,
-                1000
-            );
-        })
-        .onBackgroundClick(() => {
-            hideNodeInfo();
-        });
-
-    // Physics setup
-    obsidianGraph.d3Force('charge').strength(-150);
-    obsidianGraph.d3Force('link').distance(80);
-    obsidianGraph.d3Force('center').strength(0.1);
-
-    // Initial camera
-    obsidianGraph.cameraPosition({ x: 400, y: 200, z: 600 });
-
-    // Window resize
-    window.addEventListener('resize', () => {
-        if (obsidianGraph) {
-            obsidianGraph.width(container.clientWidth);
-            obsidianGraph.height(container.clientHeight);
-        }
+        ],
+        layout: { name: 'cose', animate: true }
     });
-
-    if (typeof pushActivity === 'function') pushActivity('Neural Attack Graph: Obsidian Engine Active', 'info');
-    } catch (err) {
-        console.error('Obsidian Graph Initialization Error:', err);
-        container.innerHTML = `<div class="h-full flex items-center justify-center text-primary font-data-mono">ERR: NEURAL_INIT_FAIL [${err.message}]</div>`;
-    }
-}
-
-function toggleGraphPhysics() {
-    isPhysicsEnabled = !isPhysicsEnabled;
-    const btn = document.getElementById('togglePhysicsBtn');
-    if (isPhysicsEnabled) {
-        obsidianGraph.resumeAnimation();
-        btn.classList.add('text-primary');
-        btn.querySelector('span').innerText = 'motion_sensor_active';
-    } else {
-        obsidianGraph.pauseAnimation();
-        btn.classList.remove('text-primary');
-        btn.querySelector('span').innerText = 'motion_sensor_idle';
-    }
-}
-
-function resetGraphView() {
-    if (obsidianGraph) {
-        obsidianGraph.cameraPosition({ x: 400, y: 200, z: 600 }, { x: 0, y: 0, z: 0 }, 1000);
-    }
-}
-
-// Cleanup legacy functions if they exist in this chunk range
-function startGraphAnimations() { return; }
-
-function renderAttackGraph(data) {
-    if (!obsidianGraph) {
-        initAttackGraph();
-        return;
-    }
-    const gData = {
-        nodes: data.nodes.map(n => ({ ...n })),
-        links: data.edges.map(e => ({ source: e.from, target: e.to }))
-    };
-    obsidianGraph.graphData(gData);
-    
-    const badge = document.getElementById('graphStatusBadge');
-    if (badge) badge.innerText = 'LIVE_NEURAL_MAP // SYNCED';
-    if (typeof pushActivity === 'function') pushActivity('Obsidian Attack Graph synchronized with live data', 'info');
 }
 
 ipcRenderer.on('graph-data', (event, data) => {
-    renderAttackGraph(data);
+    if (!cy) initAttackGraph();
+    cy.elements().remove();
+    cy.add(data);
+    cy.layout({ name: 'cose', animate: true }).run();
+    document.getElementById('chartStatusBadge').innerText = 'NEURAL ATTACK GRAPH';
+    document.getElementById('chartDisclaimer').innerText = 'Interactive graph generated from mission findings';
+    
+    // If we're on the graph view, ensure it's interactive
+    const graphEl = document.getElementById('attackGraph');
+    if (graphEl && !graphEl.classList.contains('opacity-0')) {
+        graphEl.classList.remove('pointer-events-none');
+    }
 });
 
 // Periodic graph refresh
@@ -2242,9 +1833,26 @@ function animateCounter(id, target) {
 }
 
 function toggleDashboardView(view, el) {
-    // This function is now deprecated as Attack Graph has moved to its own section.
-    // Preserving a minimal version to avoid reference errors, but the UI tabs have been removed.
-    console.log("Dashboard view toggled to:", view);
+    const chart = document.getElementById('findingsChart');
+    const graph = document.getElementById('attackGraph');
+    const tabs = document.querySelectorAll('.dash-view-tab');
+
+    tabs.forEach(t => {
+        t.classList.remove('text-primary', 'border-primary', 'border-b-2');
+        t.classList.add('text-white/30');
+    });
+    el.classList.add('text-primary', 'border-primary', 'border-b-2');
+    el.classList.remove('text-white/30');
+
+    if (view === 'chart') {
+        chart.classList.remove('opacity-0', 'pointer-events-none');
+        graph.classList.add('opacity-0', 'pointer-events-none');
+    } else {
+        chart.classList.add('opacity-0', 'pointer-events-none');
+        graph.classList.remove('opacity-0', 'pointer-events-none');
+        if (!cy) initAttackGraph();
+        ipcRenderer.send('get-attack-graph'); // Force update
+    }
 }
 
 // Module phase → kill-chain phase mapping

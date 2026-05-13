@@ -88,7 +88,7 @@
 
 /* Custom Scrollbar */
 .custom-scrollbar::-webkit-scrollbar {
-    width: 2px;
+    width: 16px; /* Larger for better grab */
 }
 
 .custom-scrollbar::-webkit-scrollbar-track {
@@ -98,6 +98,8 @@
 .custom-scrollbar::-webkit-scrollbar-thumb {
     background: var(--primary);
     box-shadow: 0 0 10px var(--primary);
+    border-radius: 2px;
+    border: 3px solid #000; /* Contrast gap */
 }
 
 /* UI Elements */
@@ -130,4 +132,184 @@
 /* Responsive Webview */
 webview {
     background: white;
+}
+
+/* ── HUD STATUS & FINDINGS ─────────────────────────────────────────── */
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #ffcc00;
+    transition: all 0.3s ease;
+    display: inline-block;
+    margin-right: 8px;
+}
+
+.status-dot.connected { background: #00ffcc; box-shadow: 0 0 10px #00ffcc; }
+.status-dot.busy { background: #ffcc00; box-shadow: 0 0 10px #ffcc00; }
+.status-dot.error { background: #ff3333; box-shadow: 0 0 10px #ff3333; }
+
+#opsFindings {
+    max-height: 400px;
+    overflow-y: auto;
+    resize: vertical;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+
+.finding-card {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    margin-bottom: 8px;
+    padding: 12px;
+    border-left: 3px solid #ff3333;
+    transition: all 0.2s;
+}
+
+.finding-card:hover {
+    background: rgba(255, 255, 255, 0.05);
+    transform: translateX(5px);
+}
+
+/* ── HIGH READABILITY CONTRAST ───────────────────────────────────────── */
+.text-white { color: #ffffff !important; }
+.text-primary { color: #ff2244 !important; }
+.font-data-mono { letter-spacing: 0.05em; font-weight: 500; }
+pre, .font-data-mono { color: rgba(255,255,255,0.95); }
+
+/* ── RESIZE HANDLES ─────────────────────────────────────────────────── */
+.resize-handle {
+    position: absolute;
+    z-index: 50;
+    background: rgba(255,34,68,0.02);
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.resize-handle::after {
+    content: '';
+    width: 30px;
+    height: 2px;
+    background: rgba(255,34,68,0.2);
+    border-radius: 2px;
+}
+.resize-handle:hover { 
+    background: rgba(255,34,68,0.2); 
+    box-shadow: 0 0 20px rgba(255,34,68,0.2);
+}
+.resize-handle:hover::after {
+    background: var(--primary);
+    width: 50px;
+}
+.rh-s { bottom: 0; left: 0; right: 0; height: 16px; cursor: ns-resize; border-bottom: 1px solid rgba(255,34,68,0.1); }
+
+/* ── INTEL CARDS ─────────────────────────────────────────────────── */
+.intel-card {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.05);
+    padding: 1.5rem;
+    cursor: pointer;
+    transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    position: relative;
+    overflow: hidden;
+}
+
+.intel-card:hover {
+    border-color: var(--primary);
+    background: rgba(255,34,68,0.05);
+    box-shadow: 0 0 30px rgba(255,34,68,0.15), inset 0 0 15px rgba(255,34,68,0.05);
+    transform: translateY(-2px) scale(1.01);
+}
+
+.intel-card.selected {
+    border-color: var(--primary);
+    background: rgba(255,34,68,0.1);
+    box-shadow: 0 0 40px rgba(255,34,68,0.3);
+}
+
+.intel-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; width: 4px; height: 100%;
+    background: transparent;
+    transition: all 0.3s;
+}
+
+.intel-card.selected::before {
+    background: var(--primary);
+    box-shadow: 0 0 10px var(--primary);
+}
+
+/* ── LOOT CARD STYLES ───────────────────────────────────────────── */
+.loot-card {
+    background: linear-gradient(145deg, rgba(255,255,255,0.03) 0%, rgba(255,255,255,0.01) 100%);
+    border: 1px solid rgba(255,255,255,0.05);
+    backdrop-filter: blur(10px);
+    transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+.loot-card:hover {
+    border-color: rgba(255,34,68,0.4);
+    background: rgba(255,34,68,0.02);
+    transform: translateY(-5px);
+    box-shadow: 0 15px 35px rgba(0,0,0,0.4), 0 0 20px rgba(255,34,68,0.05);
+}
+
+.loot-card::after {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; width: 100%; height: 100%;
+    background: radial-gradient(circle at top right, rgba(255,34,68,0.05) 0%, transparent 70%);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+}
+
+.loot-card:hover::after {
+    opacity: 1;
+}
+
+.loot-item-text {
+    color: rgba(255,255,255,0.9);
+    font-family: 'Space Grotesk', monospace;
+    font-size: 11px;
+    line-height: 1.6;
+    border-bottom: 1px solid rgba(255,255,255,0.02);
+    padding: 8px 0;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.chat-bubble {
+    padding: 1.25rem;
+    margin-bottom: 1rem;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    background: rgba(255, 255, 255, 0.02);
+    font-size: 13px;
+    line-height: 1.6;
+    position: relative;
+    overflow: hidden;
+}
+
+.chat-bubble.hellhound {
+    border-left: 2px solid var(--primary);
+    background: linear-gradient(90deg, rgba(255, 34, 68, 0.03) 0%, transparent 100%);
+}
+
+.chat-bubble pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: 'Space Grotesk', monospace;
+    color: rgba(255, 255, 255, 0.9);
+}
+
+.chat-noise-filtered {
+    animation: fade-in 0.3s ease-out;
+}
+
+.loot-item-text:last-child {
+    border-bottom: none;
 }

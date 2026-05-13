@@ -1202,6 +1202,31 @@ class HellhoundConsole(cmd.Cmd):
     # EXECUTION
     # ============================
 
+    def _persist_results(self):
+        """Saves current results to a shared sync file for the Intel Engine."""
+        sync_dir = os.path.join("storage", "sync")
+        if not os.path.exists(sync_dir):
+            try: os.makedirs(sync_dir)
+            except: pass
+        
+        sync_file = os.path.join(sync_dir, "session_sync.json")
+        try:
+            with open(sync_file, 'w') as f:
+                json.dump(self.results, f, indent=4, default=str)
+        except Exception:
+            pass 
+
+    def _load_sync_data(self):
+        """Reloads results from the shared sync file (used by Intel Engine)."""
+        sync_file = os.path.join("storage", "sync", "session_sync.json")
+        if os.path.exists(sync_file):
+            try:
+                with open(sync_file, 'r') as f:
+                    data = json.load(f)
+                    self.results.update(data)
+            except Exception:
+                pass
+
     def do_strike(self, arg):
         """strike → Execute the equipped module against the target"""
 
@@ -1307,6 +1332,7 @@ class HellhoundConsole(cmd.Cmd):
 
         if result:
             self.results[self.active_module.lower()] = result
+            self._persist_results()
             print(Style.BRIGHT + Fore.GREEN + f"\n[+] Strike complete. Intel stored under '{self.active_module.lower()}'." + Style.RESET_ALL)
             print(Fore.CYAN + "    Use 'loot' to view results, 'howl' for suggestions, or 'repro' to verify.\n" + Style.RESET_ALL)
         else:
@@ -1479,11 +1505,21 @@ class HellhoundConsole(cmd.Cmd):
         render_loot(self.target, self.results)
 
         return
+
     def do_howl(self, arg):
-        """howl → AI-powered attack chain correlation"""
+        """howl [--graph] → AI-powered attack chain correlation or attack graph generation"""
+        
+        self._load_sync_data()
 
         if not self.results:
             print(Fore.YELLOW + Style.BRIGHT + "[!] No intelligence collected yet — run Spider first." + Style.RESET_ALL)
+            return
+
+        # ── Attack Graph Generation (--graph) ────────────────
+        if "--graph" in arg:
+            from hellhound.core import nodes
+            graph_data = nodes.build_graph(self.results)
+            print(json.dumps(graph_data, indent=4))
             return
 
         # ── AI Enhanced Howl ──────────────────────────────────
@@ -1555,6 +1591,9 @@ class HellhoundConsole(cmd.Cmd):
 
     def do_ask(self, arg):
         """ask [question] → Interactive AI chat for bug bounty questions"""
+        
+        self._load_sync_data()
+        
         ai_key = self.target_context.get("ai_key")
         ai_provider = self.target_context.get("ai_provider", "gemini")
         model = self.target_context.get("ai_model", "gemini-1.5-flash")
@@ -1600,9 +1639,12 @@ class HellhoundConsole(cmd.Cmd):
         # Pick SLM-optimized persona if on ollama
         persona = ai_utils.ASK_PERSONA_SLM if provider == "ollama" else ai_utils.ASK_PERSONA
         
-        # Build context from existing scan results if available (Only for first turn or if requested)
+        # Build context from existing scan results if available (Only for technical/scan-related queries)
         context = ""
-        if not self._ask_history and self.results:
+        technical_keywords = ["target", "vuln", "scan", "bug", "exploit", "bounty", "find", "result", "how to", "chain"]
+        is_technical = any(k in question.lower() for k in technical_keywords) or len(question.split()) > 5
+        
+        if not self._ask_history and self.results and is_technical:
             context = f"\n\nCONTEXT — Current scan results available for {self.target or 'unknown target'}:\n"
             for mod, output in self.results.items():
                 intel = output.get("intel", {}) if isinstance(output, dict) else {}
@@ -1649,6 +1691,9 @@ class HellhoundConsole(cmd.Cmd):
 
     def do_analyze(self, arg):
         """analyze → AI-powered analysis of scan findings (on-demand, no auto-trigger)"""
+        
+        self._load_sync_data()
+        
         ai_key = self.target_context.get("ai_key")
         ai_provider = self.target_context.get("ai_provider", "gemini")
         model = self.target_context.get("ai_model", "gemini-1.5-flash")
@@ -1677,7 +1722,6 @@ class HellhoundConsole(cmd.Cmd):
             # 2. JWT Deep-Scan (Nested findings)
             jwt_v = []
             for j in intel.get("jwts", []):
-                # Pull general JWT vulnerabilities
                 for v in j.get("vulnerabilities", []):
                     jwt_v.append({
                         "type": f"JWT: {v.split(':')[0] if ':' in v else 'Vuln'}",
@@ -1685,7 +1729,6 @@ class HellhoundConsole(cmd.Cmd):
                         "url": j.get("url", j.get("source", "")),
                         "evidence": v
                     })
-                # Pull active verification exploits
                 for av in j.get("active_verifications", []):
                     if av.get("status") == "VERIFIED":
                         jwt_v.append({
@@ -1719,48 +1762,59 @@ class HellhoundConsole(cmd.Cmd):
                     seen_keys.add(key)
 
         if not all_findings:
-            print(Fore.YELLOW + "[!] No specific findings to analyze. Modules returned no vulnerabilities." + Style.RESET_ALL)
+            print(Fore.YELLOW + "[!] No specific findings to analyze." + Style.RESET_ALL)
             return
 
-        # Display menu
-        print(Fore.RED + Style.BRIGHT + "\n[ ANALYZE — Select findings for AI analysis ]\n" + Style.RESET_ALL)
+        # ── Handle choice as argument (For GUI/Non-Interactive) ────
+        if arg and arg.strip():
+            choices = [c.strip() for c in arg.split(",")]
+            selected = []
+            if "a" in choices:
+                selected = all_findings
+            else:
+                for c in choices:
+                    try:
+                        idx = int(c) - 1
+                        if 0 <= idx < len(all_findings):
+                            selected.append(all_findings[idx])
+                    except: continue
+            
+            if selected:
+                self._run_surgical_analysis(selected, ai_key, ai_provider, model)
+                return
 
-        for i, f in enumerate(all_findings, 1):
-            ftype = f.get("type", f.get("id", "Unknown"))
-            sev = f.get("severity", "UNKNOWN")
-            url = f.get("url", "")
-            mod = f.get("_source_module", "")
-            sev_color = Fore.MAGENTA if sev == "CRITICAL" else Fore.RED if sev == "HIGH" else Fore.YELLOW if sev == "MEDIUM" else Fore.WHITE
-            print(f"  {Fore.WHITE}[{i}]{Style.RESET_ALL} {sev_color}{ftype}{Style.RESET_ALL} ({sev}) on {Fore.CYAN}{url}{Style.RESET_ALL} [{mod}]")
+        # ── Interactive Selection (For Console) ─────────────────────
+        print(Fore.CYAN + "\n[ INTEL SELECTION CENTER ]" + Style.RESET_ALL)
+        for i, v in enumerate(all_findings, 1):
+            sev = v.get("severity", "INFO")
+            ftype = v.get("type", "Finding")
+            url = v.get("url", "")
+            print(f"[{i}] {Fore.RED if 'HIGH' in sev or 'CRITICAL' in sev else Fore.YELLOW}{ftype}{Style.RESET_ALL} -> {url[:70]}")
+        
+        print(f"\n[A] Analyze All | [Q] Abort")
+        choice = input(Fore.YELLOW + "\nhellhound [intel] > " + Style.RESET_ALL).strip().lower()
 
-        print(f"\n  {Fore.WHITE}[A]{Style.RESET_ALL} Analyze ALL findings")
-        print(f"  {Fore.WHITE}[X]{Style.RESET_ALL} Cancel\n")
-
-        try:
-            choice = input(f"  {Fore.WHITE + Style.BRIGHT}> {Style.RESET_ALL}").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-
-        if choice.upper() == "X" or not choice:
-            return
-
-        # Determine which findings to analyze
-        if choice.upper() == "A":
+        if choice == 'q': return
+        
+        selected = []
+        if choice == 'a':
             selected = all_findings
         else:
             try:
-                idx = int(choice) - 1
-                if 0 <= idx < len(all_findings):
-                    selected = [all_findings[idx]]
-                else:
-                    print(Fore.RED + "[x] Invalid selection." + Style.RESET_ALL)
-                    return
-            except ValueError:
-                print(Fore.RED + "[x] Invalid selection." + Style.RESET_ALL)
+                indices = [int(i.strip()) - 1 for i in choice.split(",")]
+                selected = [all_findings[idx] for idx in indices if 0 <= idx < len(all_findings)]
+            except:
+                print(Fore.RED + "[!] Invalid selection." + Style.RESET_ALL)
                 return
 
-        # Analyze each selected finding
+        if selected:
+            self._run_surgical_analysis(selected, ai_key, ai_provider, model)
+
+    def _run_surgical_analysis(self, selected, key, provider, model):
+        """Internal helper for AI surgical reasoning."""
+        print(Fore.MAGENTA + f"\n[*] Performing deep intelligence analysis on {len(selected)} target(s)..." + Style.RESET_ALL)
+        from hellhound.core import ai_utils
+        
         for f in selected:
             ftype = f.get("type", f.get("id", "Unknown"))
             sev = f.get("severity", "")
@@ -1773,13 +1827,14 @@ class HellhoundConsole(cmd.Cmd):
                 f"Severity: {sev}\n"
                 f"URL: {url}\n"
                 f"Parameter: {param}\n"
-                f"Evidence: {str(evidence)[:500]}\n"
+                f"Evidence: {str(evidence)[:800]}\n"
                 f"Target: {self.target}\n\n"
-                f"Analyze this finding for bug bounty impact and escalation potential."
+                f"Analyze this finding for bug bounty impact and escalation potential. "
+                f"Provide a concise, high-fidelity report with reproduction steps."
             )
             
             anim_thread, anim_stop = ai_utils.thinking_animation(f"ANALYZING {ftype.upper()[:20]}")
-            response = ai_utils.call_ai(prompt, ai_provider, ai_key, model=model, system_prompt=ai_utils.IMPACT_ADVISOR_PERSONA)
+            response = ai_utils.call_ai(prompt, provider, key, model=model, system_prompt=ai_utils.IMPACT_ADVISOR_PERSONA)
             anim_stop.set()
             anim_thread.join()
             

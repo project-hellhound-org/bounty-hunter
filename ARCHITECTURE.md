@@ -58,3 +58,16 @@ The AI Core is an agnostic, multi-tier correlation layer designed for profession
 | CDN misconfiguration + origin IP leak | SurfaceAuditor | SA-102/103 |
 | Open ports & unnecessary services | SurfaceAuditor | SA-110 |
 | Outdated frontend SDKs | SourceAuditor SA-016 | Pre-filter → AI verify |
+
+---
+
+## 5. Obsidian Neural Attack Graphing
+
+The Attack Graph is the visualization heartbeat of Hellhound, providing a high-fidelity "God's Eye View" of the target's security posture.
+
+*   **Force-Directed Physics (D3-force)**: Utilizes a dynamic physics simulation where nodes attract/repulse based on their relationship density. Highly connected targets (e.g., API Gateways) naturally cluster in the center.
+*   **3D Neural Mapping (Three.js)**: Transitions from 2D flat-space to 3D spatial awareness. Nodes are rendered as glowing spheres with emissive intensity scaled by vulnerability severity.
+*   **Tactical Interaction**:
+    *   **Node Deep-Dive**: Clicking a node triggers a tactical zoom and opens the Forensic Intelligence panel.
+    *   **Flow Particles**: Real-time directional particles visualize the "Attack Path" between discovery and exploitation.
+    *   **Minimalist HUD**: Tooltips and labels are dynamically hidden to maintain a professional, high-signal interface.

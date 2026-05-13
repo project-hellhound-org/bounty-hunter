@@ -25,7 +25,7 @@ function safeSend(channel, data) {
 // ── OUTPUT FILTER ──────────────────────────────────────────────────────────
 const ANSI_RE = /\x1b\[[0-9;]*[mGKHF]/g;
 const BRAILLE_RE = /[\u2800-\u28FF]/;
-const PROMPT_RE = /hellhound\s*[\(\[]?[^\)\]]*[\)\]]?\s*>/;
+const PROMPT_RE = /hellhound\s*([\(\[]?[^\)\]]*[\)\]]?)?\s*>/;
 
 const ANIMATION_PHRASES = [
     'hellhound framework console is',
@@ -55,7 +55,52 @@ function filterLine(raw) {
     return line;
 }
 
-// ── TELEMETRY CLASSIFIER ───────────────────────────────────────────────────
+// ── DEEP CLEANER FOR HUD ──────────────────────────────────────────────────
+// Strips banners, session markers, and CLI-only artifacts
+function deepCleanOutput(text) {
+    if (!text) return '';
+    
+    let clean = text.replace(ANSI_RE, '').replace(/\r/g, '');
+    
+    // Kill the dog banner and large blocks of ASCII art
+    clean = clean.replace(/^[ \t]*[.:#@%*=-]{10,}.*$/gm, ''); 
+    clean = clean.replace(/^[ \t]*[█╗╚═║██]{10,}.*$/gm, '');
+    clean = clean.replace(/.*Created by L4ZZ3RJ0D.*/gi, '');
+    
+    // Kill the session dividers and borders - wipe the whole line if it contains blocks
+    clean = clean.replace(/^.*█{10,}.*$/gm, '');
+    clean = clean.replace(/^.*─{10,}.*$/gm, '');
+    clean = clean.replace(/^.*═{10,}.*$/gm, '');
+    
+    // Kill the options table specifically and any global options header
+    clean = clean.replace(/.*Global options.*/gi, '');
+    clean = clean.replace(/.*No module equipped.*/gi, '');
+    clean = clean.replace(/.*Current Setting.*Required.*/gi, '');
+    clean = clean.replace(/.*Name.*Required.*Description.*/gi, '');
+    clean = clean.replace(/^-+ *-+ *-+.*$/gm, ''); // Table dividers like ---- ----
+    clean = clean.replace(/^[ \t]*(proxy|proxy_mode|bugbounty|wafbypass|oob|ai)[ \t]+.*$/gm, ''); // Specific option names
+    
+    clean = clean.replace(/HELLHOUND (SESSION|STRIKE|INTEL).*/gi, '');
+    clean = clean.replace(/SESSION CLOSED.*/gi, '');
+    clean = clean.replace(/COMMAND SENT.*/gi, '');
+    
+    // Kill the framework startup noise
+    clean = clean.replace(/.*HELLHOUND framework console is.*/gi, '');
+    clean = clean.replace(/.*Type 'help' to view.*/gi, '');
+    clean = clean.replace(/.*Type 'activate hellhound'.*/gi, '');
+    clean = clean.replace(/.*hellhound >.*/g, '');
+    clean = clean.replace(/.*Hellhound is activated.*/g, '');
+    
+    // Kill braille noise
+    clean = clean.replace(BRAILLE_RE, '');
+    
+    // Normalize newlines (kill the huge gaps)
+    clean = clean.replace(/\n{4,}/g, '\n\n');
+    
+    // Trim each line to remove console-centering indentation
+    return clean.split('\n').map(l => l.trim()).join('\n').trim();
+}
+
 const FINDING_PATTERNS = [
     { re: /\[critical\]/i,            severity: 'critical' },
     { re: /\[high\]/i,                severity: 'high'     },
@@ -77,6 +122,10 @@ function classifyLine(line) {
     for (const { re, severity } of FINDING_PATTERNS) {
         if (re.test(line)) return { line: line.trim(), severity };
     }
+    const l = line;
+    if (l.includes('Crawling') || l.includes('Found') || l.includes('Spider') || l.includes('http') || l.includes('URL')) return { line: l, severity: 'info' };
+    if (l.includes('Checking') || l.includes('Scanning') || l.includes('Testing')) return { line: l, severity: 'medium' };
+
     return null;
 }
 
@@ -97,9 +146,9 @@ class ConsoleEngine {
         this.queue = [];
         this.busy = false;
         this.current = null;
+        this.buffer = ''; // Stream buffer for prompt detection
         this.captureBuffer = '';
         this.promptsSeen = 0;
-        this.stdoutBuffer = '';
         this.currentTarget = '';
     }
 
@@ -125,71 +174,41 @@ class ConsoleEngine {
     }
 
     _handleData(data) {
-        this.stdoutBuffer += data.toString();
-        const lines = this.stdoutBuffer.split('\n');
-        this.stdoutBuffer = lines.pop(); // hold incomplete tail
-
-        lines.forEach(rawLine => this._processLine(rawLine));
-
-        // Check tail — CLI prompt has no trailing newline
-        if (PROMPT_RE.test(this.stdoutBuffer.trimEnd())) {
-            this.stdoutBuffer = '';
-            this._onPrompt();
+        this.buffer += data.toString();
+        
+        // Handle streaming output for active tasks
+        if (this.current?.streaming && this.onLine) {
+            const lines = this.buffer.split('\n');
+            this.buffer = lines.pop(); // Hold incomplete tail
+            lines.forEach(l => {
+                const filtered = filterLine(l.replace(ANSI_RE, '').replace(/\r/g, '').trim());
+                if (filtered) this.onLine(filtered);
+            });
         }
-    }
 
-    _processLine(rawLine) {
-        const isPrompt = PROMPT_RE.test(rawLine);
-
-        if (!this.ready) {
-            if (isPrompt) {
+        // Dynamic prompt detection (Console Path)
+        if (PROMPT_RE.test(this.buffer.trimEnd())) {
+            const out = this.buffer;
+            this.buffer = '';
+            
+            if (!this.ready) {
                 this.ready = true;
                 if (this.onReady) this.onReady(this.name);
                 this._drain();
             }
-            return;
+
+            if (this.current) {
+                this.promptsSeen++;
+                if (this.promptsSeen >= this.current.promptsExpected) {
+                    const task = this.current;
+                    this.current = null;
+                    this.busy = false;
+                    this.promptsSeen = 0;
+                    if (task.onDone) task.onDone(out);
+                    this._drain();
+                }
+            }
         }
-
-        if (isPrompt) { this._onPrompt(); return; }
-
-        const filtered = filterLine(rawLine);
-        if (filtered === null) return;
-
-        if (this.current && !this.current.streaming) {
-            // Capture mode — accumulate for AI/options responses
-            this.captureBuffer += filtered + '\n';
-        } else if (this.current?.streaming && this.onLine) {
-            // Streaming mode — send live to ops feed
-            this.onLine(filtered);
-        }
-    }
-
-    _onPrompt() {
-        if (!this.busy || !this.current) return;
-        this.promptsSeen++;
-        if (this.promptsSeen < this.current.promptsExpected) return;
-
-        const wasStreaming = this.current.streaming;
-        const hasOnDone = !!this.current.onDone;
-        const captured = this.captureBuffer.trim();
-
-        if (this.current.captureReply && this.current.captureChannel) {
-            this.current.captureReply(this.current.captureChannel, {
-                output: captured,
-                success: captured.length > 0
-            });
-        }
-        if (this.current.onDone) this.current.onDone(captured);
-        if (wasStreaming && !hasOnDone) {
-            // Strike complete
-            safeSend('proc-exit', { pid: this.proc?.pid || -1, code: 0 });
-        }
-
-        this.current = null;
-        this.captureBuffer = '';
-        this.promptsSeen = 0;
-        this.busy = false;
-        this._drain();
     }
 
     enqueue(entry) {
@@ -202,7 +221,6 @@ class ConsoleEngine {
         if (this.busy || this.queue.length === 0 || !this.ready) return;
         this.busy = true;
         this.current = this.queue.shift();
-        this.captureBuffer = '';
         this.promptsSeen = 0;
         this.current.lines.forEach(l => this.write(l));
     }
@@ -302,32 +320,46 @@ ipcMain.on('get-modules', (event) => {
     });
 });
 
-// 2. Options preflight — configure module and capture options output
+// 2. Options preflight — each command queued separately, each waits for its own prompt
 ipcMain.on('get-options', (event, { module, args }) => {
     const target = args.target || '';
-    const lines = [];
-    if (target) lines.push(`prey ${target}`);
-    lines.push(`equip ${module}`);
+    const cmds = [];
+    if (target) cmds.push(`prey ${target}`);
+    cmds.push(`equip ${module}`);
     Object.entries(args).forEach(([key, val]) => {
         if (key === 'target') return;
-        if (val === true) lines.push(`set ${key} true`);
-        else if (val !== false && val !== '') lines.push(`set ${key} ${val}`);
+        if (val === true) cmds.push(`set ${key} true`);
+        else if (val !== false && val !== '') cmds.push(`set ${key} ${val}`);
     });
-    lines.push('options');
+    cmds.push('options');
 
-    opsEngine.enqueue({
-        lines,
-        promptsExpected: lines.length,
-        streaming: false,
-        captureReply: event.reply.bind(event),
-        captureChannel: 'options-data'
+    let accumulated = '';
+    cmds.forEach((cmd, i) => {
+        const isLast = i === cmds.length - 1;
+        opsEngine.enqueue({
+            lines: [cmd],
+            promptsExpected: 1,
+            streaming: false,
+            onDone: isLast
+                ? (out) => event.reply('options-data', { output: accumulated + (out || ''), success: true })
+                : (out) => { if (out) accumulated += out + '\n'; }
+        });
     });
 });
 
 // 3. Strike confirmed — module already configured by get-options
 ipcMain.on('strike-confirmed', (event) => {
     event.reply('proc-started', { pid: opsEngine.proc?.pid || -1, module: 'confirmed' });
-    opsEngine.enqueue({ lines: ['strike'], promptsExpected: 1, streaming: true });
+    opsEngine.enqueue({
+        lines: ['strike'],
+        promptsExpected: 1,
+        streaming: true,
+        onDone: () => {
+            // After strike completes, run loot command to persist findings
+            // so intelEngine can reload them via session_sync
+            opsEngine.enqueue({ lines: ['loot'], promptsExpected: 1, streaming: false });
+        }
+    });
 });
 
 // 4. Abort
@@ -444,22 +476,17 @@ ipcMain.on('run-repro', (event, { cmd }) => {
     });
 });
 
-// 9. Settings sync — both engines receive global config
+// 9. Settings sync — each command queued individually on both engines
 ipcMain.on('sync-settings-to-console', (event, settings) => {
     const cmds = [];
     if (settings.proxy)     cmds.push(`proxy ${settings.proxy}`);
     if (settings.oob)       cmds.push(`setg oob ${settings.oob}`);
     if (settings.bugbounty) cmds.push(`setg bugbounty ${settings.bugbounty}`);
-    const isLocal = settings.ai_provider === 'LOCAL' || settings.ai_provider === 'LOCAL_SLM';
-    if (isLocal) {
-        cmds.push('setg ai local');
-    } else if (settings.ai_key) {
-        cmds.push(`setg ai ${settings.ai_key}`);
-    }
-    if (cmds.length === 0) return;
-    const entry = { lines: cmds, promptsExpected: cmds.length, streaming: false };
-    if (opsEngine) opsEngine.enqueue({ ...entry });
-    if (intelEngine) intelEngine.enqueue({ ...entry, lines: [...cmds] });
+    // AI is handled exclusively via ai-handshake channel — do NOT set here
+    cmds.forEach(cmd => {
+        if (opsEngine)   opsEngine.enqueue({   lines: [cmd], promptsExpected: 1, streaming: false });
+        if (intelEngine) intelEngine.enqueue({ lines: [cmd], promptsExpected: 1, streaming: false });
+    });
 });
 
 // 10. Repro shell — curl only
@@ -477,75 +504,77 @@ ipcMain.on('exec-repro', (event, command) => {
 
 // ── AI HANDLERS — all via intelEngine (never blocks opsEngine) ─────────────
 
+// ── AI HANDLERS ────────────────────────────────────────────────────────────
+// FLOW: setg ai local → activate hellhound → then ask/analyze/howl work
+// Each command queued individually (promptsExpected:1 always)
+
+// AI Handshake handles setting the provider and activating the neural core
+ipcMain.on('ai-handshake', (event, key) => {
+    const isLocal = !key || key === 'local' || key === 'ollama' || key.toUpperCase() === 'LOCAL';
+    
+    // Command selection based on user preference and console.py logic
+    const cmd = isLocal ? 'activate hellhound' : `setg ai ${key}`;
+    
+    // Sync to both engines
+    if (opsEngine) opsEngine.enqueue({ lines: [cmd], promptsExpected: 1, streaming: false });
+    
+    intelEngine.enqueue({
+        lines: [cmd],
+        promptsExpected: 1,
+        streaming: false,
+        onDone: (out) => {
+            // After activation/setting provider, check options for actual status
+            intelEngine.enqueue({
+                lines: ['options'],
+                promptsExpected: 1,
+                streaming: false,
+                onDone: (out2) => {
+                    // Strip ANSI before checking — console output is colored
+                    const clean = (out2 || '').replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '');
+                    const activated = (out || '').replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '');
+                    const isOnline = clean.includes('ONLINE') || clean.includes('CONNECTED') || activated.includes('Hellhound is activated');
+                    // Send both: activation output + options output for full context
+                    const finalOut = deepCleanOutput((out || '') + '\n' + (out2 || ''));
+                    event.reply('ai-response', finalOut);
+                }
+            });
+        }
+    });
+});
+
 ipcMain.on('ai-ask', (event, question) => {
     intelEngine.enqueue({
         lines: [`ask ${question}`],
         promptsExpected: 1,
         streaming: false,
-        onDone: (out) => event.reply('ai-response', out || 'No response. Check AI provider in Settings.')
+        onDone: (out) => {
+            const cleanOut = deepCleanOutput(out);
+            event.reply('ai-response', cleanOut || 'No response from Neural Core.');
+        }
     });
 });
 
 ipcMain.on('ai-analyze', (event, target) => {
-    // If target is "LIST", we just run 'analyze' to get the menu
-    const lines = [];
-    if (target && target !== 'LIST') lines.push(`prey ${target}`);
-    lines.push('analyze');
+    // Pass targets as argument to skip interactive menu (console.py supports this)
+    // e.g. "analyze 1,2,5" or just "analyze" for all
+    const isSelection = target && /^[\d,\s]+$/.test(target);
+    const cmd = isSelection ? `analyze ${target}` : 'analyze';
+    const cmds = [];
+    if (target && target !== 'LIST' && !isSelection) cmds.push(`prey ${target}`);
+    cmds.push(cmd);
 
-    intelEngine.enqueue({
-        lines,
-        promptsExpected: lines.length,
-        streaming: false,
-        onDone: (out) => {
-            // Check if output contains a menu [1], [2], etc.
-            const menuMatches = out.match(/\[\d+\]/g);
-            if (menuMatches && menuMatches.length > 0) {
-                // Parse the menu into structured data
-                const targets = [];
-                const lines = out.split('\n');
-                lines.forEach(line => {
-                    const match = line.match(/^\s*\[(\d+)\]\s+(.*?)\s+\((.*?)\)\s+on\s+(.*?)\s+\[(.*?)\]/i);
-                    if (match) {
-                        targets.push({
-                            id: match[1],
-                            type: match[2].trim(),
-                            severity: match[3].trim(),
-                            url: match[4].trim(),
-                            module: match[5].trim()
-                        });
-                    }
-                });
-                if (targets.length > 0) {
-                    safeSend('intel-target-list', targets);
-                    return;
-                }
-            }
-            event.reply('ai-response', out || `Analysis of ${target} complete.`);
-        }
+    let acc = '';
+    cmds.forEach((c, i) => {
+        const isLast = i === cmds.length - 1;
+        intelEngine.enqueue({
+            lines: [c],
+            promptsExpected: 1,
+            streaming: false,
+            onDone: isLast
+                ? (out) => event.reply('ai-response', acc + (out || ''))
+                : (out) => { if (out) acc += out + '\n'; }
+        });
     });
-});
-
-ipcMain.on('intel-selection-confirmed', (event, selection) => {
-    // selection is a string like "1,2,5" or just "1"
-    // Since we are already in the middle of a command (analyze),
-    // we just write to stdin and wait for the prompt.
-    
-    // We can hijack the 'onLine' of intelEngine temporarily if we want,
-    // but better to just use a one-off capture.
-    intelEngine.captureBuffer = '';
-    intelEngine.promptsSeen = 0;
-    
-    // We need to tell the engine that it's now waiting for a prompt again
-    intelEngine.busy = true;
-    intelEngine.current = {
-        streaming: false,
-        promptsExpected: 1,
-        onDone: (out) => {
-            safeSend('ai-response', out || 'Analysis complete.');
-        }
-    };
-    
-    intelEngine.write(selection);
 });
 
 ipcMain.on('ai-howl', (event) => {
@@ -553,33 +582,142 @@ ipcMain.on('ai-howl', (event) => {
         lines: ['howl'],
         promptsExpected: 1,
         streaming: false,
-        onDone: (out) => event.reply('ai-response', out || 'Howl complete. No critical patterns detected.')
+        onDone: (out) => event.reply('howl-data', out || 'Howl complete. No critical patterns detected.')
     });
 });
 
-ipcMain.on('ai-handshake', (event, key) => {
-    const isLocal = !key || key === 'local' || key === 'ollama' || key === 'LOCAL_SLM';
-    const lines = isLocal ? ['setg ai local', 'activate hellhound'] : [`setg ai ${key}`];
-    // Send to intelEngine (primary) and sync to opsEngine
+ipcMain.on('get-attack-graph', (event) => {
     intelEngine.enqueue({
-        lines,
-        promptsExpected: lines.length,
-        streaming: false,
-        onDone: (out) => {
-            event.reply('ai-response', out || 'AI Handshake initialized.');
-            event.reply('ai-status-result', out || '');
-        }
-    });
-    if (opsEngine) opsEngine.enqueue({ lines: [...lines], promptsExpected: lines.length, streaming: false });
-});
-
-ipcMain.on('check-ai-status', (event) => {
-    intelEngine.enqueue({
-        lines: ['show options'],
+        lines: ['howl --graph'],
         promptsExpected: 1,
         streaming: false,
-        onDone: (out) => event.reply('ai-status-result', out || '')
+        onDone: (out) => {
+            try {
+                // The output should be a JSON string from console.py
+                const graph = JSON.parse(out);
+                event.reply('graph-data', graph);
+            } catch (e) {
+                console.error("Failed to parse graph JSON:", e);
+                event.reply('graph-data', { nodes: [], edges: [] });
+            }
+        }
     });
+});
+
+ipcMain.on('get-arsenal', (event) => {
+    opsEngine.enqueue({
+        lines: ['arsenal'],
+        promptsExpected: 1,
+        streaming: false,
+        onDone: (out) => event.reply('arsenal-data', out)
+    });
+});
+
+ipcMain.on('get-status', (event) => {
+    opsEngine.enqueue({
+        lines: ['status'],
+        promptsExpected: 1,
+        streaming: false,
+        onDone: (out) => event.reply('status-data', out)
+    });
+});
+
+// Intel selection — send selection number(s) as analyze argument
+ipcMain.on('intel-selection-confirmed', (event, selection) => {
+    intelEngine.enqueue({
+        lines: [`analyze ${selection}`],
+        promptsExpected: 1,
+        streaming: false,
+        onDone: (out) => safeSend('ai-response', out || 'Analysis complete.')
+    });
+});
+
+
+ipcMain.on('check-ai-status', (event) => {
+    if (!intelEngine || !intelEngine.isReady()) {
+        event.reply('ai-status-result', '[!] Intel engine not ready yet.'); return;
+    }
+    if (intelEngine.busy) {
+        event.reply('ai-status-result', '[*] Engine busy (AI activation in progress). Try again shortly.'); return;
+    }
+    // Use direct 'options' command for actual status
+    intelEngine.enqueue({ lines: ['options'], promptsExpected: 1, streaming: false, onDone: (out) => event.reply('ai-status-result', out || '') });
+});
+
+// Intel Center — build structured finding cards from synced session data
+ipcMain.on('get-intel-targets', (event) => {
+    const syncFile = path.join(PROJECT_ROOT, 'storage', 'sync', 'session_sync.json');
+    if (!fs.existsSync(syncFile)) {
+        event.reply('intel-target-list', []);
+        return;
+    }
+
+    try {
+        const raw = fs.readFileSync(syncFile, 'utf8');
+        const results = JSON.parse(raw);
+        const targets = [];
+        let idCounter = 1;
+
+        for (const [module, data] of Object.entries(results)) {
+            // Recurse to find anything that looks like a finding
+            const findings = [];
+            
+            function extract(obj) {
+                if (!obj) return;
+                if (Array.isArray(obj)) {
+                    obj.forEach(item => {
+                        if (typeof item === 'object') extract(item);
+                        else if (typeof item === 'string') findings.push({ type: 'Info', context: item, severity: 'INFO' });
+                    });
+                    return;
+                }
+                if (typeof obj === 'object') {
+                    // Check for common keys
+                    const keys = ['vulnerabilities', 'findings', 'secrets', 'endpoints', 'urls', 'intel', 'results', 'data'];
+                    keys.forEach(k => {
+                        if (obj[k]) {
+                            if (Array.isArray(obj[k])) {
+                                obj[k].forEach(item => {
+                                    if (typeof item === 'object') findings.push(item);
+                                    else if (typeof item === 'string') findings.push({ type: 'Info', context: item, severity: 'INFO' });
+                                });
+                            }
+                            else extract(obj[k]);
+                        }
+                    });
+                    // If it has a 'url' and 'type', it's likely a finding itself
+                    if (obj.url || obj.type || obj.vulnerability) {
+                        findings.push(obj);
+                    }
+                }
+            }
+            extract(data);
+            
+            findings.forEach(f => {
+                if (typeof f !== 'object') return;
+                const severity = (f.severity || "INFO").toUpperCase();
+                const type = f.type || f.vulnerability || "Intel";
+                const url = f.url || f.context || f.endpoint || "Internal Finding";
+                
+                targets.push({
+                    id: idCounter++,
+                    module: module.toUpperCase().substring(0, 12),
+                    type: type,
+                    severity: severity,
+                    url: url,
+                    raw: typeof f === 'string' ? f : JSON.stringify(f),
+                    data: f
+                });
+            });
+        }
+        
+        const ord = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, INFO: 4 };
+        targets.sort((a, b) => (ord[a.severity] || 4) - (ord[b.severity] || 4));
+        event.reply('intel-target-list', targets);
+    } catch (e) {
+        console.error("Failed to sync intel targets:", e);
+        event.reply('intel-target-list', []);
+    }
 });
 
 // 11. Export session
@@ -590,6 +728,22 @@ ipcMain.on('export-session', (event, { filename, content }) => {
         fs.writeFileSync(outputPath, content, 'utf8');
         safeSend('export-done', { path: outputPath });
     } catch (e) { console.error('Export failed:', e); }
+});
+
+ipcMain.on('open-loot-dir', () => {
+    if (fs.existsSync(LOOT_DIR)) {
+        require('electron').shell.openPath(LOOT_DIR);
+    }
+});
+
+ipcMain.on('purge-loot', (event) => {
+    if (fs.existsSync(LOOT_DIR)) {
+        try {
+            fs.rmSync(LOOT_DIR, { recursive: true, force: true });
+            fs.mkdirSync(LOOT_DIR, { recursive: true });
+            event.reply('loot-data', {});
+        } catch (e) { console.error('Purge failed:', e); }
+    }
 });
 
 // 12. Window Controls

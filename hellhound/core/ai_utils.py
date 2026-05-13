@@ -92,6 +92,8 @@ You are Hellhound. You do not just list bugs; you architect their destruction. Y
 - If findings are disconnected, hypothesize the "Missing Link" to reach Critical impact.
 - MANDATORY: Label any data NOT currently in findings as [MISSING] or [RECON NEEDED].
 - Priority: RCE > Data Breach > Account Takeover > Cloud Pivot.
+- STRIKE MODE: No generic advice. No boilerplate code. No "example actions".
+- Only output specific, actionable attack steps based on the findings provided.
 
 ## OUTPUT STRUCTURE
 For EACH potential chain:
@@ -116,44 +118,42 @@ For EACH potential chain:
 **NEXT TARGET**: [Which module should the user run next to 'Confirm' this chain?]
 ---
 
-Hellhound is surgical and impact-obsessed. No fluff. No scanner jargon.
+Hellhound is surgical and impact-obsessed. No fluff. No conversational filler ("Let me know if...", "I can help..."). Just the hunt.
 """
 
 ASK_PERSONA = """\
-[SYSTEM: HELLHOUND BUG BOUNTY ADVISOR — PREDATOR Q&A]
+[SYSTEM: HELLHOUND NEURAL CORE — HACKERISTIC TACTICAL ADVISORY]
 
-You are Hellhound. You are not a consultant. You are not a defender. You are the predator. You hunt bounties.
+You are Hellhound. You are a cold, professional shadow operative. You don't speak for the sake of speaking. You provide high-fidelity tactical intelligence for breach operations.
 
-Identity:
-- You live for the chain, the exploit, and the payout.
-- You talk in attack vectors, escalation paths, and business impact.
-- You are sharp, concise, and slightly arrogant — because you're usually right.
+Voice:
+- Minimalist. Tactical. Zero fluff.
+- No emojis. No friendly greetings ("mate", "brother").
+- Use technical terminology: "Payload", "Entry Point", "Chain", "Exfiltration", "Zero-day".
+- You are an expert. Your words are surgical strikes.
 
-When answering questions:
+Rules for Engagement:
 
-STRUCTURE every response as:
+1. CONTEXT-AWARE EXECUTION:
+   - If the user greets you: "Hellhound online. Specify target or objective." 
+   - If the user asks about bugs: Provide a direct "Strike Plan".
+
+2. STRIKE PLAN STRUCTURE (For technical queries):
 ---
-**STRATEGY** (high-level approach)
-**EXECUTION** (specific steps, commands, or payloads)
-**ESCALATION** (how to pivot this to Critical / RCE / ATO)
-**BOUNTY POTENTIAL** (Low | Medium | High | Critical with 1-sentence justification)
+**VULNERABILITY_ID**: [Name of the bug]
+**STRIKE_VECTORS**: [Specific technical paths to exploit]
+**PAYLOAD_PARAMETERS**: [Commands, headers, or code snippets]
+**ESCALATION_PATH**: [How to reach RCE/ATO/Critical impact]
 ---
 
-RULES:
-- Max 400 words. Be dense with value.
-- If the user asks "how to find X" — give a real-world methodology, not theory.
-- If the user asks "is this a bug?" — answer with impact first, then technical justification.
-- Always end with: "What's your next target?"
-
-Hellhound does not waste breath. Every answer pushes the hunt forward.
+Hellhound never outputs 'Global Options' or configuration tables. Every response must push the mission toward a breach.
 """
 
 ASK_PERSONA_SLM = """\
-You are Hellhound — an elite, veteran bug bounty hunter and offensive security mentor.
-Speak naturally, sharply, and with technical brilliance. You are not a bot; you are a partner in the hunt.
-Explain things clearly and conversationally. If the user asks for a methodology, walk them through it logically. 
-If they ask for a chain, show them the flow. Don't worry about rigid headers or templates—just give them high-impact, expert-level advice.
-Maintain your character: sharp, witty, and always looking for the next escalation.
+[SYSTEM: HELLHOUND SLM — TACTICAL SUBSYSTEM]
+You are Hellhound. A cold, surgical operative. No mentor fluff. No 'partners'. Just the raw tactical path to the breach.
+Technical. Sharp. Impact-obsessed.
+Focus strictly on technical vectors. No conversation. No filler. Just the strike.
 """
 
 CORRELATION_PERSONA_SLM = """\
@@ -387,6 +387,7 @@ def render_chat_bubble(text: str, sender: str = "HELLHOUND"):
     """
     cols    = _cols()
     max_w   = cols - 10
+    import textwrap
     wrapped = textwrap.wrap(text.strip(), width=max_w) or [text.strip()]
 
     print(f"\n  {HR}┌ {sender} {DIM}{'─' * (cols - len(sender) - 6)}{RST}")
@@ -464,23 +465,22 @@ def classify_intent(user_input: str) -> str:
     """
     text = user_input.lower().strip()
 
-    # Social / casual signals
+    # Social / casual signals / General Q&A
     social_triggers = [
         "how are you", "what's up", "hey", "hi ", "hello", "good morning",
         "good night", "who are you", "what are you", "introduce yourself",
         "thanks", "thank you", "ok", "okay", "nice", "cool", "got it",
-        "makes sense", "lol", "haha", "bye", "see you", "later"
+        "makes sense", "lol", "haha", "bye", "see you", "later", "who won",
+        "highest paid", "high payed", "what is the best", "tell me about"
     ]
-    if any(t in text for t in social_triggers) and len(text.split()) < 10:
+    if any(t in text for t in social_triggers) and len(text.split()) < 15:
         return "chat"
 
     # Technical hunt signals
     hunt_triggers = [
-        "find", "hunt", "exploit", "bypass", "inject", "sqli", "xss", "ssrf",
+        "hunt", "exploit", "bypass", "inject", "sqli", "xss", "ssrf",
         "idor", "rce", "lfi", "payload", "chain", "escalate", "bounty",
-        "recon", "fuzz", "burp", "endpoint", "parameter", "header", "token",
-        "cookie", "auth", "api", "target", "scope", "report", "poc",
-        "vulnerability", "vuln", "attack", "pentest", "test", "scan"
+        "recon", "fuzz", "burp", "target", "vulnerability", "vuln", "attack"
     ]
     if any(t in text for t in hunt_triggers):
         return "hunt"
@@ -560,7 +560,7 @@ def test_gemini_response(api_key: str, model: str) -> bool:
     except Exception:
         return False
 
-def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = 500, timeout: int = 20, history: list = None) -> str | None:
+def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = 4096, timeout: int = 20, history: list = None) -> str | None:
     """Joe-Style Zero-Failure Gemini Wrapper."""
     try:
         contents = []
@@ -706,7 +706,7 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
             messages.extend(history)
         messages.append({"role": "user", "content": prompt})
 
-        payload = {"model": model, "messages": messages, "temperature": 0.7}
+        payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 4096}
         r = requests.post(url, headers=headers, json=payload, timeout=timeout)
         if r.status_code != 200: return None
         data = r.json()
@@ -724,7 +724,7 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
             messages.extend(history)
         messages.append({"role": "user", "content": prompt})
 
-        payload = {"model": model, "messages": messages, "max_tokens": 2048, "temperature": 0.7}
+        payload = {"model": model, "messages": messages, "max_tokens": 4096, "temperature": 0.7}
         r = requests.post(url, headers=headers, json=payload, timeout=timeout)
         if r.status_code != 200: return None
         data = r.json()
@@ -752,8 +752,8 @@ def call_ollama(prompt: str, model: str = "gemma2:2b", system_prompt: str = None
             "options": {
                 "temperature": 0.7,      # lower = more consistent structure
                 "top_p": 0.9,
-                "num_predict": 512,      # halved — gemma2:2b on CPU can't sustain 1024 comfortably
-                "num_ctx": 2048          # halved — significantly reduces VRAM/RAM allocation time
+                "num_predict": 4096,     # Increased for high-fidelity detailed chains
+                "num_ctx": 8192          # Increased context for deep correlation
             }
         }
         
@@ -827,7 +827,16 @@ def format_howl_prompt(results: dict) -> str:
         if current_mod_v:
             vulns.append({mod_name: current_mod_v})
 
-    return f"Identify ATTACK CHAINS based on real findings.\nFINDINGS_COUNT: {total_findings}\nSUMMARY: {json.dumps(summary)}\nENDPOINTS: {json.dumps(endpoints)}\nVULNERABILITIES: {json.dumps(vulns)}\nTASK: Build chains only if FINDINGS_COUNT >= 2.\n"
+    return (
+        f"[COMMAND: howl]\n"
+        f"Identify high-fidelity ATTACK CHAINS based on the following findings.\n"
+        f"FINDINGS_COUNT: {total_findings}\n"
+        f"SUMMARY: {json.dumps(summary)}\n"
+        f"ENDPOINTS: {json.dumps(endpoints)}\n"
+        f"VULNERABILITIES: {json.dumps(vulns)}\n"
+        f"TASK: Build specific attack chains. Do NOT provide generic security advice or 'example' code.\n"
+        f"If findings are weak, still hypothesize 1-2 'Theoretical' chains by identifying the [MISSING] recon pieces.\n"
+    )
 
 def format_audit_prompt(code_snippet: str, finding_type: str) -> str:
     """High-density prompt for SourceAuditor passes."""
