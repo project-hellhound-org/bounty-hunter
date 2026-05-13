@@ -1188,58 +1188,289 @@ let graphStyle = 'maltego'; // 'maltego' or 'obsidian'
 
 const SAMPLE_ATTACK_GRAPH = {
     "nodes": [
-        { "id": 0, "label": "HELLHOUND_CORE", "type": "engine", "layer": "core", "description": "Central Intelligence & Orchestration Engine.", "recommendation": "Maintain core encryption and isolation." },
+        { 
+            "id": 0, "label": "HELLHOUND_CORE", "type": "engine", "layer": "core", 
+            "description": "Central Intelligence & Orchestration Engine.", 
+            "recommendation": "Maintain core encryption and isolation.",
+            "version": "12.5.1-Apex", "uptime": 345600, "scan_status": "COMPLETE",
+            "active_modules": ["Spider", "Hydra", "SecretScanner", "XSStrike"],
+            "confidence": "HIGH", "date_discovered": "2026-05-10T08:00:00Z"
+        },
         
         // PERIMETER
-        { "id": 1, "label": "CORP_FW_01", "type": "system", "layer": "external", "description": "Primary Enterprise Firewall.", "recommendation": "Audit egress rules for anomalies." },
-        { "id": 2, "label": "WAF_CLOUDFLARE", "type": "system", "layer": "external", "description": "Edge Application Firewall.", "recommendation": "Tune WAF rules for GraphQL introspection protection." },
-        { "id": 3, "label": "WORKFLOW_RECON", "type": "workflow", "layer": "external", "description": "Automated Reconnaissance Pipeline.", "recommendation": "Rotate recon API keys periodically." },
-        { "id": 4, "label": "IDS_SNORT", "type": "system", "layer": "external", "description": "Intrusion Detection System.", "recommendation": "Update signature database for latest CVEs." },
+        { 
+            "id": 1, "label": "CORP_FW_01", "type": "system", "layer": "external", 
+            "description": "Primary Enterprise Firewall.", 
+            "recommendation": "Audit egress rules for anomalies.",
+            "vendor": "Fortinet", "version": "v7.4.1", "rule_count": 1250, "last_updated": "2026-05-12T04:00:00Z",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T10:00:00Z", "remediation_effort": "MEDIUM", "remediation_time": 8
+        },
+        { 
+            "id": 2, "label": "WAF_CLOUDFLARE", "type": "system", "layer": "external", 
+            "description": "Edge Application Firewall.", 
+            "recommendation": "Tune WAF rules for GraphQL introspection protection.",
+            "vendor": "Cloudflare", "version": "Enterprise_v2", "rule_count": 84, "last_updated": "2026-05-13T00:00:00Z",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T10:05:00Z", "remediation_effort": "LOW", "remediation_time": 2
+        },
+        { 
+            "id": 3, "label": "WORKFLOW_RECON", "type": "workflow", "layer": "external", 
+            "description": "Automated Reconnaissance Pipeline.", 
+            "recommendation": "Rotate recon API keys periodically.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T10:10:00Z", "remediation_effort": "LOW", "remediation_time": 1
+        },
+        { 
+            "id": 4, "label": "IDS_SNORT", "type": "system", "layer": "external", 
+            "description": "Intrusion Detection System.", 
+            "recommendation": "Update signature database for latest CVEs.",
+            "vendor": "Cisco", "version": "3.1.50", "rule_count": 24000, "last_updated": "2026-05-12T12:00:00Z",
+            "confidence": "MEDIUM", "date_discovered": "2026-05-13T10:15:00Z", "remediation_effort": "LOW", "remediation_time": 4
+        },
         
         // TARGET ASSETS
-        { "id": 5, "label": "api.corporate.com", "type": "url_root", "layer": "target", "description": "Production API Gateway.", "recommendation": "Enforce strict rate limiting." },
-        { "id": 6, "label": "/graphql", "type": "endpoint_graphql", "layer": "target", "description": "Unified Data Endpoint.", "recommendation": "Disable introspection in production.", "found_in": "api.corporate.com" },
-        { "id": 7, "label": "/admin/dashboard", "type": "endpoint_admin", "layer": "target", "description": "Internal Admin Interface.", "recommendation": "Enforce Multi-Factor Authentication (MFA).", "found_in": "api.corporate.com" },
-        { "id": 8, "label": "/rest/user/profile", "type": "endpoint_rest", "layer": "target", "description": "User Profile Management.", "recommendation": "Validate user session fidelity.", "found_in": "api.corporate.com" },
-        { "id": 9, "label": "/ftp/backup", "type": "endpoint_sensitive", "layer": "target", "description": "Unprotected Backup Storage.", "recommendation": "Secure directory listing and encrypt backups.", "found_in": "dev.internal.corp" },
-        { "id": 10, "label": "/oauth/token", "type": "endpoint_auth", "layer": "target", "description": "Identity Provider Endpoint.", "recommendation": "Rotate RSA signing keys.", "found_in": "api.corporate.com" },
-        { "id": 11, "label": "dev.internal.corp", "type": "url_root", "layer": "target", "description": "Development Staging Server.", "recommendation": "Isolate from production network." },
+        { 
+            "id": 5, "label": "api.corporate.com", "type": "url_root", "layer": "target", 
+            "description": "Production API Gateway.", 
+            "recommendation": "Enforce strict rate limiting.",
+            "http_methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"], "response_time_ms": 85, "status_code": 200, "requires_auth": true, "auth_type": "JWT", "content_type": "JSON", "exposed_data_types": ["PII", "Financial"],
+            "confidence": "HIGH", "date_discovered": "2026-05-13T10:20:00Z"
+        },
+        { 
+            "id": 6, "label": "/graphql", "type": "endpoint_graphql", "layer": "target", 
+            "description": "Unified Data Endpoint.", 
+            "recommendation": "Disable introspection in production.",
+            "http_methods": ["POST"], "response_time_ms": 210, "status_code": 200, "requires_auth": false, "auth_type": "None", "content_type": "GraphQL", "exposed_data_types": ["Schema", "Internal Metadata"],
+            "found_in": "api.corporate.com", "confidence": "HIGH", "date_discovered": "2026-05-13T10:25:00Z"
+        },
+        { 
+            "id": 7, "label": "/admin/dashboard", "type": "endpoint_admin", "layer": "target", 
+            "description": "Internal Admin Interface.", 
+            "recommendation": "Enforce Multi-Factor Authentication (MFA).",
+            "http_methods": ["GET"], "response_time_ms": 45, "status_code": 401, "requires_auth": true, "auth_type": "Session Cookie", "content_type": "HTML", "exposed_data_types": ["Admin Metadata"],
+            "found_in": "api.corporate.com", "confidence": "HIGH", "date_discovered": "2026-05-13T10:30:00Z"
+        },
+        { 
+            "id": 8, "label": "/rest/user/profile", "type": "endpoint_rest", "layer": "target", 
+            "description": "User Profile Management.", 
+            "recommendation": "Validate user session fidelity.",
+            "http_methods": ["GET", "POST"], "response_time_ms": 120, "status_code": 200, "requires_auth": true, "auth_type": "Bearer", "content_type": "JSON", "exposed_data_types": ["PII", "Credentials"],
+            "found_in": "api.corporate.com", "confidence": "HIGH", "date_discovered": "2026-05-13T10:35:00Z"
+        },
+        { 
+            "id": 9, "label": "/ftp/backup", "type": "endpoint_sensitive", "layer": "target", 
+            "description": "Unprotected Backup Storage.", 
+            "recommendation": "Secure directory listing and encrypt backups.",
+            "http_methods": ["GET"], "response_time_ms": 500, "status_code": 200, "requires_auth": false, "auth_type": "None", "content_type": "Binary", "exposed_data_types": ["Backups", "Config Files", "Secrets"],
+            "found_in": "dev.internal.corp", "confidence": "HIGH", "date_discovered": "2026-05-13T10:40:00Z"
+        },
+        { 
+            "id": 10, "label": "/oauth/token", "type": "endpoint_auth", "layer": "target", 
+            "description": "Identity Provider Endpoint.", 
+            "recommendation": "Rotate RSA signing keys.",
+            "http_methods": ["POST"], "response_time_ms": 300, "status_code": 200, "requires_auth": false, "auth_type": "Basic", "content_type": "JSON", "exposed_data_types": ["Access Tokens"],
+            "found_in": "api.corporate.com", "confidence": "HIGH", "date_discovered": "2026-05-13T10:45:00Z"
+        },
+        { 
+            "id": 11, "label": "dev.internal.corp", "type": "url_root", "layer": "target", 
+            "description": "Development Staging Server.", 
+            "recommendation": "Isolate from production network.",
+            "http_methods": ["GET", "POST"], "response_time_ms": 45, "status_code": 200, "requires_auth": false, "auth_type": "None", "content_type": "HTML", "exposed_data_types": ["Source Code", "Internal Paths"],
+            "confidence": "HIGH", "date_discovered": "2026-05-13T10:50:00Z"
+        },
         
         // INTELLIGENCE / SECRETS
-        { "id": 12, "label": "AWS_PROD_KEY", "type": "secret_aws", "layer": "intel", "severity": "critical", "risk": "critical", "description": "Compromised AWS Access Key.", "recommendation": "Revoke IAM user and rotate keys.", "found_in": "/ftp/backup/config.json" },
-        { "id": 13, "label": "JWT_SECRET", "type": "secret_jwt", "layer": "intel", "severity": "high", "risk": "high", "description": "Hardcoded JWT HMAC Secret.", "recommendation": "Move to HashiCorp Vault.", "found_in": "/rest/user/profile (Leaked in source)" },
-        { "id": 14, "label": "DB_CREDENTIALS", "type": "secret_db", "layer": "intel", "severity": "high", "risk": "high", "description": "Production Database Password.", "recommendation": "Implement DB user rotation.", "found_in": "/ftp/backup/db_dump.sql" },
-        { "id": 15, "label": "SLACK_WEBHOOK", "type": "secret_token", "layer": "intel", "severity": "medium", "risk": "medium", "description": "Exposed Slack Incoming Webhook.", "recommendation": "Deactivate webhook URL.", "found_in": "api.corporate.com JS bundle" },
-        { "id": 16, "label": "SSH_PRIVATE_KEY", "type": "secret_ssh", "layer": "intel", "severity": "critical", "risk": "critical", "description": "Root SSH Key for Dev Server.", "recommendation": "Cycle SSH keys and enforce passphrase.", "found_in": "/ftp/backup/.ssh/id_rsa" },
-        { "id": 17, "label": "STRIPE_KEY", "type": "secret_payment", "layer": "intel", "severity": "high", "risk": "high", "description": "Stripe Live API Key.", "recommendation": "Restrict key permissions to specific IPs.", "found_in": "/rest/user/profile logs" },
-        { "id": 18, "label": "GITHUB_TOKEN", "type": "secret_token", "layer": "intel", "severity": "high", "risk": "high", "description": "Personal Access Token with Repo Access.", "recommendation": "Revoke and use fine-grained tokens.", "found_in": "dev.internal.corp .env" },
-        { "id": 19, "label": "DOCKER_CONFIG", "type": "secret_token", "layer": "intel", "severity": "medium", "risk": "medium", "description": "Registry Authentication Token.", "recommendation": "Use short-lived auth tokens.", "found_in": "dev.internal.corp logs" },
+        { 
+            "id": 12, "label": "AWS_PROD_KEY", "type": "secret_aws", "layer": "intel", "severity": "critical", "risk": "critical", 
+            "description": "Compromised AWS Access Key.", 
+            "recommendation": "Revoke IAM user and rotate keys.",
+            "exposure_location": "/ftp/backup/config.json", "exposure_method": "Hardcoded", "privilege_level": "Admin", "rotation_required": true, "rotation_days": 30, "is_active": true,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:00:00Z", "remediation_effort": "HIGH", "remediation_time": 4, "affected_assets": ["AWS Account: 123456789012"]
+        },
+        { 
+            "id": 13, "label": "JWT_SECRET", "type": "secret_jwt", "layer": "intel", "severity": "high", "risk": "high", 
+            "description": "Hardcoded JWT HMAC Secret.", 
+            "recommendation": "Move to HashiCorp Vault.",
+            "exposure_location": "/rest/user/profile", "exposure_method": "Source Map", "privilege_level": "Write", "rotation_required": true, "rotation_days": 90, "is_active": true,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:05:00Z", "remediation_effort": "MEDIUM", "remediation_time": 8, "affected_assets": ["api.corporate.com"]
+        },
+        { 
+            "id": 14, "label": "DB_CREDENTIALS", "type": "secret_db", "layer": "intel", "severity": "high", "risk": "high", 
+            "description": "Production Database Password.", 
+            "recommendation": "Implement DB user rotation.",
+            "exposure_location": "/ftp/backup/db_dump.sql", "exposure_method": "Logs", "privilege_level": "Admin", "rotation_required": true, "rotation_days": 30, "is_active": true,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:10:00Z", "remediation_effort": "MEDIUM", "remediation_time": 4, "affected_assets": ["PostgreSQL Prod Cluster"]
+        },
+        { 
+            "id": 15, "label": "SLACK_WEBHOOK", "type": "secret_token", "layer": "intel", "severity": "medium", "risk": "medium", 
+            "description": "Exposed Slack Incoming Webhook.", 
+            "recommendation": "Deactivate webhook URL.",
+            "exposure_location": "api.corporate.com JS bundle", "exposure_method": "Source Map", "privilege_level": "Write", "rotation_required": false, "is_active": true,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:15:00Z", "remediation_effort": "LOW", "remediation_time": 1, "affected_assets": ["Slack Workspace: Corp-Dev"]
+        },
+        { 
+            "id": 16, "label": "SSH_PRIVATE_KEY", "type": "secret_ssh", "layer": "intel", "severity": "critical", "risk": "critical", 
+            "description": "Root SSH Key for Dev Server.", 
+            "recommendation": "Cycle SSH keys and enforce passphrase.",
+            "exposure_location": "/ftp/backup/.ssh/id_rsa", "exposure_method": "Hardcoded", "privilege_level": "Root", "rotation_required": true, "rotation_days": 90, "is_active": true,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:20:00Z", "remediation_effort": "MEDIUM", "remediation_time": 2, "affected_assets": ["dev.internal.corp"]
+        },
+        { 
+            "id": 17, "label": "STRIPE_KEY", "type": "secret_payment", "layer": "intel", "severity": "high", "risk": "high", 
+            "description": "Stripe Live API Key.", 
+            "recommendation": "Restrict key permissions to specific IPs.",
+            "exposure_location": "/rest/user/profile logs", "exposure_method": "Logs", "privilege_level": "Admin", "rotation_required": true, "rotation_days": 30, "is_active": true,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:25:00Z", "remediation_effort": "LOW", "remediation_time": 1, "affected_assets": ["Stripe Prod Account"]
+        },
+        { 
+            "id": 18, "label": "GITHUB_TOKEN", "type": "secret_token", "layer": "intel", "severity": "high", "risk": "high", 
+            "description": "Personal Access Token with Repo Access.", 
+            "recommendation": "Revoke and use fine-grained tokens.",
+            "exposure_location": "dev.internal.corp .env", "exposure_method": "Environment File", "privilege_level": "Admin", "rotation_required": true, "rotation_days": 30, "is_active": true,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:30:00Z", "remediation_effort": "LOW", "remediation_time": 1, "affected_assets": ["GitHub Org: Hellhound-Org"]
+        },
+        { 
+            "id": 19, "label": "DOCKER_CONFIG", "type": "secret_token", "layer": "intel", "severity": "medium", "risk": "medium", 
+            "description": "Registry Authentication Token.", 
+            "recommendation": "Use short-lived auth tokens.",
+            "exposure_location": "dev.internal.corp logs", "exposure_method": "Logs", "privilege_level": "Read", "rotation_required": true, "rotation_days": 30, "is_active": true,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:35:00Z", "remediation_effort": "LOW", "remediation_time": 1, "affected_assets": ["Docker Hub: hellhound-repo"]
+        },
         
         // VULNERABILITIES
-        { "id": 20, "label": "LOG4J_RCE", "type": "vuln_log4j", "layer": "vulnerabilities", "severity": "critical", "risk": "critical", "cwe": "CWE-94", "cvss_score": "10.0", "description": "RCE via JNDI injection in dev server.", "recommendation": "Update Log4j and set formatMsgNoLookups=true." },
-        { "id": 21, "label": "SQL_INJECTION", "type": "vuln_sqli", "layer": "vulnerabilities", "severity": "critical", "risk": "critical", "cwe": "CWE-89", "cvss_score": "9.8", "description": "Unfiltered input in search parameter.", "recommendation": "Use parameterized queries." },
-        { "id": 22, "label": "IDOR_USER_DATA", "type": "vuln_idor", "layer": "vulnerabilities", "severity": "high", "risk": "high", "cwe": "CWE-639", "cvss_score": "7.5", "description": "Can access any user profile via ID manipulation.", "recommendation": "Implement attribute-based access control." },
-        { "id": 23, "label": "XSS_STORED", "type": "vuln_xss", "layer": "vulnerabilities", "severity": "medium", "risk": "medium", "cwe": "CWE-79", "cvss_score": "5.4", "description": "Stored XSS in user comments section.", "recommendation": "Sanitize HTML input and use CSP." },
-        { "id": 24, "label": "BAC_ADMIN_PANEL", "type": "vuln_broken_access", "layer": "vulnerabilities", "severity": "high", "risk": "high", "cwe": "CWE-285", "cvss_score": "8.1", "description": "Admin dashboard accessible without proper role check.", "recommendation": "Validate user role on every request." },
-        { "id": 25, "label": "GRAPHQL_INTRO", "type": "vuln_graphql", "layer": "vulnerabilities", "severity": "medium", "risk": "medium", "cwe": "CWE-200", "cvss_score": "5.0", "description": "Introspection enabled, leaking schema details.", "recommendation": "Disable introspection in production." },
-        { "id": 26, "label": "SSRF_METADATA", "type": "vuln_ssrf", "layer": "vulnerabilities", "severity": "high", "risk": "high", "cwe": "CWE-918", "cvss_score": "8.3", "description": "Can reach cloud metadata service via webhook proxy.", "recommendation": "Validate destination URLs and block internal IPs." },
-        { "id": 27, "label": "OPEN_REDIRECT", "type": "vuln_open_redirect", "layer": "vulnerabilities", "severity": "low", "risk": "low", "cwe": "CWE-601", "cvss_score": "3.5", "description": "Unvalidated redirect in logout parameter.", "recommendation": "Use a whitelist of allowed domains." },
-        { "id": 28, "label": "JWT_NONE_ALGO", "type": "vuln_broken_access", "layer": "vulnerabilities", "severity": "high", "risk": "high", "cwe": "CWE-287", "cvss_score": "7.8", "description": "JWT accepting 'none' algorithm for auth bypass.", "recommendation": "Enforce specific signing algorithms." },
-        { "id": 29, "label": "S3_BUCKET_PUBLIC", "type": "vuln_broken_access", "layer": "vulnerabilities", "severity": "high", "risk": "high", "cwe": "CWE-284", "cvss_score": "7.2", "description": "Publicly readable backup bucket.", "recommendation": "Restrict S3 bucket permissions." },
+        { 
+            "id": 20, "label": "LOG4J_RCE", "type": "vuln_log4j", "layer": "vulnerabilities", "severity": "critical", "risk": "critical", 
+            "cwe": "CWE-94", "cvss_score": "10.0", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", "cve_id": "CVE-2021-44228",
+            "epss_score": 0.974, "epss_percentile": 99.8, "known_weapons": true, "exploit_available": true, "exploit_db_id": "EDB-50421", "owasp_category": "A03:2021-Injection", "exploit_complexity": "LOW", "privileges_required": "NONE", "user_interaction": "NONE",
+            "description": "RCE via JNDI injection in dev server.", 
+            "recommendation": "Update Log4j to 2.17.1+ and set formatMsgNoLookups=true.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:40:00Z", "remediation_effort": "MEDIUM", "remediation_time": 4, "affected_assets": ["dev.internal.corp"]
+        },
+        { 
+            "id": 21, "label": "SQL_INJECTION", "type": "vuln_sqli", "layer": "vulnerabilities", "severity": "critical", "risk": "critical", 
+            "cwe": "CWE-89", "cvss_score": "9.8", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", "cve_id": "CVE-2023-1234",
+            "epss_score": 0.85, "epss_percentile": 92.5, "known_weapons": false, "exploit_available": true, "owasp_category": "A03:2021-Injection", "exploit_complexity": "LOW", "privileges_required": "NONE", "user_interaction": "NONE",
+            "description": "Unfiltered input in search parameter.", 
+            "recommendation": "Use parameterized queries.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:45:00Z", "remediation_effort": "MEDIUM", "remediation_time": 8, "affected_assets": ["api.corporate.com"]
+        },
+        { 
+            "id": 22, "label": "IDOR_USER_DATA", "type": "vuln_idor", "layer": "vulnerabilities", "severity": "high", "risk": "high", 
+            "cwe": "CWE-639", "cvss_score": "7.5", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N", "owasp_category": "A01:2021-Broken Access Control", "exploit_complexity": "LOW", "privileges_required": "LOW", "user_interaction": "NONE",
+            "description": "Can access any user profile via ID manipulation.", 
+            "recommendation": "Implement attribute-based access control.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:50:00Z", "remediation_effort": "MEDIUM", "remediation_time": 12, "affected_assets": ["api.corporate.com"]
+        },
+        { 
+            "id": 23, "label": "XSS_STORED", "type": "vuln_xss", "layer": "vulnerabilities", "severity": "medium", "risk": "medium", 
+            "cwe": "CWE-79", "cvss_score": "5.4", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:L/I:L/A:N", "owasp_category": "A03:2021-Injection", "exploit_complexity": "MEDIUM", "privileges_required": "LOW", "user_interaction": "REQUIRED",
+            "description": "Stored XSS in user comments section.", 
+            "recommendation": "Sanitize HTML input and use CSP.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T11:55:00Z", "remediation_effort": "LOW", "remediation_time": 4, "affected_assets": ["api.corporate.com"]
+        },
+        { 
+            "id": 24, "label": "BAC_ADMIN_PANEL", "type": "vuln_broken_access", "layer": "vulnerabilities", "severity": "high", "risk": "high", 
+            "cwe": "CWE-285", "cvss_score": "8.1", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N", "owasp_category": "A01:2021-Broken Access Control", "exploit_complexity": "LOW", "privileges_required": "NONE", "user_interaction": "NONE",
+            "description": "Admin dashboard accessible without proper role check.", 
+            "recommendation": "Validate user role on every request.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T12:00:00Z", "remediation_effort": "MEDIUM", "remediation_time": 6, "affected_assets": ["api.corporate.com"]
+        },
+        { 
+            "id": 25, "label": "GRAPHQL_INTRO", "type": "vuln_graphql", "layer": "vulnerabilities", "severity": "medium", "risk": "medium", 
+            "cwe": "CWE-200", "cvss_score": "5.0", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", "owasp_category": "A01:2021-Broken Access Control", "exploit_complexity": "LOW", "privileges_required": "NONE", "user_interaction": "NONE",
+            "description": "Introspection enabled, leaking schema details.", 
+            "recommendation": "Disable introspection in production.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T12:05:00Z", "remediation_effort": "LOW", "remediation_time": 1, "affected_assets": ["api.corporate.com"]
+        },
+        { 
+            "id": 26, "label": "SSRF_METADATA", "type": "vuln_ssrf", "layer": "vulnerabilities", "severity": "high", "risk": "high", 
+            "cwe": "CWE-918", "cvss_score": "8.3", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N", "owasp_category": "A10:2021-Server-Side Request Forgery", "exploit_complexity": "LOW", "privileges_required": "NONE", "user_interaction": "NONE",
+            "description": "Can reach cloud metadata service via webhook proxy.", 
+            "recommendation": "Validate destination URLs and block internal IPs.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T12:10:00Z", "remediation_effort": "MEDIUM", "remediation_time": 8, "affected_assets": ["dev.internal.corp"]
+        },
+        { 
+            "id": 27, "label": "OPEN_REDIRECT", "type": "vuln_open_redirect", "layer": "vulnerabilities", "severity": "low", "risk": "low", 
+            "cwe": "CWE-601", "cvss_score": "3.5", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N", "owasp_category": "A03:2021-Injection", "exploit_complexity": "LOW", "privileges_required": "NONE", "user_interaction": "REQUIRED",
+            "description": "Unvalidated redirect in logout parameter.", 
+            "recommendation": "Use a whitelist of allowed domains.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T12:15:00Z", "remediation_effort": "LOW", "remediation_time": 2, "affected_assets": ["api.corporate.com"]
+        },
+        { 
+            "id": 28, "label": "JWT_NONE_ALGO", "type": "vuln_broken_access", "layer": "vulnerabilities", "severity": "high", "risk": "high", 
+            "cwe": "CWE-287", "cvss_score": "7.8", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N", "owasp_category": "A07:2021-Identification and Authentication Failures", "exploit_complexity": "LOW", "privileges_required": "NONE", "user_interaction": "NONE",
+            "description": "JWT accepting 'none' algorithm for auth bypass.", 
+            "recommendation": "Enforce specific signing algorithms.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T12:20:00Z", "remediation_effort": "MEDIUM", "remediation_time": 4, "affected_assets": ["api.corporate.com"]
+        },
+        { 
+            "id": 29, "label": "S3_BUCKET_PUBLIC", "type": "vuln_broken_access", "layer": "vulnerabilities", "severity": "high", "risk": "high", 
+            "cwe": "CWE-284", "cvss_score": "7.2", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", "owasp_category": "A01:2021-Broken Access Control", "exploit_complexity": "LOW", "privileges_required": "NONE", "user_interaction": "NONE",
+            "description": "Publicly readable backup bucket.", 
+            "recommendation": "Restrict S3 bucket permissions.",
+            "confidence": "HIGH", "date_discovered": "2026-05-13T12:25:00Z", "remediation_effort": "LOW", "remediation_time": 1, "affected_assets": ["S3 Bucket: corp-prod-backups"]
+        },
         
         // TECHNOLOGY
-        { "id": 30, "label": "NODEJS_EXPRESS", "type": "tech_backend", "layer": "target", "description": "Core application runtime." },
-        { "id": 31, "label": "REACT_FRONTEND", "type": "tech_frontend", "layer": "target", "description": "Client-side SPA framework." },
-        { "id": 32, "label": "POSTGRESQL", "type": "tech_database", "layer": "target", "description": "Primary relational database." },
-        { "id": 33, "label": "DOCKER_CONTAINER", "type": "tech_container", "layer": "target", "description": "Microservice isolation layer." },
-        { "id": 34, "label": "CLOUDFRONT_CDN", "type": "tech_cdn", "layer": "target", "description": "Content delivery and caching." },
+        { 
+            "id": 30, "label": "NODEJS_EXPRESS", "type": "tech_backend", "layer": "target", 
+            "description": "Core application runtime.",
+            "version": "16.14.0", "latest_version": "20.11.0", "end_of_life": "2023-09-11", "vulnerable_version": true, "known_cves": ["CVE-2023-1234"], "deprecated": true,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T12:30:00Z"
+        },
+        { 
+            "id": 31, "label": "REACT_FRONTEND", "type": "tech_frontend", "layer": "target", 
+            "description": "Client-side SPA framework.",
+            "version": "17.0.2", "latest_version": "18.2.0", "vulnerable_version": false, "deprecated": false,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T12:35:00Z"
+        },
+        { 
+            "id": 32, "label": "POSTGRESQL", "type": "tech_database", "layer": "target", 
+            "description": "Primary relational database.",
+            "version": "13.8", "latest_version": "16.1", "vulnerable_version": false, "deprecated": false,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T12:40:00Z"
+        },
+        { 
+            "id": 33, "label": "DOCKER_CONTAINER", "type": "tech_container", "layer": "target", 
+            "description": "Microservice isolation layer.",
+            "version": "20.10.12", "latest_version": "24.0.7", "vulnerable_version": false, "deprecated": false,
+            "confidence": "HIGH", "date_discovered": "2026-05-13T12:45:00Z"
+        },
+        { 
+            "id": 34, "label": "CLOUDFRONT_CDN", "type": "tech_cdn", "layer": "target", 
+            "description": "Content delivery and caching.",
+            "version": "Managed", "confidence": "HIGH", "date_discovered": "2026-05-13T12:50:00Z"
+        },
         
         // ATTACK CHAINS
-        { "id": 35, "label": "CHAIN_PRIV_ESC", "type": "attack_chain", "layer": "post_exploit", "severity": "high", "impact": "Full takeover of dev server environment." },
-        { "id": 36, "label": "CHAIN_DATA_EXFIL", "type": "attack_chain", "layer": "post_exploit", "severity": "critical", "impact": "Exporting production database via leaked AWS keys." },
-        { "id": 37, "label": "CHAIN_LATERAL_MOVE", "type": "attack_chain", "layer": "post_exploit", "severity": "high", "impact": "Pivoting from dev server to production gateway." },
-        { "id": 38, "label": "CHAIN_PERSISTENCE", "type": "attack_chain", "layer": "post_exploit", "severity": "high", "impact": "Maintaining access via SSH key injection." },
-        { "id": 39, "label": "CHAIN_ACC_TAKEOVER", "type": "attack_chain", "layer": "post_exploit", "severity": "critical", "impact": "Bypassing auth via JWT manipulation to hijack admins." }
+        { 
+            "id": 35, "label": "CHAIN_PRIV_ESC", "type": "attack_chain", "layer": "post_exploit", "severity": "high", 
+            "impact": "Full takeover of dev server environment.",
+            "kill_chain_phase": "Exploitation", "prerequisites": ["LOG4J_RCE", "SSH_PRIVATE_KEY"], "estimated_time": "30 minutes", "detection_score": 45, "mitre_techniques": ["T1068", "T1078"],
+            "confidence": "HIGH", "date_discovered": "2026-05-13T13:00:00Z"
+        },
+        { 
+            "id": 36, "label": "CHAIN_DATA_EXFIL", "type": "attack_chain", "layer": "post_exploit", "severity": "critical", 
+            "impact": "Exporting production database via leaked AWS keys.",
+            "kill_chain_phase": "Actions", "prerequisites": ["AWS_PROD_KEY", "DB_CREDENTIALS"], "estimated_time": "2 hours", "detection_score": 15, "mitre_techniques": ["T1020", "T1537"],
+            "confidence": "HIGH", "date_discovered": "2026-05-13T13:05:00Z"
+        },
+        { 
+            "id": 37, "label": "CHAIN_LATERAL_MOVE", "type": "attack_chain", "layer": "post_exploit", "severity": "high", 
+            "impact": "Pivoting from dev server to production gateway.",
+            "kill_chain_phase": "Installation", "prerequisites": ["SSH_PRIVATE_KEY", "SSRF_METADATA"], "estimated_time": "1 hour", "detection_score": 30, "mitre_techniques": ["T1021", "T1190"],
+            "confidence": "HIGH", "date_discovered": "2026-05-13T13:10:00Z"
+        },
+        { 
+            "id": 38, "label": "CHAIN_PERSISTENCE", "type": "attack_chain", "layer": "post_exploit", "severity": "high", 
+            "impact": "Maintaining access via SSH key injection.",
+            "kill_chain_phase": "Installation", "prerequisites": ["BAC_ADMIN_PANEL", "SSH_PRIVATE_KEY"], "estimated_time": "15 minutes", "detection_score": 20, "mitre_techniques": ["T1098", "T1133"],
+            "confidence": "HIGH", "date_discovered": "2026-05-13T13:15:00Z"
+        },
+        { 
+            "id": 39, "label": "CHAIN_ACC_TAKEOVER", "type": "attack_chain", "layer": "post_exploit", "severity": "critical", 
+            "impact": "Bypassing auth via JWT manipulation to hijack admins.",
+            "kill_chain_phase": "Exploitation", "prerequisites": ["JWT_NONE_ALGO", "IDOR_USER_DATA"], "estimated_time": "10 minutes", "detection_score": 60, "mitre_techniques": ["T1550", "T1078"],
+            "confidence": "HIGH", "date_discovered": "2026-05-13T13:20:00Z"
+        }
     ],
     "edges": [
         { "from": 0, "to": 1 }, { "from": 0, "to": 2 }, { "from": 0, "to": 3 }, { "from": 0, "to": 4 },
@@ -1257,7 +1488,6 @@ const SAMPLE_ATTACK_GRAPH = {
         { "from": 5, "to": 30 }, { "from": 11, "to": 33 }, { "from": 14, "to": 32 }, { "from": 10, "to": 31 }
     ]
 };
-
 function convertToCytoFormat(json) {
     const elements = [];
     (json.nodes || []).forEach(n => {
