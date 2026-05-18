@@ -213,34 +213,42 @@ if [ "${SKIP_OLLAMA:-0}" = "1" ]; then
     warn "Skipping Ollama install (SKIP_OLLAMA=1)"
 else
     echo ""
-    info "Setting up Local AI Engine (Ollama + gemma2:2b)..."
+    info "Ollama provides local AI (gemma2:2b) for unlimited pentesting without API tokens."
+    read -p "$(echo -e "${CYN}[?]${RST} Do you want to install Ollama and the gemma2:2b model? [Y/n]: ")" -r PROMPT_REPLY
     
-    if command -v ollama &>/dev/null; then
-        success "Ollama already installed: $(ollama --version 2>/dev/null || echo 'unknown')"
+    if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
+        warn "Skipping Ollama install as requested by user."
+        warn "Hellhound will still work with Gemini API keys without local AI."
     else
-        info "Installing Ollama..."
-        if curl -fsSL https://ollama.com/install.sh | sh 2>&1 | tail -3; then
-            success "Ollama installed successfully"
+        info "Setting up Local AI Engine (Ollama + gemma2:2b)..."
+        
+        if command -v ollama &>/dev/null; then
+            success "Ollama already installed: $(ollama --version 2>/dev/null || echo 'unknown')"
         else
-            warn "Ollama install failed — you can install it manually: https://ollama.com/download"
-            warn "Hellhound will still work with Gemini API keys without local AI."
-        fi
-    fi
-
-    # Pull the default SLM model if Ollama is available
-    if command -v ollama &>/dev/null; then
-        # Check if gemma2:2b is already pulled
-        if ollama list 2>/dev/null | grep -q "gemma2:2b"; then
-            success "Model gemma2:2b already available"
-        else
-            info "Pulling gemma2:2b (~1.6 GB, this may take a few minutes)..."
-            start_animation "DOWNLOADING SLM"
-            if ollama pull gemma2:2b 2>&1 | tail -1; then
-                stop_animation
-                success "gemma2:2b model ready for local AI pentesting"
+            info "Installing Ollama..."
+            if curl -fsSL https://ollama.com/install.sh | sh 2>&1 | tail -3; then
+                success "Ollama installed successfully"
             else
-                stop_animation
-                warn "Failed to pull gemma2:2b — you can pull it later: ollama pull gemma2:2b"
+                warn "Ollama install failed — you can install it manually: https://ollama.com/download"
+                warn "Hellhound will still work with Gemini API keys without local AI."
+            fi
+        fi
+
+        # Pull the default SLM model if Ollama is available
+        if command -v ollama &>/dev/null; then
+            # Check if gemma2:2b is already pulled
+            if ollama list 2>/dev/null | grep -q "gemma2:2b"; then
+                success "Model gemma2:2b already available"
+            else
+                info "Pulling gemma2:2b (~1.6 GB, this may take a few minutes)..."
+                start_animation "DOWNLOADING SLM"
+                if ollama pull gemma2:2b 2>&1 | tail -1; then
+                    stop_animation
+                    success "gemma2:2b model ready for local AI pentesting"
+                else
+                    stop_animation
+                    warn "Failed to pull gemma2:2b — you can pull it later: ollama pull gemma2:2b"
+                fi
             fi
         fi
     fi
