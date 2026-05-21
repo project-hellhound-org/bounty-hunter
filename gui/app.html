@@ -241,6 +241,14 @@
                     <span class="material-symbols-outlined">hub</span>
                     <span class="font-label-surgical text-[10px] tracking-widest uppercase">Neural Graph</span>
                 </div>
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('repeater', this)">
+                    <span class="material-symbols-outlined text-primary">swap_horiz</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">HTTP Repeater</span>
+                </div>
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('decaffeinator', this)">
+                    <span class="material-symbols-outlined text-[#00ffc4]">coffee</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase font-bold">De-Caffeinator</span>
+                </div>
                 <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('settings', this)">
                     <span class="material-symbols-outlined">settings_suggest</span>
                     <span class="font-label-surgical text-[10px] tracking-widest uppercase">Settings</span>
@@ -283,6 +291,18 @@
             <div class="h-8 w-px bg-white/10 hidden md:block"></div>
             
             <div class="flex items-center gap-3 pr-2">
+                <!-- WAF Status Indicator -->
+                <div id="wafStatusBtn" title="WAF Protection Status (Live checking via Repeater)"
+                    class="flex items-center gap-2 px-3 py-1 border border-white/10 bg-white/5 rounded">
+                    <span id="wafStatusIcon" class="material-symbols-outlined text-[12px] text-green-400">shield</span>
+                    <span id="wafStatusLabel" class="font-label-surgical text-[8px] text-green-400 uppercase tracking-widest">WAF: SAFE</span>
+                </div>
+                <!-- Heartbeat Monitor -->
+                <div id="heartbeatBtn" title="Target Response Latency (Latest transaction)"
+                    class="flex items-center gap-2 px-3 py-1 border border-white/10 bg-white/5 rounded">
+                    <span class="material-symbols-outlined text-[12px] text-primary">analytics</span>
+                    <span id="heartbeatLabel" class="font-label-surgical text-[8px] text-primary uppercase tracking-widest font-bold">LATENCY: -- MS</span>
+                </div>
                 <!-- Proxy Status Indicator -->
                 <button onclick="checkProxyStatus()" id="proxyStatusBtn" title="Proxy Status — click to check"
                     class="flex items-center gap-2 px-3 py-1 border border-white/10 hover:border-white/30 transition-colors">
@@ -689,6 +709,7 @@
                             <div class="flex items-center gap-4">
                                 <button onclick="copyActivePoC()" class="px-6 py-2 border border-white/10 text-white/60 font-label-surgical text-[10px] tracking-widest hover:border-white/40 hover:text-white transition-all uppercase">Copy_PoC</button>
                                 <button onclick="saveActivePoC()" class="px-6 py-2 border border-white/10 text-white/60 font-label-surgical text-[10px] tracking-widest hover:border-white/40 hover:text-white transition-all uppercase">Save_Artifact</button>
+                                <button id="reproAllBtn" onclick="fireConsoleRepro()" class="px-6 py-2 border border-primary/30 text-primary/80 font-label-surgical text-[10px] tracking-widest hover:border-primary/60 hover:text-primary transition-all uppercase">Replay_All</button>
                             </div>
                             <button id="reproFireBtn" onclick="fireRepro()"
                                 class="px-10 py-3 bg-primary text-background font-h1-visor text-[12px] tracking-[0.3em] uppercase font-bold hover:brightness-110 shadow-[0_0_30px_#ff2244] transition-all flex items-center gap-3">
@@ -858,8 +879,10 @@
                             <div class="space-y-4">
                                 <label class="font-label-surgical text-white text-[9px] uppercase tracking-widest">ai_provider</label>
                                 <select id="ai_provider" class="term-input w-full font-bold" onchange="toggleAiKeyInput()">
-                                    <option value="LOCAL">LOCAL_SLM (Gemma 2B)</option>
+                                    <option value="LOCAL">LOCAL_SLM (Ollama / Gemma 2B)</option>
                                     <option value="GEMINI">GEMINI_PRO (Cloud)</option>
+                                    <option value="OPENAI">OPENAI_GPT (Cloud)</option>
+                                    <option value="ANTHROPIC">ANTHROPIC_CLAUDE (Cloud)</option>
                                 </select>
                             </div>
                             <div id="aiKeyContainer" class="space-y-4 hidden">
@@ -932,6 +955,165 @@
             </div>
         </section>
 
+        <!-- HTTP REPEATER SECTION -->
+        <section id="repeater" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
+            <!-- Header bar -->
+            <div class="flex items-center justify-between" style="flex-shrink:0;">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">HTTP_REPEATER <span class="text-primary not-italic">// HUB</span></h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Intercept, Modify, and Replay HTTP Requests // Live Pentest Traffic log</p>
+                </div>
+            </div>
+
+            <!-- Main grid -->
+            <div class="flex-1 grid grid-cols-12 gap-6 min-h-0">
+                <!-- Traffic Log Pane (Col-span-4) -->
+                <div class="col-span-4 panel bg-black/95 border border-white/10 p-6 flex flex-col min-h-0">
+                    <div class="flex items-center justify-between mb-4" style="flex-shrink:0;">
+                        <h3 class="font-label-surgical text-[10px] text-primary font-bold tracking-[0.4em] uppercase">Traffic_History</h3>
+                        <button onclick="addNewRepeaterTab()" class="px-3 py-1 bg-primary/10 border border-primary/30 hover:bg-primary/20 text-primary font-label-surgical text-[9px] uppercase tracking-widest transition-all rounded">
+                            + New Request
+                        </button>
+                    </div>
+                    <!-- Search inside Traffic History -->
+                    <div class="relative mb-4" style="flex-shrink:0;">
+                        <input id="trafficSearch" type="text" placeholder="FILTER HISTORY..." 
+                            class="w-full bg-white/5 border border-white/10 text-white font-data-mono text-[10px] px-4 py-2 uppercase outline-none focus:border-primary transition-all pr-10" 
+                            oninput="filterTrafficHistory()">
+                        <span class="material-symbols-outlined absolute right-3 top-1/2 -translate-y-1/2 text-white/20 text-[14px]">search</span>
+                    </div>
+                    <!-- Scrollable Traffic history list -->
+                    <div id="trafficHistoryList" class="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-1">
+                        <div class="text-white/30 italic text-[10px] text-center font-data-mono py-8">No traffic intercepted yet. Runs/strikes will stream here.</div>
+                    </div>
+                </div>
+
+                <!-- Repeater Workspace Pane (Col-span-8) -->
+                <div class="col-span-8 panel bg-black/90 border border-white/10 p-6 flex flex-col min-h-0">
+                    <!-- Tab Bar -->
+                    <div class="flex items-center justify-between border-b border-white/10 pb-2 mb-4" style="flex-shrink:0;">
+                        <div id="repeaterTabsHeader" class="flex items-center gap-2 overflow-x-auto select-none custom-scrollbar">
+                            <!-- Injected tabs dynamically -->
+                        </div>
+                    </div>
+
+                    <!-- Target Configuration Bar -->
+                    <div class="flex items-center gap-4 mb-4" style="flex-shrink:0;">
+                        <select id="repeaterMethod" class="bg-white/5 border border-white/10 text-primary font-data-mono text-[11px] font-bold px-3 py-2 uppercase outline-none focus:border-primary transition-all rounded">
+                            <option value="GET">GET</option>
+                            <option value="POST">POST</option>
+                            <option value="PUT">PUT</option>
+                            <option value="DELETE">DELETE</option>
+                            <option value="PATCH">PATCH</option>
+                            <option value="OPTIONS">OPTIONS</option>
+                            <option value="HEAD">HEAD</option>
+                        </select>
+                        <input id="repeaterTarget" type="text" placeholder="http://127.0.0.1:5000/api/admin" 
+                            class="flex-1 bg-white/5 border border-white/10 text-white font-data-mono text-[11px] px-4 py-2 outline-none focus:border-primary transition-all rounded">
+                        
+                        <button id="repeaterSendBtn" onclick="sendActiveRepeater()" class="px-6 py-2 bg-primary hover:bg-primary-hover text-background font-label-surgical text-[11px] font-bold uppercase tracking-widest transition-all rounded flex items-center gap-2 shadow-[0_0_15px_rgba(255,34,68,0.3)] hover:scale-102">
+                            <span>SEND</span><span class="material-symbols-outlined text-[14px]">send</span>
+                        </button>
+                    </div>
+
+                    <!-- Editor Workspace Split -->
+                    <div class="flex-1 grid grid-cols-2 gap-4 min-h-0">
+                        <!-- Request (Left) -->
+                        <div class="flex flex-col min-h-0">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="font-label-surgical text-[9px] text-white/40 uppercase tracking-widest font-bold">Raw Request Payload</span>
+                                <span class="font-data-mono text-[8px] text-white/20">Edit headers & body</span>
+                            </div>
+                            <textarea id="repeaterRawRequest" 
+                                class="bg-black/45 border border-white/10 text-white font-data-mono text-[12px] p-4 outline-none focus:border-primary/50 transition-all rounded resize-none w-full select-text leading-relaxed whitespace-pre" 
+                                style="height: 60%;"
+                                placeholder="GET / HTTP/1.1&#10;Host: localhost&#10;User-Agent: Hellhound-Repeater/1.0&#10;&#10;"></textarea>
+
+                            <!-- Token Forge cryptographic sandbox panel -->
+                            <div class="mt-4 border border-white/10 bg-black/60 p-4 flex flex-col gap-3 rounded" style="height: 40%; min-height: 180px;">
+                                <div class="flex items-center justify-between">
+                                    <span class="font-label-surgical text-[9px] text-[#00ffc4] uppercase tracking-widest font-bold">🛠️ Token Forge Sandbox</span>
+                                    <span class="font-data-mono text-[8px] text-white/30">Encode, Decode, and Tamper Tokens</span>
+                                </div>
+                                <div class="flex-grow flex gap-4 min-h-0">
+                                    <textarea id="tokenForgeInput" class="flex-1 bg-black text-white font-data-mono text-[10px] p-2 border border-white/5 resize-none focus:outline-none focus:border-primary/40" placeholder="Payload or raw token..."></textarea>
+                                    <textarea id="tokenForgeOutput" readonly class="flex-1 bg-black/20 text-[#00ffc4] font-data-mono text-[10px] p-2 border border-white/5 resize-none focus:outline-none" placeholder="Results..."></textarea>
+                                </div>
+                                <div class="grid grid-cols-4 gap-2 flex-shrink-0">
+                                    <button onclick="tokenForgeAction('base64_encode')" class="py-1.5 bg-white/5 border border-white/10 text-white/80 hover:bg-white/10 font-label-surgical text-[8px] uppercase tracking-widest">B64 Enc</button>
+                                    <button onclick="tokenForgeAction('base64_decode')" class="py-1.5 bg-white/5 border border-white/10 text-white/80 hover:bg-white/10 font-label-surgical text-[8px] uppercase tracking-widest">B64 Dec</button>
+                                    <button onclick="tokenForgeAction('jwt_alg_none')" class="py-1.5 bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 font-label-surgical text-[8px] uppercase tracking-widest font-bold">JWT None</button>
+                                    <button onclick="tokenForgeAction('inject')" class="py-1.5 bg-[#00ffc4]/20 border border-[#00ffc4]/30 text-[#00ffc4] hover:bg-[#00ffc4]/30 font-label-surgical text-[8px] uppercase tracking-widest font-bold">Inject</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Response (Right) -->
+                        <div class="flex flex-col min-h-0 border-l border-white/5 pl-4">
+                            <div class="flex items-center justify-between mb-2">
+                                <span class="font-label-surgical text-[9px] text-white/40 uppercase tracking-widest font-bold">Response Stream</span>
+                                <div id="repeaterResponseMeta" class="flex gap-2">
+                                    <!-- Dynamic response details -->
+                                </div>
+                            </div>
+                            <!-- Response tab headers -->
+                            <div class="flex border-b border-white/10 mb-2 text-[10px] font-label-surgical tracking-widest uppercase">
+                                <button onclick="setResponseView('raw')" id="respTab-raw" class="px-3 py-1 text-white border-b-2 border-primary font-bold">Raw</button>
+                                <button onclick="setResponseView('headers')" id="respTab-headers" class="px-3 py-1 text-white/40 hover:text-white transition-colors">Headers</button>
+                                <button onclick="setResponseView('body')" id="respTab-body" class="px-3 py-1 text-white/40 hover:text-white transition-colors">Body</button>
+                            </div>
+                            
+                            <div id="repeaterResponseViewer" class="flex-1 bg-black/45 border border-white/10 text-white/80 font-data-mono text-[12px] p-4 rounded overflow-auto select-text leading-relaxed whitespace-pre-wrap select-text">
+                                <div class="text-white/20 italic text-[10px] text-center font-data-mono py-16">Send request to retrieve telemetry response stream</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- DE-CAFFEINATOR JS AST SANDBOX SECTION -->
+        <section id="decaffeinator" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
+            <div class="flex items-center justify-between" style="flex-shrink:0;">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">DE-CAFFEINATOR <span class="text-[#00ffc4] not-italic">// AST SANDBOX</span></h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Static Script Analysis & Secret Mining // Deobfuscate AST Trees</p>
+                </div>
+            </div>
+            
+            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
+                <!-- Left Column: Source Input -->
+                <div class="col-span-5 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Source Script Input</span>
+                    <textarea id="decafInput" class="flex-grow term-input w-full font-data-mono text-[10px] p-4 bg-black border border-white/10 text-white/80 resize-none focus:outline-none focus:border-primary/50" placeholder="Paste obfuscated JS code here..."></textarea>
+                    
+                    <div class="flex gap-4" style="flex-shrink:0;">
+                        <button onclick="deobfuscateScript()" class="flex-1 py-3 bg-primary text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">Deobfuscate Script</button>
+                        <button onclick="mineScript()" class="flex-1 py-3 border border-[#00ffc4]/40 bg-[#00ffc4]/10 text-[#00ffc4] font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:bg-[#00ffc4]/20 transition-all rounded shadow-md">Mine Secrets & Endpoints</button>
+                    </div>
+                </div>
+                
+                <!-- Right Column: Outputs -->
+                <div class="col-span-7 flex flex-col gap-6 min-h-0">
+                    <!-- Beautified Script Preview -->
+                    <div class="flex-grow flex flex-col gap-3 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Beautified Script Preview</span>
+                        <div class="flex-grow overflow-hidden border border-white/5 bg-black/40 rounded">
+                            <textarea id="decafBeautified" readonly class="w-full h-full p-4 font-data-mono text-[10px] text-[#00ffc4]/90 bg-transparent resize-none focus:outline-none custom-scrollbar leading-relaxed" placeholder="Beautified preview will render here..."></textarea>
+                        </div>
+                    </div>
+                    
+                    <!-- Extracted Entities & Endpoints -->
+                    <div class="h-64 flex flex-col gap-3 min-h-0 panel bg-black/60 border border-white/10 p-6" style="flex-shrink:0;">
+                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Extracted Entities / Endpoints</span>
+                        <div id="decafEntitiesList" class="flex-grow overflow-y-auto border border-white/5 bg-black/40 p-4 space-y-2 custom-scrollbar text-[10px] font-data-mono rounded">
+                            <div class="text-white/20 italic">Run endpoint mining to extract paths and secrets.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
     </main>
 
     <!-- ── REPRO SHELL (Universal Resize Handles Restored) ──────────────── -->
@@ -953,10 +1135,12 @@
         <div class="resize-handle rh-se" data-dir="se"></div>
         <div class="resize-handle rh-sw" data-dir="sw"></div>
         
-        <div id="reproOutput" class="flex-1 p-6 font-data-mono overflow-y-auto overflow-x-hidden text-white w-full" style="font-size:13px; scrollbar-width:thin; scrollbar-color:#ff2244 rgba(255,255,255,0.03);"></div>
-        <div class="p-3 bg-black border-t border-white/10 flex items-center gap-3">
-            <span class="text-primary font-data-mono text-[14px] font-black pl-2">›</span>
-            <input id="reproInput" type="text" class="flex-1 bg-transparent border-none focus:outline-none text-white font-data-mono" style="font-size: 11px;" placeholder="COMMAND..." onkeydown="handleRepro(event)">
+        <div id="reproOutput" class="flex-1 p-6 font-data-mono overflow-y-auto overflow-x-hidden text-white w-full flex flex-col" style="font-size:13px; scrollbar-width:thin; scrollbar-color:#ff2244 rgba(255,255,255,0.03);">
+            <pre class="panel-repro-pre font-data-mono text-[13px] text-white/90 whitespace-pre-wrap break-all w-full select-text"></pre>
+            <div id="reproCommandLine" class="flex items-center w-full mt-1 hidden">
+                <span id="reproPrompt" class="text-green-400 font-data-mono font-bold mr-2 select-none"></span>
+                <input id="reproInput" type="text" class="flex-1 bg-transparent border-none focus:outline-none text-white font-data-mono p-0 m-0" style="font-size: 13px;" placeholder="" onkeydown="handleRepro(event)">
+            </div>
         </div>
     </div>
     
@@ -968,7 +1152,7 @@
     </div>
 
     <!-- ── OVERLAY: AI NEURAL CORE (ASK/ANALYZE/HOWL RESTORED) ───────────── -->
-    <div id="aiContainer" class="fixed top-0 right-0 h-full w-[450px] bg-surface/98 border-l border-white/10 z-[550] translate-x-full transition-transform duration-500 backdrop-blur-3xl shadow-[-50px_0_100px_rgba(0,0,0,0.9)] flex flex-col pointer-events-none">
+    <div id="aiContainer" class="fixed top-16 right-0 h-[calc(100vh-64px)] w-[450px] bg-surface/98 border-l border-white/10 z-[550] translate-x-full transition-transform duration-500 backdrop-blur-3xl shadow-[-50px_0_100px_rgba(0,0,0,0.9)] flex flex-col pointer-events-none">
         <!-- Left edge drag handle for resizing -->
         <div id="aiResizeHandle" style="position:absolute;left:-4px;top:0;width:8px;height:100%;cursor:ew-resize;z-index:10;background:transparent;" title="Drag to resize"></div>
         <div class="p-10 flex-1 flex flex-col overflow-hidden">

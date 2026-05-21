@@ -1023,12 +1023,12 @@ class HellhoundConsole(cmd.Cmd):
         elif key in ("ai_provider", "aiprovider"):
             # Still allow manual override if needed, but mark as manual
             prov = raw_value.lower().strip()
-            if prov in ("gemini", "openai", "anthropic"):
+            if prov in ("gemini", "openai", "anthropic", "local", "ollama"):
                 self.target_context["ai_provider"] = prov
                 self.target_context["ai_status_label"] = f"MANUAL: {prov.upper()}"
                 print(Fore.GREEN + f"[✓] Global AI Provider => {prov} (Manual Override)")
             else:
-                print(Fore.RED + f"[x] Unsupported AI provider: {prov}. Use gemini | openai | anthropic")
+                print(Fore.RED + f"[x] Unsupported AI provider: {prov}. Use gemini | openai | anthropic | local")
         elif key == "ai_model":
             self.target_context["ai_model"] = raw_value
             self.target_context["ai_status_label"] = f"MANUAL: {raw_value.upper()}"
@@ -1075,23 +1075,24 @@ class HellhoundConsole(cmd.Cmd):
 
     def _activate_ai(self, raw_value, silent=False):
         """Private helper to handle AI handshake and context updates."""
+        explicit_prov = self.target_context.get("ai_provider")
         if raw_value.lower() in ("local", "ollama"):
             # Local SLM mode
             self.target_context["ai_key"] = "local"
             if not silent:
                 with console.status("[bold white]INITIALIZING NEURAL CORE...[/]", spinner="earth"):
-                    result = ai_utils.universal_handshake("ollama")
+                    result = ai_utils.universal_handshake("ollama", explicit_provider="ollama")
             else:
-                result = ai_utils.universal_handshake("ollama")
+                result = ai_utils.universal_handshake("ollama", explicit_provider="ollama")
         else:
             self.target_context["ai_key"] = raw_value
             masked = f"{raw_value[:4]}...{raw_value[-4:] if len(raw_value)>8 else ''}"
             if not silent:
                 print(Fore.GREEN + f"[✓] AI Key => {masked}")
                 with console.status("[bold white]ESTABLISHING QUANTUM LINK...[/]", spinner="bouncingBall"):
-                    result = ai_utils.universal_handshake(raw_value)
+                    result = ai_utils.universal_handshake(raw_value, explicit_provider=explicit_prov)
             else:
-                result = ai_utils.universal_handshake(raw_value)
+                result = ai_utils.universal_handshake(raw_value, explicit_provider=explicit_prov)
         
         if result["success"]:
             self.target_context["ai_provider"] = result["provider"]
@@ -1639,22 +1640,26 @@ class HellhoundConsole(cmd.Cmd):
         # Pick SLM-optimized persona if on ollama
         persona = ai_utils.ASK_PERSONA_SLM if provider == "ollama" else ai_utils.ASK_PERSONA
         
-        # Build context from existing scan results if available (Only for technical/scan-related queries)
+        # Build context from existing scan results if available
         context = ""
-        technical_keywords = ["target", "vuln", "scan", "bug", "exploit", "bounty", "find", "result", "how to", "chain"]
-        is_technical = any(k in question.lower() for k in technical_keywords) or len(question.split()) > 5
-        
-        if not self._ask_history and self.results and is_technical:
-            context = f"\n\nCONTEXT — Current scan results available for {self.target or 'unknown target'}:\n"
+        if self.target:
+            context += f"\n\n[SYSTEM CONTEXT: Active Target = {self.target}]\n"
+            
+        if not self._ask_history and self.results:
+            context += "Recent Scan Findings:\n"
+            found_any = False
             for mod, output in self.results.items():
                 intel = output.get("intel", {}) if isinstance(output, dict) else {}
                 vulns = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", [])
                 if vulns:
+                    found_any = True
                     context += f"  {mod}: {len(vulns)} finding(s)\n"
                     for v in vulns[:3]:
                         vtype = v.get("type", v.get("id", "unknown"))
                         sev = v.get("severity", "")
                         context += f"    - {vtype} {sev}\n"
+            if not found_any:
+                context += "  No findings discovered yet.\n"
         
         prompt = f"{question}{context}"
         

@@ -32,11 +32,7 @@ const ANIMATION_PHRASES = [
     'hellhound is using',
     'hellhound is thinking',
     'framework console is starting',
-    'hud initializing',
-    'recon probing', 'recon well-known', 'recon sitemaps',
-    'recon phase', 'recon robots',
-    'well-known 0/', 'sitemaps 0/', 'probing base 0/',
-    'intelligent probing', 'intelligent prob',
+    'hud initializing'
 ];
 
 function isAsciiArt(line) {
@@ -102,20 +98,25 @@ function deepCleanOutput(text) {
 }
 
 const FINDING_PATTERNS = [
+    { re: /^(?:critical|crit|fatal)[:\-\s]/i, severity: 'critical' },
+    { re: /^(?:high|warning|warn)[:\-\s]/i,   severity: 'high' },
+    { re: /^(?:medium|med)[:\-\s]/i,          severity: 'medium' },
+    { re: /^(?:low)[:\-\s]/i,                 severity: 'low' },
     { re: /\[critical\]/i,            severity: 'critical' },
     { re: /\[high\]/i,                severity: 'high'     },
     { re: /\[medium\]/i,              severity: 'medium'   },
     { re: /\[low\]/i,                 severity: 'low'      },
     { re: /\[info\]/i,                severity: 'info'     },
     { re: /\[vuln\]|\bvulnerable\b/i, severity: 'high'     },
-    { re: /\[found\]|\bfound\b/i,     severity: 'info'     },
-    { re: /\[warn\]|\bwarning\b/i,    severity: 'medium'   },
-    { re: /\[error\]|\berror\b/i,     severity: 'low'      },
-    { re: /https?:\/\/[^\s]+/,        severity: 'info'     },
-    { re: /\[\*\]/,                   severity: 'info'     },
-    { re: /\[>\]|\[!\]/,              severity: 'medium'   },
     { re: /\[secret\]/i,              severity: 'high'     },
     { re: /\[leak\]/i,                severity: 'high'     },
+    { re: /robots\.txt|sitemaps|sitemap/i, severity: 'medium' },
+    { re: /comment leak|credentials? leak|extract leak/i, severity: 'high' },
+    { re: /\[warn\]|\bwarning\b/i,    severity: 'medium'   },
+    { re: /\[error\]|\berror\b/i,     severity: 'low'      },
+    { re: /\[\*\]/,                   severity: 'info'     },
+    { re: /\[>\]|\[!\]/,              severity: 'medium'   },
+    { re: /https?:\/\/[^\s]+/,        severity: 'info'     },
 ];
 
 function classifyLine(line) {
@@ -388,22 +389,21 @@ ipcMain.on('kill-proc', () => {
 
 // 6. Loot Polling — recursive scan to find nested loot files
 ipcMain.on('get-loot', (event) => {
-    if (!fs.existsSync(LOOT_DIR)) return;
     const lootMap = {};
 
-    function scanDir(dir) {
+    function scanDir(dir, baseDir) {
         try {
             fs.readdirSync(dir).forEach(entry => {
                 const fullPath = path.join(dir, entry);
                 const stat = fs.statSync(fullPath);
                 if (stat.isDirectory()) {
-                    scanDir(fullPath); // recurse into target subdirectories
+                    scanDir(fullPath, baseDir); // recurse into target subdirectories
                 } else if (entry.endsWith('.json') || entry.endsWith('.txt')) {
                     try {
                         const raw = fs.readFileSync(fullPath, 'utf8').trim();
                         if (!raw) return;
                         // Use relative path as key so session log shows target/module
-                        const relKey = path.relative(LOOT_DIR, fullPath);
+                        const relKey = path.relative(baseDir, fullPath);
                         let lines = [];
                         if (entry.endsWith('.json')) {
                             try {
@@ -440,7 +440,94 @@ ipcMain.on('get-loot', (event) => {
         return results.slice(0, 200); // cap per file
     }
 
-    scanDir(LOOT_DIR);
+    if (fs.existsSync(LOOT_DIR)) {
+        scanDir(LOOT_DIR, LOOT_DIR);
+    }
+    
+    const REPORTS_DIR = path.join(PROJECT_ROOT, 'storage', 'reports');
+    if (fs.existsSync(REPORTS_DIR)) {
+        scanDir(REPORTS_DIR, REPORTS_DIR);
+    }
+
+    // Dynamic Live Session Sync
+    const syncFile = path.join(PROJECT_ROOT, 'storage', 'sync', 'session_sync.json');
+    if (fs.existsSync(syncFile)) {
+        try {
+            const raw = fs.readFileSync(syncFile, 'utf8');
+            const data = JSON.parse(raw);
+            const activeLines = [];
+            
+            let totalRisk = 0;
+            let totalIssues = 0;
+            for (const [mod, output] of Object.entries(data)) {
+                if (output && typeof output === 'object') {
+                    totalRisk += output.risk_score || 0;
+                    const intel = output.intel || {};
+                    for (const vk of ['vulnerabilities', 'findings', 'cors_vulnerabilities', 'cves', 'jwts']) {
+                        if (Array.isArray(intel[vk])) totalIssues += intel[vk].length;
+                    }
+                }
+            }
+            
+            activeLines.push(`Risk Score: ${totalRisk}`);
+            activeLines.push(`Issues Identified: ${totalIssues}`);
+            activeLines.push(``);
+            
+            for (const [mod, output] of Object.entries(data)) {
+                if (!output || typeof output !== 'object') continue;
+                const intel = output.intel || {};
+                
+                if (mod === 'spider') {
+                    const endpoints = intel.endpoints || [];
+                    const secrets = intel.secrets || [];
+                    activeLines.push(`=== SPIDER MODULE ===`);
+                    activeLines.push(`Discovered Endpoints: ${endpoints.length}`);
+                    activeLines.push(`Extracted Secrets: ${secrets.length}`);
+                    secrets.forEach(sec => {
+                        let secStr = sec.content || sec.value || sec.match || JSON.stringify(sec);
+                        if (sec.type) secStr = `[${sec.type}] ${secStr}`;
+                        if (sec.source) secStr += ` (${sec.source})`;
+                        activeLines.push(`  ↳ Secret: ${secStr}`);
+                    });
+                    activeLines.push(``);
+                } else {
+                    let hasFindings = false;
+                    for (const vk of ['vulnerabilities', 'findings', 'cors_vulnerabilities', 'cves', 'jwts', 'reconstructed']) {
+                        const items = intel[vk] || [];
+                        if (Array.isArray(items) && items.length > 0) {
+                            if (!hasFindings) {
+                                activeLines.push(`=== ${mod.toUpperCase()} FINDINGS ===`);
+                                hasFindings = true;
+                            }
+                            items.forEach(v => {
+                                if (typeof v === 'string') {
+                                    activeLines.push(`- ${v}`);
+                                } else if (v && typeof v === 'object') {
+                                    const sev = (v.severity || v.confidence || 'INFO').toUpperCase();
+                                    const vtype = v.finding_type || v.type || v.name || 'Vulnerability';
+                                    const method = v.method || 'GET';
+                                    const url = v.url || 'N/A';
+                                    const param = v.parameter || v.param_name || '';
+                                    activeLines.push(`[${sev}] ${vtype.replace(/_/g, ' ').toUpperCase()}`);
+                                    activeLines.push(`  Method: ${method} | Target: ${url}`);
+                                    if (param) activeLines.push(`  Parameter: ${param}`);
+                                    if (v.evidence) activeLines.push(`  Evidence: ${v.evidence}`);
+                                    if (v.poc_curl) activeLines.push(`  PoC: ${v.poc_curl}`);
+                                    activeLines.push(``);
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            if (activeLines.length > 3) {
+                lootMap['ACTIVE_SESSION_FINDINGS.txt'] = activeLines;
+            }
+        } catch (e) {
+            console.error("Failed to parse active sync data for loot:", e);
+        }
+    }
+
     event.reply('loot-data', lootMap);
 });
 
@@ -509,18 +596,32 @@ ipcMain.on('exec-repro', (event, command) => {
 // Each command queued individually (promptsExpected:1 always)
 
 // AI Handshake handles setting the provider and activating the neural core
-ipcMain.on('ai-handshake', (event, key) => {
-    const isLocal = !key || key === 'local' || key === 'ollama' || key.toUpperCase() === 'LOCAL';
+ipcMain.on('ai-handshake', (event, payload) => {
+    let provider = '';
+    let key = '';
+    if (typeof payload === 'string') {
+        key = payload;
+        provider = (!key || key === 'local' || key === 'ollama' || key.toUpperCase() === 'LOCAL') ? 'LOCAL' : '';
+    } else {
+        provider = payload.provider;
+        key = payload.key;
+    }
+
+    const isLocal = !key || key === 'local' || key === 'ollama' || key.toUpperCase() === 'LOCAL' || provider === 'LOCAL';
     
     // Command selection based on user preference and console.py logic
-    const cmd = isLocal ? 'activate hellhound' : `setg ai ${key}`;
+    const cmds = [];
+    if (!isLocal && provider) {
+        cmds.push(`setg ai_provider ${provider.toLowerCase()}`);
+    }
+    cmds.push(isLocal ? 'activate hellhound' : `setg ai ${key}`);
     
     // Sync to both engines
-    if (opsEngine) opsEngine.enqueue({ lines: [cmd], promptsExpected: 1, streaming: false });
+    if (opsEngine) opsEngine.enqueue({ lines: cmds, promptsExpected: cmds.length, streaming: false });
     
     intelEngine.enqueue({
-        lines: [cmd],
-        promptsExpected: 1,
+        lines: cmds,
+        promptsExpected: cmds.length,
         streaming: false,
         onDone: (out) => {
             // After activation/setting provider, check options for actual status

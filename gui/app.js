@@ -114,7 +114,12 @@ function showSection(id, el) {
     const target = document.getElementById(id);
     if (target) {
         target.classList.remove('hidden');
-        target.classList.add(id === 'arsenal' || id === 'ops' || id === 'intel' || id === 'loot' || id === 'repro' || id === 'graph' ? 'flex' : 'block');
+        target.classList.add(id === 'arsenal' || id === 'ops' || id === 'intel' || id === 'loot' || id === 'repro' || id === 'graph' || id === 'repeater' || id === 'decaffeinator' ? 'flex' : 'block');
+    }
+    
+    // Manage HTTP Repeater active state
+    if (id === 'repeater') {
+        initRepeater();
     }
     
     if (id === 'intel') {
@@ -320,16 +325,27 @@ function analyzeSelectedTargets() {
 const reproPanel = document.getElementById('reproPanel');
 const reproHeader = document.getElementById('reproHeader');
 
+if (reproPanel) {
+    reproPanel.addEventListener('click', () => {
+        const input = document.getElementById('reproInput');
+        if (input) input.focus();
+    });
+}
+
 let isMoving = false, isResizing = false, resizeDir = '';
 let startX, startY, startW, startH, startL, startT;
 
 reproHeader.onmousedown = (e) => {
-    // Clear CSS anchors so JS top/left/width/height have full control
-    reproPanel.style.bottom = 'auto';
-    reproPanel.style.right = 'auto';
     isMoving = true;
     startX = e.clientX; startY = e.clientY;
     startL = reproPanel.offsetLeft; startT = reproPanel.offsetTop;
+    
+    // Explicitly lock coordinates BEFORE clearing anchors to prevent layout jumping
+    reproPanel.style.left = startL + 'px';
+    reproPanel.style.top = startT + 'px';
+    reproPanel.style.bottom = 'auto';
+    reproPanel.style.right = 'auto';
+    
     document.onmousemove = (ev) => {
         if (isMoving) {
             reproPanel.style.left = (startL + ev.clientX - startX) + 'px';
@@ -342,13 +358,17 @@ reproHeader.onmousedown = (e) => {
 document.querySelectorAll('.resize-handle').forEach(handle => {
     handle.onmousedown = (e) => {
         e.stopPropagation();
-        // Clear anchors on first resize too
-        reproPanel.style.bottom = 'auto';
-        reproPanel.style.right = 'auto';
         isResizing = true; resizeDir = handle.dataset.dir;
         startX = e.clientX; startY = e.clientY;
         startW = reproPanel.offsetWidth; startH = reproPanel.offsetHeight;
         startL = reproPanel.offsetLeft;  startT = reproPanel.offsetTop;
+        
+        // Explicitly lock coordinates BEFORE clearing anchors
+        reproPanel.style.left = startL + 'px';
+        reproPanel.style.top = startT + 'px';
+        reproPanel.style.bottom = 'auto';
+        reproPanel.style.right = 'auto';
+        
         document.onmousemove = (ev) => {
             if (!isResizing) return;
             const dx = ev.clientX - startX;
@@ -365,14 +385,352 @@ document.querySelectorAll('.resize-handle').forEach(handle => {
     };
 });
 
-function toggleRepro() { reproPanel.classList.toggle('hidden'); if(!reproPanel.classList.contains('hidden')) document.getElementById('reproInput').focus(); }
+function toggleRepro() {
+    reproPanel.classList.toggle('hidden');
+    if(!reproPanel.classList.contains('hidden')) {
+        document.getElementById('reproCommandLine').classList.remove('hidden');
+        updatePrompt();
+        document.getElementById('reproInput').focus();
+    }
+}
 
-// Repro shell: kept as bash for curl/repro command execution (intentional for pentest workflow)
-const reproShell = spawn('/bin/bash', { env: process.env, shell: true, cwd: PROJECT_ROOT });
-// Repro shell — plain bash for curl/pentest commands
-// stdout and stderr both go to the same pre element — no div boxing
-// Curl progress (stderr) is filtered: those lines are purely numeric stats
+const os = require('os');
+const HOME_DIR = os.homedir();
+let currentDir = PROJECT_ROOT;
 
+const cmdHistory = [];
+let historyIndex = -1;
+
+function focusAndSetCursorAtEnd(input) {
+    input.focus();
+    const len = input.value.length;
+    input.setSelectionRange(len, len);
+}
+
+function handleTabComplete(input) {
+    const value = input.value;
+    const lastSpace = value.lastIndexOf(' ');
+    const lastWord = lastSpace === -1 ? value : value.substring(lastSpace + 1);
+    
+    let targetDir = currentDir;
+    let filePrefix = lastWord;
+    
+    if (lastWord.includes('/')) {
+        const lastSlash = lastWord.lastIndexOf('/');
+        const pathPart = lastWord.substring(0, lastSlash + 1);
+        filePrefix = lastWord.substring(lastSlash + 1);
+        
+        if (pathPart.startsWith('~')) {
+            targetDir = path.resolve(HOME_DIR, pathPart.substring(2));
+        } else {
+            targetDir = path.resolve(targetDir, pathPart);
+        }
+    }
+    
+    try {
+        if (!fs.existsSync(targetDir)) return;
+        const files = fs.readdirSync(targetDir);
+        const matches = files.filter(f => f.startsWith(filePrefix));
+        
+        if (matches.length === 1) {
+            const completed = matches[0];
+            const fullPath = path.join(targetDir, completed);
+            const isDir = fs.statSync(fullPath).isDirectory();
+            const replacement = completed + (isDir ? '/' : ' ');
+            
+            const before = lastSpace === -1 ? '' : value.substring(0, lastSpace + 1);
+            const pathPart = lastWord.includes('/') ? lastWord.substring(0, lastWord.lastIndexOf('/') + 1) : '';
+            
+            input.value = before + pathPart + replacement;
+            focusAndSetCursorAtEnd(input);
+        } else if (matches.length > 1) {
+            // Find the longest common prefix
+            let commonPrefix = filePrefix;
+            let idx = filePrefix.length;
+            let ok = true;
+            while (ok) {
+                if (matches[0].length <= idx) break;
+                const char = matches[0][idx];
+                for (let i = 1; i < matches.length; i++) {
+                    if (matches[i].length <= idx || matches[i][idx] !== char) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    commonPrefix += char;
+                    idx++;
+                }
+            }
+            
+            if (commonPrefix.length > filePrefix.length) {
+                const before = lastSpace === -1 ? '' : value.substring(0, lastSpace + 1);
+                const pathPart = lastWord.includes('/') ? lastWord.substring(0, lastWord.lastIndexOf('/') + 1) : '';
+                input.value = before + pathPart + commonPrefix;
+                focusAndSetCursorAtEnd(input);
+            } else {
+                const pre = document.querySelector('pre.panel-repro-pre');
+                if (pre) {
+                    const prompt = document.getElementById('reproPrompt').textContent;
+                    pre.textContent += prompt + value + '\n' + matches.join('   ') + '\n';
+                    const output = document.getElementById('reproOutput');
+                    if (output) output.scrollTop = output.scrollHeight;
+                }
+            }
+        }
+    } catch (_) {}
+}
+
+function handleArrowUp(input) {
+    if (cmdHistory.length === 0) return;
+    if (historyIndex < cmdHistory.length - 1) {
+        historyIndex++;
+        input.value = cmdHistory[cmdHistory.length - 1 - historyIndex];
+        focusAndSetCursorAtEnd(input);
+    }
+}
+
+function handleArrowDown(input) {
+    if (historyIndex > 0) {
+        historyIndex--;
+        input.value = cmdHistory[cmdHistory.length - 1 - historyIndex];
+        focusAndSetCursorAtEnd(input);
+    } else if (historyIndex === 0) {
+        historyIndex = -1;
+        input.value = '';
+        focusAndSetCursorAtEnd(input);
+    }
+}
+
+function updatePrompt() {
+    const promptEl = document.getElementById('reproPrompt');
+    if (!promptEl) return;
+    let displayDir = currentDir;
+    if (currentDir.startsWith(PROJECT_ROOT)) {
+        const rel = path.relative(PROJECT_ROOT, currentDir);
+        displayDir = rel ? `./${rel}` : '.';
+    } else if (currentDir.startsWith(HOME_DIR)) {
+        const rel = path.relative(HOME_DIR, currentDir);
+        displayDir = rel ? `~/${rel}` : '~';
+    }
+    promptEl.textContent = `hellhound@pentest:${displayDir}$ `;
+}
+
+function printOutput(text) {
+    const output = document.getElementById('reproOutput');
+    if (!output) return;
+    let pre = output.querySelector('pre.panel-repro-pre');
+    if (!pre) {
+        pre = document.createElement('pre');
+        pre.className = 'panel-repro-pre font-data-mono text-[13px] text-white/90 whitespace-pre-wrap break-all w-full select-text';
+        output.insertBefore(pre, document.getElementById('reproCommandLine'));
+    }
+    pre.textContent += text;
+    output.scrollTop = output.scrollHeight;
+}
+
+ipcRenderer.on('repro-out', (event, text) => {
+    printOutput(text + '\n');
+    document.getElementById('reproCommandLine').classList.remove('hidden');
+    const input = document.getElementById('reproInput');
+    if (input) input.focus();
+});
+
+function handleRepro(event) {
+    const input = document.getElementById('reproInput');
+    if (!input) return;
+    
+    if (event.key === 'c' && event.ctrlKey) {
+        event.preventDefault();
+        const pre = document.querySelector('pre.panel-repro-pre');
+        const promptText = document.getElementById('reproPrompt').textContent;
+        if (pre) {
+            pre.textContent += promptText + input.value + '^C\n';
+        }
+        input.value = '';
+        const output = document.getElementById('reproOutput');
+        if (output) output.scrollTop = output.scrollHeight;
+        return;
+    }
+
+    if (event.key === 'Tab') {
+        event.preventDefault();
+        handleTabComplete(input);
+        return;
+    }
+    
+    if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        handleArrowUp(input);
+        return;
+    }
+    
+    if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        handleArrowDown(input);
+        return;
+    }
+    
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        const fullCmd = input.value;
+        const cmd = fullCmd.trim();
+        const promptText = document.getElementById('reproPrompt').textContent;
+        
+        printOutput(promptText + fullCmd + '\n');
+        input.value = '';
+        
+        if (!cmd) return;
+        
+        cmdHistory.push(fullCmd);
+        historyIndex = -1;
+        
+        const parts = cmd.split(/\s+/);
+        const exe = parts[0];
+        
+        if (exe === 'clear') {
+            const pre = document.querySelector('pre.panel-repro-pre');
+            if (pre) pre.textContent = '';
+            return;
+        }
+        
+        if (exe === 'help') {
+            printOutput(`Available commands:
+  cd [dir]    Change directory
+  ls [dir]    List files and directories
+  cat [file]  Print file contents (supports JSON beauty formatting)
+  pwd         Print working directory
+  clear       Clear the screen
+  curl [args] Execute a curl request
+  help        Show this help menu\n`);
+            return;
+        }
+        
+        if (exe === 'pwd') {
+            printOutput(currentDir + '\n');
+            return;
+        }
+        
+        if (exe === 'cd') {
+            const target = parts.slice(1).join(' ').trim();
+            let targetPath = HOME_DIR;
+            if (target === '~') {
+                targetPath = HOME_DIR;
+            } else if (target) {
+                if (target.startsWith('~')) {
+                    targetPath = path.resolve(HOME_DIR, target.substring(1).replace(/^[/\\]+/, ''));
+                } else {
+                    targetPath = path.resolve(currentDir, target);
+                }
+            } else {
+                targetPath = PROJECT_ROOT;
+            }
+            
+            try {
+                if (!fs.existsSync(targetPath)) {
+                    printOutput(`cd: ${target}: No such file or directory\n`);
+                } else if (!fs.statSync(targetPath).isDirectory()) {
+                    printOutput(`cd: ${target}: Not a directory\n`);
+                } else {
+                    currentDir = targetPath;
+                    updatePrompt();
+                }
+            } catch (e) {
+                printOutput(`cd: ${target}: Error: ${e.message}\n`);
+            }
+            return;
+        }
+        
+        if (exe === 'ls') {
+            const target = parts.slice(1).join(' ').trim();
+            let targetPath = currentDir;
+            if (target) {
+                if (target.startsWith('~')) {
+                    targetPath = path.resolve(HOME_DIR, target.substring(1).replace(/^[/\\]+/, ''));
+                } else {
+                    targetPath = path.resolve(currentDir, target);
+                }
+            }
+            
+            try {
+                if (!fs.existsSync(targetPath)) {
+                    printOutput(`ls: cannot access '${target}': No such file or directory\n`);
+                    return;
+                }
+                if (!fs.statSync(targetPath).isDirectory()) {
+                    printOutput(`${target}\n`);
+                    return;
+                }
+                const entries = fs.readdirSync(targetPath);
+                if (entries.length === 0) return;
+                
+                const formatted = entries.map(entry => {
+                    const fullPath = path.join(targetPath, entry);
+                    try {
+                        if (fs.statSync(fullPath).isDirectory()) {
+                            return entry + '/';
+                        }
+                    } catch (_) {}
+                    return entry;
+                });
+                
+                printOutput(formatted.join('   ') + '\n');
+            } catch (e) {
+                printOutput(`ls: error: ${e.message}\n`);
+            }
+            return;
+        }
+        
+        if (exe === 'cat') {
+            const target = parts.slice(1).join(' ').trim();
+            if (!target) {
+                printOutput(`cat: missing file operand\n`);
+                return;
+            }
+            let targetPath;
+            if (target.startsWith('~')) {
+                targetPath = path.resolve(HOME_DIR, target.substring(1).replace(/^[/\\]+/, ''));
+            } else {
+                targetPath = path.resolve(currentDir, target);
+            }
+            
+            try {
+                if (!fs.existsSync(targetPath)) {
+                    printOutput(`cat: ${target}: No such file or directory\n`);
+                    return;
+                }
+                if (fs.statSync(targetPath).isDirectory()) {
+                    printOutput(`cat: ${target}: Is a directory\n`);
+                    return;
+                }
+                const content = fs.readFileSync(targetPath, 'utf8');
+                if (targetPath.endsWith('.json')) {
+                    try {
+                        const parsed = JSON.parse(content);
+                        printOutput(JSON.stringify(parsed, null, 2) + '\n');
+                    } catch (_) {
+                        printOutput(content + '\n');
+                    }
+                } else {
+                    printOutput(content + '\n');
+                }
+            } catch (e) {
+                printOutput(`cat: ${target}: Error: ${e.message}\n`);
+            }
+            return;
+        }
+        
+        if (exe === 'curl') {
+            document.getElementById('reproCommandLine').classList.add('hidden');
+            ipcRenderer.send('exec-repro', cmd);
+            return;
+        }
+        
+        printOutput(`bash: ${exe}: command execution restricted to safe navigation (cd, ls, cat, pwd, clear, help) or curl.\n`);
+    }
+}
+
+// Repro shell — plain bash for curl/pentest commands (kept for PoC replay in Repro Center)
 const CURL_PROGRESS_RE = /^\s*%\s+Total|^\s*\d+\s+\d+\s+\d+|Dload|Upload|Speed|Time/;
 
 function appendRepro(text, isError = false) {
@@ -414,17 +772,6 @@ function appendRepro(text, isError = false) {
     }
     
     output.scrollTop = output.scrollHeight;
-}
-
-reproShell.stdout.on('data', (data) => appendRepro(data.toString()));
-reproShell.stderr.on('data', (data) => appendRepro(data.toString(), true));
-
-function handleRepro(event) {
-    if (event.key === 'Enter') {
-        const input = document.getElementById('reproInput');
-        if (input.value.trim()) { reproShell.stdin.write(input.value + '\n'); appendRepro(`› ${input.value}\n`); }
-        input.value = '';
-    }
 }
 
 // ── MODULE NAME NORMALIZATION ─────────────────────────────────────────
@@ -508,7 +855,6 @@ function renderArsenal() {
         if (search) {
             mods = mods.filter(k => 
                 modules[k].name.toLowerCase().includes(search) || 
-                modules[k].description.toLowerCase().includes(search) ||
                 k.toLowerCase().includes(search)
             );
         }
@@ -904,6 +1250,11 @@ ipcRenderer.on('proc-out', (event, { pid, data }) => {
 });
 
 ipcRenderer.on('telemetry-event', (event, { line, severity }) => {
+    // If Threat Map is active, feed real events to the map animation
+    if (typeof handleRealTelemetryEvent === 'function') {
+        handleRealTelemetryEvent(line, severity);
+    }
+
     const container = document.getElementById('opsFindings');
     if (!container) return;
 
@@ -1014,18 +1365,36 @@ function fireRepro() {
         return;
     }
     
-    if (!reproShell || !reproShell.stdin.writable) {
-        pushActivity('Repro engine disconnected', 'warn');
-        return;
+    const btn = document.getElementById('reproFireBtn');
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = `<span class="material-symbols-outlined text-[16px] animate-spin">refresh</span> REPLAYING...`;
     }
-    
+
     const terminal = document.getElementById('reproTerminal');
     if (terminal) {
         terminal.innerHTML += `\n<div class="text-green-500 font-bold mt-4 mb-2 uppercase tracking-[0.2em] animate-pulse">› INITIATING REPLAY...</div>`;
     }
     
-    reproShell.stdin.write(activePoCCmd + '\n');
-    pushActivity('Surgical payload piped to execution hub', 'strike');
+    // Spawn an isolated process to run the command directly
+    const proc = spawn('/bin/bash', ['-c', activePoCCmd], { env: process.env, cwd: PROJECT_ROOT });
+    
+    proc.stdout.on('data', (data) => {
+        appendRepro(data.toString());
+    });
+    
+    proc.stderr.on('data', (data) => {
+        appendRepro(data.toString(), true);
+    });
+    
+    proc.on('close', (code) => {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = `<span class="material-symbols-outlined text-[18px]">replay</span> INITIATE_REPLAY`;
+        }
+        appendRepro(`\n[Process completed with exit code ${code}]\n`);
+        pushActivity(`PoC replay completed (exit ${code})`, code === 0 ? 'ok' : 'warn');
+    });
 }
 
 function clearReproCommands() {
@@ -1114,25 +1483,27 @@ function appendHellhoundMessage(role, text) {
 
     if (!cleanText && role === 'hellhound') return;
 
+    const isUser = role !== 'hellhound';
+    
     const bubble = document.createElement('div');
-    bubble.className = `chat-bubble ${role} animate-fade-in chat-noise-filtered group mb-4`;
+    bubble.className = `chat-bubble animate-fade-in group mb-6 flex flex-col w-full ${isUser ? 'items-end' : 'items-start'}`;
     
     const roleLabel = role === 'hellhound' ? 'HELLHOUND' : 'YOU';
     const labelColor = role === 'hellhound' ? 'text-primary/60' : 'text-blue-400/60';
+    const timeStr = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
 
     bubble.innerHTML = `
-        <div class="flex items-center justify-between mb-2">
+        <div class="flex items-center gap-3 mb-1 ${isUser ? 'flex-row-reverse' : ''}">
             <div class="font-label-surgical text-[9px] ${labelColor} uppercase tracking-[0.2em] font-bold">${roleLabel}</div>
-            <div class="flex items-center gap-3">
-                <button onclick="copyMessage(this)" class="text-white/20 hover:text-white/60 transition-colors p-1" title="Copy Message">
-                    <span class="material-symbols-outlined text-[14px]">content_copy</span>
-                </button>
-                <div class="text-[8px] text-white/10 font-data-mono opacity-0 group-hover:opacity-100 transition-opacity uppercase">${new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
-            </div>
+            <div class="text-[8px] text-white/10 font-data-mono opacity-0 group-hover:opacity-100 transition-opacity uppercase">${timeStr}</div>
         </div>
-        <div class="chat-text-container bg-white/3 border border-white/5 p-4 rounded-lg relative overflow-hidden">
-            <div class="absolute top-0 left-0 w-1 h-full ${role === 'hellhound' ? 'bg-primary/20' : 'bg-blue-500/20'}"></div>
-            <pre class="font-data-mono text-[13px] text-white/90 whitespace-pre-wrap leading-relaxed select-text">${cleanText}</pre>
+        <div class="relative group/content max-w-[85%]">
+            <div class="chat-text-container p-4 overflow-hidden ${isUser ? 'bg-blue-500/10 border border-blue-500/20 rounded-t-2xl rounded-bl-2xl rounded-br-sm' : 'bg-white/5 border border-white/10 rounded-t-2xl rounded-br-2xl rounded-bl-sm'} shadow-lg backdrop-blur-sm">
+                <pre class="font-data-mono text-[13px] text-white/90 whitespace-pre-wrap leading-relaxed select-text font-sans">${cleanText}</pre>
+            </div>
+            <button onclick="copyMessage(this)" class="absolute ${isUser ? '-left-10' : '-right-10'} top-1/2 -translate-y-1/2 opacity-0 group-hover/content:opacity-100 text-white/20 hover:text-white/60 transition-all p-1.5 bg-black/40 rounded-full border border-white/10 backdrop-blur-sm z-10" title="Copy Message">
+                <span class="material-symbols-outlined text-[14px]">content_copy</span>
+            </button>
         </div>
     `;
     container.appendChild(bubble);
@@ -1618,6 +1989,37 @@ function showNodeInfo(data) {
         `;
     }
 
+    // Action Buttons
+    let actionsHtml = `<div class="mt-4 pt-4 border-t border-white/10 flex flex-col gap-2">`;
+    let hasActions = false;
+
+    if (data.type === 'url' || data.type === 'endpoint_rest' || data.type === 'endpoint_admin' || data.type === 'endpoint_sensitive' || data.type === 'vulnerability' || data.type === 'vuln_idor' || data.type === 'vuln_sqli' || data.type === 'vuln_bac') {
+        let nodeUrl = data.label;
+        if (!nodeUrl.startsWith('http://') && !nodeUrl.startsWith('https://')) {
+            nodeUrl = 'http://' + nodeUrl;
+        }
+        actionsHtml += `
+            <button onclick="graphLoadToRepeater('${nodeUrl}')" class="w-full py-2 bg-primary text-background font-label-surgical text-[9px] font-bold uppercase tracking-widest hover:brightness-110 transition-all rounded">
+                ⚡ Load to Repeater
+            </button>
+        `;
+        hasActions = true;
+    }
+
+    if ((data.label && data.label.toLowerCase().includes('.js')) || data.type === 'technology') {
+        actionsHtml += `
+            <button onclick="graphSendToDeCaff('${data.label}')" class="w-full py-2 border border-[#00ffc4]/40 bg-[#00ffc4]/10 text-[#00ffc4] font-label-surgical text-[9px] font-bold uppercase tracking-widest hover:bg-[#00ffc4]/20 transition-all rounded">
+                ☕ Send to De-Caffeinator
+            </button>
+        `;
+        hasActions = true;
+    }
+
+    actionsHtml += `</div>`;
+    if (hasActions) {
+        metaHtml += actionsHtml;
+    }
+
     meta.innerHTML = metaHtml;
     panel.style.display = 'block';
 }
@@ -1987,9 +2389,9 @@ function syncAICore() {
 
     setAIStatus('connecting', 'Activating Hellhound...');
 
-    // Send ONE command: activate hellhound for local, setg ai <key> for cloud
+    // Send ONE payload: activate hellhound for local, setg ai <key> & setg ai_provider for cloud
     const aiKey = isLocal ? 'local' : key;
-    ipcRenderer.send('ai-handshake', aiKey);
+    ipcRenderer.send('ai-handshake', { provider: provider, key: aiKey });
 
     // Update buttons
     const btns = document.querySelectorAll('[onclick="initializeNeuralHandshake()"], [onclick="syncAICore()"]');
@@ -2183,7 +2585,7 @@ function loadGlobalSettings() {
 // Uses the persistent console so self.results is already populated from
 // the current strike — no need to pass finding data manually.
 
-function fireRepro() {
+function fireConsoleRepro() {
     const timeout = document.getElementById('reproTimeout')?.value || '10';
     const delay = document.getElementById('reproDelay')?.value || '0.5';
 
@@ -2202,10 +2604,10 @@ function fireRepro() {
     }
 
     // Visual feedback on button
-    const btn = document.getElementById('reproFireBtn');
+    const btn = document.getElementById('reproAllBtn');
     if (btn) {
         btn.disabled = true;
-        btn.innerHTML = `<span class="material-symbols-outlined text-[16px] animate-spin">refresh</span> REPLAYING...`;
+        btn.innerHTML = `<span class="material-symbols-outlined text-[12px] animate-spin">refresh</span> REPLAYING...`;
     }
 
     appendOpsLine(`\n╔══════════════════════════════════════════════════════`);
@@ -2220,10 +2622,10 @@ function fireRepro() {
 
 // Repro complete signal from main.js
 ipcRenderer.on('repro-done', (event, { code }) => {
-    const btn = document.getElementById('reproFireBtn');
+    const btn = document.getElementById('reproAllBtn');
     if (btn) {
         btn.disabled = false;
-        btn.innerHTML = `<span class="material-symbols-outlined text-[16px]">replay</span> REPLAY_VIA_PROXY`;
+        btn.innerHTML = `Replay_All`;
     }
     appendOpsLine(`\n╔══════════════════════════════════════════════════════`);
     appendOpsLine(`║  REPRO ENGINE  : COMPLETE (exit ${code})`);
@@ -2249,15 +2651,73 @@ function checkProxyStatus() {
     if (!proxy) { dot.className = 'w-2 h-2 rounded-full bg-white/20'; label.textContent = 'NO PROXY'; return; }
     dot.className = 'w-2 h-2 rounded-full bg-yellow-500 animate-pulse';
     label.textContent = 'CHECKING';
+
+    let proxyUrlStr = proxy;
+    if (!proxyUrlStr.includes('://')) {
+        proxyUrlStr = 'http://' + proxyUrlStr;
+    }
+    
+    let url;
     try {
-        const xhr = new XMLHttpRequest();
-        xhr.timeout = 3000;
-        xhr.onloadend = () => { dot.className = 'w-2 h-2 rounded-full bg-green-500 shadow-[0_0_6px_#22c55e]'; label.textContent = 'PROXY UP'; };
-        xhr.onerror = () => { dot.className = 'w-2 h-2 rounded-full bg-red-500'; label.textContent = 'DOWN'; };
-        xhr.ontimeout = () => { dot.className = 'w-2 h-2 rounded-full bg-red-500'; label.textContent = 'TIMEOUT'; };
-        xhr.open('GET', proxy, true);
-        xhr.send();
-    } catch (_) { dot.className = 'w-2 h-2 rounded-full bg-red-500'; label.textContent = 'BAD URL'; }
+        url = new URL(proxyUrlStr);
+    } catch (e) {
+        dot.className = 'w-2 h-2 rounded-full bg-red-500';
+        label.textContent = 'BAD URL';
+        return;
+    }
+
+    const proxyHost = url.hostname;
+    const proxyPort = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
+
+    // Verify conflicts: If proxy host/port matches the target application host/port
+    let targetHost = '';
+    let targetPort = null;
+    if (activeTarget) {
+        let targetUrlStr = activeTarget;
+        if (!targetUrlStr.includes('://')) {
+            targetUrlStr = 'http://' + targetUrlStr;
+        }
+        try {
+            const tUrl = new URL(targetUrlStr);
+            targetHost = tUrl.hostname;
+            targetPort = parseInt(tUrl.port) || (tUrl.protocol === 'https:' ? 443 : 80);
+        } catch (_) {}
+    }
+
+    if (targetHost && proxyHost === targetHost && proxyPort === targetPort) {
+        dot.className = 'w-2 h-2 rounded-full bg-yellow-500 shadow-[0_0_6px_#eab308]';
+        label.textContent = 'CONFLICT';
+        return;
+    }
+
+    const net = require('net');
+    const client = new net.Socket();
+    client.setTimeout(2500);
+
+    client.on('connect', () => {
+        dot.className = 'w-2 h-2 rounded-full bg-green-500 shadow-[0_0_6px_#22c55e]';
+        label.textContent = 'PROXY UP';
+        client.destroy();
+    });
+
+    client.on('error', () => {
+        dot.className = 'w-2 h-2 rounded-full bg-red-500';
+        label.textContent = 'DOWN';
+        client.destroy();
+    });
+
+    client.on('timeout', () => {
+        dot.className = 'w-2 h-2 rounded-full bg-red-500';
+        label.textContent = 'TIMEOUT';
+        client.destroy();
+    });
+
+    try {
+        client.connect(proxyPort, proxyHost);
+    } catch (_) {
+        dot.className = 'w-2 h-2 rounded-full bg-red-500';
+        label.textContent = 'DOWN';
+    }
 }
 
 // ── SESSION EXPORT ────────────────────────────────────────────────────
@@ -2382,9 +2842,12 @@ function pollLoot() {
     ipcRenderer.send('get-loot');
 }
 
+function openLootDir() {
+    ipcRenderer.send('open-loot-dir');
+}
+
 ipcRenderer.on('loot-data', (event, lootMap) => {
     lastLootMap = lootMap;
-    renderLootList(lootMap);
     renderLootCenter(lootMap);
     updateDashboard(lootMap);
     // Refresh graph and intel whenever loot changes
@@ -2597,8 +3060,53 @@ function renderLootCenter(lootMap) {
         
         lines.forEach(line => {
             const item = document.createElement('div');
-            item.className = 'loot-item-text';
-            item.textContent = line;
+            item.className = 'loot-item-text py-2 border-b border-white/5 font-data-mono text-[10px]';
+            
+            let trimmed = line.trim();
+            if (trimmed.startsWith('===') && trimmed.endsWith('===')) {
+                // Section Header
+                item.className = 'font-label-surgical text-[10px] text-[#00ffc4] uppercase tracking-wider mt-4 mb-2 pb-1 border-b border-[#00ffc4]/20';
+                item.textContent = trimmed.replace(/===/g, '').trim();
+            } else if (trimmed.startsWith('[CRITICAL]')) {
+                item.innerHTML = `<span class="px-1.5 py-0.5 rounded text-[8px] bg-purple-500/20 text-purple-400 font-bold mr-2">CRIT</span> <span class="text-white">${trimmed.substring(10).trim()}</span>`;
+            } else if (trimmed.startsWith('[HIGH]')) {
+                item.innerHTML = `<span class="px-1.5 py-0.5 rounded text-[8px] bg-red-500/20 text-red-400 font-bold mr-2">HIGH</span> <span class="text-white">${trimmed.substring(6).trim()}</span>`;
+            } else if (trimmed.startsWith('[MEDIUM]')) {
+                item.innerHTML = `<span class="px-1.5 py-0.5 rounded text-[8px] bg-yellow-500/20 text-yellow-400 font-bold mr-2">MED</span> <span class="text-white">${trimmed.substring(8).trim()}</span>`;
+            } else if (trimmed.startsWith('[LOW]')) {
+                item.innerHTML = `<span class="px-1.5 py-0.5 rounded text-[8px] bg-white/10 text-white/50 font-bold mr-2">LOW</span> <span class="text-white/70">${trimmed.substring(5).trim()}</span>`;
+            } else if (trimmed.startsWith('[INFO]')) {
+                item.innerHTML = `<span class="px-1.5 py-0.5 rounded text-[8px] bg-blue-500/10 text-blue-400 font-bold mr-2">INFO</span> <span class="text-white/60">${trimmed.substring(6).trim()}</span>`;
+            } else if (trimmed.startsWith('Method:')) {
+                const parts = trimmed.split('|');
+                let html = '';
+                parts.forEach(p => {
+                    const sub = p.trim().split(':');
+                    if (sub.length >= 2) {
+                        html += `<span class="text-white/30 mr-1">${sub[0].trim()}:</span><span class="text-white/80 mr-4 font-bold">${sub.slice(1).join(':').trim()}</span> `;
+                    } else {
+                        html += `<span class="text-white/80">${p}</span>`;
+                    }
+                });
+                item.innerHTML = html;
+            } else if (trimmed.startsWith('Parameter:') || trimmed.startsWith('Evidence:') || trimmed.startsWith('PoC:') || trimmed.startsWith('Secret:')) {
+                const colonIdx = trimmed.indexOf(':');
+                if (colonIdx !== -1) {
+                    const label = trimmed.substring(0, colonIdx).trim();
+                    const val = trimmed.substring(colonIdx + 1).trim();
+                    let valColor = 'text-white/70';
+                    if (label === 'PoC') valColor = 'text-yellow-300 font-bold select-all';
+                    if (label === 'Secret') valColor = 'text-cyan-300 font-bold select-all';
+                    if (label === 'Parameter') valColor = 'text-red-400 font-bold';
+                    item.innerHTML = `<span class="text-white/30 mr-2">${label}:</span><span class="${valColor}">${val}</span>`;
+                } else {
+                    item.textContent = line;
+                }
+            } else if (trimmed.startsWith('↳')) {
+                item.innerHTML = `<span class="text-[#00ffc4] mr-2">↳</span><span class="text-white/80">${trimmed.substring(1).trim()}</span>`;
+            } else {
+                item.textContent = line;
+            }
             content.appendChild(item);
         });
 
@@ -2703,6 +3211,994 @@ function renderFindingsChart(data, total, isReal = false) {
             bar.style.width = bar.dataset.target + '%';
         });
     });
+}
+
+// ── HTTP REPEATER SYSTEM ─────────────────────────────────────────────
+let repeaterTabs = [];
+let activeRepeaterTabId = null;
+let currentResponseView = 'raw';
+let trafficHistory = [];
+
+function initRepeater() {
+    if (repeaterTabs.length === 0) {
+        addNewRepeaterTab();
+    } else {
+        renderRepeaterTabs();
+        loadActiveTabIntoWorkspace();
+    }
+    renderTrafficHistory();
+}
+
+function addNewRepeaterTab(method = 'GET', url = 'http://127.0.0.1:5000/', rawReq = '') {
+    const tabId = 'tab_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+    if (!rawReq) {
+        rawReq = `${method} / HTTP/1.1\r\nHost: 127.0.0.1:5000\r\nUser-Agent: Hellhound-Repeater/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n`;
+    }
+    const newTab = {
+        id: tabId,
+        name: `Req #${repeaterTabs.length + 1}`,
+        method: method,
+        url: url,
+        rawRequest: rawReq,
+        response: null
+    };
+    repeaterTabs.push(newTab);
+    activeRepeaterTabId = tabId;
+    renderRepeaterTabs();
+    loadActiveTabIntoWorkspace();
+}
+
+function closeRepeaterTab(tabId, event) {
+    if (event) event.stopPropagation();
+    const index = repeaterTabs.findIndex(t => t.id === tabId);
+    if (index === -1) return;
+    
+    repeaterTabs.splice(index, 1);
+    if (activeRepeaterTabId === tabId) {
+        if (repeaterTabs.length > 0) {
+            activeRepeaterTabId = repeaterTabs[Math.max(0, index - 1)].id;
+        } else {
+            activeRepeaterTabId = null;
+        }
+    }
+    renderRepeaterTabs();
+    if (activeRepeaterTabId) {
+        loadActiveTabIntoWorkspace();
+    } else {
+        clearRepeaterWorkspace();
+    }
+}
+
+function selectRepeaterTab(tabId) {
+    saveActiveTabFromWorkspace();
+    activeRepeaterTabId = tabId;
+    renderRepeaterTabs();
+    loadActiveTabIntoWorkspace();
+}
+
+function saveActiveTabFromWorkspace() {
+    if (!activeRepeaterTabId) return;
+    const tab = repeaterTabs.find(t => t.id === activeRepeaterTabId);
+    if (!tab) return;
+    
+    const methodEl = document.getElementById('repeaterMethod');
+    const targetEl = document.getElementById('repeaterTarget');
+    const rawReqEl = document.getElementById('repeaterRawRequest');
+    
+    if (methodEl) tab.method = methodEl.value;
+    if (targetEl) tab.url = targetEl.value;
+    if (rawReqEl) tab.rawRequest = rawReqEl.value;
+}
+
+function renderRepeaterTabs() {
+    const container = document.getElementById('repeaterTabsHeader');
+    if (!container) return;
+    
+    container.innerHTML = repeaterTabs.map(tab => {
+        const isActive = tab.id === activeRepeaterTabId;
+        const activeClass = isActive 
+            ? 'bg-primary/20 border border-primary/40 text-primary font-bold shadow-[inset_0_0_8px_rgba(255,34,68,0.15)]' 
+            : 'bg-white/5 border border-white/5 text-white/50 hover:text-white hover:bg-white/10';
+        return `
+            <div onclick="selectRepeaterTab('${tab.id}')" 
+                class="flex items-center gap-2 px-3 py-1.5 rounded cursor-pointer transition-all text-[10px] font-data-mono uppercase tracking-wider ${activeClass}">
+                <span>${tab.method}</span>
+                <span class="max-w-[80px] truncate">${tab.name}</span>
+                <span onclick="closeRepeaterTab('${tab.id}', event)" class="material-symbols-outlined text-[12px] hover:text-red-500 transition-colors ml-1">close</span>
+            </div>
+        `;
+    }).join('');
+}
+
+function loadActiveTabIntoWorkspace() {
+    if (!activeRepeaterTabId) return;
+    const tab = repeaterTabs.find(t => t.id === activeRepeaterTabId);
+    if (!tab) return;
+    
+    const methodEl = document.getElementById('repeaterMethod');
+    const targetEl = document.getElementById('repeaterTarget');
+    const rawReqEl = document.getElementById('repeaterRawRequest');
+    
+    if (methodEl) methodEl.value = tab.method;
+    if (targetEl) targetEl.value = tab.url;
+    if (rawReqEl) rawReqEl.value = tab.rawRequest;
+    
+    renderResponseViewer(tab.response);
+}
+
+function clearRepeaterWorkspace() {
+    const methodEl = document.getElementById('repeaterMethod');
+    const targetEl = document.getElementById('repeaterTarget');
+    const rawReqEl = document.getElementById('repeaterRawRequest');
+    
+    if (methodEl) methodEl.value = 'GET';
+    if (targetEl) targetEl.value = '';
+    if (rawReqEl) rawReqEl.value = '';
+    
+    renderResponseViewer(null);
+}
+
+function parseRawRequest(rawStr) {
+    const parts = rawStr.split(/\r?\n\r?\n/);
+    const headerLines = parts[0].split(/\r?\n/);
+    const body = parts.slice(1).join('\n\n');
+    
+    const requestLine = headerLines[0].split(' ');
+    const method = requestLine[0] || 'GET';
+    const path = requestLine[1] || '/';
+    
+    const headers = {};
+    for (let i = 1; i < headerLines.length; i++) {
+        const line = headerLines[i];
+        const colonIdx = line.indexOf(':');
+        if (colonIdx !== -1) {
+            const key = line.substring(0, colonIdx).trim().toLowerCase();
+            const val = line.substring(colonIdx + 1).trim();
+            headers[key] = val;
+        }
+    }
+    
+    return { method, path, headers, body };
+}
+
+function sendRawHttpRequest(protocol, hostname, port, rawRequest, proxy, callback) {
+    const net = require('net');
+    const tls = require('tls');
+    
+    let proxyHost = null;
+    let proxyPort = null;
+    if (proxy) {
+        let proxyUrlStr = proxy;
+        if (!proxyUrlStr.includes('://')) proxyUrlStr = 'http://' + proxyUrlStr;
+        try {
+            const pUrl = new URL(proxyUrlStr);
+            proxyHost = pUrl.hostname;
+            proxyPort = parseInt(pUrl.port) || 8080;
+        } catch(e) {}
+    }
+    
+    const startTime = Date.now();
+    let socket;
+    
+    function handleConnectedSocket(establishedSocket) {
+        let responseBuffer = Buffer.alloc(0);
+        let headerParsed = false;
+        let contentLength = -1;
+        let isChunked = false;
+        let headerEndIndex = -1;
+        
+        establishedSocket.on('data', (chunk) => {
+            responseBuffer = Buffer.concat([responseBuffer, chunk]);
+            
+            if (!headerParsed) {
+                headerEndIndex = responseBuffer.indexOf('\r\n\r\n');
+                if (headerEndIndex !== -1) {
+                    headerParsed = true;
+                    const headerStr = responseBuffer.slice(0, headerEndIndex).toString('utf8');
+                    
+                    const clMatch = headerStr.match(/content-length:\s*(\d+)/i);
+                    if (clMatch) {
+                        contentLength = parseInt(clMatch[1], 10);
+                    }
+                    
+                    if (/transfer-encoding:\s*chunked/i.test(headerStr)) {
+                        isChunked = true;
+                    }
+                }
+            }
+            
+            if (headerParsed) {
+                const bodyBytesReceived = responseBuffer.length - (headerEndIndex + 4);
+                if (contentLength !== -1 && bodyBytesReceived >= contentLength) {
+                    establishedSocket.end();
+                } else if (isChunked) {
+                    // Check if chunked body ends with 0\r\n\r\n
+                    if (responseBuffer.slice(-5).toString() === '0\r\n\r\n' || 
+                        responseBuffer.indexOf('\r\n0\r\n\r\n') !== -1) {
+                        establishedSocket.end();
+                    }
+                }
+            }
+        });
+        
+        establishedSocket.on('end', () => {
+            callback(null, responseBuffer, Date.now() - startTime);
+        });
+        
+        establishedSocket.on('error', (err) => {
+            if (responseBuffer.length > 0) {
+                callback(null, responseBuffer, Date.now() - startTime);
+            } else {
+                callback(err);
+            }
+        });
+        
+        // Write request payload
+        establishedSocket.write(rawRequest);
+    }
+    
+    if (proxyHost && proxyPort) {
+        // Route via Proxy
+        const conn = net.connect(proxyPort, proxyHost);
+        let connectBuffer = '';
+        
+        conn.on('connect', () => {
+            if (protocol === 'https:') {
+                // HTTPS CONNECT Tunneling
+                conn.write(`CONNECT ${hostname}:${port} HTTP/1.1\r\nHost: ${hostname}:${port}\r\n\r\n`);
+            } else {
+                // HTTP Absolute Path Request
+                let modifiedRequest = rawRequest;
+                const reqStr = rawRequest.toString('utf8');
+                const firstLineEnd = reqStr.indexOf('\r\n');
+                if (firstLineEnd !== -1) {
+                    const firstLine = reqStr.substring(0, firstLineEnd);
+                    const parts = firstLine.split(' ');
+                    if (parts.length >= 2 && !parts[1].startsWith('http')) {
+                        parts[1] = `http://${hostname}:${port}${parts[1]}`;
+                        modifiedRequest = Buffer.concat([
+                            Buffer.from(parts.join(' ')),
+                            rawRequest.slice(firstLineEnd)
+                        ]);
+                    }
+                }
+                handleConnectedSocket(conn);
+            }
+        });
+        
+        conn.on('data', (chunk) => {
+            if (protocol === 'https:' && !socket) {
+                connectBuffer += chunk.toString('utf8');
+                if (connectBuffer.includes('\r\n\r\n')) {
+                    if (connectBuffer.startsWith('HTTP/1.1 200') || connectBuffer.startsWith('HTTP/1.0 200')) {
+                        // CONNECT Established! Now wrap in TLS.
+                        socket = tls.connect({
+                            socket: conn,
+                            servername: hostname,
+                            rejectUnauthorized: false
+                        }, () => {
+                            handleConnectedSocket(socket);
+                        });
+                        socket.on('error', (err) => callback(err));
+                    } else {
+                        callback(new Error(`Proxy CONNECT failed:\n${connectBuffer}`));
+                        conn.end();
+                    }
+                }
+            }
+        });
+        
+        conn.on('error', (err) => {
+            callback(err);
+        });
+        
+    } else {
+        // Direct Connection
+        if (protocol === 'https:') {
+            const secureSocket = tls.connect({
+                host: hostname,
+                port: port,
+                servername: hostname,
+                rejectUnauthorized: false
+            }, () => {
+                handleConnectedSocket(secureSocket);
+            });
+            secureSocket.on('error', (err) => callback(err));
+        } else {
+            const plainSocket = net.connect(port, hostname, () => {
+                handleConnectedSocket(plainSocket);
+            });
+            plainSocket.on('error', (err) => callback(err));
+        }
+    }
+}
+
+function parseRawResponse(responseBuffer) {
+    const boundary = responseBuffer.indexOf('\r\n\r\n');
+    let rawHeaders = '';
+    let bodyBuffer = Buffer.alloc(0);
+    if (boundary !== -1) {
+        rawHeaders = responseBuffer.slice(0, boundary).toString('utf8');
+        bodyBuffer = responseBuffer.slice(boundary + 4);
+    } else {
+        rawHeaders = responseBuffer.toString('utf8');
+    }
+    
+    const lines = rawHeaders.split('\r\n');
+    const statusLine = lines[0] || 'HTTP/1.1 0 ERROR';
+    const statusParts = statusLine.split(' ');
+    const statusCode = parseInt(statusParts[1], 10) || 0;
+    const statusText = statusParts.slice(2).join(' ') || '';
+    
+    const headersList = lines.slice(1).filter(l => l.trim());
+    const headersStr = headersList.join('\n');
+    
+    return {
+        statusCode,
+        statusText,
+        headers: headersStr,
+        body: bodyBuffer.toString('utf8'),
+        raw: responseBuffer.toString('utf8')
+    };
+}
+
+function sendActiveRepeater() {
+    if (!activeRepeaterTabId) return;
+    saveActiveTabFromWorkspace();
+    
+    const tab = repeaterTabs.find(t => t.id === activeRepeaterTabId);
+    if (!tab) return;
+    
+    const sendBtn = document.getElementById('repeaterSendBtn');
+    if (sendBtn) {
+        sendBtn.disabled = true;
+        sendBtn.classList.add('opacity-50', 'pointer-events-none');
+    }
+    
+    const metaContainer = document.getElementById('repeaterResponseMeta');
+    const viewer = document.getElementById('repeaterResponseViewer');
+    if (metaContainer) metaContainer.innerHTML = '';
+    if (viewer) viewer.innerHTML = `<div class="text-primary animate-pulse text-[10px] text-center font-data-mono py-16">FORWARDING PAYLOAD THROUGH HELLHOUND REPRO ENGINE...</div>`;
+    
+    const parsedReq = parseRawRequest(tab.rawRequest);
+    const reqMethod = parsedReq.method;
+    const reqPath = parsedReq.path;
+    const reqHeaders = parsedReq.headers;
+    const reqBody = parsedReq.body;
+    
+    let targetUrlStr = tab.url || reqHeaders['host'] || reqHeaders['Host'];
+    if (!targetUrlStr) {
+        if (metaContainer) metaContainer.innerHTML = `<span class="text-red-500 font-label-surgical text-[9px]">ERROR: NO TARGET URL</span>`;
+        if (viewer) viewer.innerHTML = `<div class="text-red-500 text-[10px] font-data-mono py-16">Please specify a target URL or Host header.</div>`;
+        if (sendBtn) {
+            sendBtn.disabled = false;
+            sendBtn.classList.remove('opacity-50', 'pointer-events-none');
+        }
+        return;
+    }
+    
+    if (!/^https?:\/\//i.test(targetUrlStr)) {
+        targetUrlStr = 'http://' + targetUrlStr;
+    }
+    
+    try {
+        const targetUrl = new URL(targetUrlStr);
+        let targetHostname = targetUrl.hostname;
+        let targetPort = targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80);
+        
+        // Retrieve settings for proxy & WAF bypass
+        const settings = JSON.parse(localStorage.getItem('hh_global_settings') || '{}');
+        const proxy = settings.proxy;
+        
+        // Prepare request text
+        // Ensure Host header is set
+        let reqPayloadStr = `${reqMethod} ${reqPath} HTTP/1.1\r\n`;
+        const headerLines = [];
+        let hasHost = false;
+        for (const [k, v] of Object.entries(reqHeaders)) {
+            if (k.toLowerCase() === 'host') {
+                headerLines.push(`${k}: ${targetUrl.host}`);
+                hasHost = true;
+            } else {
+                headerLines.push(`${k}: ${v}`);
+            }
+        }
+        if (!hasHost) {
+            headerLines.push(`Host: ${targetUrl.host}`);
+        }
+        
+        // Inject WAF spoofing headers if option is enabled
+        if (settings.wafbypass === 'true' || settings.wafbypass === true) {
+            const bypassHeaders = {
+                'X-Forwarded-For': '127.0.0.1',
+                'X-Originating-IP': '127.0.0.1',
+                'X-Remote-IP': '127.0.0.1',
+                'X-Remote-Addr': '127.0.0.1',
+                'X-Client-IP': '127.0.0.1',
+                'Client-IP': '127.0.0.1',
+                'X-Real-IP': '127.0.0.1'
+            };
+            for (const [hk, hv] of Object.entries(bypassHeaders)) {
+                let found = false;
+                for (const k of Object.keys(reqHeaders)) {
+                    if (k.toLowerCase() === hk.toLowerCase()) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    headerLines.push(`${hk}: ${hv}`);
+                }
+            }
+        }
+        
+        // If content-length is not set and there is a body, set it
+        let hasContentLength = false;
+        for (const [k, v] of Object.entries(reqHeaders)) {
+            if (k.toLowerCase() === 'content-length') hasContentLength = true;
+        }
+        if (reqBody && !hasContentLength) {
+            headerLines.push(`Content-Length: ${Buffer.byteLength(reqBody)}`);
+        }
+        
+        reqPayloadStr += headerLines.join('\r\n') + '\r\n\r\n';
+        if (reqBody) {
+            reqPayloadStr += reqBody;
+        }
+        
+        const rawReqBuffer = Buffer.from(reqPayloadStr, 'utf8');
+        const startTime = Date.now();
+        
+        // Latency-based auto-throttling
+        const currentLatency = window.lastRecordedLatency || 0;
+        let delayMs = 0;
+        if (currentLatency > 800) {
+            delayMs = Math.min(2000, currentLatency - 400);
+            if (typeof pushActivity === 'function') {
+                pushActivity(`High latency detected (${currentLatency}ms). Auto-throttling: delaying request by ${delayMs}ms`, 'warning');
+            }
+        }
+        
+        setTimeout(() => {
+            sendRawHttpRequest(targetUrl.protocol, targetHostname, targetPort, rawReqBuffer, proxy, (err, responseBuffer, latency) => {
+                if (err) {
+                    tab.response = {
+                        statusCode: 0,
+                        statusText: 'ERR_CONNECTION',
+                        latency: Date.now() - startTime,
+                        size: 0,
+                        raw: `HELLHOUND COMPILER ERROR:\nConnection failed.\n\n${err.message}`,
+                        headers: `Error: ${err.message}`,
+                        body: err.message
+                    };
+                    if (activeRepeaterTabId === tab.id) {
+                        renderResponseViewer(tab.response);
+                    }
+                    if (sendBtn) {
+                        sendBtn.disabled = false;
+                        sendBtn.classList.remove('opacity-50', 'pointer-events-none');
+                    }
+                    return;
+                }
+                
+                // Track latency globally
+                window.lastRecordedLatency = latency;
+                
+                const parsedResp = parseRawResponse(responseBuffer);
+                
+                // WAF Fingerprinting
+                let wafDetected = "SAFE";
+                let wafColor = "text-green-400";
+                let wafIcon = "shield";
+                
+                const responseTextLower = parsedResp.raw.toLowerCase();
+                if (responseTextLower.includes('cloudflare') || parsedResp.headers.toLowerCase().includes('cf-ray')) {
+                    wafDetected = "CLOUDFLARE";
+                    wafColor = "text-orange-500 animate-pulse";
+                    wafIcon = "shield_with_heart";
+                } else if (responseTextLower.includes('aws-waf') || responseTextLower.includes('awswaf')) {
+                    wafDetected = "AWS WAF";
+                    wafColor = "text-red-500 animate-pulse";
+                    wafIcon = "shield_with_heart";
+                } else if (responseTextLower.includes('akamai')) {
+                    wafDetected = "AKAMAI";
+                    wafColor = "text-yellow-500 animate-pulse";
+                    wafIcon = "shield_with_heart";
+                } else if (responseTextLower.includes('imperva') || responseTextLower.includes('incapsula')) {
+                    wafDetected = "IMPERVA";
+                    wafColor = "text-purple-500 animate-pulse";
+                    wafIcon = "shield_with_heart";
+                } else if (responseTextLower.includes('modsecurity') || responseTextLower.includes('mod_security')) {
+                    wafDetected = "MODSECURITY";
+                    wafColor = "text-blue-400 animate-pulse";
+                    wafIcon = "shield_with_heart";
+                }
+                
+                const wafLabel = document.getElementById('wafStatusLabel');
+                const wafIconEl = document.getElementById('wafStatusIcon');
+                if (wafLabel && wafIconEl) {
+                    wafLabel.innerText = `WAF: ${wafDetected}`;
+                    wafLabel.className = `font-label-surgical text-[8px] uppercase tracking-widest ${wafColor}`;
+                    wafIconEl.innerText = wafIcon;
+                    wafIconEl.className = `material-symbols-outlined text-[12px] ${wafColor}`;
+                }
+                
+                const heartbeatLabel = document.getElementById('heartbeatLabel');
+                if (heartbeatLabel) {
+                    heartbeatLabel.innerText = `LATENCY: ${latency} MS`;
+                    if (latency > 1000) {
+                        heartbeatLabel.className = `font-label-surgical text-[8px] uppercase tracking-widest font-bold text-red-500`;
+                    } else if (latency > 500) {
+                        heartbeatLabel.className = `font-label-surgical text-[8px] uppercase tracking-widest font-bold text-yellow-500`;
+                    } else {
+                        heartbeatLabel.className = `font-label-surgical text-[8px] uppercase tracking-widest font-bold text-primary`;
+                    }
+                }
+                
+                tab.response = {
+                    statusCode: parsedResp.statusCode,
+                    statusText: parsedResp.statusText,
+                    latency: latency,
+                    size: responseBuffer.length,
+                    raw: parsedResp.raw,
+                    headers: parsedResp.headers,
+                    body: parsedResp.body
+                };
+                
+                addTrafficHistoryItem({
+                    time: new Date().toLocaleTimeString('en-GB', { hour12: false }),
+                    method: reqMethod,
+                    url: targetUrlStr.replace(/\/$/, '') + reqPath,
+                    status: parsedResp.statusCode,
+                    latency: latency,
+                    rawRequest: tab.rawRequest
+                });
+                
+                if (activeRepeaterTabId === tab.id) {
+                    renderResponseViewer(tab.response);
+                }
+                
+                if (sendBtn) {
+                    sendBtn.disabled = false;
+                    sendBtn.classList.remove('opacity-50', 'pointer-events-none');
+                }
+            });
+        }, delayMs);
+        
+    } catch (e) {
+        if (metaContainer) metaContainer.innerHTML = `<span class="text-red-500 font-label-surgical text-[9px]">BAD TARGET URL</span>`;
+        if (viewer) viewer.innerHTML = `<div class="text-red-500 text-[10px] font-data-mono py-16">URL Parse Error: ${e.message}</div>`;
+        if (sendBtn) {
+            sendBtn.disabled = false;
+            sendBtn.classList.remove('opacity-50', 'pointer-events-none');
+        }
+    }
+}
+
+function setResponseView(view) {
+    currentResponseView = view;
+    ['raw', 'headers', 'body'].forEach(v => {
+        const btn = document.getElementById(`respTab-${v}`);
+        if (btn) {
+            if (v === view) {
+                btn.className = 'px-3 py-1 text-white border-b-2 border-primary font-bold';
+            } else {
+                btn.className = 'px-3 py-1 text-white/40 hover:text-white transition-colors';
+            }
+        }
+    });
+    
+    if (activeRepeaterTabId) {
+        const tab = repeaterTabs.find(t => t.id === activeRepeaterTabId);
+        if (tab) {
+            renderResponseViewer(tab.response);
+        }
+    }
+}
+
+function renderResponseViewer(response) {
+    const metaContainer = document.getElementById('repeaterResponseMeta');
+    const viewer = document.getElementById('repeaterResponseViewer');
+    if (!metaContainer || !viewer) return;
+    
+    if (!response) {
+        metaContainer.innerHTML = '';
+        viewer.innerHTML = `<div class="text-white/20 italic text-[10px] text-center font-data-mono py-16">Send request to retrieve telemetry response stream</div>`;
+        return;
+    }
+    
+    let statusColor = 'text-green-400 border-green-500/20 bg-green-500/5';
+    if (response.statusCode >= 400 && response.statusCode < 500) {
+        statusColor = 'text-yellow-400 border-yellow-500/20 bg-yellow-500/5';
+    } else if (response.statusCode >= 500 || response.statusCode === 0) {
+        statusColor = 'text-red-400 border-red-500/20 bg-red-500/5';
+    }
+    
+    metaContainer.innerHTML = `
+        <span class="px-2 py-0.5 border rounded font-data-mono text-[9px] ${statusColor}">${response.statusCode} ${response.statusText}</span>
+        <span class="px-2 py-0.5 border border-white/10 bg-white/5 rounded font-data-mono text-[9px] text-white/50">${response.latency} ms</span>
+        <span class="px-2 py-0.5 border border-white/10 bg-white/5 rounded font-data-mono text-[9px] text-white/50">${(response.size / 1024).toFixed(2)} KB</span>
+    `;
+    
+    function escapeHTML(str) {
+        if (!str) return '';
+        return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+    
+    let contentToRender = '';
+    if (currentResponseView === 'raw') {
+        const boundary = response.raw.indexOf('\r\n\r\n');
+        if (boundary !== -1) {
+            const headers = response.raw.substring(0, boundary);
+            const body = response.raw.substring(boundary + 4);
+            contentToRender = `<span style="color: #00ffc4; font-weight: 500;">${escapeHTML(headers)}</span>\n\n<span style="color: rgba(255,255,255,0.7);">${escapeHTML(body)}</span>`;
+        } else {
+            contentToRender = `<span style="color: rgba(255,255,255,0.7);">${escapeHTML(response.raw)}</span>`;
+        }
+    } else if (currentResponseView === 'headers') {
+        contentToRender = `<span style="color: #00ffc4; font-weight: 500;">${escapeHTML(response.headers)}</span>`;
+    } else if (currentResponseView === 'body') {
+        contentToRender = `<span style="color: rgba(255,255,255,0.7);">${escapeHTML(response.body)}</span>`;
+    }
+    
+    viewer.innerHTML = contentToRender;
+}
+
+function addTrafficHistoryItem(item) {
+    trafficHistory.unshift(item);
+    if (trafficHistory.length > 50) {
+        trafficHistory.pop();
+    }
+    renderTrafficHistory();
+}
+
+function renderTrafficHistory() {
+    const container = document.getElementById('trafficHistoryList');
+    if (!container) return;
+    
+    const searchVal = (document.getElementById('trafficSearch')?.value || '').toLowerCase();
+    const filtered = trafficHistory.filter(item => {
+        return item.method.toLowerCase().includes(searchVal) || 
+               item.url.toLowerCase().includes(searchVal) ||
+               String(item.status).includes(searchVal);
+    });
+    
+    if (filtered.length === 0) {
+        container.innerHTML = `<div class="text-white/30 italic text-[10px] text-center font-data-mono py-8">No traffic intercepted yet. Runs/strikes will stream here.</div>`;
+        return;
+    }
+    
+    container.innerHTML = filtered.map((item, idx) => {
+        let statusColor = 'text-green-400';
+        if (item.status >= 400 && item.status < 500) statusColor = 'text-yellow-400';
+        else if (item.status >= 500 || item.status === 0) statusColor = 'text-red-400';
+        
+        return `
+            <div onclick="loadTrafficItemToRepeater(${idx})" 
+                class="group border border-white/5 bg-white/[0.01] hover:bg-white/[0.03] hover:border-primary/30 p-3 rounded cursor-pointer transition-all flex flex-col gap-1">
+                <div class="flex justify-between items-center text-[8px] text-white/30 font-data-mono">
+                    <span>${item.time} // ${item.latency}ms</span>
+                    <span class="font-bold ${statusColor}">${item.status}</span>
+                </div>
+                <div class="text-[10px] text-white/80 font-data-mono font-bold flex items-center gap-2 truncate">
+                    <span class="text-primary font-bold text-[9px] group-hover:scale-105 transition-transform">${item.method}</span>
+                    <span class="truncate flex-1">${item.url}</span>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function loadTrafficItemToRepeater(idx) {
+    const item = trafficHistory[idx];
+    if (!item) return;
+    addNewRepeaterTab(item.method, item.url, item.rawRequest);
+}
+
+function filterTrafficHistory() {
+    renderTrafficHistory();
+}
+
+function handleRealTelemetryEvent(line, severity) {
+    let method = 'GET';
+    let urlStr = '';
+    let status = 200;
+    
+    if (line.includes('curl ')) {
+        const urlMatch = line.match(/https?:\/\/[^\s'"]+/);
+        if (urlMatch) urlStr = urlMatch[0];
+        
+        const methodMatch = line.match(/-X\s+([A-Z]+)/);
+        if (methodMatch) method = methodMatch[1];
+        else if (line.includes('--data') || line.includes('-d ')) method = 'POST';
+    } else {
+        const parts = line.split(' ');
+        if (parts.length >= 2) {
+            const possibleMethod = parts[0].toUpperCase();
+            if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'].includes(possibleMethod)) {
+                method = possibleMethod;
+                const urlMatch = line.match(/https?:\/\/[^\s]+/);
+                if (urlMatch) urlStr = urlMatch[0].replace(/-$/, '').trim();
+            }
+        }
+        
+        const statusMatch = line.match(/\b([2-5]\d\d)\b/);
+        if (statusMatch) status = parseInt(statusMatch[1]);
+    }
+    
+    if (!urlStr) return;
+    
+    let rawRequest = `${method} ${new URL(urlStr).pathname} HTTP/1.1\r\nHost: ${new URL(urlStr).host}\r\nUser-Agent: Hellhound-Repeater/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n`;
+    
+    addTrafficHistoryItem({
+        time: new Date().toLocaleTimeString('en-GB', { hour12: false }),
+        method: method,
+        url: urlStr,
+        status: status,
+        latency: 120,
+        rawRequest: rawRequest
+    });
+}
+
+// ── DE-CAFFEINATOR JS AST SANDBOX LOGIC ─────────────────────────────
+
+function deobfuscateScript() {
+    const input = document.getElementById('decafInput').value;
+    if (!input.trim()) {
+        alert("Please paste some script contents into the Source Script Input pane.");
+        return;
+    }
+    
+    // Basic Javascript Beautifier engine
+    let beautified = '';
+    let indentLevel = 0;
+    const tabString = '    ';
+    
+    // Remove formatting/minification loosely
+    let clean = input
+        .replace(/\r/g, '')
+        .replace(/;\s*/g, ';\n')
+        .replace(/\{\s*/g, '{\n')
+        .replace(/\}\s*/g, '\n}\n')
+        .replace(/\n\s*\n/g, '\n');
+        
+    const lines = clean.split('\n');
+    for (let line of lines) {
+        line = line.trim();
+        if (!line) continue;
+        
+        if (line.includes('}')) {
+            indentLevel = Math.max(0, indentLevel - 1);
+        }
+        
+        beautified += tabString.repeat(indentLevel) + line + '\n';
+        
+        if (line.includes('{')) {
+            indentLevel++;
+        }
+    }
+    
+    document.getElementById('decafBeautified').value = beautified;
+    if (typeof pushActivity === 'function') pushActivity('De-Caffeinator: Beautification compiled.', 'success');
+}
+
+function mineScript() {
+    const input = document.getElementById('decafInput').value;
+    if (!input.trim()) {
+        alert("Please paste some script contents to mine.");
+        return;
+    }
+    
+    const list = document.getElementById('decafEntitiesList');
+    list.innerHTML = '';
+    
+    const results = [];
+    
+    // Regex for secrets and endpoints
+    const regexes = {
+        'API Path': /"(\/[a-zA-Z0-9_\-\/]+)"|'(\/[a-zA-Z0-9_\-\/]+)'/g,
+        'AWS Secret Key': /([^a-zA-Z0-9\/+])[a-zA-Z0-9\/+]{40}(?=[^a-zA-Z0-9\/+])/g,
+        'Generic API Key': /(?:key|api_key|token|auth|secret|pwd|passwd|password)\s*[:=]\s*["']([a-zA-Z0-9_\-\+=]{16,})["']/gi,
+        'JWT Token': /eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}/g,
+        'Internal Domain/IP': /(?:https?:\/\/)?(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d+)?(?:\/[a-zA-Z0-9_\-\/]+)*/g
+    };
+    
+    for (const [category, regex] of Object.entries(regexes)) {
+        let match;
+        // reset regex state
+        regex.lastIndex = 0;
+        const matchesSeen = new Set();
+        while ((match = regex.exec(input)) !== null) {
+            const matchedValue = (match[1] || match[2] || match[0]).trim();
+            if (matchedValue && !matchesSeen.has(matchedValue) && matchedValue.length < 200) {
+                matchesSeen.add(matchedValue);
+                results.push({ category, value: matchedValue });
+            }
+        }
+    }
+    
+    if (results.length === 0) {
+        list.innerHTML = `<div class="text-white/20 italic text-center py-8">No sensitive entities or endpoints detected in the source.</div>`;
+        return;
+    }
+    
+    results.forEach(res => {
+        const item = document.createElement('div');
+        item.className = 'flex items-center justify-between p-2 border-b border-white/5 hover:bg-white/5 transition-colors';
+        
+        let actions = '';
+        if (res.category === 'API Path' || res.category === 'Internal Domain/IP') {
+            actions = `
+                <button onclick="loadEndpointToRepeater('${res.value}')" class="px-2 py-1 bg-primary text-background font-label-surgical text-[8px] font-bold uppercase tracking-widest hover:brightness-110 transition-all rounded shadow">
+                    Load Repeater
+                </button>
+            `;
+        } else {
+            actions = `
+                <button onclick="copyToClipboard('${res.value}')" class="px-2 py-1 bg-[#00ffc4]/20 border border-[#00ffc4]/30 text-[#00ffc4] font-label-surgical text-[8px] font-bold uppercase tracking-widest hover:bg-[#00ffc4]/30 transition-all rounded">
+                    Copy Key
+                </button>
+            `;
+        }
+        
+        item.innerHTML = `
+            <div class="flex flex-col gap-1 min-w-0 flex-1 mr-4">
+                <span class="text-white/30 text-[8px] uppercase tracking-wider">${res.category}</span>
+                <span class="text-white font-data-mono truncate select-all text-[9px]">${res.value}</span>
+            </div>
+            <div class="flex-shrink-0">
+                ${actions}
+            </div>
+        `;
+        list.appendChild(item);
+    });
+    
+    if (typeof pushActivity === 'function') pushActivity(`De-Caffeinator: Extracted ${results.length} entities from script.`, 'success');
+}
+
+function loadEndpointToRepeater(val) {
+    let targetUrl = val;
+    // Build valid URL if path only
+    if (val.startsWith('/')) {
+        const activeTargetVal = document.getElementById('headerTarget').innerText;
+        if (activeTargetVal && activeTargetVal !== 'NO_TARGET_ENGAGED') {
+            targetUrl = activeTargetVal.replace(/\/$/, '') + val;
+        } else {
+            targetUrl = 'http://localhost' + val;
+        }
+    }
+    
+    try {
+        const parsed = new URL(targetUrl);
+        const host = parsed.host;
+        const path = parsed.pathname + parsed.search;
+        const rawRequest = `GET ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: Hellhound-Repeater/1.0\r\nConnection: close\r\n\r\n`;
+        
+        showSection('repeater', document.querySelector('[onclick*="showSection(\'repeater\'"]'));
+        document.getElementById('repeaterTarget').value = targetUrl;
+        document.getElementById('repeaterMethod').value = 'GET';
+        document.getElementById('repeaterRawRequest').value = rawRequest;
+        
+        if (typeof pushActivity === 'function') pushActivity(`Loaded mined endpoint to Repeater: ${targetUrl}`, 'success');
+    } catch (e) {
+        showSection('repeater', document.querySelector('[onclick*="showSection(\'repeater\'"]'));
+        document.getElementById('repeaterTarget').value = targetUrl;
+        document.getElementById('repeaterRawRequest').value = `GET ${val} HTTP/1.1\r\nHost: target\r\nUser-Agent: Hellhound-Repeater/1.0\r\nConnection: close\r\n\r\n`;
+    }
+}
+
+function copyToClipboard(text) {
+    navigator.clipboard.writeText(text);
+    if (typeof pushActivity === 'function') pushActivity('Copied credential key to clipboard.', 'success');
+}
+
+// ── TOKEN FORGE CRYPTOGRAPHIC SANDBOX LOGIC ─────────────────────────
+
+function tokenForgeAction(action) {
+    const input = document.getElementById('tokenForgeInput').value;
+    const outputEl = document.getElementById('tokenForgeOutput');
+    
+    if (action === 'inject') {
+        const outVal = outputEl.value;
+        if (!outVal) {
+            alert("No Forge output value available to inject.");
+            return;
+        }
+        
+        const reqTextarea = document.getElementById('repeaterRawRequest');
+        const start = reqTextarea.selectionStart;
+        const end = reqTextarea.selectionEnd;
+        const text = reqTextarea.value;
+        
+        reqTextarea.value = text.substring(0, start) + outVal + text.substring(end);
+        reqTextarea.focus();
+        reqTextarea.selectionStart = start;
+        reqTextarea.selectionEnd = start + outVal.length;
+        
+        if (typeof pushActivity === 'function') pushActivity("Token Forge: Injected token to active editor cursor location", "success");
+        return;
+    }
+    
+    if (!input.trim()) {
+        alert("Please specify some input data in the Token Forge Input pane.");
+        return;
+    }
+    
+    let result = '';
+    
+    try {
+        if (action === 'base64_encode') {
+            result = Buffer.from(input, 'utf8').toString('base64');
+        } else if (action === 'base64_decode') {
+            result = Buffer.from(input, 'base64').toString('utf8');
+        } else if (action === 'jwt_alg_none') {
+            const parts = input.split('.');
+            if (parts.length >= 2) {
+                let header = {};
+                try {
+                    header = JSON.parse(Buffer.from(parts[0], 'base64').toString('utf8'));
+                } catch(e) {}
+                header.alg = 'none';
+                
+                const newHeaderB64 = Buffer.from(JSON.stringify(header), 'utf8')
+                    .toString('base64')
+                    .replace(/=/g, '')
+                    .replace(/\+/g, '-')
+                    .replace(/\//g, '_');
+                    
+                const payloadB64 = parts[1].replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+                result = `${newHeaderB64}.${payloadB64}.`;
+            } else {
+                let payloadStr = input;
+                try {
+                    JSON.parse(input);
+                } catch (e) {
+                    payloadStr = JSON.stringify({ user: input, role: 'admin' });
+                }
+                const header = { alg: 'none', typ: 'JWT' };
+                const headerB64 = Buffer.from(JSON.stringify(header), 'utf8').toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+                const payloadB64 = Buffer.from(payloadStr, 'utf8').toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+                result = `${headerB64}.${payloadB64}.`;
+            }
+        }
+    } catch (e) {
+        result = `ERROR: ${e.message}`;
+    }
+    
+    outputEl.value = result;
+    if (typeof pushActivity === 'function') pushActivity(`Token Forge: Executed ${action} action.`, 'success');
+}
+
+// ── ATTACK GRAPH TRANSITION HOOKS ────────────────────────────────────
+
+function graphLoadToRepeater(url) {
+    try {
+        let cleanUrl = url;
+        if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+            cleanUrl = 'http://' + cleanUrl;
+        }
+        const parsed = new URL(cleanUrl);
+        const host = parsed.host;
+        const path = parsed.pathname + parsed.search;
+        const rawRequest = `GET ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: Hellhound-Repeater/1.0\r\nConnection: close\r\n\r\n`;
+        
+        showSection('repeater', document.querySelector('[onclick*="showSection(\'repeater\'"]'));
+        document.getElementById('repeaterTarget').value = cleanUrl;
+        document.getElementById('repeaterMethod').value = 'GET';
+        document.getElementById('repeaterRawRequest').value = rawRequest;
+        
+        if (typeof pushActivity === 'function') pushActivity(`Loaded Attack Graph node URL to Repeater: ${cleanUrl}`, 'success');
+    } catch (e) {
+        showSection('repeater', document.querySelector('[onclick*="showSection(\'repeater\'"]'));
+        document.getElementById('repeaterTarget').value = url;
+        document.getElementById('repeaterRawRequest').value = `GET / HTTP/1.1\r\nHost: ${url}\r\nUser-Agent: Hellhound-Repeater/1.0\r\nConnection: close\r\n\r\n`;
+    }
+}
+
+function graphSendToDeCaff(label) {
+    showSection('decaffeinator', document.querySelector('[onclick*="showSection(\'decaffeinator\'"]'));
+    document.getElementById('decafInput').value = `// Fetching script endpoint: ${label}\n// Paste actual script contents or run mining below if endpoint contains target content.\n\nfunction main() {\n  console.log("Analyzing remote endpoint ${label}");\n}`;
+    if (typeof pushActivity === 'function') pushActivity(`Sent Script endpoint to De-Caffeinator: ${label}`, 'success');
 }
 
 // ── INIT ─────────────────────────────────────────────────────────────

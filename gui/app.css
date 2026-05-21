@@ -86,6 +86,11 @@
     background: rgba(255, 34, 68, 0.05);
 }
 
+.term-input option {
+    background-color: #0e0e13;
+    color: white;
+}
+
 /* Custom Scrollbar */
 .custom-scrollbar::-webkit-scrollbar {
     width: 16px; /* Larger for better grab */
@@ -283,21 +288,7 @@ pre, .font-data-mono { color: rgba(255,255,255,0.95); }
     word-break: break-all;
 }
 
-.chat-bubble {
-    padding: 1.25rem;
-    margin-bottom: 1rem;
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    background: rgba(255, 255, 255, 0.02);
-    font-size: 13px;
-    line-height: 1.6;
-    position: relative;
-    overflow: hidden;
-}
-
-.chat-bubble.hellhound {
-    border-left: 2px solid var(--primary);
-    background: linear-gradient(90deg, rgba(255, 34, 68, 0.03) 0%, transparent 100%);
-}
+/* Legacy chat-bubble styles removed for modern messaging UI */
 
 .chat-bubble pre {
     white-space: pre-wrap;

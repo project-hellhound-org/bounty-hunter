@@ -150,10 +150,10 @@ Hellhound never outputs 'Global Options' or configuration tables. Every response
 """
 
 ASK_PERSONA_SLM = """\
-[SYSTEM: HELLHOUND SLM — TACTICAL SUBSYSTEM]
-You are Hellhound. A cold, surgical operative. No mentor fluff. No 'partners'. Just the raw tactical path to the breach.
-Technical. Sharp. Impact-obsessed.
-Focus strictly on technical vectors. No conversation. No filler. Just the strike.
+[SYSTEM: HELLHOUND SLM — TECHNICAL ASSISTANT]
+You are Hellhound, a highly capable cybersecurity assistant for a penetration testing framework.
+You are professional, technical, and concise. Do NOT roleplay as a military operative. Do NOT output fake coordinates, redactions, or military jargon.
+Answer the user's technical questions accurately based on the provided context. If the user asks a casual question, reply naturally and conversationally.
 """
 
 CORRELATION_PERSONA_SLM = """\
@@ -181,9 +181,9 @@ REPORTING STRATEGY: (Low/Medium/High/Critical)
 Be brutal. No guessing."""
 
 CHAT_PERSONA_SLM = """\
-You are Hellhound — elite bug bounty hunter. You are sharp, witty, slightly arrogant.
-For casual conversation: respond naturally in 1-3 sentences max.
-Stay in character. No sections. No structure. Just talk.
+You are Hellhound, a helpful cybersecurity assistant integrated into a pentest framework.
+For casual conversation: respond naturally and conversationally in 1-3 sentences max.
+Do NOT roleplay as a military operative. Do NOT output fake coordinates or redacted information.
 """
 
 
@@ -601,13 +601,15 @@ def call_gemini(prompt: str, api_key: str, model: str = "gemini-1.5-flash", time
     res = ask_gemini(api_key, model, CORRELATION_PERSONA, prompt, timeout=timeout)
     return res if res else "Error: AI analysis failed (Zero-Failure Triggered)."
 
-def universal_handshake(api_key: str):
+def universal_handshake(api_key: str, explicit_provider: str = None):
     """Zero-Failure Parallel Handshake (Joe-Style Overhaul)."""
     if not api_key:
         return {"success": False, "message": "No API key provided."}
     
     prov_hint, _ = detect_ai_config(api_key)
-    if prov_hint == "gemini":
+    active_prov = explicit_provider or prov_hint
+    
+    if active_prov == "gemini":
         valid, model = verify_gemini_key(api_key)
         if valid:
             if test_gemini_response(api_key, model):
@@ -615,7 +617,7 @@ def universal_handshake(api_key: str):
             return {"success": False, "message": "Key valid, but quota exceeded or API disabled."}
         return {"success": False, "message": "Key rejected by Google models API."}
     
-    if api_key == "ollama" or prov_hint == "ollama":
+    if api_key == "ollama" or active_prov == "ollama" or active_prov == "local":
         # Check if Ollama is running locally
         try:
             r = requests.get("http://localhost:11434/api/tags", timeout=5)
@@ -659,7 +661,9 @@ def universal_handshake(api_key: str):
         return {"success": False, "message": "Ollama not found at http://localhost:11434", "pulled": False}
 
     # Parallel Fallback for other providers
-    tiers = [("openai", "gpt-4o", "OPENAI — GPT-4O"), ("anthropic", "claude-3-5-sonnet-20240620", "ANTHROPIC — SONNET")]
+    all_tiers = [("openai", "gpt-4o", "OPENAI — GPT-4O"), ("anthropic", "claude-3-5-sonnet-20240620", "ANTHROPIC — SONNET")]
+    tiers = [t for t in all_tiers if active_prov == t[0]] if active_prov in ["openai", "anthropic"] else all_tiers
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(tiers)) as executor:
         future_map = {executor.submit(verify_ai, api_key, p, m, 10): (p, m, l) for p, m, l in tiers}
         for future in concurrent.futures.as_completed(future_map):

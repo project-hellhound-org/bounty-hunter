@@ -235,7 +235,7 @@ class BlobUnpacker:
         return "".join(output)
 
     def scan_js_for_maps(self, js_url: str):
-        """Fetches a JS file, mines it for secrets/routes, and looks for a source map comment"""
+        """Fetches a JS file, mines it for secrets/routes, and looks for a source map using De-Caffeinator logic"""
         try:
             resp = requests.get(js_url, timeout=5, verify=False)
             if resp.status_code == 200:
@@ -244,13 +244,33 @@ class BlobUnpacker:
                 self._mine_content(beautified, js_url)
                 self.loot["minified_content"][js_url] = beautified
                 
-                # 2. Look for the map reference
-                match = MAP_COMMENT_REGEX.search(resp.text[-2000:]) # Usually at the end
-                if match:
-                    map_file = match.group(1)
-                    full_map_url = urljoin(js_url, map_file)
-                    self.loot["discovered_maps"].append(full_map_url)
-                    return full_map_url
+                map_url = None
+                
+                # Check 1: HTTP Headers (SourceMap or X-SourceMap)
+                map_header = resp.headers.get('SourceMap') or resp.headers.get('X-SourceMap')
+                if map_header:
+                    map_url = urljoin(js_url, map_header)
+                
+                # Check 2: Comment (//# sourceMappingURL=)
+                if not map_url:
+                    match = MAP_COMMENT_REGEX.search(resp.text[-2000:]) # Usually at the end
+                    if match:
+                        map_file = match.group(1)
+                        map_url = urljoin(js_url, map_file)
+                
+                # Check 3: Inference (Bruteforce .map extension)
+                if not map_url:
+                    inferred_url = js_url + ".map"
+                    try:
+                        inf_resp = requests.head(inferred_url, timeout=3, verify=False)
+                        if inf_resp.status_code == 200:
+                            map_url = inferred_url
+                    except:
+                        pass
+                
+                if map_url:
+                    self.loot["discovered_maps"].append(map_url)
+                    return map_url
         except: pass
         return None
 
@@ -269,23 +289,58 @@ def run(target, emit, options=None):
         elif isinstance(m, str):
             maps.add(m)
     
-    # 1. Discovery Phase: Scan all discovered JS files for hidden map references
     js_files = []
     # Extract JS files from spider intel
     for ep in spider_intel.get("endpoints", []):
         url = ep.get("url", "")
         if url.endswith(".js"):
             js_files.append(url)
+            
+    # --- UPGRADE: Active Ingestion / Crawling (Ported from De-Caffeinator) ---
+    emit.info("Running active JS discovery (HTML & Next.js chunk parsing)...")
+    try:
+        idx_resp = requests.get(target, timeout=10, verify=False)
+        if idx_resp.status_code == 200:
+            html = idx_resp.text
+            
+            # 1. Find all <script src="..."></script>
+            script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+\.js)["\']', html, re.IGNORECASE)
+            for src in script_srcs:
+                full_js = urljoin(target, src)
+                js_files.append(full_js)
+                
+            # 2. Next.js _buildManifest.js detection
+            manifest_match = re.search(r'/_next/static/([^/]+)/_buildManifest\.js', html)
+            if manifest_match:
+                build_id = manifest_match.group(1)
+                manifest_url = urljoin(target, f"/_next/static/{build_id}/_buildManifest.js")
+                
+                m_resp = requests.get(manifest_url, timeout=5, verify=False)
+                if m_resp.status_code == 200:
+                    emit.info("Discovered Next.js build manifest! Extracting hidden chunks...")
+                    chunks = re.findall(r'["\']([^"\']+\.js)["\']', m_resp.text)
+                    for chunk in chunks:
+                        if not chunk.startswith('http') and not chunk.startswith('/'):
+                            chunk = f"/_next/{chunk}" # Structure commonly used in Next.js manifests
+                        full_chunk = urljoin(target, chunk)
+                        js_files.append(full_chunk)
+    except Exception as e:
+        emit.error(f"Error during active JS discovery: {e}")
+
+    # Remove duplicates
+    js_files = list(set(js_files))
     
     unpacker = BlobUnpacker(emit)
     
     emit.progress_start("BlobUnpacker")
     emit.info(f"Blob Unpacker (Intelligence Mastery): {target}")
+    
     if not js_files:
         emit.info("No JS files found for analysis.")
     else:
-        emit.info(f"Scanning {len(js_files)} JS files for hidden source maps...")
-        js_todo = list(set(js_files))[:25]
+        emit.info(f"Scanning {len(js_files)} JS files for hidden source maps (checking comments, headers, and inference)...")
+        # Throttle to max 50 to avoid hanging the framework on massive sites
+        js_todo = js_files[:50]
         for i, js in enumerate(js_todo):
             emit.progress_update(i, "BlobUnpacker")
             map_url = unpacker.scan_js_for_maps(js)
