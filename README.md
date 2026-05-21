@@ -2,7 +2,7 @@
   <img src="Images/hellhound.png" alt="Hellhound" width="100%"/>
 </p>
 
-<h1 align="center">HELLHOUND v12.5.1</h1>
+<h1 align="center">HELLHOUND v12.6.0</h1>
 <h1 align="center">Apex-King Pentest Framework</h1>
 
 <p align="center">
@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.13-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
-  <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.5.1-red?style=flat-square" alt="Release Version"/></a>
+  <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.6.0-red?style=flat-square" alt="Release Version"/></a>
   <img src="https://img.shields.io/badge/AI--Powered-Gemini%20%7C%20OpenAI%20%7C%20Gemma--2b-red?style=flat-square" alt="AI Support"/>
   <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License"/>
 </p>
@@ -91,13 +91,13 @@ Hellhound's power lies in its modularity. Each module is optimized for high high
 
 ---
 
-## ◓ Recent Updates (v12.5.1)
+## ◓ Recent Updates (v12.6.0)
 
-- **Obsidian 3D Engine**: Replaced legacy 2D graphing with a high-fidelity 3D force-directed neural map. Optimized for enterprise threat clustering and organic attack-chain visualization.
-- **Neural Core Activation**: Added `activate hellhound` command for seamless local SLM (Gemma-2b) integration via Ollama.
-- **Hybrid AI Provider**: Optimized `setg ai` logic to auto-detect and configure Gemini/OpenAI keys or local environments.
-- **Spider v12.3**: Integrated high-fidelity standalone recon engine with full SPA support and automated risk scoring.
-- **Module Hardening**: Comprehensive stability updates for `JWTanalyzer` and `PATHtraveller` reconnaissance pipelines.
+- **AST Sandbox & De-Caffeinator**: Built client-side AST unpacker and code beautifier tab to expand nested/packed scripts. Includes AST regex-mining utilities to extract endpoints and API keys instantly.
+- **Token Forge**: Added direct JWT and token forgery utilities (including signature stripping and `alg: none` tampering headers) inside the active HTTP Repeater request pane.
+- **WAF Evading & Auto-Throttling**: Integrated active spoofing headers (`X-Forwarded-For`, etc.), signature-based WAF identification (Cloudflare, AWS WAF, etc.), and connection-latency based auto-throttling to minimize target application blocking.
+- **Surgical Threat Graph Navigation**: Map Cytoscape node actions to direct HUD pivots (one-click Repeater injection or De-Caffeinator AST sandbox mapping).
+- **Module Hardening**: Standardized module categorization and directory listing in loot dashboard blocks.
 
 ---
 
