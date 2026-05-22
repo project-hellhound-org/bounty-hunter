@@ -25,7 +25,7 @@ function safeSend(channel, data) {
 // ── OUTPUT FILTER ──────────────────────────────────────────────────────────
 const ANSI_RE = /\x1b\[[0-9;]*[mGKHF]/g;
 const BRAILLE_RE = /[\u2800-\u28FF]/;
-const PROMPT_RE = /hellhound\s*([\(\[]?[^\)\]]*[\)\]]?)?\s*>/;
+const PROMPT_RE = /hellhound\s*([\(\[]?[^\)\]]*[\)\]]?)?\s*>\s*$/;
 
 const ANIMATION_PHRASES = [
     'hellhound framework console is',
@@ -296,6 +296,18 @@ function createWindow() {
         }
     });
     mainWindow.loadFile('app.html');
+    
+    // Force a micro-resize to trigger repaint on Linux compositor
+    mainWindow.webContents.on('did-finish-load', () => {
+        setTimeout(() => {
+            if (mainWindow) {
+                const [w, h] = mainWindow.getSize();
+                mainWindow.setSize(w + 1, h);
+                mainWindow.setSize(w, h);
+            }
+        }, 150);
+    });
+
     mainWindow.on('closed', () => { mainWindow = null; });
     spawnEngines();
 }
@@ -480,16 +492,99 @@ ipcMain.on('get-loot', (event) => {
                 if (mod === 'spider') {
                     const endpoints = intel.endpoints || [];
                     const secrets = intel.secrets || [];
+                    const robots = intel.robots_disallowed || [];
+                    const comments = intel.comments || [];
+                    const sourcemaps = intel.sourcemaps || [];
+                    const graphql = intel.graphql || [];
+                    const openapi = intel.openapi || [];
+                    const cors = intel.cors_issues || [];
+                    const extracted = intel.extracted_data || [];
+
                     activeLines.push(`=== SPIDER MODULE ===`);
                     activeLines.push(`Discovered Endpoints: ${endpoints.length}`);
                     activeLines.push(`Extracted Secrets: ${secrets.length}`);
-                    secrets.forEach(sec => {
-                        let secStr = sec.content || sec.value || sec.match || JSON.stringify(sec);
-                        if (sec.type) secStr = `[${sec.type}] ${secStr}`;
-                        if (sec.source) secStr += ` (${sec.source})`;
-                        activeLines.push(`  ↳ Secret: ${secStr}`);
-                    });
+                    activeLines.push(`Robots Disallowed Paths: ${robots.length}`);
+                    activeLines.push(`Comment Leaks: ${comments.length}`);
+                    activeLines.push(`GraphQL Endpoints: ${graphql.length}`);
+                    activeLines.push(`OpenAPI Specs: ${openapi.length}`);
+                    activeLines.push(`Source Maps: ${sourcemaps.length}`);
+                    activeLines.push(`CORS Flaws: ${cors.length}`);
+                    activeLines.push(`Extracted Data Leaks: ${extracted.length}`);
                     activeLines.push(``);
+
+                    if (secrets.length > 0) {
+                        activeLines.push(`--- SECRETS IDENTIFIED ---`);
+                        secrets.forEach(sec => {
+                            let secStr = sec.content || sec.value || sec.match || JSON.stringify(sec);
+                            if (sec.type) secStr = `[${sec.type}] ${secStr}`;
+                            if (sec.source) secStr += ` (${sec.source})`;
+                            activeLines.push(`  ↳ Secret: ${secStr}`);
+                        });
+                        activeLines.push(``);
+                    }
+
+                    if (robots.length > 0) {
+                        activeLines.push(`--- ROBOTS.TXT FINDINGS ---`);
+                        robots.forEach(r => {
+                            let pathVal = typeof r === 'string' ? r : (r.path || r.url || JSON.stringify(r));
+                            activeLines.push(`[HIGH] ROBOTS DISALLOWED ENTRY: ${pathVal}`);
+                        });
+                        activeLines.push(``);
+                    }
+
+                    if (comments.length > 0) {
+                        activeLines.push(`--- SENSITIVE COMMENT LEAKS ---`);
+                        comments.forEach(c => {
+                            let cStr = c.content || c.comment || JSON.stringify(c);
+                            let src = c.source ? ` in ${c.source}` : '';
+                            activeLines.push(`[HIGH] COMMENT LEAK: ${cStr}${src}`);
+                        });
+                        activeLines.push(``);
+                    }
+
+                    if (extracted.length > 0) {
+                        activeLines.push(`--- EXTRACTED LEAKS ---`);
+                        extracted.forEach(ex => {
+                            let label = ex.label || ex.type || 'Data';
+                            let val = ex.content || ex.value || JSON.stringify(ex);
+                            let src = ex.source ? ` (${ex.source})` : '';
+                            activeLines.push(`[HIGH] EXTRACT LEAK: [${label}] ${val}${src}`);
+                        });
+                        activeLines.push(``);
+                    }
+
+                    if (sourcemaps.length > 0) {
+                        activeLines.push(`--- SOURCE MAPS EXPOSED ---`);
+                        sourcemaps.forEach(sm => {
+                            let parent = sm.parent ? ` (parent: ${sm.parent})` : '';
+                            activeLines.push(`[HIGH] EXPOSED SOURCE MAP: ${sm.url}${parent}`);
+                        });
+                        activeLines.push(``);
+                    }
+
+                    if (graphql.length > 0) {
+                        activeLines.push(`--- GRAPHQL EXPOSED ---`);
+                        graphql.forEach(g => {
+                            activeLines.push(`[HIGH] GRAPHQL ENDPOINT: ${g.url || g}`);
+                        });
+                        activeLines.push(``);
+                    }
+
+                    if (openapi.length > 0) {
+                        activeLines.push(`--- OPENAPI ENDPOINTS ---`);
+                        openapi.forEach(o => {
+                            activeLines.push(`[INFO] OPENAPI SPEC EXPOSED: ${o.url || o}`);
+                        });
+                        activeLines.push(``);
+                    }
+
+                    if (cors.length > 0) {
+                        activeLines.push(`--- CORS ISSUES ---`);
+                        cors.forEach(c => {
+                            activeLines.push(`[MEDIUM] CORS VULNERABILITY: ${c.url || c.origin || JSON.stringify(c)}`);
+                        });
+                        activeLines.push(``);
+                    }
                 } else {
                     let hasFindings = false;
                     for (const vk of ['vulnerabilities', 'findings', 'cors_vulnerabilities', 'cves', 'jwts', 'reconstructed']) {
@@ -576,16 +671,42 @@ ipcMain.on('sync-settings-to-console', (event, settings) => {
     });
 });
 
-// 10. Repro shell — curl only
-ipcMain.on('exec-repro', (event, command) => {
+ipcMain.on('exec-repro', (event, payload) => {
+    let command = '';
+    let cwd = process.cwd();
+    if (typeof payload === 'string') {
+        command = payload;
+    } else if (payload && typeof payload === 'object') {
+        command = payload.command || '';
+        cwd = payload.cwd || cwd;
+    }
+
     if (!command.trim().startsWith('curl')) {
-        event.reply('repro-out', 'Error: Repro shell restricted to curl commands only.');
+        event.reply('repro-out', 'Error: Repro shell restricted to curl commands only.\n');
+        event.reply('repro-done');
         return;
     }
-    exec(command, (error, stdout, stderr) => {
-        if (stdout) event.reply('repro-out', stdout);
-        if (stderr) event.reply('repro-out', `[STDERR] ${stderr}`);
-        if (error) event.reply('repro-out', `[ERROR] ${error.message}`);
+
+    let cleanCommand = command;
+    const parts = command.split(/\s+/);
+    const hasSilent = parts.some(p => p === '-s' || p === '--silent' || p === '-sS' || p === '--no-progress-meter');
+    if (!hasSilent) {
+        cleanCommand = command.replace(/^(\s*curl\b)/, '$1 -sS');
+    }
+
+    const { spawn } = require('child_process');
+    const child = spawn('bash', ['-c', cleanCommand], { cwd });
+    child.stdout.on('data', (data) => {
+        event.reply('repro-out', data.toString());
+    });
+    child.stderr.on('data', (data) => {
+        event.reply('repro-out', data.toString());
+    });
+    child.on('error', (err) => {
+        event.reply('repro-out', `\n[ERROR] Command failed to start: ${err.message}\n`);
+    });
+    child.on('close', (code) => {
+        event.reply('repro-done');
     });
 });
 
@@ -644,11 +765,31 @@ ipcMain.on('ai-handshake', (event, payload) => {
 });
 
 ipcMain.on('ai-ask', (event, question) => {
+    const sanitizedQuestion = (question || '').replace(/\r?\n/g, ' ');
+    let completed = false;
+    
+    // Safety timeout: 45 seconds to prevent permanent UI lockup
+    const timer = setTimeout(() => {
+        if (!completed) {
+            completed = true;
+            event.reply('ai-response', 'Error: Neural Core request timed out. Please check model connectivity.');
+            if (intelEngine) {
+                intelEngine.current = null;
+                intelEngine.busy = false;
+                intelEngine.promptsSeen = 0;
+                intelEngine._drain();
+            }
+        }
+    }, 45000);
+
     intelEngine.enqueue({
-        lines: [`ask ${question}`],
+        lines: [`ask ${sanitizedQuestion}`],
         promptsExpected: 1,
         streaming: false,
         onDone: (out) => {
+            if (completed) return;
+            completed = true;
+            clearTimeout(timer);
             const cleanOut = deepCleanOutput(out);
             event.reply('ai-response', cleanOut || 'No response from Neural Core.');
         }
@@ -656,24 +797,47 @@ ipcMain.on('ai-ask', (event, question) => {
 });
 
 ipcMain.on('ai-analyze', (event, target) => {
+    const sanitizedTarget = (target || '').replace(/\r?\n/g, ' ');
     // Pass targets as argument to skip interactive menu (console.py supports this)
     // e.g. "analyze 1,2,5" or just "analyze" for all
-    const isSelection = target && /^[\d,\s]+$/.test(target);
-    const cmd = isSelection ? `analyze ${target}` : 'analyze';
+    const isSelection = sanitizedTarget && /^[\d,\s]+$/.test(sanitizedTarget);
+    const cmd = isSelection ? `analyze ${sanitizedTarget}` : 'analyze';
     const cmds = [];
-    if (target && target !== 'LIST' && !isSelection) cmds.push(`prey ${target}`);
+    if (sanitizedTarget && sanitizedTarget !== 'LIST' && !isSelection) cmds.push(`prey ${sanitizedTarget}`);
     cmds.push(cmd);
 
     let acc = '';
+    let completed = false;
+
+    // Safety timeout: 60 seconds
+    const timer = setTimeout(() => {
+        if (!completed) {
+            completed = true;
+            event.reply('ai-response', 'Error: Neural Core analysis timed out. Please try again.');
+            if (intelEngine) {
+                intelEngine.current = null;
+                intelEngine.busy = false;
+                intelEngine.promptsSeen = 0;
+                intelEngine._drain();
+            }
+        }
+    }, 60000);
+
     cmds.forEach((c, i) => {
         const isLast = i === cmds.length - 1;
         intelEngine.enqueue({
             lines: [c],
             promptsExpected: 1,
             streaming: false,
-            onDone: isLast
-                ? (out) => event.reply('ai-response', acc + (out || ''))
-                : (out) => { if (out) acc += out + '\n'; }
+            onDone: (out) => {
+                if (completed) return;
+                if (out) acc += out + '\n';
+                if (isLast) {
+                    completed = true;
+                    clearTimeout(timer);
+                    event.reply('ai-response', acc);
+                }
+            }
         });
     });
 });

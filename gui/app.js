@@ -525,15 +525,47 @@ function printOutput(text) {
         pre.className = 'panel-repro-pre font-data-mono text-[13px] text-white/90 whitespace-pre-wrap break-all w-full select-text';
         output.insertBefore(pre, document.getElementById('reproCommandLine'));
     }
-    pre.textContent += text;
+
+    const escapeHtml = (str) => {
+        return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    };
+
+    const promptRegex = /(hellhound@pentest:[^$#\n]*[$#])(.*)/;
+    const lines = text.split('\n');
+    let htmlContent = '';
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const match = line.match(promptRegex);
+        if (match) {
+            htmlContent += `<span class="text-green-400 font-bold">${escapeHtml(match[1])}</span>${escapeHtml(match[2])}`;
+        } else {
+            htmlContent += escapeHtml(line);
+        }
+        if (i < lines.length - 1) {
+            htmlContent += '\n';
+        }
+    }
+
+    const temp = document.createElement('span');
+    temp.innerHTML = htmlContent;
+    while (temp.firstChild) {
+        pre.appendChild(temp.firstChild);
+    }
     output.scrollTop = output.scrollHeight;
 }
 
 ipcRenderer.on('repro-out', (event, text) => {
-    printOutput(text + '\n');
+    printOutput(text);
+});
+
+ipcRenderer.on('repro-done', (event) => {
     document.getElementById('reproCommandLine').classList.remove('hidden');
     const input = document.getElementById('reproInput');
-    if (input) input.focus();
+    if (input) {
+        input.value = '';
+        input.style.height = '24px';
+        input.focus();
+    }
 });
 
 function handleRepro(event) {
@@ -545,9 +577,10 @@ function handleRepro(event) {
         const pre = document.querySelector('pre.panel-repro-pre');
         const promptText = document.getElementById('reproPrompt').textContent;
         if (pre) {
-            pre.textContent += promptText + input.value + '^C\n';
+            printOutput(promptText + input.value + '^C\n');
         }
         input.value = '';
+        input.style.height = '24px';
         const output = document.getElementById('reproOutput');
         if (output) output.scrollTop = output.scrollHeight;
         return;
@@ -572,6 +605,10 @@ function handleRepro(event) {
     }
     
     if (event.key === 'Enter') {
+        if (event.shiftKey) {
+            // Let default newline insertion happen
+            return;
+        }
         event.preventDefault();
         const fullCmd = input.value;
         const cmd = fullCmd.trim();
@@ -579,6 +616,7 @@ function handleRepro(event) {
         
         printOutput(promptText + fullCmd + '\n');
         input.value = '';
+        input.style.height = '24px';
         
         if (!cmd) return;
         
@@ -722,7 +760,7 @@ function handleRepro(event) {
         
         if (exe === 'curl') {
             document.getElementById('reproCommandLine').classList.add('hidden');
-            ipcRenderer.send('exec-repro', cmd);
+            ipcRenderer.send('exec-repro', { command: cmd, cwd: currentDir });
             return;
         }
         
@@ -1532,6 +1570,14 @@ document.addEventListener('DOMContentLoaded', () => {
             // Shift+Enter naturally inserts newline in textarea — no handler needed
         });
     }
+    
+    const reproInput = document.getElementById('reproInput');
+    if (reproInput) {
+        reproInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = this.scrollHeight + 'px';
+        });
+    }
 });
 
 function clearAIHistory() {
@@ -2178,6 +2224,32 @@ let rotationAngle = 0;
 let mouseX = 0;
 let mouseY = 0;
 
+let currentGraphMode = 'sample';
+
+function setGraphMode(mode) {
+    if (mode === 'live') {
+        const checkTarget = activeTarget || '';
+        const isNotEngaged = !checkTarget || checkTarget === 'NO_TARGET_ENGAGED' || checkTarget === 'NO TARGET' || checkTarget === 'NO TARGET ENGAGED';
+        if (isNotEngaged) {
+            alert('Live graph requires an active target to be engaged. Engaging a target generates telemetry.');
+            return;
+        }
+    }
+    currentGraphMode = mode;
+    const sampleBtn = document.getElementById('graphModeSample');
+    const liveBtn = document.getElementById('graphModeLive');
+    if (sampleBtn && liveBtn) {
+        if (mode === 'sample') {
+            sampleBtn.className = 'px-4 py-2 font-label-surgical text-[10px] tracking-widest uppercase bg-primary text-background font-bold transition-all';
+            liveBtn.className = 'px-4 py-2 font-label-surgical text-[10px] tracking-widest uppercase text-white/40 hover:text-white transition-all';
+        } else {
+            liveBtn.className = 'px-4 py-2 font-label-surgical text-[10px] tracking-widest uppercase bg-primary text-background font-bold transition-all';
+            sampleBtn.className = 'px-4 py-2 font-label-surgical text-[10px] tracking-widest uppercase text-white/40 hover:text-white transition-all';
+        }
+    }
+    initAttackGraph();
+}
+
 function initAttackGraph() {
     const container = document.getElementById('attackGraph');
     if (!container) return;
@@ -2194,10 +2266,18 @@ function initAttackGraph() {
         return;
     }
 
-    const gData = {
-        nodes: SAMPLE_ATTACK_GRAPH.nodes.map(n => ({ ...n })),
-        links: SAMPLE_ATTACK_GRAPH.edges.map(e => ({ source: e.from, target: e.to }))
-    };
+    let gData;
+    if (currentGraphMode === 'live') {
+        gData = { nodes: [], links: [] };
+        ipcRenderer.send('get-attack-graph');
+    } else {
+        gData = {
+            nodes: SAMPLE_ATTACK_GRAPH.nodes.map(n => ({ ...n })),
+            links: SAMPLE_ATTACK_GRAPH.edges.map(e => ({ source: e.from, target: e.to }))
+        };
+        const badge = document.getElementById('graphStatusBadge');
+        if (badge) badge.innerText = 'SAMPLE_MAP // STANDBY';
+    }
 
     container.innerHTML = '';
     try {
@@ -2226,74 +2306,96 @@ function initAttackGraph() {
             return new THREE.Mesh(geometry, material);
         })
         .onNodeHover((node, prevNode) => {
-            if (prevNode) {
-                prevNode.__threeObj.scale.set(1, 1, 1);
-                prevNode.__threeObj.material.emissiveIntensity = prevNode.severity === 'critical' ? 2 : 0.5;
-            }
-            if (node) {
-                node.__threeObj.scale.set(1.5, 1.5, 1.5);
-                node.__threeObj.material.emissiveIntensity = 5;
-                
-                // Show tooltip logic (minimal)
-                const tooltip = document.createElement('div');
-                tooltip.className = 'obsidian-tooltip';
-                tooltip.innerHTML = `
-                    <div class="flex items-center gap-2">
-                        <span class="material-symbols-outlined text-[12px]" style="color:${getNodeColor(node.type, node)}">${getNodeIcon(node.type)}</span>
-                        <span class="font-label-surgical text-[10px] tracking-widest text-white uppercase">${node.label}</span>
-                    </div>
-                `;
-                // 3d-force-graph has built-in nodeLabel, but user wants custom
+            try {
+                if (prevNode && prevNode.__threeObj) {
+                    if (prevNode.__threeObj.scale) prevNode.__threeObj.scale.set(1, 1, 1);
+                    if (prevNode.__threeObj.material) {
+                        prevNode.__threeObj.material.emissiveIntensity = prevNode.severity === 'critical' ? 2 : 0.5;
+                    }
+                }
+                if (node && node.__threeObj) {
+                    if (node.__threeObj.scale) node.__threeObj.scale.set(1.5, 1.5, 1.5);
+                    if (node.__threeObj.material) {
+                        node.__threeObj.material.emissiveIntensity = 5;
+                    }
+                    
+                    // Show tooltip logic (minimal)
+                    const tooltip = document.createElement('div');
+                    tooltip.className = 'obsidian-tooltip';
+                    tooltip.innerHTML = `
+                        <div class="flex items-center gap-2">
+                            <span class="material-symbols-outlined text-[12px]" style="color:${getNodeColor(node.type, node)}">${getNodeIcon(node.type)}</span>
+                            <span class="font-label-surgical text-[10px] tracking-widest text-white uppercase">${node.label}</span>
+                        </div>
+                    `;
+                }
+            } catch (err) {
+                console.error("Error in onNodeHover:", err);
             }
             
             // Edge highlighting
-            obsidianGraph.linkDirectionalParticles(node ? 2 : 0);
-            obsidianGraph.linkDirectionalParticleWidth(1);
+            try {
+                if (obsidianGraph) {
+                    obsidianGraph.linkDirectionalParticles(node ? 2 : 0);
+                    obsidianGraph.linkDirectionalParticleWidth(1);
+                }
+            } catch (_) {}
         })
         .onNodeClick(node => {
-            showNodeInfo({
-                label: node.label,
-                type: node.type,
-                icon: getNodeIcon(node.type),
-                description: node.description,
-                severity: node.severity,
-                risk: node.risk,
-                cwe: node.cwe,
-                cvss_score: node.cvss_score,
-                version: node.version,
-                recommendation: node.recommendation
-            });
-            
-            // Aim at node
-            const distance = 100;
-            const distRatio = 1 + distance/Math.hypot(node.x, node.y, node.z);
-            obsidianGraph.cameraPosition(
-                { x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio },
-                node,
-                1000
-            );
+            try {
+                if (!node) return;
+                showNodeInfo({
+                    label: node.label,
+                    type: node.type,
+                    icon: getNodeIcon(node.type),
+                    description: node.description,
+                    severity: node.severity,
+                    risk: node.risk,
+                    cwe: node.cwe,
+                    cvss_score: node.cvss_score,
+                    version: node.version,
+                    recommendation: node.recommendation
+                });
+                
+                // Aim at node safely without camera positioning crashes
+                const x = node.x || 0;
+                const y = node.y || 0;
+                const z = node.z || 0;
+                const hypot = Math.hypot(x, y, z);
+                if (hypot > 0 && obsidianGraph) {
+                    const distance = 100;
+                    const distRatio = 1 + distance / hypot;
+                    obsidianGraph.cameraPosition(
+                        { x: x * distRatio, y: y * distRatio, z: z * distRatio },
+                        node,
+                        1000
+                    );
+                }
+            } catch (err) {
+                console.error("Error in onNodeClick:", err);
+            }
         })
         .onBackgroundClick(() => {
             hideNodeInfo();
         });
 
-    // Physics setup
-    obsidianGraph.d3Force('charge').strength(-150);
-    obsidianGraph.d3Force('link').distance(80);
-    obsidianGraph.d3Force('center').strength(0.1);
+        // Physics setup
+        obsidianGraph.d3Force('charge').strength(-150);
+        obsidianGraph.d3Force('link').distance(80);
+        obsidianGraph.d3Force('center').strength(0.1);
 
-    // Initial camera
-    obsidianGraph.cameraPosition({ x: 400, y: 200, z: 600 });
+        // Initial camera
+        obsidianGraph.cameraPosition({ x: 400, y: 200, z: 600 });
 
-    // Window resize
-    window.addEventListener('resize', () => {
-        if (obsidianGraph) {
-            obsidianGraph.width(container.clientWidth);
-            obsidianGraph.height(container.clientHeight);
-        }
-    });
+        // Window resize
+        window.addEventListener('resize', () => {
+            if (obsidianGraph) {
+                obsidianGraph.width(container.clientWidth);
+                obsidianGraph.height(container.clientHeight);
+            }
+        });
 
-    if (typeof pushActivity === 'function') pushActivity('Neural Attack Graph: Obsidian Engine Active', 'info');
+        if (typeof pushActivity === 'function') pushActivity('Neural Attack Graph: Obsidian Engine Active', 'info');
     } catch (err) {
         console.error('Obsidian Graph Initialization Error:', err);
         container.innerHTML = `<div class="h-full flex items-center justify-center text-primary font-data-mono">ERR: NEURAL_INIT_FAIL [${err.message}]</div>`;
@@ -2324,6 +2426,7 @@ function resetGraphView() {
 function startGraphAnimations() { return; }
 
 function renderAttackGraph(data) {
+    if (currentGraphMode !== 'live') return;
     if (!obsidianGraph) {
         initAttackGraph();
         return;
@@ -2345,8 +2448,9 @@ ipcRenderer.on('graph-data', (event, data) => {
 
 // Periodic graph refresh
 setInterval(() => {
-    if (document.getElementById('dashboard').classList.contains('hidden')) return;
-    ipcRenderer.send('get-attack-graph');
+    if (currentGraphMode === 'live') {
+        ipcRenderer.send('get-attack-graph');
+    }
 }, 30000);
 
 
@@ -3077,28 +3181,32 @@ function renderLootCenter(lootMap) {
                 item.innerHTML = `<span class="px-1.5 py-0.5 rounded text-[8px] bg-white/10 text-white/50 font-bold mr-2">LOW</span> <span class="text-white/70">${trimmed.substring(5).trim()}</span>`;
             } else if (trimmed.startsWith('[INFO]')) {
                 item.innerHTML = `<span class="px-1.5 py-0.5 rounded text-[8px] bg-blue-500/10 text-blue-400 font-bold mr-2">INFO</span> <span class="text-white/60">${trimmed.substring(6).trim()}</span>`;
-            } else if (trimmed.startsWith('Method:')) {
+            } else if (trimmed.startsWith('Method:') || trimmed.startsWith('Payload:')) {
                 const parts = trimmed.split('|');
                 let html = '';
                 parts.forEach(p => {
                     const sub = p.trim().split(':');
                     if (sub.length >= 2) {
-                        html += `<span class="text-white/30 mr-1">${sub[0].trim()}:</span><span class="text-white/80 mr-4 font-bold">${sub.slice(1).join(':').trim()}</span> `;
+                        const lbl = sub[0].trim();
+                        const val = sub.slice(1).join(':').trim();
+                        html += `<span class="text-[#00ffc4] font-bold mr-1">${lbl}:</span><span class="text-white/80 mr-4 font-bold">${val}</span> `;
                     } else {
                         html += `<span class="text-white/80">${p}</span>`;
                     }
                 });
                 item.innerHTML = html;
-            } else if (trimmed.startsWith('Parameter:') || trimmed.startsWith('Evidence:') || trimmed.startsWith('PoC:') || trimmed.startsWith('Secret:')) {
+            } else if (trimmed.startsWith('Parameter:') || trimmed.startsWith('Evidence:') || trimmed.startsWith('PoC:') || trimmed.startsWith('Secret:') || trimmed.startsWith('URL:') || trimmed.startsWith('Vulnerable:')) {
                 const colonIdx = trimmed.indexOf(':');
                 if (colonIdx !== -1) {
                     const label = trimmed.substring(0, colonIdx).trim();
                     const val = trimmed.substring(colonIdx + 1).trim();
-                    let valColor = 'text-white/70';
-                    if (label === 'PoC') valColor = 'text-yellow-300 font-bold select-all';
-                    if (label === 'Secret') valColor = 'text-cyan-300 font-bold select-all';
-                    if (label === 'Parameter') valColor = 'text-red-400 font-bold';
-                    item.innerHTML = `<span class="text-white/30 mr-2">${label}:</span><span class="${valColor}">${val}</span>`;
+                    let valColor = 'text-white/80';
+                    let labelColor = 'text-[#00ffc4] font-bold';
+                    if (label === 'PoC') { valColor = 'text-yellow-300 font-bold select-all'; labelColor = 'text-primary font-bold'; }
+                    if (label === 'Secret') { valColor = 'text-cyan-300 font-bold select-all'; labelColor = 'text-primary font-bold'; }
+                    if (label === 'Parameter') { valColor = 'text-purple-300 font-bold'; labelColor = 'text-primary font-bold'; }
+                    if (label === 'Vulnerable') { valColor = 'text-red-400 font-bold'; labelColor = 'text-primary font-bold'; }
+                    item.innerHTML = `<span class="${labelColor} mr-2">${label}:</span><span class="${valColor}">${val}</span>`;
                 } else {
                     item.textContent = line;
                 }
@@ -3588,7 +3696,7 @@ function sendActiveRepeater() {
         
         // Retrieve settings for proxy & WAF bypass
         const settings = JSON.parse(localStorage.getItem('hh_global_settings') || '{}');
-        const proxy = settings.proxy;
+        const proxy = settings.proxy_mode === 'ALL' ? settings.proxy : null;
         
         // Prepare request text
         // Ensure Host header is set
@@ -4061,7 +4169,7 @@ function loadEndpointToRepeater(val) {
     // Build valid URL if path only
     if (val.startsWith('/')) {
         const activeTargetVal = document.getElementById('headerTarget').innerText;
-        if (activeTargetVal && activeTargetVal !== 'NO_TARGET_ENGAGED') {
+        if (activeTargetVal && activeTargetVal !== 'NO_TARGET_ENGAGED' && activeTargetVal !== 'NO TARGET' && activeTargetVal !== 'NO TARGET ENGAGED') {
             targetUrl = activeTargetVal.replace(/\/$/, '') + val;
         } else {
             targetUrl = 'http://localhost' + val;
@@ -4199,6 +4307,266 @@ function graphSendToDeCaff(label) {
     showSection('decaffeinator', document.querySelector('[onclick*="showSection(\'decaffeinator\'"]'));
     document.getElementById('decafInput').value = `// Fetching script endpoint: ${label}\n// Paste actual script contents or run mining below if endpoint contains target content.\n\nfunction main() {\n  console.log("Analyzing remote endpoint ${label}");\n}`;
     if (typeof pushActivity === 'function') pushActivity(`Sent Script endpoint to De-Caffeinator: ${label}`, 'success');
+}
+
+// ── COOKIE FORGE & REPEATER TRANSMIT LOGIC ─────────────────────────────
+function getCryptoModule() {
+    try {
+        return require('crypto');
+    } catch (e) {
+        console.error("Crypto not available:", e);
+        return null;
+    }
+}
+
+function base64url(source) {
+    let encoded = Buffer.from(source).toString('base64');
+    return encoded.replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function base64urlDecode(str) {
+    str = str.replace(/-/g, '+').replace(/_/g, '/');
+    while (str.length % 4) {
+        str += '=';
+    }
+    return Buffer.from(str, 'base64').toString('utf8');
+}
+
+function cookieForgeAction(action) {
+    const type = document.getElementById('cookieForgeType').value;
+    const input = document.getElementById('cookieForgeInput').value.trim();
+    const secret = document.getElementById('cookieForgeSecret').value;
+    const outputArea = document.getElementById('cookieForgeOutput');
+    const headerArea = document.getElementById('cookieForgeHeader');
+    const payloadArea = document.getElementById('cookieForgePayload');
+
+    if (action === 'decode') {
+        if (!input) {
+            alert('Please paste a raw token to decode.');
+            return;
+        }
+        try {
+            if (type === 'jwt') {
+                const parts = input.split('.');
+                if (parts.length < 2) {
+                    throw new Error('Invalid JWT format (needs at least header and payload parts)');
+                }
+                const headerDec = base64urlDecode(parts[0]);
+                const payloadDec = base64urlDecode(parts[1]);
+                
+                headerArea.value = JSON.stringify(JSON.parse(headerDec), null, 2);
+                payloadArea.value = JSON.stringify(JSON.parse(payloadDec), null, 2);
+                
+                if (typeof pushActivity === 'function') pushActivity('Successfully parsed and loaded JWT structure', 'success');
+            } else if (type === 'base64') {
+                const decoded = Buffer.from(input, 'base64').toString('utf8');
+                headerArea.value = '';
+                try {
+                    payloadArea.value = JSON.stringify(JSON.parse(decoded), null, 2);
+                } catch (_) {
+                    payloadArea.value = decoded;
+                }
+                if (typeof pushActivity === 'function') pushActivity('Decoded Base64 cookie payload', 'success');
+            } else if (type === 'hex') {
+                const decoded = Buffer.from(input, 'hex').toString('utf8');
+                headerArea.value = '';
+                try {
+                    payloadArea.value = JSON.stringify(JSON.parse(decoded), null, 2);
+                } catch (_) {
+                    payloadArea.value = decoded;
+                }
+                if (typeof pushActivity === 'function') pushActivity('Decoded Hex cookie payload', 'success');
+            } else if (type === 'url') {
+                const decoded = decodeURIComponent(input);
+                headerArea.value = '';
+                try {
+                    payloadArea.value = JSON.stringify(JSON.parse(decoded), null, 2);
+                } catch (_) {
+                    payloadArea.value = decoded;
+                }
+                if (typeof pushActivity === 'function') pushActivity('Decoded URL cookie payload', 'success');
+            }
+        } catch (e) {
+            alert('Error decoding: ' + e.message);
+            if (typeof pushActivity === 'function') pushActivity('Cookie Forge decode error: ' + e.message, 'warning');
+        }
+    } else if (action === 'forge') {
+        try {
+            if (type === 'jwt') {
+                const rawHeader = headerArea.value.trim() || '{"alg":"HS256","typ":"JWT"}';
+                const rawPayload = payloadArea.value.trim();
+                if (!rawPayload) {
+                    throw new Error('Payload cannot be empty');
+                }
+                
+                const parsedHeader = JSON.parse(rawHeader);
+                const parsedPayload = JSON.parse(rawPayload);
+                
+                const headerB64 = base64url(JSON.stringify(parsedHeader));
+                const payloadB64 = base64url(JSON.stringify(parsedPayload));
+                
+                const tokenStr = `${headerB64}.${payloadB64}`;
+                const alg = (parsedHeader.alg || '').toUpperCase();
+                
+                if (alg === 'NONE') {
+                    outputArea.value = tokenStr + '.';
+                } else if (alg === 'HS256') {
+                    const crypto = getCryptoModule();
+                    if (!crypto) {
+                        throw new Error('HMAC signature requires Node crypto library');
+                    }
+                    const hmac = crypto.createHmac('sha256', secret || '');
+                    hmac.update(tokenStr);
+                    const sigB64 = hmac.digest('base64')
+                        .replace(/=/g, '')
+                        .replace(/\+/g, '-')
+                        .replace(/\//g, '_');
+                    outputArea.value = `${tokenStr}.${sigB64}`;
+                } else {
+                    throw new Error('Algorithm ' + alg + ' not supported. Use HS256 or None.');
+                }
+                if (typeof pushActivity === 'function') pushActivity('Forged JWT session token', 'success');
+            } else if (type === 'base64') {
+                const content = payloadArea.value;
+                const encoded = Buffer.from(content).toString('base64');
+                outputArea.value = encoded;
+                if (typeof pushActivity === 'function') pushActivity('Forged Base64 cookie', 'success');
+            } else if (type === 'hex') {
+                const content = payloadArea.value;
+                const encoded = Buffer.from(content).toString('hex');
+                outputArea.value = encoded;
+                if (typeof pushActivity === 'function') pushActivity('Forged Hex cookie', 'success');
+            } else if (type === 'url') {
+                const content = payloadArea.value;
+                const encoded = encodeURIComponent(content);
+                outputArea.value = encoded;
+                if (typeof pushActivity === 'function') pushActivity('Forged URL-encoded cookie', 'success');
+            }
+        } catch (e) {
+            alert('Error forging: ' + e.message);
+            if (typeof pushActivity === 'function') pushActivity('Cookie Forge compile error: ' + e.message, 'warning');
+        }
+    }
+}
+
+function cookieForgePreset(preset) {
+    const typeSel = document.getElementById('cookieForgeType');
+    const secretInput = document.getElementById('cookieForgeSecret');
+    const headerArea = document.getElementById('cookieForgeHeader');
+    const payloadArea = document.getElementById('cookieForgePayload');
+    const outputArea = document.getElementById('cookieForgeOutput');
+
+    if (preset === 'jwt_none') {
+        typeSel.value = 'jwt';
+        headerArea.value = JSON.stringify({ alg: "none", typ: "JWT" }, null, 2);
+        payloadArea.value = JSON.stringify({ user: "admin", role: "administrator", exp: Math.floor(Date.now() / 1000) + 3600 }, null, 2);
+        secretInput.value = '';
+        cookieForgeAction('forge');
+    } else if (preset === 'jwt_jwks_bypass') {
+        typeSel.value = 'jwt';
+        headerArea.value = JSON.stringify({ alg: "HS256", jku: "http://127.0.0.1:5000/.well-known/jwks.json", kid: "key-id-1" }, null, 2);
+        payloadArea.value = JSON.stringify({ user: "admin", role: "administrator" }, null, 2);
+        secretInput.value = 'secret';
+        cookieForgeAction('forge');
+    } else if (preset === 'b64_admin') {
+        typeSel.value = 'base64';
+        headerArea.value = '';
+        payloadArea.value = JSON.stringify({ logged_in: true, username: "admin", admin: true, privileges: "super" }, null, 2);
+        cookieForgeAction('forge');
+    } else if (preset === 'send_repeater') {
+        const forgedValue = outputArea.value.trim();
+        if (!forgedValue) {
+            alert('No forged token found. Click Forge first!');
+            return;
+        }
+        
+        showSection('repeater', document.querySelector('[onclick*="showSection(\'repeater\'"]'));
+        
+        const rawReqTextarea = document.getElementById('repeaterRawRequest');
+        let currentReq = rawReqTextarea.value || `GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n`;
+        
+        const lines = currentReq.split('\n');
+        let hasCookie = false;
+        const newLines = lines.map(line => {
+            if (line.toLowerCase().startsWith('cookie:')) {
+                hasCookie = true;
+                return `Cookie: session=${forgedValue}`;
+            }
+            return line;
+        });
+        
+        if (!hasCookie) {
+            const emptyIdx = newLines.findIndex(l => l.trim() === '');
+            if (emptyIdx !== -1) {
+                newLines.splice(emptyIdx, 0, `Cookie: session=${forgedValue}`);
+            } else {
+                newLines.push(`Cookie: session=${forgedValue}`);
+            }
+        }
+        
+        rawReqTextarea.value = newLines.join('\n');
+        if (typeof pushActivity === 'function') pushActivity('Exported forged token to HTTP Repeater cookie headers', 'success');
+    }
+}
+
+function copyForgeOutput() {
+    const outputArea = document.getElementById('cookieForgeOutput');
+    if (!outputArea.value) return;
+    navigator.clipboard.writeText(outputArea.value);
+    if (typeof pushActivity === 'function') pushActivity('Copied forged cookie token to clipboard', 'info');
+}
+
+function transmitToRepro() {
+    if (!activeRepeaterTabId) return;
+    const tab = repeaterTabs.find(t => t.id === activeRepeaterTabId);
+    if (!tab) return;
+    
+    const parsedReq = parseRawRequest(tab.rawRequest);
+    const reqMethod = parsedReq.method;
+    const reqPath = parsedReq.path;
+    const reqHeaders = parsedReq.headers;
+    const reqBody = parsedReq.body;
+    
+    let targetUrlStr = tab.url || reqHeaders['host'] || reqHeaders['Host'] || '';
+    if (!targetUrlStr) {
+        alert('Please specify a target URL or Host header first.');
+        return;
+    }
+    
+    if (!/^https?:\/\//i.test(targetUrlStr)) {
+        targetUrlStr = 'http://' + targetUrlStr;
+    }
+    
+    let curlCmd = `curl -X ${reqMethod}`;
+    for (const [k, v] of Object.entries(reqHeaders)) {
+        if (k.toLowerCase() === 'host') continue;
+        curlCmd += ` -H "${k}: ${v.replace(/"/g, '\\"')}"`;
+    }
+    if (reqBody) {
+        curlCmd += ` -d "${reqBody.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
+    }
+    
+    try {
+        const urlObj = new URL(targetUrlStr);
+        const fullUrl = urlObj.origin + reqPath;
+        curlCmd += ` "${fullUrl}"`;
+    } catch (_) {
+        curlCmd += ` "${targetUrlStr}${reqPath}"`;
+    }
+    
+    const reproPanel = document.getElementById('reproPanel');
+    if (reproPanel && reproPanel.classList.contains('hidden')) {
+        toggleRepro();
+    }
+    
+    const reproInput = document.getElementById('reproInput');
+    if (reproInput) {
+        reproInput.value = curlCmd;
+        reproInput.focus();
+        if (typeof pushActivity === 'function') {
+            pushActivity('Transmitted Repeater request to Repro Shell as curl command', 'info');
+        }
+    }
 }
 
 // ── INIT ─────────────────────────────────────────────────────────────

@@ -57,7 +57,8 @@
         /* ── LIGHT THEME ─────────────────────────────────────────────────── */
         body.theme-light { --primary: #cc0022; --background: #f0f0f4; --surface: #e2e2e8; }
         body.theme-light { background-color: #f0f0f4; color: #111; }
-        body.theme-light header { background: rgba(240,240,244,0.92) !important; border-color: rgba(0,0,0,0.08) !important; }
+        header { background: #0c0c18 !important; border-bottom: 1px solid rgba(255,255,255,0.08) !important; }
+        body.theme-light header { background: #e8e8f0 !important; border-color: rgba(0,0,0,0.1) !important; border-bottom: 1px solid rgba(0,0,0,0.1) !important; }
         body.theme-light .panel { background: rgba(255,255,255,0.85) !important; border-color: rgba(0,0,0,0.08) !important; }
         body.theme-light .text-white { color: #111 !important; }
         body.theme-light .text-white\/80, body.theme-light .text-white\/70, body.theme-light .text-white\/60 { color: #333 !important; }
@@ -245,6 +246,10 @@
                     <span class="material-symbols-outlined text-primary">swap_horiz</span>
                     <span class="font-label-surgical text-[10px] tracking-widest uppercase">HTTP Repeater</span>
                 </div>
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('cookieforge', this)">
+                    <span class="material-symbols-outlined text-[#00ffc4]">cookie</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase font-bold">Cookie Forge</span>
+                </div>
                 <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('decaffeinator', this)">
                     <span class="material-symbols-outlined text-[#00ffc4]">coffee</span>
                     <span class="font-label-surgical text-[10px] tracking-widest uppercase font-bold">De-Caffeinator</span>
@@ -258,79 +263,79 @@
     </aside>
 
     <!-- ── TOP BAR (Header) ──────────────────────────────────────────────── -->
-    <header class="relative z-[400] h-16 border-b border-white/10 bg-background/90 backdrop-blur-xl flex items-center justify-between px-8 pointer-events-auto">
-        <div class="flex items-center gap-8 h-full">
-            <div id="logoTrigger" class="flex items-center gap-5 cursor-pointer group h-full px-2">
-                <div class="w-10 h-10 border border-white/20 flex items-center justify-center group-hover:border-primary transition-all duration-300">
-                    <img src="../Images/logo.png" class="w-6 h-6 object-contain opacity-60 group-hover:opacity-100 transition-opacity" alt="">
+    <header class="relative z-[400] h-16 border-b border-white/10 flex items-center justify-between px-4 pointer-events-auto select-none" style="-webkit-app-region: drag;">
+        <div class="flex items-center gap-4 h-full">
+            <div id="logoTrigger" class="flex items-center gap-3 cursor-pointer group h-full px-1" style="-webkit-app-region: no-drag;">
+                <div class="w-8 h-8 border border-white/20 flex items-center justify-center group-hover:border-primary transition-all duration-300">
+                    <img src="../Images/logo.png" class="w-5 h-5 object-contain opacity-60 group-hover:opacity-100 transition-opacity" alt="">
                 </div>
                 <div class="flex flex-col">
-                    <h1 class="font-h1-visor text-[12px] tracking-[0.5em] text-white group-hover:text-primary transition-colors">HELLHOUND</h1>
-                    <span id="headerTitle" class="font-label-surgical text-[8px] text-white/40 uppercase tracking-[0.2em]">APEX-KING OVERVIEW</span>
+                    <h1 class="font-h1-visor text-[10px] tracking-[0.5em] text-white group-hover:text-primary transition-colors">HELLHOUND</h1>
+                    <span id="headerTitle" class="font-label-surgical text-[7px] text-white/40 uppercase tracking-[0.2em]">APEX-KING OVERVIEW</span>
                 </div>
             </div>
             
             <div class="h-6 w-px bg-white/10"></div>
             
-            <div class="flex items-center gap-4">
-                <span class="font-label-surgical text-[9px] text-white/30 uppercase tracking-[0.2em]">Active_Target:</span>
-                <span id="headerTarget" class="font-data-mono text-[12px] text-primary font-bold uppercase tracking-widest cursor-pointer hover:bg-primary/10 px-3 py-1 transition-all border border-transparent hover:border-primary/40" onclick="openTargetModal()">NO_TARGET_ENGAGED</span>
+            <div class="flex items-center gap-2">
+                <span class="font-label-surgical text-[8px] text-white/30 uppercase tracking-[0.2em] hidden sm:inline">Active_Target:</span>
+                <span id="headerTarget" class="font-data-mono text-[10px] text-primary font-bold uppercase tracking-widest cursor-pointer hover:bg-primary/10 px-2 py-0.5 transition-all border border-transparent hover:border-primary/40 max-w-[120px] truncate" style="-webkit-app-region: no-drag;" onclick="openTargetModal()">NO_TARGET_ENGAGED</span>
                 
-                <button id="monitorShortcut" onclick="navigateMonitor()" class="hidden w-10 h-10 flex items-center justify-center bg-white/5 border border-white/10 text-white/40 hover:text-white hover:border-primary transition-all rounded shadow-lg group" title="Open Monitor">
-                    <span class="material-symbols-outlined text-[20px]">visibility</span>
+                <button id="monitorShortcut" style="-webkit-app-region: no-drag;" onclick="navigateMonitor()" class="hidden w-8 h-8 flex items-center justify-center bg-white/5 border border-white/10 text-white/40 hover:text-white hover:border-primary transition-all rounded shadow-lg group" title="Open Monitor">
+                    <span class="material-symbols-outlined text-[18px]">visibility</span>
                 </button>
             </div>
         </div>
 
-        <div class="flex items-center gap-6 h-full">
-            <div class="text-right hidden md:block">
+        <div class="flex items-center gap-3 h-full flex-shrink-0">
+            <div class="text-right hidden xl:block">
                 <span class="font-label-surgical text-[8px] text-white/30 uppercase block tracking-[0.2em]">Neural_Sync</span>
                 <span class="font-data-mono text-[10px] text-green-500 font-bold tracking-widest uppercase">ESTABLISHED</span>
             </div>
             
-            <div class="h-8 w-px bg-white/10 hidden md:block"></div>
+            <div class="h-8 w-px bg-white/10 hidden xl:block"></div>
             
-            <div class="flex items-center gap-3 pr-2">
+            <div class="flex items-center gap-1.5 pr-1 flex-shrink-0">
                 <!-- WAF Status Indicator -->
-                <div id="wafStatusBtn" title="WAF Protection Status (Live checking via Repeater)"
-                    class="flex items-center gap-2 px-3 py-1 border border-white/10 bg-white/5 rounded">
-                    <span id="wafStatusIcon" class="material-symbols-outlined text-[12px] text-green-400">shield</span>
-                    <span id="wafStatusLabel" class="font-label-surgical text-[8px] text-green-400 uppercase tracking-widest">WAF: SAFE</span>
+                <div id="wafStatusBtn" style="-webkit-app-region: no-drag;" title="WAF Protection Status (Live checking via Repeater)"
+                    class="flex items-center gap-1 px-2 py-0.5 border border-white/10 bg-white/5 rounded">
+                    <span id="wafStatusIcon" class="material-symbols-outlined text-[10px] text-green-400">shield</span>
+                    <span id="wafStatusLabel" class="font-label-surgical text-[7px] text-green-400 uppercase tracking-widest">WAF: SAFE</span>
                 </div>
                 <!-- Heartbeat Monitor -->
-                <div id="heartbeatBtn" title="Target Response Latency (Latest transaction)"
-                    class="flex items-center gap-2 px-3 py-1 border border-white/10 bg-white/5 rounded">
-                    <span class="material-symbols-outlined text-[12px] text-primary">analytics</span>
-                    <span id="heartbeatLabel" class="font-label-surgical text-[8px] text-primary uppercase tracking-widest font-bold">LATENCY: -- MS</span>
+                <div id="heartbeatBtn" style="-webkit-app-region: no-drag;" title="Target Response Latency (Latest transaction)"
+                    class="flex items-center gap-1 px-2 py-0.5 border border-white/10 bg-white/5 rounded">
+                    <span class="material-symbols-outlined text-[10px] text-primary">analytics</span>
+                    <span id="heartbeatLabel" class="font-label-surgical text-[7px] text-primary uppercase tracking-widest font-bold">LATENCY: -- MS</span>
                 </div>
                 <!-- Proxy Status Indicator -->
-                <button onclick="checkProxyStatus()" id="proxyStatusBtn" title="Proxy Status — click to check"
-                    class="flex items-center gap-2 px-3 py-1 border border-white/10 hover:border-white/30 transition-colors">
-                    <div id="proxyStatusDot" class="w-2 h-2 rounded-full bg-white/20"></div>
-                    <span id="proxyStatusLabel" class="font-label-surgical text-[8px] text-white/30 uppercase tracking-widest">PROXY</span>
+                <button onclick="checkProxyStatus()" id="proxyStatusBtn" style="-webkit-app-region: no-drag;" title="Proxy Status — click to check"
+                    class="flex items-center gap-1 px-2 py-0.5 border border-white/10 hover:border-white/30 transition-colors">
+                    <div id="proxyStatusDot" class="w-1.5 h-1.5 rounded-full bg-white/20"></div>
+                    <span id="proxyStatusLabel" class="font-label-surgical text-[7px] text-white/30 uppercase tracking-widest">PROXY</span>
                 </button>
                 <!-- Export Session -->
-                <button onclick="exportSession()" title="Export session to markdown"
-                    class="w-9 h-9 flex items-center justify-center text-white/30 hover:text-white transition-colors">
-                    <span class="material-symbols-outlined text-[18px]">download</span>
+                <button onclick="exportSession()" style="-webkit-app-region: no-drag;" title="Export session to markdown"
+                    class="w-8 h-8 flex items-center justify-center text-white/30 hover:text-white transition-colors">
+                    <span class="material-symbols-outlined text-[16px]">download</span>
                 </button>
-                <button id="aiTrigger" class="w-12 h-12 flex items-center justify-center text-white/60 hover:text-primary transition-all" title="Hellhound">
-                    <span class="material-symbols-outlined text-[24px]">psychology</span>
+                <button id="aiTrigger" style="-webkit-app-region: no-drag;" class="w-10 h-10 flex items-center justify-center text-white/60 hover:text-primary transition-all" title="Hellhound">
+                    <span class="material-symbols-outlined text-[20px]">psychology</span>
                 </button>
                 <!-- Theme Toggle -->
-                <button id="themeToggleBtn" onclick="toggleTheme()" title="Toggle Theme"
-                    class="w-9 h-9 flex items-center justify-center text-white/40 hover:text-white transition-colors">
-                    <span id="themeIcon" class="material-symbols-outlined text-[18px]">dark_mode</span>
+                <button id="themeToggleBtn" style="-webkit-app-region: no-drag;" onclick="toggleTheme()" title="Toggle Theme"
+                    class="w-8 h-8 flex items-center justify-center text-white/40 hover:text-white transition-colors">
+                    <span id="themeIcon" class="material-symbols-outlined text-[16px]">dark_mode</span>
                 </button>
-                <div class="w-px h-5 bg-white/20 mx-2"></div>
-                <button onclick="windowControl('minimize')" class="w-9 h-9 flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition-all">
-                    <span class="material-symbols-outlined text-[18px]">remove</span>
+                <div class="w-px h-5 bg-white/20 mx-1"></div>
+                <button onclick="windowControl('minimize')" style="-webkit-app-region: no-drag;" class="w-8 h-8 flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition-all">
+                    <span class="material-symbols-outlined text-[16px]">remove</span>
                 </button>
-                <button onclick="windowControl('maximize')" class="w-9 h-9 flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition-all">
-                    <span class="material-symbols-outlined text-[16px]">check_box_outline_blank</span>
+                <button onclick="windowControl('maximize')" style="-webkit-app-region: no-drag;" class="w-8 h-8 flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition-all">
+                    <span class="material-symbols-outlined text-[14px]">check_box_outline_blank</span>
                 </button>
-                <button onclick="windowControl('close')" class="w-9 h-9 flex items-center justify-center text-white/40 hover:bg-primary hover:text-white transition-all group">
-                    <span class="material-symbols-outlined text-[18px]">close</span>
+                <button onclick="windowControl('close')" style="-webkit-app-region: no-drag;" class="w-8 h-8 flex items-center justify-center text-white/40 hover:bg-primary hover:text-white transition-all group">
+                    <span class="material-symbols-outlined text-[16px]">close</span>
                 </button>
             </div>
         </div>
@@ -736,7 +741,19 @@
                         </div>
                     </div>
                     <div class="flex items-center gap-4">
+                        <div class="flex border border-white/10 rounded overflow-hidden">
+                            <button id="graphModeSample" onclick="setGraphMode('sample')" class="px-4 py-2 font-label-surgical text-[10px] tracking-widest uppercase bg-primary text-background font-bold transition-all">Sample</button>
+                            <button id="graphModeLive" onclick="setGraphMode('live')" class="px-4 py-2 font-label-surgical text-[10px] tracking-widest uppercase text-white/40 hover:text-white transition-all">Live</button>
+                        </div>
                         <span id="graphStatusBadge" class="font-label-surgical text-[10px] text-primary border border-primary/40 px-4 py-2 uppercase tracking-widest bg-primary/5">Cold Start // Standby</span>
+                        <!-- Layout Cycle Button -->
+                        <button onclick="toggleGraphLayout()" class="px-4 py-2 border border-white/10 hover:border-primary/50 hover:bg-primary/5 transition-all text-white/40 hover:text-white flex items-center justify-center gap-2" title="Cycle Projection Layout">
+                            <span class="material-symbols-outlined text-[18px]">account_tree</span>
+                        </button>
+                        <!-- Reset View Button -->
+                        <button onclick="resetGraphView()" class="px-4 py-2 border border-white/10 hover:border-primary/50 hover:bg-primary/5 transition-all text-white/40 hover:text-white flex items-center justify-center gap-2" title="Reset Viewport">
+                            <span class="material-symbols-outlined text-[18px]">fit_screen</span>
+                        </button>
                         <button onclick="initAttackGraph()" class="px-4 py-2 border border-white/10 hover:border-primary transition-all text-white/40 hover:text-white material-symbols-outlined text-[18px]">refresh</button>
                     </div>
                 </div>
@@ -1014,6 +1031,9 @@
                         <button id="repeaterSendBtn" onclick="sendActiveRepeater()" class="px-6 py-2 bg-primary hover:bg-primary-hover text-background font-label-surgical text-[11px] font-bold uppercase tracking-widest transition-all rounded flex items-center gap-2 shadow-[0_0_15px_rgba(255,34,68,0.3)] hover:scale-102">
                             <span>SEND</span><span class="material-symbols-outlined text-[14px]">send</span>
                         </button>
+                        <button id="repeaterReproBtn" onclick="transmitToRepro()" class="px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/20 text-white font-label-surgical text-[11px] uppercase tracking-widest transition-all rounded flex items-center gap-2">
+                            <span>SEND TO REPRO</span><span class="material-symbols-outlined text-[14px]">terminal</span>
+                        </button>
                     </div>
 
                     <!-- Editor Workspace Split -->
@@ -1025,27 +1045,8 @@
                                 <span class="font-data-mono text-[8px] text-white/20">Edit headers & body</span>
                             </div>
                             <textarea id="repeaterRawRequest" 
-                                class="bg-black/45 border border-white/10 text-white font-data-mono text-[12px] p-4 outline-none focus:border-primary/50 transition-all rounded resize-none w-full select-text leading-relaxed whitespace-pre" 
-                                style="height: 60%;"
+                                class="flex-1 h-full bg-black/45 border border-white/10 text-white font-data-mono text-[12px] p-4 outline-none focus:border-primary/50 transition-all rounded resize-none w-full select-text leading-relaxed whitespace-pre" 
                                 placeholder="GET / HTTP/1.1&#10;Host: localhost&#10;User-Agent: Hellhound-Repeater/1.0&#10;&#10;"></textarea>
-
-                            <!-- Token Forge cryptographic sandbox panel -->
-                            <div class="mt-4 border border-white/10 bg-black/60 p-4 flex flex-col gap-3 rounded" style="height: 40%; min-height: 180px;">
-                                <div class="flex items-center justify-between">
-                                    <span class="font-label-surgical text-[9px] text-[#00ffc4] uppercase tracking-widest font-bold">🛠️ Token Forge Sandbox</span>
-                                    <span class="font-data-mono text-[8px] text-white/30">Encode, Decode, and Tamper Tokens</span>
-                                </div>
-                                <div class="flex-grow flex gap-4 min-h-0">
-                                    <textarea id="tokenForgeInput" class="flex-1 bg-black text-white font-data-mono text-[10px] p-2 border border-white/5 resize-none focus:outline-none focus:border-primary/40" placeholder="Payload or raw token..."></textarea>
-                                    <textarea id="tokenForgeOutput" readonly class="flex-1 bg-black/20 text-[#00ffc4] font-data-mono text-[10px] p-2 border border-white/5 resize-none focus:outline-none" placeholder="Results..."></textarea>
-                                </div>
-                                <div class="grid grid-cols-4 gap-2 flex-shrink-0">
-                                    <button onclick="tokenForgeAction('base64_encode')" class="py-1.5 bg-white/5 border border-white/10 text-white/80 hover:bg-white/10 font-label-surgical text-[8px] uppercase tracking-widest">B64 Enc</button>
-                                    <button onclick="tokenForgeAction('base64_decode')" class="py-1.5 bg-white/5 border border-white/10 text-white/80 hover:bg-white/10 font-label-surgical text-[8px] uppercase tracking-widest">B64 Dec</button>
-                                    <button onclick="tokenForgeAction('jwt_alg_none')" class="py-1.5 bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 font-label-surgical text-[8px] uppercase tracking-widest font-bold">JWT None</button>
-                                    <button onclick="tokenForgeAction('inject')" class="py-1.5 bg-[#00ffc4]/20 border border-[#00ffc4]/30 text-[#00ffc4] hover:bg-[#00ffc4]/30 font-label-surgical text-[8px] uppercase tracking-widest font-bold">Inject</button>
-                                </div>
-                            </div>
                         </div>
 
                         <!-- Response (Right) -->
@@ -1065,6 +1066,82 @@
                             
                             <div id="repeaterResponseViewer" class="flex-1 bg-black/45 border border-white/10 text-white/80 font-data-mono text-[12px] p-4 rounded overflow-auto select-text leading-relaxed whitespace-pre-wrap select-text">
                                 <div class="text-white/20 italic text-[10px] text-center font-data-mono py-16">Send request to retrieve telemetry response stream</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- COOKIE FORGE SECTION -->
+        <section id="cookieforge" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
+            <div class="flex items-center justify-between" style="flex-shrink:0;">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">COOKIE_FORGE <span class="text-[#00ffc4] not-italic">// SESSION TAMPERER</span></h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Forge, Tamper, and Re-sign Session Cookies and JWT Tokens</p>
+                </div>
+            </div>
+
+            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
+                <!-- Inputs & Controls Panel -->
+                <div class="col-span-5 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Token Inputs</span>
+                    
+                    <div class="flex flex-col gap-2">
+                        <label class="font-label-surgical text-[9px] text-white/40 uppercase">Cookie / Token Type</label>
+                        <select id="cookieForgeType" class="bg-white/5 border border-white/10 text-[#00ffc4] font-data-mono text-[11px] px-3 py-2 uppercase outline-none focus:border-primary transition-all rounded">
+                            <option value="jwt">JSON Web Token (JWT)</option>
+                            <option value="base64">Base64 Encoded Cookie</option>
+                            <option value="hex">Hex Encoded Value</option>
+                            <option value="url">URL Encoded Session</option>
+                        </select>
+                    </div>
+
+                    <div class="flex-grow flex flex-col min-h-0">
+                        <label class="font-label-surgical text-[9px] text-white/40 uppercase mb-2">Raw Value</label>
+                        <textarea id="cookieForgeInput" class="flex-grow bg-black text-white font-data-mono text-[12px] p-4 border border-white/10 resize-none focus:outline-none focus:border-[#00ffc4]/40 rounded select-text leading-relaxed" placeholder="Paste your raw cookie, JWT token, or session string here..."></textarea>
+                    </div>
+
+                    <div class="flex flex-col gap-2 flex-shrink-0">
+                        <label class="font-label-surgical text-[9px] text-white/40 uppercase">Secret Key / Salt (for signing/tampering)</label>
+                        <input id="cookieForgeSecret" type="text" placeholder="e.g. secret, key, private_key, or leave empty for None" class="bg-white/5 border border-white/10 text-white font-data-mono text-[11px] px-4 py-2 outline-none focus:border-[#00ffc4] transition-all rounded">
+                    </div>
+                </div>
+
+                <!-- Live Editor & Analysis Pane -->
+                <div class="col-span-7 flex flex-col gap-4 min-h-0 panel bg-black/80 border border-white/10 p-6">
+                    <div class="flex items-center justify-between" style="flex-shrink:0;">
+                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Analysis & Tampering Workbench</span>
+                        <div class="flex gap-2">
+                            <button onclick="cookieForgeAction('decode')" class="px-4 py-1.5 bg-[#00ffc4]/10 border border-[#00ffc4]/30 text-[#00ffc4] hover:bg-[#00ffc4]/20 font-label-surgical text-[9px] uppercase tracking-widest transition-all rounded">Decode & Load</button>
+                            <button onclick="cookieForgeAction('forge')" class="px-4 py-1.5 bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 font-label-surgical text-[9px] uppercase tracking-widest font-bold transition-all rounded">Forge Token</button>
+                        </div>
+                    </div>
+
+                    <div class="flex-grow grid grid-cols-2 gap-4 min-h-0">
+                        <!-- Payload Component tamperes -->
+                        <div class="flex flex-col min-h-0 gap-2">
+                            <label class="font-label-surgical text-[9px] text-white/40 uppercase">Header / Metadata</label>
+                            <textarea id="cookieForgeHeader" class="flex-1 bg-black text-[#00ffc4] font-data-mono text-[11px] p-3 border border-white/10 resize-none focus:outline-none focus:border-[#00ffc4]/40 rounded select-text" placeholder="{ &quot;alg&quot;: &quot;HS256&quot;, &quot;typ&quot;: &quot;JWT&quot; }"></textarea>
+
+                            <label class="font-label-surgical text-[9px] text-white/40 uppercase mt-2">Payload / Claims</label>
+                            <textarea id="cookieForgePayload" class="flex-1 bg-black text-[#00ffc4] font-data-mono text-[11px] p-3 border border-white/10 resize-none focus:outline-none focus:border-[#00ffc4]/40 rounded select-text" placeholder="{ &quot;user&quot;: &quot;admin&quot;, &quot;role&quot;: &quot;administrator&quot; }"></textarea>
+                        </div>
+
+                        <!-- Results and Tampering Actions -->
+                        <div class="flex flex-col min-h-0 gap-2">
+                            <label class="font-label-surgical text-[9px] text-white/40 uppercase">Forged Output Result</label>
+                            <div class="flex-1 flex flex-col min-h-0 border border-white/10 bg-black/45 p-4 rounded">
+                                <textarea id="cookieForgeOutput" readonly class="flex-grow bg-transparent text-white font-data-mono text-[11px] resize-none outline-none select-text border-none leading-relaxed" placeholder="Generated token will stream here..."></textarea>
+                                <button onclick="copyForgeOutput()" class="mt-2 w-full py-2 bg-white/5 hover:bg-white/10 border border-white/10 text-white font-label-surgical text-[9px] uppercase tracking-widest transition-all">Copy Forged Token</button>
+                            </div>
+
+                            <label class="font-label-surgical text-[9px] text-white/40 uppercase mt-2">Quick Tampering Preset Buttons</label>
+                            <div class="grid grid-cols-2 gap-2 flex-shrink-0">
+                                <button onclick="cookieForgePreset('jwt_none')" class="py-2 bg-white/5 border border-white/10 text-white/80 hover:bg-[#00ffc4]/15 hover:text-[#00ffc4] font-label-surgical text-[8px] uppercase tracking-widest transition-colors rounded">JWT None Alg</button>
+                                <button onclick="cookieForgePreset('jwt_jwks_bypass')" class="py-2 bg-white/5 border border-white/10 text-white/80 hover:bg-[#00ffc4]/15 hover:text-[#00ffc4] font-label-surgical text-[8px] uppercase tracking-widest transition-colors rounded">JWKS Key Spoof</button>
+                                <button onclick="cookieForgePreset('b64_admin')" class="py-2 bg-white/5 border border-white/10 text-white/80 hover:bg-[#00ffc4]/15 hover:text-[#00ffc4] font-label-surgical text-[8px] uppercase tracking-widest transition-colors rounded">B64 "admin" Force</button>
+                                <button onclick="cookieForgePreset('send_repeater')" class="py-2 bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 font-label-surgical text-[8px] uppercase tracking-widest font-bold transition-all rounded">Send to Repeater</button>
                             </div>
                         </div>
                     </div>
@@ -1137,9 +1214,9 @@
         
         <div id="reproOutput" class="flex-1 p-6 font-data-mono overflow-y-auto overflow-x-hidden text-white w-full flex flex-col" style="font-size:13px; scrollbar-width:thin; scrollbar-color:#ff2244 rgba(255,255,255,0.03);">
             <pre class="panel-repro-pre font-data-mono text-[13px] text-white/90 whitespace-pre-wrap break-all w-full select-text"></pre>
-            <div id="reproCommandLine" class="flex items-center w-full mt-1 hidden">
-                <span id="reproPrompt" class="text-green-400 font-data-mono font-bold mr-2 select-none"></span>
-                <input id="reproInput" type="text" class="flex-1 bg-transparent border-none focus:outline-none text-white font-data-mono p-0 m-0" style="font-size: 13px;" placeholder="" onkeydown="handleRepro(event)">
+            <div id="reproCommandLine" class="flex items-start w-full mt-1 hidden">
+                <span id="reproPrompt" class="text-green-400 font-data-mono font-bold mr-2 select-none" style="margin-top: 2px;"></span>
+                <textarea id="reproInput" rows="1" class="flex-1 bg-transparent border-none focus:outline-none text-white font-data-mono p-0 m-0 resize-none h-6 leading-6 custom-scrollbar" style="font-size: 13px; outline: none; border: none; box-shadow: none;" placeholder="" onkeydown="handleRepro(event)"></textarea>
             </div>
         </div>
     </div>
@@ -1217,20 +1294,11 @@
                     <div class="flex items-center gap-4">
                         <div class="w-2 h-2 rounded-full bg-primary animate-pulse shadow-[0_0_10px_#ff2244]"></div>
                         <span class="font-h2-tactical text-[13px] text-white uppercase tracking-[0.4em]">Strike_Confirmation</span>
+                    </div>
                     <button onclick="abortStrike()" class="text-white/20 hover:text-white transition-colors material-symbols-outlined text-[18px]">close</button>
                 </div>
                 <div class="flex-1 overflow-y-auto px-8 py-6 custom-scrollbar">
                     <div id="confirmLoading" class="flex items-center gap-4 py-8">
-                               <!-- Layout Cycle Button -->
-                        <button onclick="toggleGraphLayout()" class="p-2 bg-white/5 border border-white/10 hover:border-primary/50 hover:bg-primary/5 transition-all group flex items-center gap-2" title="Cycle Projection Layout">
-                            <span class="material-symbols-outlined text-[18px] group-hover:rotate-180 transition-transform">account_tree</span>
-                            <span class="font-label-surgical text-[9px] uppercase tracking-widest hidden md:inline">Cycle Layout</span>
-                        </button>
-                        
-                        <!-- Reset View Button -->
-                        <button onclick="resetGraphView()" class="p-2 bg-white/5 border border-white/10 hover:border-primary/50 hover:bg-primary/5 transition-all group flex items-center gap-2" title="Reset Viewport">
-                            <span class="material-symbols-outlined text-[18px]">fit_screen</span>
-                        </button>
                         <span class="material-symbols-outlined text-primary text-[20px] animate-spin">refresh</span>
                         <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-widest">Verifying configuration with console...</span>
                     </div>
