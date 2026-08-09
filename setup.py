@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="hellhound",
-    version="12.5.1",
-    description="HELLHOUND — Modular Web Offensive Framework",
+    version="12.6.0",
+    description="HELLHOUND — Autonomous AI Bug Bounty Reconnaissance & Triage Framework",
     packages=find_packages(),
     include_package_data=True,
     install_requires=[

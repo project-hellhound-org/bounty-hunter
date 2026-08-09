@@ -285,14 +285,14 @@ if command -v npm &>/dev/null; then
     
     cat <<EOF > "$DESKTOP_FILE"
 [Desktop Entry]
-Name=Hellhound Apex-King
-Comment=Offensive Intelligence HUD
+Name=Hellhound Bounty Hunter
+Comment=Autonomous AI Bug Bounty Reconnaissance & Triage Assistant
 Exec=$PROJECT_ROOT/gui/hellhound-gui.sh
 Icon=hellhound
 Terminal=false
 Type=Application
 Categories=Network;Security;
-Keywords=pentest;ai;hellhound;
+Keywords=bounty-hunter;pentest;ai;hellhound;
 EOF
     
     # Update system desktop database for app menu visibility
