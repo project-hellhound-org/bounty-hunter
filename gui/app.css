@@ -107,6 +107,15 @@
     border: 3px solid #000; /* Contrast gap */
 }
 
+.no-scrollbar::-webkit-scrollbar {
+    display: none !important;
+}
+
+.no-scrollbar {
+    -ms-overflow-style: none !important;
+    scrollbar-width: none !important;
+}
+
 /* UI Elements */
 .ai-msg {
     padding: 1rem;
@@ -304,3 +313,77 @@ pre, .font-data-mono { color: rgba(255,255,255,0.95); }
 .loot-item-text:last-child {
     border-bottom: none;
 }
+
+/* ── NOTION EDITOR STYLING ───────────────────────────────────────── */
+#killbookNotionEditor h1 {
+    font-size: 16px !important;
+    font-weight: 700 !important;
+    color: #ff2244 !important;
+    margin-top: 14px !important;
+    margin-bottom: 6px !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid rgba(255, 34, 68, 0.2);
+    padding-bottom: 4px;
+}
+#killbookNotionEditor h2 {
+    font-size: 14px !important;
+    font-weight: 700 !important;
+    color: #00ffc4 !important;
+    margin-top: 12px !important;
+    margin-bottom: 4px !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+    letter-spacing: 0.05em;
+}
+#killbookNotionEditor h3 {
+    font-size: 12px !important;
+    font-weight: 700 !important;
+    color: #ffffff !important;
+    margin-top: 10px !important;
+    margin-bottom: 2px !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+}
+#killbookNotionEditor ul {
+    list-style-type: disc !important;
+    padding-left: 20px !important;
+    margin-top: 6px !important;
+    margin-bottom: 6px !important;
+}
+#killbookNotionEditor li {
+    margin-bottom: 4px !important;
+}
+#killbookNotionEditor blockquote {
+    border-left: 3px solid #ff2244 !important;
+    padding-left: 12px !important;
+    color: rgba(255,255,255,0.7) !important;
+    font-style: italic !important;
+    background: rgba(255,34,68,0.04) !important;
+    margin: 12px 0 !important;
+    padding-top: 6px !important;
+    padding-bottom: 6px !important;
+    border-radius: 0 4px 4px 0;
+}
+#killbookNotionEditor pre {
+    background: rgba(0,0,0,0.5) !important;
+    border: 1px solid rgba(255,255,255,0.08) !important;
+    padding: 10px !important;
+    border-radius: 4px !important;
+    font-family: 'Space Grotesk', monospace !important;
+    font-size: 11px !important;
+    color: #00ffc4 !important;
+    overflow-x: auto !important;
+    margin: 12px 0 !important;
+}
+#killbookNotionEditor:empty::before {
+    content: attr(placeholder);
+    color: rgba(255,255,255,0.25) !important;
+    pointer-events: none;
+}
+#killbookNotionEditor div, #killbookNotionEditor p {
+    margin-bottom: 8px;
+}
+.slash-item:hover {
+    background: rgba(255, 34, 68, 0.15) !important;
+    color: #ffffff !important;
+}
+

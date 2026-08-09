@@ -25,7 +25,7 @@ function safeSend(channel, data) {
 // ── OUTPUT FILTER ──────────────────────────────────────────────────────────
 const ANSI_RE = /\x1b\[[0-9;]*[mGKHF]/g;
 const BRAILLE_RE = /[\u2800-\u28FF]/;
-const PROMPT_RE = /hellhound\s*([\(\[]?[^\)\]]*[\)\]]?)?\s*>\s*$/;
+const PROMPT_RE = /^hellhound\s*([\(\[]?[^\)\]]*[\)\]]?)?\s*>\s*$/m;
 
 const ANIMATION_PHRASES = [
     'hellhound framework console is',
@@ -333,45 +333,46 @@ ipcMain.on('get-modules', (event) => {
     });
 });
 
-// 2. Options preflight — each command queued separately, each waits for its own prompt
+// 2. Options preflight — inspect module options via CLI
 ipcMain.on('get-options', (event, { module, args }) => {
     const target = args.target || '';
-    const cmds = [];
-    if (target) cmds.push(`prey ${target}`);
-    cmds.push(`equip ${module}`);
-    Object.entries(args).forEach(([key, val]) => {
-        if (key === 'target') return;
-        if (val === true) cmds.push(`set ${key} true`);
-        else if (val !== false && val !== '') cmds.push(`set ${key} ${val}`);
-    });
-    cmds.push('options');
-
-    let accumulated = '';
-    cmds.forEach((cmd, i) => {
-        const isLast = i === cmds.length - 1;
-        opsEngine.enqueue({
-            lines: [cmd],
-            promptsExpected: 1,
-            streaming: false,
-            onDone: isLast
-                ? (out) => event.reply('options-data', { output: accumulated + (out || ''), success: true })
-                : (out) => { if (out) accumulated += out + '\n'; }
-        });
+    const bin = getHellhoundBin();
+    const cmdStr = `/scan ${module} ${target}`.trim();
+    
+    exec(`${bin} --print "${cmdStr}"`, (error, stdout, stderr) => {
+        const out = stdout || stderr || '';
+        event.reply('options-data', { output: out, success: !error });
     });
 });
 
-// 3. Strike confirmed — module already configured by get-options
-ipcMain.on('strike-confirmed', (event) => {
-    event.reply('proc-started', { pid: opsEngine.proc?.pid || -1, module: 'confirmed' });
-    opsEngine.enqueue({
-        lines: ['strike'],
-        promptsExpected: 1,
-        streaming: true,
-        onDone: () => {
-            // After strike completes, run loot command to persist findings
-            // so intelEngine can reload them via session_sync
-            opsEngine.enqueue({ lines: ['loot'], promptsExpected: 1, streaming: false });
-        }
+// 3. Strike confirmed — execute vulnerability module via CLI --print
+ipcMain.on('strike-confirmed', (event, payload) => {
+    const bin = getHellhoundBin();
+    const module = (payload && payload.module) || 'spider';
+    const target = (payload && payload.target) || '';
+    
+    event.reply('proc-started', { pid: 1, module: module });
+    
+    const child = spawn(bin, ['--print', `/scan ${module} ${target}`], {
+        env: { ...process.env, PYTHONUNBUFFERED: '1' }
+    });
+    
+    child.stdout.on('data', (data) => {
+        const str = data.toString();
+        safeSend('proc-out', { pid: child.pid, data: str });
+        const lines = str.split('\n');
+        lines.forEach(l => {
+            const ev = classifyLine(l);
+            if (ev) safeSend('telemetry-event', ev);
+        });
+    });
+    
+    child.stderr.on('data', (data) => {
+        safeSend('proc-out', { pid: child.pid, data: data.toString() });
+    });
+    
+    child.on('close', (code) => {
+        safeSend('proc-exit', { pid: child.pid, code: code || 0 });
     });
 });
 
@@ -713,158 +714,48 @@ ipcMain.on('exec-repro', (event, payload) => {
 // ── AI HANDLERS — all via intelEngine (never blocks opsEngine) ─────────────
 
 // ── AI HANDLERS ────────────────────────────────────────────────────────────
-// FLOW: setg ai local → activate hellhound → then ask/analyze/howl work
-// Each command queued individually (promptsExpected:1 always)
-
-// AI Handshake handles setting the provider and activating the neural core
 ipcMain.on('ai-handshake', (event, payload) => {
-    let provider = '';
-    let key = '';
-    if (typeof payload === 'string') {
-        key = payload;
-        provider = (!key || key === 'local' || key === 'ollama' || key.toUpperCase() === 'LOCAL') ? 'LOCAL' : '';
-    } else {
-        provider = payload.provider;
-        key = payload.key;
-    }
-
-    const isLocal = !key || key === 'local' || key === 'ollama' || key.toUpperCase() === 'LOCAL' || provider === 'LOCAL';
-    
-    // Command selection based on user preference and console.py logic
-    const cmds = [];
-    if (!isLocal && provider) {
-        cmds.push(`setg ai_provider ${provider.toLowerCase()}`);
-    }
-    cmds.push(isLocal ? 'activate hellhound' : `setg ai ${key}`);
-    
-    // Sync to both engines
-    if (opsEngine) opsEngine.enqueue({ lines: cmds, promptsExpected: cmds.length, streaming: false });
-    
-    intelEngine.enqueue({
-        lines: cmds,
-        promptsExpected: cmds.length,
-        streaming: false,
-        onDone: (out) => {
-            // After activation/setting provider, check options for actual status
-            intelEngine.enqueue({
-                lines: ['options'],
-                promptsExpected: 1,
-                streaming: false,
-                onDone: (out2) => {
-                    // Strip ANSI before checking — console output is colored
-                    const clean = (out2 || '').replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '');
-                    const activated = (out || '').replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '');
-                    const isOnline = clean.includes('ONLINE') || clean.includes('CONNECTED') || activated.includes('Hellhound is activated');
-                    // Send both: activation output + options output for full context
-                    const finalOut = deepCleanOutput((out || '') + '\n' + (out2 || ''));
-                    event.reply('ai-response', finalOut);
-                }
-            });
-        }
+    let key = typeof payload === 'string' ? payload : (payload.key || 'local');
+    const bin = getHellhoundBin();
+    exec(`${bin} --print "/model ${key}"`, (error, stdout) => {
+        event.reply('ai-response', stdout || 'AI model updated.');
     });
 });
 
 ipcMain.on('ai-ask', (event, question) => {
-    const sanitizedQuestion = (question || '').replace(/\r?\n/g, ' ');
-    let completed = false;
-    
-    // Safety timeout: 45 seconds to prevent permanent UI lockup
-    const timer = setTimeout(() => {
-        if (!completed) {
-            completed = true;
-            event.reply('ai-response', 'Error: Neural Core request timed out. Please check model connectivity.');
-            if (intelEngine) {
-                intelEngine.current = null;
-                intelEngine.busy = false;
-                intelEngine.promptsSeen = 0;
-                intelEngine._drain();
-            }
-        }
-    }, 45000);
-
-    intelEngine.enqueue({
-        lines: [`ask ${sanitizedQuestion}`],
-        promptsExpected: 1,
-        streaming: false,
-        onDone: (out) => {
-            if (completed) return;
-            completed = true;
-            clearTimeout(timer);
-            const cleanOut = deepCleanOutput(out);
-            event.reply('ai-response', cleanOut || 'No response from Neural Core.');
-        }
+    const sanitizedQuestion = (question || '').replace(/\r?\n/g, ' ').replace(/"/g, '\\"');
+    const bin = getHellhoundBin();
+    exec(`${bin} --print "/ask ${sanitizedQuestion}"`, { maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
+        const out = stdout || stderr || 'No response received from Neural Core.';
+        event.reply('ai-response', deepCleanOutput(out));
     });
 });
 
 ipcMain.on('ai-analyze', (event, target) => {
-    const sanitizedTarget = (target || '').replace(/\r?\n/g, ' ');
-    // Pass targets as argument to skip interactive menu (console.py supports this)
-    // e.g. "analyze 1,2,5" or just "analyze" for all
-    const isSelection = sanitizedTarget && /^[\d,\s]+$/.test(sanitizedTarget);
-    const cmd = isSelection ? `analyze ${sanitizedTarget}` : 'analyze';
-    const cmds = [];
-    if (sanitizedTarget && sanitizedTarget !== 'LIST' && !isSelection) cmds.push(`prey ${sanitizedTarget}`);
-    cmds.push(cmd);
-
-    let acc = '';
-    let completed = false;
-
-    // Safety timeout: 60 seconds
-    const timer = setTimeout(() => {
-        if (!completed) {
-            completed = true;
-            event.reply('ai-response', 'Error: Neural Core analysis timed out. Please try again.');
-            if (intelEngine) {
-                intelEngine.current = null;
-                intelEngine.busy = false;
-                intelEngine.promptsSeen = 0;
-                intelEngine._drain();
-            }
-        }
-    }, 60000);
-
-    cmds.forEach((c, i) => {
-        const isLast = i === cmds.length - 1;
-        intelEngine.enqueue({
-            lines: [c],
-            promptsExpected: 1,
-            streaming: false,
-            onDone: (out) => {
-                if (completed) return;
-                if (out) acc += out + '\n';
-                if (isLast) {
-                    completed = true;
-                    clearTimeout(timer);
-                    event.reply('ai-response', acc);
-                }
-            }
-        });
+    const sanitizedTarget = (target || '').replace(/\r?\n/g, ' ').trim();
+    const bin = getHellhoundBin();
+    exec(`${bin} --print "/howl"`, { maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
+        const out = stdout || stderr || 'Analysis complete.';
+        event.reply('ai-response', deepCleanOutput(out));
     });
 });
 
 ipcMain.on('ai-howl', (event) => {
-    intelEngine.enqueue({
-        lines: ['howl'],
-        promptsExpected: 1,
-        streaming: false,
-        onDone: (out) => event.reply('howl-data', out || 'Howl complete. No critical patterns detected.')
+    const bin = getHellhoundBin();
+    exec(`${bin} --print "/howl"`, { maxBuffer: 1024 * 1024 * 5 }, (error, stdout) => {
+        event.reply('howl-data', stdout || 'Howl correlation complete.');
     });
 });
 
 ipcMain.on('get-attack-graph', (event) => {
-    intelEngine.enqueue({
-        lines: ['howl --graph'],
-        promptsExpected: 1,
-        streaming: false,
-        onDone: (out) => {
-            try {
-                // The output should be a JSON string from console.py
-                const graph = JSON.parse(out);
-                event.reply('graph-data', graph);
-            } catch (e) {
-                console.error("Failed to parse graph JSON:", e);
-                event.reply('graph-data', { nodes: [], edges: [] });
-            }
+    const bin = getHellhoundBin();
+    exec(`${bin} --print "/howl --graph"`, { maxBuffer: 1024 * 1024 * 5 }, (error, stdout) => {
+        try {
+            const graph = JSON.parse(stdout);
+            event.reply('graph-data', graph);
+        } catch (e) {
+            console.error("Failed to parse graph JSON:", e);
+            event.reply('graph-data', { nodes: [], edges: [] });
         }
     });
 });
@@ -1019,3 +910,26 @@ ipcMain.on('window-maximize', () => {
     else mainWindow.maximize();
 });
 ipcMain.on('window-close', () => { if (mainWindow) mainWindow.close(); });
+
+// 13. Evidence Screenshot Capture
+ipcMain.on('window-screenshot', (event) => {
+    if (!mainWindow) return;
+    mainWindow.webContents.capturePage().then(img => {
+        try {
+            const SCREENSHOTS_DIR = path.join(LOOT_DIR, 'screenshots');
+            if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+            
+            const filename = `shot_${Date.now()}.png`;
+            const absolutePath = path.join(SCREENSHOTS_DIR, filename);
+            
+            fs.writeFileSync(absolutePath, img.toPNG());
+            event.reply('window-screenshot-response', { path: absolutePath });
+        } catch (e) {
+            console.error('Failed to save screenshot:', e);
+            event.reply('window-screenshot-response', { error: e.message });
+        }
+    }).catch(err => {
+        console.error('Failed to capture page:', err);
+        event.reply('window-screenshot-response', { error: err.message });
+    });
+});

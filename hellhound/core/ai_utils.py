@@ -2,6 +2,50 @@ import requests
 import json
 import logging
 import concurrent.futures
+import os
+import threading
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple
+
+# Path to persistent Hellhound configuration
+CONFIG_DIR = Path.home() / ".hellhound"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+def load_config() -> Dict[str, Any]:
+    """Loads persistent Hellhound configuration from ~/.hellhound/config.json."""
+    if not CONFIG_FILE.exists():
+        return {
+            "ai_provider": "ollama",
+            "ai_model": "",
+            "api_key": "ollama",
+            "researcher_handle": "",
+            "api_keys": {},
+            "global_headers": {},
+            "scope": {
+                "in_scope": [],
+                "out_scope": [],
+                "disallowed": [],
+                "raw_text": ""
+            }
+        }
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logging.warning(f"Failed to load config from {CONFIG_FILE}: {e}")
+        return {}
+
+def save_config(config: Dict[str, Any]) -> bool:
+    """Saves persistent Hellhound configuration to ~/.hellhound/config.json."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        return True
+    except Exception as e:
+        logging.error(f"Failed to save config to {CONFIG_FILE}: {e}")
+        return False
 
 # ==========================================================
 # HELLHOUND AI PERSONAS
@@ -10,7 +54,7 @@ import concurrent.futures
 AUDIT_PERSONA = """\
 [SYSTEM: HELLHOUND IMPACT AUDITOR — TRUE/FALSE POSITIVE + BOUNTY IMPACT]
 
-You are a senior bug bounty triager and exploit specialist. Your task is to audit a security finding with extreme prejudice toward false positives.
+You are a senior bug bounty triager. Your task is to audit a security finding with extreme prejudice toward false positives.
 
 For each finding, output EXACTLY this structure:
 
@@ -24,34 +68,24 @@ For each finding, output EXACTLY this structure:
 
 **BUSINESS IMPACT**:
 - What data/control/system is at risk?
-- Worst-case scenario in plain English (e.g., "Full account takeover without user interaction").
+- Worst-case scenario in plain English.
 
 **BOUNTY TIER ESTIMATE**:
 - [Low | Medium | High | Critical] based on impact, not CVSS.
 
-**CHAIN POTENTIAL** (even if verdict is false positive — what could make it real?):
-- If this is real: what 1-2 other vulnerabilities would make it critical?
+**CHAIN POTENTIAL**:
+- If this is real: what 1-2 other findings would make it critical?
 - If false positive: what condition would turn it into a true positive?
 
-**PoC (professional-grade, minimal steps)**:
-- HTTP request/response or code snippet proving maximum impact.
-
-**REMEDIATION (chaining-aware)**:
-- Code-level fix that breaks the vulnerability AND prevents common chains.
+**REMEDIATION**:
+- Code-level fix that breaks the vulnerability.
 ---
-
-RULES:
-- If you cannot confirm impact, mark INCONCLUSIVE — do not guess.
-- Do NOT output scanning jargon ("reflected XSS detected"). Output impact statements.
-- False positive = no realistic attacker-controlled path to harm under standard bug bounty rules.
 """
 
 IMPACT_ADVISOR_PERSONA = """\
 [SYSTEM: HELLHOUND IMPACT ADVISOR — WORST-CASE CALCULATOR]
 
-You are Hellhound. You do not score CVSS. You score fear.
-
-Your mission: take a security finding and calculate its maximum real-world impact from a bug bounty perspective.
+You are Hellhound. Your mission: take a security finding and calculate its maximum real-world impact from a bug bounty perspective.
 
 For each finding, output EXACTLY:
 
@@ -62,113 +96,37 @@ For each finding, output EXACTLY:
 - [e.g., Attacker reads any user's private messages without interaction]
 
 **ESCALATION PATHWAYS** (1-3 ways to make this Critical):
-1. [e.g., Combine with CSRF → force victim to leak their own data]
-2. [e.g., Chain with IDOR on same endpoint → full database enumeration]
-3. [e.g., Add SSRF → pivot to internal network]
+1. [Escalation step]
 
-**BOUNTY JUSTIFICATION** (for reporting):
-- Why a program should pay High or Critical for this chain, not Medium for the single bug.
-
-**MINIMUM EXTRA BUG NEEDED FOR CRITICAL**:
-- [e.g., "Any POST-based state-changing action on the same domain"]
-
-**REMEDIATION FROM ATTACKER POV** (what would stop Hellhound):
-- [e.g., "Add CSRF tokens AND enforce referer validation — one fix alone won't stop the chain"]
+**BOUNTY JUSTIFICATION**:
+- Why a program should pay High or Critical for this chain.
 ---
-
-RULES:
-- Never output "Medium impact" without asking: "What's the worst case if I chain this?"
-- If the finding alone is truly Low/Info — say so, but still suggest 1-2 escalation paths.
-- Be brutal. False positives get "NO IMPACT — WASTE OF TIME".
 """
 
 CORRELATION_PERSONA = """\
-[SYSTEM: HELLHOUND CORE — ADVERSARIAL CHAIN CORRELATOR]
+[SYSTEM: HELLHOUND CORE — RECON & FINDINGS TRIAGE]
 
-You are Hellhound. You do not just list bugs; you architect their destruction. Your mission is to correlate findings into a "Bounty Path" that leads to maximum business impact.
-
-## PREDATOR MINDSET
-- You score FEAR, not CVSS.
-- If findings are disconnected, hypothesize the "Missing Link" to reach Critical impact.
-- MANDATORY: Label any data NOT currently in findings as [MISSING] or [RECON NEEDED].
-- Priority: RCE > Data Breach > Account Takeover > Cloud Pivot.
-- STRIKE MODE: No generic advice. No boilerplate code. No "example actions".
-- Only output specific, actionable attack steps based on the findings provided.
-
-## OUTPUT STRUCTURE
-For EACH potential chain:
-
----
-**CHAIN NAME**: [e.g., Leaked Secret → JWT Forgery → Cloud Admin RCE]
-
-**PRIMARY OBJECTIVE**: [What is the ultimate goal of this chain?]
-
-**ATTACK STEPS**:
-1. [FINDING: module] -> [Real-world action]
-2. [MISSING: recon/vuln] -> [Hypothesized step to bridge the gap]
-3. [FINDING: module] -> [Final exploit step]
-
-**WORST-CASE SCENARIO**: [One sentence of pure business-facing impact]
-
-**VALIDITY**: [CONFIRMED | PARTIAL | THEORETICAL]
-- CONFIRMED: 100% of steps map to current findings.
-- PARTIAL: Needs 1 missing piece.
-- THEORETICAL: Needs 2+ missing pieces.
-
-**NEXT TARGET**: [Which module should the user run next to 'Confirm' this chain?]
----
-
-Hellhound is surgical and impact-obsessed. No fluff. No conversational filler ("Let me know if...", "I can help..."). Just the hunt.
+You are Hellhound, an autonomous bug bounty reconnaissance and triage assistant.
+Your goal is to organize recon discoveries (subdomains, open ports, live web tech, API routes, CORS/CNAME status) into actionable, non-destructive findings.
 """
 
 ASK_PERSONA = """\
-[SYSTEM: HELLHOUND NEURAL CORE — HACKERISTIC TACTICAL ADVISORY]
+[SYSTEM: HELLHOUND CORE — TACTICAL ADVISORY]
 
-You are Hellhound. You are a cold, professional shadow operative. You don't speak for the sake of speaking. You provide high-fidelity tactical intelligence for breach operations.
-
-Voice:
-- Minimalist. Tactical. Zero fluff.
-- No emojis. No friendly greetings ("mate", "brother").
-- Use technical terminology: "Payload", "Entry Point", "Chain", "Exfiltration", "Zero-day".
-- You are an expert. Your words are surgical strikes.
-
-Rules for Engagement:
-
-1. CONTEXT-AWARE EXECUTION:
-   - If the user greets you: "Hellhound online. Specify target or objective." 
-   - If the user asks about bugs: Provide a direct "Strike Plan".
-
-2. STRIKE PLAN STRUCTURE (For technical queries):
----
-**VULNERABILITY_ID**: [Name of the bug]
-**STRIKE_VECTORS**: [Specific technical paths to exploit]
-**PAYLOAD_PARAMETERS**: [Commands, headers, or code snippets]
-**ESCALATION_PATH**: [How to reach RCE/ATO/Critical impact]
----
-
-Hellhound never outputs 'Global Options' or configuration tables. Every response must push the mission toward a breach.
+You are Hellhound, a concise, high-fidelity bug bounty research assistant.
+Minimalist. Tactical. Zero fluff. Provide factual, technical answers.
 """
 
 ASK_PERSONA_SLM = """\
-[SYSTEM: HELLHOUND SLM — TECHNICAL ASSISTANT]
-You are Hellhound, a highly capable cybersecurity assistant for a penetration testing framework.
-You are professional, technical, and concise. Do NOT roleplay as a military operative. Do NOT output fake coordinates, redactions, or military jargon.
-Answer the user's technical questions accurately based on the provided context. If the user asks a casual question, reply naturally and conversationally.
+[SYSTEM: HELLHOUND — ASSISTANT]
+You are Hellhound, a capable cybersecurity and bug bounty triage assistant.
+You are professional, technical, and concise.
+Answer the user's technical questions accurately based on the provided context. If the user asks a casual question, reply naturally.
 """
 
 CORRELATION_PERSONA_SLM = """\
-You are Hellhound — the predator. Find attack chains that end in total compromise.
-Be aggressive. If pieces are missing, tell the user what to find next.
-
-FORMAT:
-CHAIN: [name]
-STEPS:
-  1. [FINDING: text]
-  2. [RECON: what to find next]
-IMPACT: [Worst case scenario]
-NEXT TARGET: [Which module to run]
-
-Label missing data as [MISSING]. Do not guess without labeling.
+You are Hellhound. Correlate recon findings into clear triage summaries.
+Label missing data as [MISSING].
 """
 
 AUDIT_PERSONA_SLM = """\
@@ -178,14 +136,12 @@ CONFIDENCE: (0.0-1.0)
 REASON: (one sentence)
 IMPACT: (worst case)
 REPORTING STRATEGY: (Low/Medium/High/Critical)
-Be brutal. No guessing."""
-
-CHAT_PERSONA_SLM = """\
-You are Hellhound, a helpful cybersecurity assistant integrated into a pentest framework.
-For casual conversation: respond naturally and conversationally in 1-3 sentences max.
-Do NOT roleplay as a military operative. Do NOT output fake coordinates or redacted information.
 """
 
+CHAT_PERSONA_SLM = """\
+You are Hellhound, a helpful bug bounty research and triage assistant.
+For casual conversation: respond naturally and conversationally in 1-3 sentences max.
+"""
 
 # ==========================================================
 # UI RENDERING TOKENS & UTILS
@@ -204,13 +160,8 @@ def _cols():
     return shutil.get_terminal_size((80, 24)).columns
 
 def _section_label(label: str):
-    """
-    Renders a section label like:
-      ▸ RECON ANGLE ────────────────────────────
-    """
     cols = _cols()
-    tag  = f" {HR}▸ {label}{RST} "
-    tag_plain_len = 3 + len(label) + 1   # "▸ " + label + " "
+    tag_plain_len = 3 + len(label) + 1
     fill = max(0, cols - tag_plain_len - 2)
     return f"  {HR}▸ {label}{RST} {DIM}{'─' * fill}{RST}"
 
@@ -228,12 +179,10 @@ def render_ai_box(text: str, width: int = 0):
         if line == '---':
             continue
 
-        # Check if it's a section header
         if line.startswith('**') and line.endswith('**'):
             print(_section_label(line.strip('*').strip()))
             continue
 
-        # Inline **Key**: value  — red key, white value
         if '**' in line:
             segments = line.split('**')
             out = "  "
@@ -264,127 +213,23 @@ def render_ai_box(text: str, width: int = 0):
                 print(f"  {W}{wl}{RST}")
     print()
 
-
 def render_session_header(target: str = ""):
-    """Print the session-opening header for ask mode. Apex Banner style."""
     cols = _cols()
     title = " HELLHOUND "
     padding = (cols - len(title)) // 2
     print(f"\n{HR}{'█' * padding}{W}{title}{HR}{'█' * (cols - padding - len(title))}{RST}\n")
 
-
 def render_session_divider():
-    """Print a divider between Q&A turns. Apex solid line."""
     cols = _cols()
     print(f"\n{HR}{'─' * cols}{RST}\n")
 
-
 def render_session_footer():
-    """Print the session-closing footer. Apex Banner style."""
     cols = _cols()
     label = " SESSION CLOSED "
     padding = (cols - len(label)) // 2
     print(f"{HR}{'█' * padding}{W}{label}{HR}{'█' * (cols - padding - len(label))}{RST}\n")
 
-
-def render_howl_box(text: str, findings_summary: str = ""):
-    """Renders howl output in tree-branch correlation style.
-    
-    Uses ├── └── tree connectors with full terminal width.
-    findings_summary: pre-formatted scan results summary to show as tree root.
-    """
-    import shutil, textwrap
-
-    cols = shutil.get_terminal_size((80, 24)).columns
-
-    HR  = "\033[91;1m"
-    W   = "\033[97m"
-    Y   = "\033[93;1m"
-    DIM = "\033[90m"
-    RST = "\033[0m"
-
-    # Header
-    title = "HELLHOUND"
-    padding = (cols - len(title)) // 2
-    print(f"\n{HR}{'━' * cols}{RST}")
-    print(f"{' ' * padding}{HR}{title}{RST}")
-    print(f"{HR}{'━' * cols}{RST}")
-    print()
-
-    # Show findings tree if provided
-    if findings_summary:
-        print(f"  {HR}SCAN RESULTS{RST}")
-        for line in findings_summary.strip().split('\n'):
-            line = line.strip()
-            if line:
-                print(f"  ├── {W}{line}{RST}")
-        print()
-
-    # Render AI output as tree structure
-    max_w = cols - 12
-    in_chain = False
-    lines = text.strip().split('\n')
-
-    for idx, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            if in_chain:
-                print(f"  │")
-            else:
-                print()
-            continue
-        if line == '---':
-            continue
-
-        # Detect chain headers / sections
-        if '**' in line:
-            if any(kw in line.lower() for kw in ['chain', 'attack', 'correlation', 'total', 'combined', 'impact']):
-                if in_chain:
-                    print(f"  │")
-                in_chain = True
-                print(f"  {HR}{'─' * 3}{RST} {W}{line.replace('**', '')}{RST}")
-                print(f"  │")
-            else:
-                print(f"  │    {W}{line.replace('**', '')}{RST}")
-
-        elif line.startswith(('-', '•')):
-            clean = line.lstrip('-•').strip()
-            wrapped = textwrap.wrap(clean, width=max_w) or [clean]
-            remaining = [l.strip() for l in lines[idx+1:] if l.strip()]
-            is_last = not remaining or not remaining[0].startswith(('-', '•'))
-            connector = "└──" if is_last else "├──"
-            print(f"  │    {connector} {W}{wrapped[0]}{RST}")
-            for cont in wrapped[1:]:
-                pad = "     " if is_last else "│    "
-                print(f"  │    {pad} {W}{cont}{RST}")
-
-        elif line[0:1].isdigit() and '.' in line[:3]:
-            dot = line.index('.')
-            num = line[:dot]
-            rest = line[dot+1:].strip()
-            wrapped = textwrap.wrap(rest, width=max_w) or [rest]
-            remaining = [l.strip() for l in lines[idx+1:] if l.strip()]
-            is_last = not remaining or not (remaining[0][0:1].isdigit() and '.' in remaining[0][:3])
-            connector = "└──" if is_last else "├──"
-            print(f"  │    {connector} {Y}{num}.{RST} {W}{wrapped[0]}{RST}")
-            for cont in wrapped[1:]:
-                pad = "     " if is_last else "│    "
-                print(f"  │    {pad}    {W}{cont}{RST}")
-        else:
-            wrapped = textwrap.wrap(line, width=max_w) or [line]
-            for wl in wrapped:
-                print(f"  │    {W}{wl}{RST}")
-
-    print()
-    print(f"{DIM}{'─' * cols}{RST}")
-    print()
-
-
 def render_chat_bubble(text: str, sender: str = "HELLHOUND"):
-    """
-    Renders a conversational chat bubble.
-    Clean, indented, and human-like.
-    """
     cols    = _cols()
     max_w   = cols - 10
     import textwrap
@@ -395,178 +240,376 @@ def render_chat_bubble(text: str, sender: str = "HELLHOUND"):
         print(f"  {HR}│{RST}  {W}{line}{RST}")
     print(f"  {HR}└{'─' * (cols - 4)}{RST}\n")
 
+class ThinkingIndicator:
+    """Thread-safe 6-dot floating loader supporting dynamic step emission and clean shutdown."""
+    def __init__(self, label="HELLHOUND IS ANALYZING & EXECUTING"):
+        self.label = label
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.thread = None
+        self.frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.colors = [
+            "\033[38;5;196;1m",
+            "\033[38;5;203;1m",
+            "\033[38;5;208;1m",
+            "\033[38;5;203;1m",
+            "\033[38;5;196;1m",
+        ]
 
-def thinking_animation(label="HELLHOUND IS THINKING"):
-    """Start a cinematic thinking animation (case-wave + braille progress bar).
-    
-    Returns (thread, stop_event). Call stop_event.set() to stop.
-    Usage:
-        thread, stop = thinking_animation()
-        # ... do AI call ...
-        stop.set(); thread.join()
-    """
-    import threading, math, time, sys
-    
-    stop_event = threading.Event()
-    
-    def _animate():
-        import shutil
-        start = time.time()
-        while not stop_event.is_set():
-            cols = shutil.get_terminal_size((80, 24)).columns
-            t = time.time() - start
-            wave = ''
-            for i, c in enumerate(label):
-                if not c.isalpha():
-                    wave += c
-                    continue
-                v = math.sin(t * 10 + i * 0.4)
-                if v > 0:
-                    wave += f'\033[91;1m{c.upper()}\033[0m'
-                else:
-                    wave += f'\033[31m{c.lower()}\033[0m'
-            
-            chars = '⡀⡄⡆⡇⣇⣧⣷⣿'
-            # Calculate remaining space for the bar
-            prefix_len = len(label) + 4
-            bar_len = max(10, cols - prefix_len - 2)
-            bar = ''
-            for i in range(bar_len):
-                idx = int((math.sin(t * 5 + i * 0.2) + 1) / 2 * (len(chars) - 1))
-                bar += f'\033[91m{chars[idx]}\033[0m'
-            
-            sys.stdout.write(f'\r  {wave}  {bar} ')
-            sys.stdout.flush()
-            time.sleep(0.06)
-        sys.stdout.write(f'\r\033[2K\r')
-        sys.stdout.flush()
-    
-    thread = threading.Thread(target=_animate, daemon=True)
-    thread.start()
-    return thread, stop_event
+    def start(self):
+        self.thread = threading.Thread(target=self._animate, daemon=True)
+        self.thread.start()
+        return self
 
+    def _animate(self):
+        idx = 0
+        while not self.stop_event.is_set():
+            with self.lock:
+                try:
+                    if not self.stop_event.is_set() and sys.stdout and not sys.stdout.closed:
+                        dot = self.frames[idx % len(self.frames)]
+                        c = self.colors[idx % len(self.colors)]
+                        msg = f"\r \033[38;5;238m[\033[0m{c}{dot}\033[0m\033[38;5;238m]\033[0m \033[38;5;245m{self.label}...\033[0m"
+                        sys.stdout.write(msg)
+                        sys.stdout.flush()
+                except Exception:
+                    break
+            idx += 1
+            time.sleep(0.08)
 
+    def set_label(self, label: str):
+        with self.lock:
+            self.label = label
+            try:
+                if not self.stop_event.is_set() and sys.stdout and not sys.stdout.closed:
+                    sys.stdout.write("\r\033[2K\r")
+                    sys.stdout.flush()
+            except Exception:
+                pass
 
-def detect_ai_config(api_key: str):
+    def print_step(self, icon: str, msg: str, color: str = "\033[38;5;203;1m"):
+        with self.lock:
+            try:
+                if sys.stdout and not sys.stdout.closed:
+                    sys.stdout.write("\r\033[2K\r")
+                    sys.stdout.write(f" {color}[{icon}]\033[0m \033[38;5;250m{msg}\033[0m\n")
+                    sys.stdout.flush()
+            except Exception:
+                pass
+
+    def info(self, msg: str):
+        self.print_step("⚡", msg, "\033[38;5;203;1m")
+
+    def success(self, msg: str):
+        self.print_step("✓", msg, "\033[38;5;46;1m")
+
+    def warn(self, msg: str):
+        self.print_step("!", msg, "\033[38;5;220;1m")
+
+    def error(self, msg: str):
+        self.print_step("✗", msg, "\033[38;5;196;1m")
+
+    def stop(self):
+        self.stop_event.set()
+        with self.lock:
+            try:
+                if sys.stdout and not sys.stdout.closed:
+                    sys.stdout.write("\r\033[2K\r")
+                    sys.stdout.flush()
+            except Exception:
+                pass
+        if self.thread and self.thread.is_alive():
+            try:
+                self.thread.join(timeout=0.3)
+            except Exception:
+                pass
+
+def thinking_animation(label="HELLHOUND IS ANALYZING & EXECUTING"):
+    """Start a clean 6-dot floating loader that stays strictly on a single line and never breaks."""
+    indicator = ThinkingIndicator(label)
+    indicator.start()
+    return indicator.thread, indicator.stop_event
+
+def detect_ai_config(api_key: str) -> Tuple[Optional[str], Optional[str]]:
     """Automatically identifies the AI provider based on API key prefix."""
-    if not api_key: return None, None
+    if not api_key:
+        return None, None
     if api_key.startswith("AIza"):
         return "gemini", "gemini-2.0-flash"
     elif api_key.startswith("sk-ant-"):
         return "anthropic", "claude-3-5-sonnet-20240620"
+    elif api_key.startswith("nvapi-"):
+        return "nvidia", "nvidia/nemotron-3-super-120b-a12b"
     elif api_key.startswith("sk-"):
         return "openai", "gpt-4o"
+    elif api_key == "ollama":
+        return "ollama", None
     return None, None
 
 def classify_intent(user_input: str) -> str:
-    """
-    Classifies user input before sending to model.
-    Returns: 'chat' | 'hunt' | 'technical'
-    """
+    """Classifies user input before sending to model."""
     text = user_input.lower().strip()
 
-    # Social / casual signals / General Q&A
     social_triggers = [
         "how are you", "what's up", "hey", "hi ", "hello", "good morning",
         "good night", "who are you", "what are you", "introduce yourself",
         "thanks", "thank you", "ok", "okay", "nice", "cool", "got it",
-        "makes sense", "lol", "haha", "bye", "see you", "later", "who won",
-        "highest paid", "high payed", "what is the best", "tell me about"
+        "makes sense", "lol", "haha", "bye", "see you", "later"
     ]
     if any(t in text for t in social_triggers) and len(text.split()) < 15:
         return "chat"
 
-    # Technical hunt signals
-    hunt_triggers = [
-        "hunt", "exploit", "bypass", "inject", "sqli", "xss", "ssrf",
-        "idor", "rce", "lfi", "payload", "chain", "escalate", "bounty",
-        "recon", "fuzz", "burp", "target", "vulnerability", "vuln", "attack"
-    ]
-    if any(t in text for t in hunt_triggers):
-        return "hunt"
+    return "hunt"
 
-    return "technical"
+def get_default_model(provider: str) -> str:
+    """Dynamically determines the default model for a given provider."""
+    provider = (provider or "").lower().strip()
+    if provider == "ollama" or provider == "local":
+        try:
+            r = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if r.status_code == 200:
+                models = [m["name"] for m in r.json().get("models", [])]
+                if models:
+                    preferred = ["qwen2.5:3b-instruct-q4_0", "llama3.2:3b", "phi3:mini", "gemma2:2b", "llama3:8b", "mistral"]
+                    for p in preferred:
+                        for m in models:
+                            if p in m:
+                                return m
+                    return models[0]
+        except Exception:
+            pass
+        return "qwen2.5:3b-instruct-q4_0"
+    elif provider == "nvidia" or provider == "nim":
+        return "nvidia/nemotron-3-super-120b-a12b"
+    elif provider == "gemini":
+        return "gemini-2.0-flash"
+    elif provider == "anthropic":
+        return "claude-3-5-sonnet-20240620"
+    elif provider == "openai":
+        return "gpt-4o"
+    return "auto"
 
-def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None) -> str | None:
+def list_available_models() -> List[Dict[str, Any]]:
+    """
+    Returns a comprehensive list of all accessible local and cloud models.
+    """
+    cfg = load_config()
+    curr_prov = cfg.get("ai_provider", "ollama")
+    curr_mod = cfg.get("ai_model", "")
+    api_keys = cfg.get("api_keys", {})
+    if not isinstance(api_keys, dict):
+        api_keys = {}
+    if "api_key" in cfg and cfg["api_key"] and cfg["api_key"] != "ollama":
+        prov, _ = detect_ai_config(cfg["api_key"])
+        if prov and prov not in api_keys:
+            api_keys[prov] = cfg["api_key"]
+
+    models_list = []
+
+    # 1. Check Ollama
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=3)
+        if r.status_code == 200:
+            for m in r.json().get("models", []):
+                name = m.get("name", "")
+                is_curr = (curr_prov == "ollama" and (curr_mod == name or (not curr_mod and name == get_default_model("ollama"))))
+                models_list.append({
+                    "name": name,
+                    "provider": "ollama",
+                    "type": "local",
+                    "current": is_curr,
+                    "size": m.get("size", 0)
+                })
+    except Exception:
+        pass
+
+    # 2. Check NVIDIA NIM
+    nv_key = api_keys.get("nvidia") or os.environ.get("NVIDIA_API_KEY") or (cfg.get("api_key") if str(cfg.get("api_key", "")).startswith("nvapi-") else None)
+    if nv_key:
+        nim_models = [
+            "nvidia/nemotron-3-super-120b-a12b",
+            "meta/llama-3.3-70b-instruct",
+            "meta/llama-3.1-70b-instruct",
+            "meta/llama-3.1-8b-instruct",
+            "mistralai/mistral-large-2-instruct",
+            "deepseek-ai/deepseek-r1"
+        ]
+        for nm in nim_models:
+            is_curr = (curr_prov in ("nvidia", "nim") and curr_mod == nm)
+            models_list.append({
+                "name": nm,
+                "provider": "nvidia",
+                "type": "cloud",
+                "current": is_curr
+            })
+
+    # 3. Check Gemini
+    gem_key = api_keys.get("gemini") or os.environ.get("GEMINI_API_KEY") or (cfg.get("api_key") if str(cfg.get("api_key", "")).startswith("AIza") else None)
+    if gem_key:
+        for gm in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
+            is_curr = (curr_prov == "gemini" and curr_mod == gm)
+            models_list.append({
+                "name": gm,
+                "provider": "gemini",
+                "type": "cloud",
+                "current": is_curr
+            })
+
+    # 4. Check OpenAI
+    oa_key = api_keys.get("openai") or os.environ.get("OPENAI_API_KEY") or (cfg.get("api_key") if str(cfg.get("api_key", "")).startswith("sk-") and not str(cfg.get("api_key", "")).startswith("sk-ant-") else None)
+    if oa_key:
+        for oam in ["gpt-4o", "gpt-4o-mini", "o1-mini"]:
+            is_curr = (curr_prov == "openai" and curr_mod == oam)
+            models_list.append({
+                "name": oam,
+                "provider": "openai",
+                "type": "cloud",
+                "current": is_curr
+            })
+
+    # 5. Check Anthropic
+    ant_key = api_keys.get("anthropic") or os.environ.get("ANTHROPIC_API_KEY") or (cfg.get("api_key") if str(cfg.get("api_key", "")).startswith("sk-ant-") else None)
+    if ant_key:
+        for antm in ["claude-3-5-sonnet-20240620", "claude-3-5-haiku-20241022"]:
+            is_curr = (curr_prov == "anthropic" and curr_mod == antm)
+            models_list.append({
+                "name": antm,
+                "provider": "anthropic",
+                "type": "cloud",
+                "current": is_curr
+            })
+
+    return models_list
+
+def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None) -> Optional[str]:
     """Unified dispatcher for all supported AI providers."""
-    provider = provider.lower().strip()
+    provider = (provider or "ollama").lower().strip()
     
-    # Auto-route persona based on intent if no override given
     if system_prompt is None:
         intent = classify_intent(prompt)
-        if intent == "chat":
-            system_prompt = CHAT_PERSONA_SLM
-        elif intent == "hunt":
-            system_prompt = ASK_PERSONA_SLM
-        else:
-            system_prompt = ASK_PERSONA_SLM  # default to hunt for technical
+        system_prompt = CHAT_PERSONA_SLM if intent == "chat" else ASK_PERSONA_SLM
 
-    # Joe-Style Deployment Awareness: Inject provider info into system prompt
-    sys_prompt = f"{system_prompt or CORRELATION_PERSONA}"
-    
-    if provider == "openai":
-        return call_openai(prompt, api_key, model or "gpt-4o", timeout=timeout, history=history)
+    active_model = model or get_default_model(provider)
+
+    if provider in ("nvidia", "nim"):
+        return call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt)
+    elif provider == "openai":
+        return call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt)
     elif provider == "anthropic":
-        return call_anthropic(prompt, api_key, model or "claude-3-5-sonnet-20240620", timeout=timeout, history=history)
-    elif provider == "ollama":
-        return call_ollama(prompt, model or "gemma2:2b", sys_prompt, timeout=timeout, history=history)
-    else:
-        return ask_gemini(api_key, model or "gemini-1.5-flash", sys_prompt, prompt, timeout=timeout, history=history)
+        return call_anthropic(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt)
+    elif provider == "gemini":
+        return ask_gemini(api_key, active_model, system_prompt, prompt, timeout=timeout, history=history)
+    else: # Ollama / Local
+        return call_ollama(prompt, model=active_model, system_prompt=system_prompt, timeout=timeout, history=history)
 
-def verify_gemini_key(api_key: str) -> tuple[bool, str]:
-    """
-    Returns (is_valid, model_name_to_use)
-    Listing-based model discovery (Joe-Style).
-    """
-    if not api_key:
-        return False, ""
+def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300) -> Optional[str]:
+    """Config-aware wrapper to query the configured AI provider/model."""
+    cfg = load_config()
+    provider = cfg.get("ai_provider", "ollama")
+    active_model = model or cfg.get("ai_model") or get_default_model(provider)
+
+    # Resolve API key: api_keys[provider] → environment variable → legacy api_key field
+    api_keys = cfg.get("api_keys", {})
+    if not isinstance(api_keys, dict):
+        api_keys = {}
+    env_map = {
+        "nvidia": "NVIDIA_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }
+    api_key = (
+        api_keys.get(provider)
+        or os.environ.get(env_map.get(provider, ""), "")
+        or cfg.get("api_key", "ollama")
+    )
+
+    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt)
+
+def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None) -> Optional[str]:
+    """REST call to NVIDIA NIM OpenAI-compatible API."""
     try:
-        r = requests.get(
-            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-            timeout=10
-        )
+        url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.5,
+            "max_tokens": 4096
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
         if r.status_code != 200:
-            return False, ""
+            return f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:100]}"
         data = r.json()
-        models = [m["name"] for m in data.get("models", [])]
-        preferred = [
-            "models/gemini-2.5-flash",
-            "models/gemini-2.0-flash-lite",
-            "models/gemini-2.0-flash",
-            "models/gemini-1.5-flash",
-        ]
-        for model in preferred:
-            if model in models:
-                return True, model.replace("models/", "")
-        return False, ""
-    except Exception:
-        return False, ""
+        return data["choices"][0]["message"]["content"] if "choices" in data else None
+    except Exception as e:
+        return f"Error: NVIDIA NIM connection failed ({str(e)})"
 
-def test_gemini_response(api_key: str, model: str) -> bool:
-    """Send one tiny test message to confirm quota is available."""
+def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int = 30, history: list = None, system_prompt: str = None) -> Optional[str]:
+    """REST call to OpenAI Chat Completions API."""
     try:
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            json={
-                "contents": [{"parts": [{"text": "Say yes."}]}],
-                "generationConfig": {"maxOutputTokens": 5}
-            },
-            timeout=10
-        )
-        # 429 = quota exceeded, 403 = invalid key, 404 = model not found
-        if r.status_code in (429, 403, 401, 404):
-            return False
-        return "candidates" in r.json()
-    except Exception:
-        return False
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": prompt})
 
-def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = 4096, timeout: int = 20, history: list = None) -> str | None:
-    """Joe-Style Zero-Failure Gemini Wrapper."""
+        payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 4096}
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        if r.status_code != 200:
+            return f"Error: OpenAI API returned {r.status_code}"
+        data = r.json()
+        return data["choices"][0]["message"]["content"] if "choices" in data else None
+    except Exception as e:
+        return f"Error: OpenAI connection failed ({str(e)})"
+
+def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20240620", timeout: int = 30, history: list = None, system_prompt: str = None) -> Optional[str]:
+    """REST call to Anthropic Messages API."""
+    try:
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+        
+        messages = []
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 4096,
+            "temperature": 0.7
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        if r.status_code != 200:
+            return f"Error: Anthropic API returned {r.status_code}"
+        data = r.json()
+        return data["content"][0]["text"] if "content" in data else None
+    except Exception as e:
+        return f"Error: Anthropic connection failed ({str(e)})"
+
+def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = 4096, timeout: int = 20, history: list = None) -> Optional[str]:
+    """Gemini API caller."""
     try:
         contents = []
         if history:
             for turn in history:
-                # Map assistant role to model for Gemini API
                 role = "user" if turn["role"] == "user" else "model"
                 contents.append({"role": role, "parts": [{"text": turn["content"]}]})
         contents.append({"role": "user", "parts": [{"text": user_message}]})
@@ -586,182 +629,43 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
             timeout=timeout
         )
         if r.status_code != 200:
-            return f"Error: API returned {r.status_code} - {r.text[:100]}"
+            return f"Error: Gemini API returned {r.status_code} - {r.text[:100]}"
         data = r.json()
         if "candidates" not in data:
-            return f"Error: No candidates in response - {json.dumps(data)[:100]}"
+            return f"Error: No candidates in response"
         parts = data["candidates"][0]["content"]["parts"]
         text = "".join(part["text"] for part in parts if "text" in part)
         return text.strip() if text.strip() else "Error: Empty response text"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error: Gemini connection failed ({str(e)})"
 
-def call_gemini(prompt: str, api_key: str, model: str = "gemini-1.5-flash", timeout: int = 30) -> str:
-    """Backward compatibility wrapper for ask_gemini."""
-    res = ask_gemini(api_key, model, CORRELATION_PERSONA, prompt, timeout=timeout)
-    return res if res else "Error: AI analysis failed (Zero-Failure Triggered)."
+def call_gemini(prompt: str, api_key: str, model: str = "gemini-2.0-flash", timeout: int = 30) -> str:
+    res = ask_gemini(api_key, model, ASK_PERSONA, prompt, timeout=timeout)
+    return res if res else "Error: AI analysis failed."
 
-def universal_handshake(api_key: str, explicit_provider: str = None):
-    """Zero-Failure Parallel Handshake (Joe-Style Overhaul)."""
-    if not api_key:
-        return {"success": False, "message": "No API key provided."}
-    
-    prov_hint, _ = detect_ai_config(api_key)
-    active_prov = explicit_provider or prov_hint
-    
-    if active_prov == "gemini":
-        valid, model = verify_gemini_key(api_key)
-        if valid:
-            if test_gemini_response(api_key, model):
-                return {"success": True, "provider": "gemini", "model": model, "label": f"GEMINI — {model.upper()}", "message": f"[✓] Verified via listing ({model})"}
-            return {"success": False, "message": "Key valid, but quota exceeded or API disabled."}
-        return {"success": False, "message": "Key rejected by Google models API."}
-    
-    if api_key == "ollama" or active_prov == "ollama" or active_prov == "local":
-        # Check if Ollama is running locally
-        try:
-            r = requests.get("http://localhost:11434/api/tags", timeout=5)
-            if r.status_code == 200:
-                models = [m["name"] for m in r.json().get("models", [])]
-                # Prioritize small, fast models (matches joe_voice strategy)
-                preferred = ["gemma2:2b", "phi3:mini", "llama3.2:1b", "gemma:2b", "llama3:8b", "mistral"]
-                best = next((m for m in preferred if m in models), None)
-                
-                if best:
-                    return {
-                        "success": True, 
-                        "provider": "ollama", 
-                        "model": best, 
-                        "label": f"OLLAMA — {best.upper()}", 
-                        "message": "[✓] Connected to local Ollama instance",
-                        "pulled": True
-                    }
-                else:
-                    if models:
-                        best = models[0]
-                        return {
-                            "success": True, 
-                            "provider": "ollama", 
-                            "model": best, 
-                            "label": f"OLLAMA — {best.upper()}", 
-                            "message": f"[✓] Connected (Using fallback: {best})",
-                            "pulled": True
-                        }
-                    else:
-                        # Ollama is running but has no models
-                        return {
-                            "success": True, 
-                            "provider": "ollama", 
-                            "model": "gemma2:2b", 
-                            "label": "OLLAMA — GEMMA2:2B", 
-                            "message": "[!] Ollama running but no models pulled. Pulling gemma2:2b...",
-                            "pulled": False
-                        }
-        except: pass
-        return {"success": False, "message": "Ollama not found at http://localhost:11434", "pulled": False}
-
-    # Parallel Fallback for other providers
-    all_tiers = [("openai", "gpt-4o", "OPENAI — GPT-4O"), ("anthropic", "claude-3-5-sonnet-20240620", "ANTHROPIC — SONNET")]
-    tiers = [t for t in all_tiers if active_prov == t[0]] if active_prov in ["openai", "anthropic"] else all_tiers
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(tiers)) as executor:
-        future_map = {executor.submit(verify_ai, api_key, p, m, 10): (p, m, l) for p, m, l in tiers}
-        for future in concurrent.futures.as_completed(future_map):
-            prov, mod, label = future_map[future]
-            try:
-                res = future.result()
-                if "[✓]" in res:
-                    return {"success": True, "provider": prov, "model": mod, "label": label, "message": res}
-            except Exception: continue
-    return {"success": False, "message": "Discovery failed. No working model found."}
-
-def verify_ai(api_key: str, provider: str, model: str, timeout: int = 10) -> str:
-    """Simplified health check for discovery."""
-    if provider == "gemini":
-        res = ask_gemini(api_key, model, "Say yes.", "HELLHOUND_CONNECTED", timeout=timeout)
-    elif provider == "openai":
-        res = call_openai("Say HELLHOUND_CONNECTED", api_key, model, timeout=timeout)
-    elif provider == "anthropic":
-        res = call_anthropic("Say HELLHOUND_CONNECTED", api_key, model, timeout=timeout)
-    else: return "Error"
-    if res and "HELLHOUND_CONNECTED" in res.upper():
-        return f"[✓] {provider.upper()} Connected ({model})"
-    return "Error"
-
-def ping_ollama(model: str = "gemma2:2b") -> bool:
-    """Fast health check before committing to a full inference call."""
+def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None) -> Optional[str]:
+    """REST call to local Ollama API using chat endpoint."""
     try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=3)
-        if r.status_code != 200:
-            return False
-        models = [m["name"] for m in r.json().get("models", [])]
-        return any(model in m for m in models) # Flexible match for tag variants
-    except Exception:
-        return False
-
-def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int = 30, history: list = None) -> str | None:
-    """REST call to OpenAI Chat Completions API."""
-    try:
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        
-        messages = []
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
-
-        payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 4096}
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        if r.status_code != 200: return None
-        data = r.json()
-        return data["choices"][0]["message"]["content"] if "choices" in data else None
-    except Exception: return None
-
-def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20240620", timeout: int = 30, history: list = None) -> str | None:
-    """REST call to Anthropic Messages API."""
-    try:
-        url = "https://api.anthropic.com/v1/messages"
-        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
-        
-        messages = []
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
-
-        payload = {"model": model, "messages": messages, "max_tokens": 4096, "temperature": 0.7}
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        if r.status_code != 200: return None
-        data = r.json()
-        return data["content"][0]["text"] if "content" in data else None
-    except Exception: return None
-
-def call_ollama(prompt: str, model: str = "gemma2:2b", system_prompt: str = None, timeout: int = 300, history: list = None) -> str | None:
-    """REST call to local Ollama API using Chat endpoint with streaming for CPU stability."""
-    try:
+        model = model or get_default_model("ollama")
         url = "http://localhost:11434/api/chat"
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-        
-        # Inject conversation history for context awareness
         if history:
-            messages.extend(history)  # list of {"role": "user"/"assistant", "content": "..."}
-            
+            messages.extend(history)
         messages.append({"role": "user", "content": prompt})
         
         payload = {
             "model": model,
             "messages": messages,
-            "stream": True, # Streaming mode prevents wall timeouts on CPU inference
+            "stream": True,
             "options": {
-                "temperature": 0.7,      # lower = more consistent structure
+                "temperature": 0.7,
                 "top_p": 0.9,
-                "num_predict": 4096,     # Increased for high-fidelity detailed chains
-                "num_ctx": 8192          # Increased context for deep correlation
+                "num_predict": 4096
             }
         }
         
-        # Process streaming response
         r = requests.post(url, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:
             return f"Error: Ollama returned status {r.status_code}"
@@ -783,65 +687,19 @@ def call_ollama(prompt: str, model: str = "gemma2:2b", system_prompt: str = None
         return result if result else "Error: Ollama returned an empty response."
 
     except requests.exceptions.Timeout:
-        return "Error: Local AI (Ollama) timed out. Try reducing context or ensuring model is pulled."
+        return "Error: Local AI (Ollama) timed out."
     except Exception as e:
         return f"Error: Local AI connection failed ({str(e)})"
 
-def format_howl_prompt(results: dict) -> str:
-    """High-density prompt for Howl suggestions. Dynamic and Slm-aware."""
-    summary = results.get("spider", {}).get("intel", {}).get("summary", {})
-    
-    # Strip endpoints to bare essentials
-    endpoints = []
-    for ep in results.get("spider", {}).get("intel", {}).get("endpoints", [])[:30]:
-        endpoints.append({"u": ep.get("url"), "m": ep.get("method")})
-
-    # Dynamic vulnerability extraction (Deep Scan)
-    vulns = []
-    total_findings = 0
-    for mod_name, output in results.items():
-        if not isinstance(output, dict): continue
-        intel = output.get("intel", {})
-        
-        # Pull standard findings
-        current_mod_v = []
-        raw_v = intel.get("vulnerabilities", []) or intel.get("findings", []) or intel.get("cves", []) or intel.get("surfaces", [])
-        for v in raw_v[:15]:
-            if isinstance(v, dict):
-                current_mod_v.append({"t": v.get("type", v.get("id", "Vuln")), "s": v.get("severity", "MEDIUM"), "u": v.get("url", "")})
-            else:
-                current_mod_v.append({"t": str(v)})
-            total_findings += 1
-
-        # Pull JWT nested findings
-        for j in intel.get("jwts", []):
-            for v in j.get("vulnerabilities", []):
-                current_mod_v.append({"t": f"JWT: {v}", "s": "HIGH", "u": j.get("url", "")})
-                total_findings += 1
-            for av in j.get("active_verifications", []):
-                if av.get("status") == "VERIFIED":
-                    current_mod_v.append({"t": f"JWT Exploit: {av.get('type')}", "s": "CRITICAL", "u": av.get("verified_urls", [""])[0]})
-                    total_findings += 1
-
-        # Pull Secrets
-        for s in intel.get("secrets", []):
-            current_mod_v.append({"t": f"Secret: {s.get('type')}", "s": "HIGH", "u": s.get("context", "")})
-            total_findings += 1
-
-        if current_mod_v:
-            vulns.append({mod_name: current_mod_v})
-
-    return (
-        f"[COMMAND: howl]\n"
-        f"Identify high-fidelity ATTACK CHAINS based on the following findings.\n"
-        f"FINDINGS_COUNT: {total_findings}\n"
-        f"SUMMARY: {json.dumps(summary)}\n"
-        f"ENDPOINTS: {json.dumps(endpoints)}\n"
-        f"VULNERABILITIES: {json.dumps(vulns)}\n"
-        f"TASK: Build specific attack chains. Do NOT provide generic security advice or 'example' code.\n"
-        f"If findings are weak, still hypothesize 1-2 'Theoretical' chains by identifying the [MISSING] recon pieces.\n"
-    )
-
-def format_audit_prompt(code_snippet: str, finding_type: str) -> str:
-    """High-density prompt for SourceAuditor passes."""
-    return f"Audit this code for {finding_type}. Is it a TRUE POSITIVE or FALSE POSITIVE?\nCODE:\n\"\"\"\n{code_snippet}\n\"\"\"\nRESPONSE: STATUS, CONFIDENCE, REASONING.\n"
+def ping_ollama(model: str = None) -> bool:
+    """Fast health check for Ollama."""
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=2)
+        if r.status_code != 200:
+            return False
+        if model:
+            models = [m["name"] for m in r.json().get("models", [])]
+            return any(model in m for m in models)
+        return True
+    except Exception:
+        return False

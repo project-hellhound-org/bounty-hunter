@@ -21,7 +21,6 @@ init(autoreset=True)
 
 from hellhound.core import oob_utils
 from hellhound.core.engine import HellhoundEngine
-from hellhound.core.suggest import suggest_actions, suggest_report
 from hellhound.core import ai_utils
 from hellhound.core.repro_engine import ReproEngine
 from hellhound.core.loot import render_loot, process_framework_results
@@ -248,6 +247,19 @@ class HellhoundConsole(cmd.Cmd):
         self.modules = load_modules()
         self.module_options = {}
 
+        from hellhound.core.emit import ConsoleEmit
+        from hellhound.core.ai_utils import load_config
+        from hellhound.core.scope import ScopeRules
+
+        cfg = load_config()
+        self.options = {
+            "ai_model": cfg.get("ai_model", "qwen2.5:3b-instruct-q4_0"),
+            "ai_provider": cfg.get("ai_provider", "ollama"),
+            "global_headers": cfg.get("global_headers", {})
+        }
+        self.scope_rules = ScopeRules.from_dict(cfg.get("scope", {}))
+        self.emit = ConsoleEmit(self)
+
         # ----------------------------
         # Target Session Context
         # ----------------------------
@@ -456,8 +468,9 @@ class HellhoundConsole(cmd.Cmd):
         _boot_sequence()
 
         # ── 3. Post-Animation Logic ───────────────────────────
-        print(f"{Fore.WHITE}Type '{Fore.YELLOW}help{Fore.WHITE}' to view available commands.")
-        print(f"{Fore.WHITE}Type '{Fore.CYAN}activate hellhound{Fore.WHITE}' to launch the AI intelligence core.\n")
+        print(f"{Fore.WHITE}Type '{Fore.YELLOW}/help{Fore.WHITE}' (or '{Fore.YELLOW}help{Fore.WHITE}') to view all unified slash commands.")
+        print(f"{Fore.WHITE}Type '{Fore.CYAN}/recon <target>{Fore.WHITE}' to begin target reconnaissance.")
+        print(f"{Fore.WHITE}Type '{Fore.CYAN}/howl{Fore.WHITE}' or '{Fore.CYAN}/ask <question>{Fore.WHITE}' to query the AI Neural Core.\n")
         
         # Give the thread a tiny bit more time if it's not finished
         # (Though animation is 4.2s, so it should be done)
@@ -1269,7 +1282,7 @@ class HellhoundConsole(cmd.Cmd):
         # Silently inject previously collected spider intel so modules
         # can skip their internal crawlers and use the Spider brain instead.
         if not runtime_options.get("spider_intel"):
-            for mod_name in ["spider", "idordetector", "bacdetector"]: # Best sources first
+            for mod_name in ["spider", "surface_auditor", "hydra"]: # Best sources first
                 res = self.results.get(mod_name)
                 if res and res.get("intel") and res["intel"].get("endpoints"):
                     runtime_options["spider_intel"] = res["intel"]
@@ -1571,7 +1584,7 @@ class HellhoundConsole(cmd.Cmd):
 
         findings_summary = "\n".join(findings_lines[:15]) # Cap the tree root display for the UI
 
-        prompt = ai_utils.format_howl_prompt(self.results)
+        prompt = f"[TRIAGE REQUEST]\nAnalyze these findings from reconnaissance for target {self.target}:\n{findings_summary}\nProvide a correlated vulnerability assessment and risk ranking."
         anim_thread, anim_stop = ai_utils.thinking_animation("CORRELATING ATTACK CHAINS")
         
         # Select persona based on provider
@@ -1584,7 +1597,7 @@ class HellhoundConsole(cmd.Cmd):
         if not ai_response or str(ai_response).startswith("Error"):
             print(Fore.RED + f"  [x] AI analysis failed: {ai_response}")
         else:
-            ai_utils.render_howl_box(ai_response, findings_summary)
+            ai_utils.render_ai_box(ai_response)
 
     # ============================
     # ASK — Interactive AI Q&A
@@ -2073,23 +2086,56 @@ class HellhoundConsole(cmd.Cmd):
 
     def default(self, line):
         """
-        Handle command aliases and unknown commands
+        Handle slash commands, aliases, and unknown commands via the unified dispatcher.
         """
-        parts = line.split()
-        if not parts:
+        clean = line.strip()
+        if not clean:
             return
 
+        # 1. Direct Slash Command Routing
+        if clean.startswith("/"):
+            from hellhound.core.commands import dispatch
+            from hellhound.core.scope import ScopeRules
+            from hellhound.core.ai_utils import load_config
+
+            cfg = load_config()
+            session_ctx = {
+                "options": self.options,
+                "scope_rules": getattr(self, "scope_rules", ScopeRules.from_dict(cfg.get("scope", {}))),
+                "results": getattr(self, "results", {}),
+                "target": getattr(self, "target", "")
+            }
+            dispatch(clean, session_ctx, emit=self.emit)
+            # Sync back state
+            self.target = session_ctx.get("target", self.target)
+            self.scope_rules = session_ctx.get("scope_rules", getattr(self, "scope_rules", None))
+            return
+
+        parts = clean.split()
         cmd = parts[0]
         args = " ".join(parts[1:])
 
-
-        # Allow real commands always
+        # Allow real legacy commands always
         if hasattr(self, f"do_{cmd}"):
-            return self.onecmd(line)
+            return self.onecmd(clean)
 
         if cmd in self.aliases:
             real_cmd = self.aliases[cmd]
             rewritten = f"{real_cmd} {args}".strip()
             return self.onecmd(rewritten)
 
-        print(f"[!] Unknown command: {cmd}")
+        # Fallback to dispatcher for slash commands, bare commands, or plain conversational natural language
+        from hellhound.core.commands import dispatch
+        from hellhound.core.scope import ScopeRules
+        from hellhound.core.ai_utils import load_config
+
+        cfg = load_config()
+        session_ctx = {
+            "options": self.options,
+            "scope_rules": getattr(self, "scope_rules", ScopeRules.from_dict(cfg.get("scope", {}))),
+            "results": getattr(self, "results", {}),
+            "target": getattr(self, "target", "")
+        }
+        dispatch(clean, session_ctx, emit=self.emit)
+        self.target = session_ctx.get("target", self.target)
+        self.scope_rules = session_ctx.get("scope_rules", getattr(self, "scope_rules", None))

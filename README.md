@@ -1,174 +1,224 @@
 <p align="center">
-  <img src="Images/hellhound.png" alt="Hellhound" width="100%"/>
+  <img src="Images/logo.png" alt="Hellhound Bounty Hunter" width="160"/>
 </p>
 
-<h1 align="center">HELLHOUND v12.6.0</h1>
-<h1 align="center">Apex-King Pentest Framework</h1>
+# HELLHOUND BOUNTY HUNTER
+### Autonomous AI Bug Bounty Reconnaissance & Triage Assistant
 
-<p align="center">
-  <b>High-performance modular web offensive framework with integrated AI Intelligence.</b>
-  <br>
-  <br>
-  <code style="color: #ff2244; font-weight: bold;">[ UNDER DEVELOPMENT ]</code>
-  <br>
-  <i>Expect architectural shifts and potential false positives as we constantly optimize for high-fidelity detection.</i>
-</p>
-
-<p align="center">
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.13-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
-  <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-v12.6.0-red?style=flat-square" alt="Release Version"/></a>
-  <img src="https://img.shields.io/badge/AI--Powered-Gemini%20%7C%20OpenAI%20%7C%20Gemma--2b-red?style=flat-square" alt="AI Support"/>
-  <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License"/>
-</p>
+Hellhound is an autonomous reconnaissance and finding triage assistant built for bug bounty hunters and security researchers. It automates repetitive enumeration workflows, verifies asset validity, checks for dangling DNS takeover vectors, and extracts endpoints—all governed by strict, code-level engagement scope boundaries.
 
 ---
 
-## The Apex-King of Web Offense
+## Overview
 
-**Hellhound** is a high-fidelity security framework engineered for professional web application assessments. Engineered for speed and surgical precision, version 12.5 introduces the **Apex-King AI Core**, enabling intelligent attack-chain correlation, automated context-aware verification, and a robust arsenal of modular security auditors.
+Modern bug bounty workflows require significant manual coordination across various reconnaissance utilities. Hellhound unifies these tasks into an autonomous reasoning loop driven by local SLMs or cloud LLMs.
 
-Whether you're performing surface reconnaissance or deep logical vulnerability analysis, Hellhound provides a unified console to manage your entire offensive pipeline.
+### Core Capabilities
 
----
-
-> [!NOTE]
-> **The Hellhound Advantage:**
-> *"Traditional security tools are like generic metal detectors—they beep at everything, and you have to dig manually to find out if it's a treasure or a soda can. **Hellhound is like a surgical robot with an AI brain.** It doesn't just 'detect'; it 'understands' the logic of the application to find hidden flaws that standard tools miss."*
-
----
-
-## Key Features
-
-- **Obsidian 3D Attack Graph**: Professional, physics-based neural network visualization. Maps threat clusters using force-directed 3D layouts with interactive node deep-dives.
-- **Cinematic HUD**: Ultra-wide 60-character Braille-wave status dashboard with real-time pulsing case-waves.
-- **Neural Intelligence**: Native support for **Local SLMs (Gemma-2b)** and Cloud LLMs (Gemini, OpenAI) for high-fidelity vulnerability verification.
-- **Howl Engine**: Professional AI-powered attack chain correlation. Automatically synthesizes findings from multiple modules to map complex exploit paths.
-- **Asynchronous Native**: Built from the ground up on `aiohttp` and `playwright` for lightning-fast multi-target analysis.
-- **Modular Arsenal**: 39+ specialized modules covering Recon, Vuln, Intel, and Exploitation.
-- **Integrated OOB**: Built-in Out-of-Band (OOB) server support for detecting blind vulnerabilities (SSRF, XXE, SQLi).
-- **Universal Rendering Engine**: Full SPA/JavaScript support via Playwright-powered technology profiling and spidering.
-- **Seamless Upgrades**: Keep your framework updated with a single `hellhound upgrade` command.
+- **Subdomain Discovery**: Active high-speed DNS brute-forcing via `shuffledns` + SecLists, and passive aggregation through `subfinder` and certificate transparency (`crt.sh`).
+- **Live Host and Technology Profiling**: High-speed probing with `httpx` to extract status codes, page titles, web servers, and technology stacks.
+- **Takeover Verification**: Verifying dangling DNS records and CNAME fingerprints (`subzy`) against known service signatures.
+- **Deep Endpoint Discovery**: Spidering and parameter extraction to map application endpoints, query keys, and hidden form fields.
+- **Configuration & Surface Audits**: Non-destructive inspections for CORS misconfigurations, WAF signatures, and GraphQL introspection.
+- **Hard Scope Enforcement**: Hard pre-execution validation ensuring all operations stay strictly within defined scope boundaries.
 
 ---
 
-### System Compatibility
-Hellhound is engineered for high-performance offensive operations across multiple environments:
+## Technical Specifications
 
-*   **Linux (Native)**: Fully optimized for Kali Linux, Ubuntu, Debian, Arch, and Parrot OS.
-*   **macOS (Native)**: Runs natively on Apple Silicon (M1/M2/M3) and Intel-based Macs.
-*   **Windows (via WSL2)**: Supported through Windows Subsystem for Linux (WSL2). This is the recommended way to run Hellhound on Windows to ensure full tool compatibility and performance.
+| Component | Detail |
+| :--- | :--- |
+| **Interface** | Claude Code-style interactive chat HUD with instant slash command dispatch |
+| **Execution Architecture** | Multi-iteration autonomous agent with tool dispatch and state persistence |
+| **Active DNS Engine** | `shuffledns` + `massdns` with curated SecLists resolvers/wordlists |
+| **Passive Recon Engine** | `subfinder` + `crt.sh` Certificate Transparency API |
+| **HTTP Inspection** | `httpx` + custom lightweight connection pool |
+| **AI Inference Options** | NVIDIA NIM, Ollama (Local SLM), OpenAI, Google Gemini, Anthropic |
+| **State Storage** | `~/.hellhound/targets/<target>/task.json` |
 
-### Prerequisites
-- **Python 3.10+** (Recommended: 3.13)
-- **Git**
-- **Playwright Dependencies** (Automated via `install.sh`)
-- **Ollama** (Required for Local SLM support)
+---
 
-### One-Step Automated Install
+## Installation & Setup
+
+### System Prerequisites
+
+- **OS**: Linux (Debian, Ubuntu, Kali, Parrot, Arch), macOS, or Windows via WSL2
+- **Python**: Version 3.10 or newer (Python 3.12 / 3.13 recommended)
+- **Optional Binaries**: `shuffledns`, `massdns`, `subfinder`, `httpx`, `seclists`
+
+### Automated Installation
+
+Run the automated installer from the project root:
+
 ```bash
-# Clone the repository
 git clone https://github.com/project-hellhound-org/Hellhound-Pentest.git
 cd Hellhound-Pentest
-
-# Run the professional installer
 chmod +x install.sh
 ./install.sh
 ```
-*After installation, restart your terminal or run `source ~/.bashrc` to activate the `hellhound` command.*
+
+After installation completes, reload your shell configuration:
+
+```bash
+source ~/.bashrc   # or source ~/.zshrc
+```
+
+### Manual / Virtual Environment Installation
+
+If you prefer manual setup in an isolated environment:
+
+```bash
+python3 -m venv ~/.hellhound-env
+source ~/.hellhound-env/bin/activate
+pip install --upgrade pip
+pip install -e .
+playwright install chromium
+playwright install-deps chromium
+```
 
 ---
 
-## The Arsenal
+## AI Configuration
 
-Hellhound's power lies in its modularity. Each module is optimized for high high-fidelity results with minimal false positives.
+Hellhound supports completely offline local models via Ollama as well as high-performance cloud providers.
 
-| Category | Modules | Description |
-| :--- | :--- | :--- |
-| **Recon** | `Spider`, `SurfaceAuditor`, `TransportAuditor`, `WAFbuster`, `GraphQL`, `CORSbuster`, `FUZZhunter` | Deep surface mapping and service discovery. |
-| **Vulnerability Audit** | `XSStrike`, `SQLIdetector`, `SSRFdetector`, `XXEdetector`, `IDORdetector`, `PATHtraveller`, `RBAC` | Targeted vulnerability identification and logic auditing. |
-| **Intelligence** | `SecretScanner`, `TechProfiler`, `SourceAuditor`, `CloudScout`, `BlobUnpacker`, `JWTanalyzer` | Harvesting sensitive data and infrastructure intelligence. |
-| **Analysis & Exploitation** | `Exmap`, `Hydra`, `CMDinj` | Universal exploitation matrix and parameter orchestration. |
+### Option 1: NVIDIA NIM (Recommended Cloud Engine)
+
+NVIDIA NIM provides high throughput reasoning with models like Nemotron 120B and Llama 3.3 70B.
+
+1. Obtain an API key from [NVIDIA Build](https://build.nvidia.com/).
+2. Configure your key in Hellhound:
+
+```bash
+# Method A: Via CLI environment variable
+export NVIDIA_API_KEY="nvapi-your-key-here"
+
+# Method B: Persistently in ~/.hellhound/config.json
+# Run hellhound and enter:
+> /model nvidia/nemotron-3-super-120b-a12b
+```
+
+Supported NVIDIA models:
+- `nvidia/nemotron-3-super-120b-a12b` (Default NIM Model)
+- `meta/llama-3.3-70b-instruct`
+- `meta/llama-3.1-70b-instruct`
+- `deepseek-ai/deepseek-r1`
 
 ---
 
-## ◓ Recent Updates (v12.6.0)
+### Option 2: Ollama (Local SLM — 100% Offline)
 
-- **AST Sandbox & De-Caffeinator**: Built client-side AST unpacker and code beautifier tab to expand nested/packed scripts. Includes AST regex-mining utilities to extract endpoints and API keys instantly.
-- **Token Forge**: Added direct JWT and token forgery utilities (including signature stripping and `alg: none` tampering headers) inside the active HTTP Repeater request pane.
-- **WAF Evading & Auto-Throttling**: Integrated active spoofing headers (`X-Forwarded-For`, etc.), signature-based WAF identification (Cloudflare, AWS WAF, etc.), and connection-latency based auto-throttling to minimize target application blocking.
-- **Surgical Threat Graph Navigation**: Map Cytoscape node actions to direct HUD pivots (one-click Repeater injection or De-Caffeinator AST sandbox mapping).
-- **Module Hardening**: Standardized module categorization and directory listing in loot dashboard blocks.
+For private, offline operation without API keys or external data transfer:
+
+1. Install Ollama:
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+2. Pull the recommended local SLM:
+```bash
+ollama pull qwen2.5:3b-instruct-q4_0
+# or
+ollama pull gemma2:2b
+```
+
+3. Select your local model in Hellhound:
+```bash
+hellhound
+> /model qwen2.5:3b-instruct-q4_0
+```
 
 ---
 
-## Getting Started
+### Option 3: OpenAI, Google Gemini, or Anthropic
 
-Launch the framework console from any directory:
+Set the appropriate environment variable in your shell profile:
+
+```bash
+# OpenAI
+export OPENAI_API_KEY="sk-..."
+
+# Google Gemini
+export GEMINI_API_KEY="AIza..."
+
+# Anthropic Claude
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+Switch models at any time within the chat prompt:
+```bash
+> /model gpt-4o
+> /model gemini-2.0-flash
+> /model claude-3-5-sonnet-20240620
+```
+
+---
+
+## Usage Guide
+
+### Starting the Console
+
+Launch the interactive interface:
+
 ```bash
 hellhound
 ```
 
-### Initial Configuration
-Setup your AI provider and OOB listener for maximum impact:
+---
+
+### Defining Scope
+
+Engagement scope rules can be set before running reconnaissance. The scope guard validates all targets prior to any tool execution:
+
 ```bash
-# 1. Connect Cloud AI (Gemini or OpenAI)
-hellhound > setg ai <your_api_key>
+# Set target domain
+> /target example.com
 
-# 2. Or Launch Local SLM (Requires Ollama + gemma:2b)
-hellhound > activate hellhound
-
-# 3. Start OOB Listener
-hellhound > oob start
+# Define in-scope assets, wildcards, and exclusions
+> /scope in:example.com,*.example.com out:dev.example.com rule:no-dos
 ```
-
-### Core Operational Workflow
-```bash
-# 1. Acquire Target
-hellhound > prey https://target-app.com --cookie "session=..."
-
-# 2. Map Attack Surface
-hellhound [Spider] > strike
-
-# 3. High-Fidelity Audit
-hellhound [XSStrike] > strike      # Advanced XSS audit
-hellhound [IDORdetector] > strike  # Logical scoping audit
-
-# 4. Intelligence Synthesis
-hellhound > howl                   # AI Attack-Chain Correlation
-```
-
-## Neural Core Experience
-
-<p align="center">
-  <img src="Images/Ask_interface.png" alt="Ask Interface" width="100%"/>
-  <br><i>The Neural Core "Ask" interface — expert-level security guidance.</i>
-</p>
-
-<p align="center">
-  <img src="Images/Analyze_interface.png" alt="Analyze Interface" width="100%"/>
-  <br><i>Strategic "Analyze" mode — high-fidelity vulnerability triage.</i>
-</p>
-
-<p align="center">
-  <img src="Images/howl_interface.png" alt="Howl Interface" width="100%"/>
-  <br><i>"Howl" Attack-Chain Correlation — synthesizing complex exploit paths.</i>
-</p>
 
 ---
 
-## Documentation
-For deep-dives into framework architecture, module logic, and detection signatures, visit:
-- [Architecture Guide](ARCHITECTURE.md)
+### Interactive Natural Language Execution
+
+You can prompt Hellhound directly in natural language:
+
+- **Active Enumeration**:
+  `"Recon target example.com with active DNS brute-forcing only"`
+- **Live Host Discovery**:
+  `"Probe all discovered subdomains for live web services and detect their tech stacks"`
+- **Takeover Inspection**:
+  `"Check if any subdomains resolve to dangling CNAME records vulnerable to takeover"`
+- **Application Spidering**:
+  `"Spider https://app.example.com to depth 2 and discover API endpoints and parameters"`
+- **Triage & Reporting**:
+  `"Summarize all verified findings and export loot for target example.com"`
 
 ---
 
-## Compliance & Usage
-Hellhound is developed strictly for **authorized security assessments**. This software is licensed under the **GNU General Public License v3 (GPLv3)**. Usage must comply with all applicable local, national, and international laws.
+### Slash Commands Reference
 
-## Author
+| Command | Usage | Description |
+| :--- | :--- | :--- |
+| `/target` | `/target [domain]` | Set active target context or display current target details |
+| `/scope` | `/scope [in:domain out:domain rule:no-dos]` | View or update engagement boundaries |
+| `/hunt` | `/hunt [target]` | Execute full reconnaissance and triage pipeline |
+| `/scan` | `/scan <tool> [target]` | Execute a single tool (`shuffledns`, `subfinder`, `httpx`, `spider`, `subzy`) |
+| `/model` | `/model [name]` | List available models or switch active inference model |
+| `/loot` | `/loot [target]` | View discovered assets, live hosts, and verified findings |
+| `/headers`| `/headers [Key: Value]` | Configure persistent research identity headers (e.g. `X-Bug-Bounty`) |
+| `/clear` | `/clear` | Clear screen and redraw dashboard |
+| `/exit` | `/exit` | Exit the session |
 
-<p align="center">
-  <a href="https://l4zz3rj0d.github.io">
-    <img src="https://img.shields.io/badge/Founder-L4ZZ3RJ0D-c0392b?style=for-the-badge" alt="L4ZZ3RJ0D"/>
-  </a>
-</p>
+---
+
+## Ethical Use & Scope Policy
+
+Hellhound is designed exclusively for **authorized security testing, bug bounty programs, and educational environments**. Users must ensure explicit written authorization exists before testing any target.
+
+---
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0](LICENSE).

@@ -209,7 +209,7 @@
                 </div>
             </div>
 
-            <nav class="space-y-2 flex-1">
+            <nav class="space-y-2 flex-1 overflow-y-auto no-scrollbar pr-2">
                 <div class="nav-item active flex items-center gap-4 p-4 border-l-4 border-primary bg-primary/10 cursor-pointer transition-all hover:bg-primary/20" onclick="showSection('dashboard', this)">
                     <span class="material-symbols-outlined text-primary">grid_view</span>
                     <span class="font-label-surgical text-[10px] tracking-widest uppercase">Overview</span>
@@ -254,6 +254,36 @@
                     <span class="material-symbols-outlined text-[#00ffc4]">coffee</span>
                     <span class="font-label-surgical text-[10px] tracking-widest uppercase font-bold">De-Caffeinator</span>
                 </div>
+                <!-- Manual pentest modules start -->
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('killbook', this)">
+                    <span class="material-symbols-outlined text-primary">book</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Killbook</span>
+                </div>
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('strikecast', this)">
+                    <span class="material-symbols-outlined text-[#00ffc4]">bolt</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Strike Cast</span>
+                </div>
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('payloadloom', this)">
+                    <span class="material-symbols-outlined text-[#00ffc4]">construction</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Payload Loom</span>
+                </div>
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('tokenstalker', this)">
+                    <span class="material-symbols-outlined text-[#00ffc4]">gps_fixed</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Token Stalker</span>
+                </div>
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('greyzone', this)">
+                    <span class="material-symbols-outlined text-yellow-400">rule</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Grey Zone</span>
+                </div>
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('killchainloom', this)">
+                    <span class="material-symbols-outlined text-[#00ffc4]">hub</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Killchain Loom</span>
+                </div>
+                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('ghostproof', this)">
+                    <span class="material-symbols-outlined text-[#00ffc4]">verified</span>
+                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Ghost Proof</span>
+                </div>
+                <!-- Manual pentest modules end -->
                 <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('settings', this)">
                     <span class="material-symbols-outlined">settings_suggest</span>
                     <span class="font-label-surgical text-[10px] tracking-widest uppercase">Settings</span>
@@ -1190,6 +1220,425 @@
                 </div>
             </div>
         </section>
+
+        <!-- 1. KILLBOOK SECTION -->
+        <section id="killbook" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
+            <div class="flex items-center justify-between" style="flex-shrink:0;">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">KILLBOOK <span class="text-primary not-italic">// EVIDENCE DEPOT</span></h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">No Friction Notes & Screenshot Log // Push directly to markdown report</p>
+                </div>
+                <div class="flex gap-4">
+                    <button onclick="createNewKillbookNote()" class="px-6 py-2.5 bg-white/5 border border-white/10 text-white/80 font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:bg-white/10 transition-all rounded shadow-md flex items-center gap-2">
+                        <span class="material-symbols-outlined text-[14px]">edit_note</span> New Note
+                    </button>
+                    <button onclick="exportKillbookReport()" class="px-6 py-2.5 bg-primary text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md flex items-center gap-2">
+                        <span class="material-symbols-outlined text-[14px]">download</span> Push to Report
+                    </button>
+                    <button onclick="clearKillbook()" class="px-6 py-2.5 border border-primary/20 text-primary font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:bg-primary/10 transition-all rounded shadow-md">
+                        Clear All
+                    </button>
+                </div>
+            </div>
+
+            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
+                <!-- Left: Chronological timeline list -->
+                <div class="col-span-4 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Timeline Entries</span>
+                    <div id="killbookTimelineList" class="flex-grow overflow-y-auto space-y-3 pr-2 custom-scrollbar">
+                        <div class="text-white/20 italic text-[10px] font-data-mono">Press F2 anywhere to capture screen or click a note card.</div>
+                    </div>
+                </div>
+
+                <!-- Right: Detailed expansion and previews -->
+                <div class="col-span-8 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6 relative">
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Workspace Note</span>
+                    
+                    <div id="killbookDetailViewer" class="flex-grow flex items-center justify-center text-white/20 italic font-data-mono text-[10px]">
+                        Select an entry from the timeline to open the Notion-style workspace.
+                    </div>
+                    
+                    <!-- Notion Editor Workspace container -->
+                    <div id="killbookWorkspace" class="flex-grow flex flex-col min-h-0 hidden relative">
+                        <!-- Workspace Header -->
+                        <div class="flex items-center justify-between border-b border-white/10 pb-4 mb-4" style="flex-shrink:0;">
+                            <div class="space-y-1 flex-1 mr-4">
+                                <input id="killbookNotionTitle" type="text" class="bg-transparent border-none text-base font-bold text-white tracking-wide focus:outline-none w-full" placeholder="Untitled Note">
+                                <div class="flex items-center gap-3 text-[9px] text-white/40 font-data-mono uppercase">
+                                    <span id="killbookNotionMeta">Target: Target // Panel: Overview</span>
+                                    <span class="h-3 w-px bg-white/10"></span>
+                                    <span id="killbookNotionDate">Date</span>
+                                </div>
+                            </div>
+                            
+                            <div class="flex items-center gap-3">
+                                <!-- Evidence Bundle Icon (Shown if screenshot exists) -->
+                                <button id="killbookBundleBtn" class="hidden px-3 py-1.5 bg-primary/10 border border-primary/30 text-primary hover:bg-primary/20 transition-all rounded flex items-center gap-1.5 text-[9px] font-label-surgical tracking-wider uppercase font-bold" title="View Evidence Screenshots">
+                                    <span class="material-symbols-outlined text-[14px]">photo_library</span>
+                                    <span>Evidence Stack (1)</span>
+                                </button>
+                                
+                                <div id="killbookTagsContainer" class="flex gap-1"></div>
+                            </div>
+                        </div>
+
+                        <!-- Notion Editor Contenteditable Workspace -->
+                        <div class="flex-grow relative overflow-y-auto pr-2 custom-scrollbar" style="min-height:0;">
+                            <div id="killbookNotionEditor" contenteditable="true" class="w-full min-h-full p-4 bg-black/20 border border-white/5 rounded focus:outline-none focus:border-white/15 text-white/90 font-sans text-[12px] leading-relaxed space-y-4 prose prose-invert" placeholder="Type '/' for commands or '/h1 ' for headings..."></div>
+                            
+                            <!-- Slash Commands Popover Menu -->
+                            <div id="killbookSlashMenu" class="hidden absolute bg-surface border border-white/15 rounded shadow-2xl p-1 z-50 w-48 text-[11px] font-sans pointer-events-auto">
+                                <div class="px-2.5 py-1.5 text-[9px] text-white/40 uppercase tracking-wider font-bold">Blocks</div>
+                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('h1')">
+                                    <span class="material-symbols-outlined text-[14px]">format_h1</span>
+                                    <span>Heading 1</span>
+                                </div>
+                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('h2')">
+                                    <span class="material-symbols-outlined text-[14px]">format_h2</span>
+                                    <span>Heading 2</span>
+                                </div>
+                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('h3')">
+                                    <span class="material-symbols-outlined text-[14px]">format_h3</span>
+                                    <span>Heading 3</span>
+                                </div>
+                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('bullet')">
+                                    <span class="material-symbols-outlined text-[14px]">format_list_bulleted</span>
+                                    <span>Bulleted List</span>
+                                </div>
+                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('code')">
+                                    <span class="material-symbols-outlined text-[14px]">code</span>
+                                    <span>Code Block</span>
+                                </div>
+                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('quote')">
+                                    <span class="material-symbols-outlined text-[14px]">format_quote</span>
+                                    <span>Blockquote</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 2. STRIKE CAST SECTION -->
+        <section id="strikecast" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
+            <div class="flex items-center justify-between" style="flex-shrink:0;">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">STRIKE CAST <span class="text-[#00ffc4] not-italic">// AD-HOC BLAST</span></h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Instant command-line curl requests // Ctrl+Enter to blast</p>
+                </div>
+            </div>
+
+            <div class="flex-grow flex flex-col gap-6 min-h-0">
+                <!-- Single-line blast loader -->
+                <div class="panel bg-black/60 border border-white/10 p-6 flex flex-col gap-4" style="flex-shrink:0;">
+                    <div class="flex items-center gap-4">
+                        <input id="strikeCastInput" type="text" class="flex-grow bg-black border border-white/10 px-4 py-3 font-data-mono text-[11px] text-[#00ffc4] focus:outline-none focus:border-[#00ffc4]/50" placeholder="GET https://example.com/api -H 'Host: spoofed.com' -d 'key=val'" onkeydown="if(event.ctrlKey && event.key==='Enter') executeStrikeCast()">
+                        <button onclick="executeStrikeCast()" class="px-8 py-3 bg-[#00ffc4] text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">BLAST</button>
+                    </div>
+                    <div class="flex justify-between items-center text-[9px] font-label-surgical text-white/40 tracking-wider">
+                        <span>EXPLAIN: GET/POST url, -H for custom headers, -d for request payloads. Press Ctrl+Enter to send.</span>
+                        <button onclick="saveStrikeCastAsTestCase()" class="text-[#00ffc4] hover:underline uppercase">Save as Test Case (Ghost Proof)</button>
+                    </div>
+                </div>
+
+                <!-- Responses display -->
+                <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
+                    <!-- Left: Metadata/Headers -->
+                    <div class="col-span-4 flex flex-col gap-3 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                        <div class="flex justify-between items-center">
+                            <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Response Headers</span>
+                            <button onclick="sendStrikeCastToKillbook()" class="text-[9px] font-label-surgical text-primary hover:underline uppercase">Send to Killbook</button>
+                        </div>
+                        <div class="flex-grow overflow-auto border border-white/5 bg-black/40 p-4 rounded custom-scrollbar">
+                            <pre id="strikeCastHeaders" class="font-data-mono text-[10px] text-white/70 whitespace-pre-wrap">Headers appear here...</pre>
+                        </div>
+                    </div>
+
+                    <!-- Right: Response Body -->
+                    <div class="col-span-8 flex flex-col gap-3 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Body Payload</span>
+                        <div class="flex-grow overflow-auto border border-white/5 bg-black/40 p-4 rounded custom-scrollbar">
+                            <pre id="strikeCastBody" class="font-data-mono text-[10px] text-[#00ffc4]/90 whitespace-pre-wrap">Body matches appear here...</pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 3. PAYLOAD LOOM SECTION -->
+        <section id="payloadloom" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
+            <div class="flex items-center justify-between" style="flex-shrink:0;">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">PAYLOAD LOOM <span class="text-[#00ffc4] not-italic">// EXPLOIT BUILDER</span></h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Generate working exploit curl instructions dynamically from targets and findings</p>
+                </div>
+            </div>
+
+            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
+                <!-- Left panel: Finding selection & mapping sources -->
+                <div class="col-span-4 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Target Findings (Intel Center)</span>
+                    <div id="payloadLoomFindingsList" class="flex-grow overflow-y-auto space-y-2 pr-2 custom-scrollbar">
+                        <div class="text-white/20 italic text-[10px] font-data-mono">Select a vulnerability from Intel Center to map variables.</div>
+                    </div>
+                </div>
+
+                <!-- Right panel: Interactive generation workbench -->
+                <div class="col-span-8 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <div class="flex justify-between items-center">
+                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Exploit Compiler Template</span>
+                        <div class="flex gap-3">
+                            <button onclick="testCompiledPayload()" class="px-4 py-1.5 bg-[#00ffc4] text-background font-label-surgical text-[9px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">TEST</button>
+                            <button onclick="saveLoomExploitToKillbook()" class="px-4 py-1.5 border border-primary/20 text-primary font-label-surgical text-[9px] tracking-widest uppercase font-bold hover:bg-primary/10 transition-all rounded shadow-md">SAVE TO KILLBOOK</button>
+                        </div>
+                    </div>
+                    
+                    <div class="flex flex-col gap-3 flex-grow min-h-0">
+                        <textarea id="payloadLoomEditor" class="flex-grow w-full font-data-mono text-[11px] p-4 bg-black border border-white/10 text-white/80 resize-none focus:outline-none focus:border-primary/50" placeholder="curl template compilation deck..."></textarea>
+                        
+                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Loom Response Output</span>
+                        <div class="h-48 overflow-auto border border-white/5 bg-black/40 p-4 rounded custom-scrollbar">
+                            <pre id="payloadLoomOutput" class="font-data-mono text-[10px] text-[#00ffc4] whitespace-pre-wrap">Response logs appear here...</pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 4. TOKEN STALKER SECTION -->
+        <section id="tokenstalker" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
+            <div class="flex items-center justify-between" style="flex-shrink:0;">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">TOKEN STALKER <span class="text-[#00ffc4] not-italic">// RECON STRUCT</span></h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Extract, Decode, Sign, Hex-edit, and Modify raw strings and headers</p>
+                </div>
+            </div>
+
+            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
+                <!-- Paste and extract section -->
+                <div class="col-span-5 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Input Raw Text or Header Response</span>
+                    <textarea id="tokenStalkerInput" class="h-44 w-full font-data-mono text-[10px] p-4 bg-black border border-white/10 text-white/80 resize-none focus:outline-none focus:border-[#00ffc4]/50" placeholder="Paste response content or header payloads here..." oninput="stalkTokens()"></textarea>
+                    
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Discovered Leaked Tokens</span>
+                    <div id="stalkerTokensGrid" class="flex-grow overflow-y-auto space-y-2 pr-2 custom-scrollbar">
+                        <div class="text-white/20 italic text-[10px] font-data-mono">Awaiting text paste logic inputs...</div>
+                    </div>
+                </div>
+
+                <!-- Decoding / Re-signing workspace -->
+                <div class="col-span-7 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <div class="flex justify-between items-center">
+                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Token Cryptanalysis Workbench</span>
+                        <div class="flex gap-3">
+                            <button onclick="reencodeStalkerToken()" class="px-4 py-1.5 bg-[#00ffc4] text-background font-label-surgical text-[9px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">Re-encode</button>
+                            <button onclick="sendStalkerTokenToStrikeCast()" class="px-4 py-1.5 border border-primary/20 text-primary font-label-surgical text-[9px] tracking-widest uppercase font-bold hover:bg-primary/10 transition-all rounded shadow-md">Send to Strike Cast</button>
+                        </div>
+                    </div>
+                    <div class="flex-grow flex flex-col gap-4 min-h-0">
+                        <div class="flex-1 flex flex-col gap-2">
+                            <span class="font-label-surgical text-[9px] text-white/30 uppercase font-bold">Decoded JSON payload / string</span>
+                            <textarea id="stalkerDecoded" class="flex-grow w-full font-data-mono text-[10px] p-4 bg-black border border-white/5 text-[#00ffc4] resize-none focus:outline-none" placeholder="Decoded string context..."></textarea>
+                        </div>
+                        <div class="flex-1 flex flex-col gap-2">
+                            <span class="font-label-surgical text-[9px] text-white/30 uppercase font-bold">Encoded modified Output</span>
+                            <textarea id="stalkerEncoded" readonly class="flex-grow w-full font-data-mono text-[10px] p-4 bg-black border border-white/5 text-primary resize-none focus:outline-none" placeholder="Re-encoded output will print here..."></textarea>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 5. GREY ZONE SECTION -->
+        <section id="greyzone" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
+            <div class="flex items-center justify-between" style="flex-shrink:0;">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">GREY ZONE <span class="text-yellow-400 not-italic">// TEST COVERAGE</span></h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Track manual testing checklists versus automated agent output telemetry</p>
+                </div>
+                <div class="flex gap-4">
+                    <button onclick="exportGreyZoneReport()" class="px-6 py-2.5 bg-yellow-400 text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">
+                        Export Coverage Report
+                    </button>
+                </div>
+            </div>
+
+            <!-- Table filter header -->
+            <div class="panel bg-black/60 border border-white/10 p-6 flex flex-col gap-4 flex-grow min-h-0">
+                <div class="flex justify-between items-center" style="flex-shrink:0;">
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Verification Matrix</span>
+                    <div class="flex items-center gap-3">
+                        <span class="font-label-surgical text-[9px] text-white/40 uppercase">Filter:</span>
+                        <select id="greyZoneFilter" onchange="syncGreyZoneTable()" class="bg-black border border-white/10 font-label-surgical text-[9px] text-white/80 p-2 rounded focus:outline-none">
+                            <option value="ALL">Show All findings</option>
+                            <option value="PENDING">Hide "Tested" (Pending checks)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Grid findings checklist -->
+                <div class="flex-grow overflow-y-auto border border-white/5 bg-black/40 rounded custom-scrollbar text-[10px] font-data-mono">
+                    <div class="grid grid-cols-12 gap-4 px-6 py-3 border-b border-white/10 bg-white/5 sticky top-0 uppercase tracking-widest text-white/50 text-[9px]">
+                        <span class="col-span-3">Finding</span>
+                        <span class="col-span-1">Severity</span>
+                        <span class="col-span-3">Target URL</span>
+                        <span class="col-span-2">Manual Status</span>
+                        <span class="col-span-3">Notes</span>
+                    </div>
+                    <div id="greyZoneTableBody" class="divide-y divide-white/5">
+                        <div class="px-6 py-8 text-center text-white/20 italic">Awaiting findings synchronization...</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 6. KILLCHAIN LOOM SECTION -->
+        <section id="killchainloom" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
+            <div class="flex items-center justify-between" style="flex-shrink:0;">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">KILLCHAIN LOOM <span class="text-[#00ffc4] not-italic">// STEP CHAINER</span></h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Visual multi-step HTTP request pipelines. Propagate outputs using {output_N} tags.</p>
+                </div>
+                <div class="flex gap-4">
+                    <button onclick="runKillchainLoom()" class="px-6 py-2.5 bg-[#00ffc4] text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">
+                        RUN CHAIN
+                    </button>
+                    <button onclick="exportKillchainToKillbook()" class="px-6 py-2.5 border border-primary/20 text-primary font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:bg-primary/10 transition-all rounded shadow-md">
+                        Export to Killbook
+                    </button>
+                </div>
+            </div>
+
+            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
+                <!-- Left steps column -->
+                <div class="col-span-6 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <div class="flex justify-between items-center">
+                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Execution Steps List</span>
+                        <button onclick="addKillchainStep()" class="text-[9px] font-label-surgical text-[#00ffc4] hover:underline uppercase">Add Step</button>
+                    </div>
+                    <div id="killchainStepsList" class="flex-grow overflow-y-auto space-y-4 pr-2 custom-scrollbar">
+                        <!-- Step blocks here -->
+                    </div>
+                </div>
+
+                <!-- Right output timeline console -->
+                <div class="col-span-6 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Execution Timeline Log</span>
+                    <div id="killchainConsole" class="flex-grow overflow-y-auto border border-white/5 bg-black/40 p-4 rounded custom-scrollbar text-[10px] font-data-mono text-white/80 space-y-3">
+                        <div class="text-white/20 italic">Click "RUN CHAIN" to execute sequential pipeline steps.</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 7. GHOST PROOF SECTION -->
+        <section id="ghostproof" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
+            <div class="flex items-center justify-between" style="flex-shrink:0;">
+                <div>
+                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">GHOST PROOF <span class="text-[#00ffc4] not-italic">// REGRESSION SUITE</span></h2>
+                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Maintain and execute regression test cases to verify vulnerability patches</p>
+                </div>
+            </div>
+
+            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
+                <!-- Left Test Cases List -->
+                <div class="col-span-5 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Stored Test Suites</span>
+                    <div id="ghostProofCasesList" class="flex-grow overflow-y-auto space-y-2 pr-2 custom-scrollbar">
+                        <div class="text-white/20 italic text-[10px] font-data-mono">No regression tests saved yet. Save a case from Strike Cast.</div>
+                    </div>
+                </div>
+
+                <!-- Right Match Config & Diff View -->
+                <div class="col-span-7 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
+                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Assertion Rules & Diff</span>
+                    
+                    <div class="grid grid-cols-2 gap-4 bg-black/40 p-4 border border-white/5 rounded" style="flex-shrink:0;">
+                        <div>
+                            <label class="font-label-surgical text-[9px] text-white/40 uppercase tracking-widest block mb-2">Matching Criterion</label>
+                            <select id="ghostMatchRule" onchange="updateSelectedGhostCaseRule()" class="w-full bg-black border border-white/10 font-label-surgical text-[9px] text-white/80 p-2 rounded focus:outline-none">
+                                <option value="status">Status Code Only</option>
+                                <option value="contains">Body Contains Text</option>
+                                <option value="exact">Exact Body Match</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="font-label-surgical text-[9px] text-white/40 uppercase tracking-widest block mb-2">Assertion Pattern</label>
+                            <input id="ghostMatchValue" type="text" oninput="updateSelectedGhostCaseMatchVal()" class="w-full bg-black border border-white/10 font-data-mono text-[9px] text-white px-3 py-2 rounded focus:outline-none" placeholder="Expected status (e.g. 200) or body substring...">
+                        </div>
+                    </div>
+
+                    <div class="flex-grow flex flex-col min-h-0">
+                        <span class="font-label-surgical text-[9px] text-white/30 uppercase font-bold mb-2">Diff Results / Console Logs</span>
+                        <div class="flex-grow overflow-auto border border-white/5 bg-black/40 p-4 rounded custom-scrollbar text-[10px] font-data-mono">
+                            <pre id="ghostProofDiffOutput" class="text-white/70 whitespace-pre-wrap leading-relaxed">Select a regression test card and click "Retest" to see assertion results...</pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Global F2 Screenshot Capture Modal Dialog overlay -->
+        <div id="killbookCaptureModal" class="hidden fixed inset-0 z-[800] flex items-center justify-center pointer-events-auto">
+            <div class="absolute inset-0 bg-black/85 backdrop-blur-sm" onclick="closeKillbookModal()"></div>
+            <div class="relative panel bg-[#0c0c16] border border-primary/50 shadow-[0_0_80px_rgba(255,34,68,0.25)] w-[580px] z-10 flex flex-col">
+                <div class="flex items-center justify-between px-6 py-4 border-b border-white/10 bg-white/5">
+                    <span class="font-h2-tactical text-[11px] text-white uppercase tracking-[0.3em]">Capture Evidence note</span>
+                    <button onclick="closeKillbookModal()" class="text-white/20 hover:text-white transition-colors material-symbols-outlined text-[16px]">close</button>
+                </div>
+                
+                <div class="px-6 py-4 space-y-4">
+                    <!-- Image snapshot preview -->
+                    <div id="killbookShotPreviewContainer" class="h-36 border border-white/10 bg-black/50 overflow-hidden flex items-center justify-center relative rounded">
+                        <img id="killbookShotPreview" src="" class="max-h-full max-w-full object-contain" alt="">
+                        <div class="absolute bottom-2 left-2 bg-black/80 px-2 py-0.5 rounded border border-white/10 font-data-mono text-[8px] text-white/55 uppercase" id="killbookShotPathText"></div>
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-4 text-[9px] font-data-mono text-white/55">
+                        <div>
+                            <span class="text-white/30 uppercase tracking-widest block">Active Target</span>
+                            <span id="killbookTargetVal" class="text-white/90"></span>
+                        </div>
+                        <div>
+                            <span class="text-white/30 uppercase tracking-widest block">Panel Context</span>
+                            <span id="killbookPanelVal" class="text-white/90"></span>
+                        </div>
+                    </div>
+
+                    <div>
+                        <label class="font-label-surgical text-[9px] text-white/30 uppercase tracking-widest block mb-1">Add note</label>
+                        <textarea id="killbookNoteVal" class="w-full h-20 bg-black border border-white/10 p-3 font-data-mono text-[10px] text-white focus:outline-none focus:border-primary/50 resize-none rounded" placeholder="Type custom notes..."></textarea>
+                    </div>
+
+                    <div>
+                        <label class="font-label-surgical text-[9px] text-white/30 uppercase tracking-widest block mb-2">Category Tags</label>
+                        <div class="flex gap-3">
+                            <label class="flex items-center gap-1.5 cursor-pointer text-[9px] font-label-surgical text-white/60 hover:text-white uppercase"><input type="checkbox" name="killbookTag" value="PoC" class="accent-primary"> PoC</label>
+                            <label class="flex items-center gap-1.5 cursor-pointer text-[9px] font-label-surgical text-white/60 hover:text-white uppercase"><input type="checkbox" name="killbookTag" value="Critical" class="accent-primary"> Critical</label>
+                            <label class="flex items-center gap-1.5 cursor-pointer text-[9px] font-label-surgical text-white/60 hover:text-white uppercase"><input type="checkbox" name="killbookTag" value="Retest" class="accent-primary"> Retest</label>
+                            <label class="flex items-center gap-1.5 cursor-pointer text-[9px] font-label-surgical text-white/60 hover:text-white uppercase"><input type="checkbox" name="killbookTag" value="False Positive" class="accent-primary"> False Positive</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="flex gap-3 px-6 py-4 border-t border-white/10">
+                    <button onclick="closeKillbookModal()" class="flex-1 py-3 border border-white/20 text-white/60 font-label-surgical text-[10px] tracking-widest uppercase hover:text-white transition-all rounded">Cancel</button>
+                    <button onclick="saveKillbookEvidence()" class="flex-1 py-3 bg-primary text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">Save Note</button>
+                </div>
+        </div>
+        
+        <!-- Evidence Bundle Lightbox Modal -->
+        <div id="killbookLightboxModal" class="hidden fixed inset-0 z-[900] flex items-center justify-center pointer-events-auto">
+            <div class="absolute inset-0 bg-black/90 backdrop-blur-md" onclick="closeKillbookLightbox()"></div>
+            <div class="relative max-w-[90%] max-h-[90%] z-10 flex flex-col items-center gap-4">
+                <button onclick="closeKillbookLightbox()" class="absolute -top-10 right-0 text-white/50 hover:text-white transition-colors flex items-center gap-1.5 text-[10px] font-label-surgical tracking-widest uppercase font-bold">
+                    <span class="material-symbols-outlined text-[16px]">close</span> Close
+                </button>
+                <img id="killbookLightboxImage" src="" class="max-w-full max-h-[80vh] object-contain border border-white/10 rounded shadow-2xl" alt="">
+                <span id="killbookLightboxPath" class="text-[9px] font-data-mono text-white/40 uppercase tracking-widest bg-black/80 px-3 py-1 rounded border border-white/5">Path: screenshot_path</span>
+            </div>
+        </div>
 
     </main>
 

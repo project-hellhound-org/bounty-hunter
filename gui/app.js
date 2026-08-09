@@ -114,7 +114,8 @@ function showSection(id, el) {
     const target = document.getElementById(id);
     if (target) {
         target.classList.remove('hidden');
-        target.classList.add(id === 'arsenal' || id === 'ops' || id === 'intel' || id === 'loot' || id === 'repro' || id === 'graph' || id === 'repeater' || id === 'decaffeinator' ? 'flex' : 'block');
+        const flexPanels = ['arsenal', 'ops', 'intel', 'loot', 'repro', 'graph', 'repeater', 'decaffeinator', 'killbook', 'strikecast', 'payloadloom', 'tokenstalker', 'greyzone', 'killchainloom', 'ghostproof'];
+        target.classList.add(flexPanels.includes(id) ? 'flex' : 'block');
     }
     
     // Manage HTTP Repeater active state
@@ -131,6 +132,20 @@ function showSection(id, el) {
     if (id === 'loot') pollLoot();
     if (id === 'graph') {
         setTimeout(initAttackGraph, 100);
+    }
+
+    // Callbacks for manual efficiency modules
+    if (id === 'killbook') {
+        renderKillbookTimeline();
+    }
+    if (id === 'payloadloom') {
+        syncPayloadLoomFindings();
+    }
+    if (id === 'greyzone') {
+        syncGreyZoneTable();
+    }
+    if (id === 'ghostproof') {
+        renderGhostProofSuite();
     }
 }
 
@@ -4583,4 +4598,1433 @@ window.onload = () => {
     pushActivity('Hellhound Apex-King HUD online', 'info');
     const sampleTotal = Object.values(SAMPLE_CHART_DATA).reduce((a, b) => a + b, 0);
     renderFindingsChart(SAMPLE_CHART_DATA, sampleTotal, false);
+    
+    // Initialize F2 hotkey and manual efficiency panels
+    initManualEfficiencyModules();
 };
+
+// ── MANUAL EFFICIENCY WORKBENCHES (KILLBOOK, STRIKE CAST, PAYLOAD LOOM, TOKEN STALKER, GREY ZONE, KILLCHAIN LOOM, GHOST PROOF) ──
+
+// local storage states
+let killbookDb = [];
+let strikeCastHistory = [];
+let tokenStalkerHistory = [];
+let greyZoneStatus = {}; // maps ID -> { status, notes }
+let killchainSteps = [];
+let ghostProofCases = [];
+
+let activeScreenshotPath = '';
+let currentStrikeCastResponse = null;
+let selectedLoomFinding = null;
+let selectedStalkerTokenIndex = null;
+let selectedGhostCaseIndex = null;
+
+function initManualEfficiencyModules() {
+    // Add global F2 listener
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'F2') {
+            e.preventDefault();
+            triggerEvidenceCapture();
+        }
+    });
+
+    // Handle incoming screenshot from main process
+    ipcRenderer.on('window-screenshot-response', (event, response) => {
+        if (response.error) {
+            alert('Screenshot capture failed: ' + response.error);
+            return;
+        }
+        
+        activeScreenshotPath = response.path;
+        
+        const previewContainer = document.getElementById('killbookShotPreviewContainer');
+        if (previewContainer) {
+            previewContainer.classList.remove('hidden');
+        }
+        
+        const previewImg = document.getElementById('killbookShotPreview');
+        if (previewImg) {
+            previewImg.src = `file://${response.path}`;
+        }
+        
+        const pathText = document.getElementById('killbookShotPathText');
+        if (pathText) {
+            pathText.innerText = path.basename(response.path);
+        }
+
+        const targetVal = document.getElementById('killbookTargetVal');
+        if (targetVal) {
+            targetVal.innerText = activeTarget || 'NO ACTIVE TARGET';
+        }
+
+        const panelVal = document.getElementById('killbookPanelVal');
+        if (panelVal) {
+            // Find currently active content area panel
+            let activePanelName = 'Unknown Panel';
+            document.querySelectorAll('.content-area').forEach(sec => {
+                if (!sec.classList.contains('hidden')) {
+                    const h2 = sec.querySelector('h2');
+                    activePanelName = h2 ? h2.innerText.split('//')[0].trim() : sec.id.toUpperCase();
+                }
+            });
+            panelVal.innerText = activePanelName;
+        }
+
+        const noteVal = document.getElementById('killbookNoteVal');
+        if (noteVal) {
+            noteVal.value = window.getSelection().toString().trim();
+        }
+
+        // Reset check boxes
+        document.querySelectorAll('input[name="killbookTag"]').forEach(cb => cb.checked = false);
+
+        const modal = document.getElementById('killbookCaptureModal');
+        if (modal) {
+            modal.classList.remove('hidden');
+        }
+    });
+
+    // Notion Editor input / slash command listener
+    const notionEditor = document.getElementById('killbookNotionEditor');
+    if (notionEditor) {
+        notionEditor.addEventListener('keydown', handleNotionEditorInput);
+        notionEditor.addEventListener('input', saveActiveNotionNote);
+    }
+    
+    const notionTitle = document.getElementById('killbookNotionTitle');
+    if (notionTitle) {
+        notionTitle.addEventListener('input', () => {
+            if (activeKillbookEntryId) {
+                const entry = killbookDb.find(e => e.id === activeKillbookEntryId);
+                if (entry) {
+                    entry.title = notionTitle.value;
+                    const cardTitle = document.getElementById(`timeline_title_${activeKillbookEntryId}`);
+                    if (cardTitle) {
+                        cardTitle.innerText = notionTitle.value || 'Untitled Note';
+                    }
+                }
+            }
+        });
+    }
+
+    // Close slash menu when clicking outside
+    window.addEventListener('click', (e) => {
+        const slashMenu = document.getElementById('killbookSlashMenu');
+        if (slashMenu && !e.target.closest('#killbookSlashMenu') && !e.target.closest('#killbookNotionEditor')) {
+            slashMenu.classList.add('hidden');
+        }
+    });
+
+    // Populate initial Killchain step
+    addKillchainStep();
+}
+
+function triggerEvidenceCapture() {
+    ipcRenderer.send('window-screenshot');
+}
+
+function openManualNoteModal() {
+    activeScreenshotPath = null;
+    
+    const previewContainer = document.getElementById('killbookShotPreviewContainer');
+    if (previewContainer) {
+        previewContainer.classList.add('hidden');
+    }
+    
+    const targetVal = document.getElementById('killbookTargetVal');
+    if (targetVal) {
+        targetVal.innerText = activeTarget || 'NO ACTIVE TARGET';
+    }
+
+    const panelVal = document.getElementById('killbookPanelVal');
+    if (panelVal) {
+        let activePanelName = 'Unknown Panel';
+        document.querySelectorAll('.content-area').forEach(sec => {
+            if (!sec.classList.contains('hidden')) {
+                const h2 = sec.querySelector('h2');
+                activePanelName = h2 ? h2.innerText.split('//')[0].trim() : sec.id.toUpperCase();
+            }
+        });
+        panelVal.innerText = activePanelName;
+    }
+
+    const noteVal = document.getElementById('killbookNoteVal');
+    if (noteVal) {
+        noteVal.value = '';
+    }
+
+    // Reset checkboxes
+    document.querySelectorAll('input[name="killbookTag"]').forEach(cb => cb.checked = false);
+
+    const modal = document.getElementById('killbookCaptureModal');
+    if (modal) {
+        modal.classList.remove('hidden');
+    }
+}
+
+function closeKillbookModal() {
+    const modal = document.getElementById('killbookCaptureModal');
+    if (modal) {
+        modal.classList.add('hidden');
+    }
+}
+
+function saveKillbookEvidence() {
+    const note = document.getElementById('killbookNoteVal').value;
+    const target = document.getElementById('killbookTargetVal').innerText;
+    const panel = document.getElementById('killbookPanelVal').innerText;
+    const tags = [];
+    document.querySelectorAll('input[name="killbookTag"]:checked').forEach(cb => {
+        tags.push(cb.value);
+    });
+
+    const titleText = activeScreenshotPath ? `Screenshot - ${panel}` : `Note - ${panel}`;
+    const noteHtml = `<p>${note.replace(/\n/g, '<br>') || 'Empty note content'}</p>`;
+
+    const evidence = {
+        id: 'ev_' + Date.now(),
+        title: titleText,
+        timestamp: new Date().toISOString(),
+        target: target,
+        panel: panel,
+        screenshot: activeScreenshotPath,
+        note: noteHtml,
+        tags: tags
+    };
+
+    killbookDb.unshift(evidence);
+    closeKillbookModal();
+    renderKillbookTimeline();
+    
+    // Auto-select the newly added note in the editor workspace
+    viewKillbookDetail(evidence);
+    
+    activeScreenshotPath = null;
+    pushActivity('Evidence captured to Killbook', 'success');
+}
+
+function createNewKillbookNote() {
+    const newNote = {
+        id: 'ev_' + Date.now(),
+        title: 'New Note',
+        timestamp: new Date().toISOString(),
+        target: activeTarget || 'NO ACTIVE TARGET',
+        panel: 'Killbook',
+        screenshot: null,
+        note: '<p>Type "/" for commands or just start typing...</p>',
+        tags: []
+    };
+    killbookDb.unshift(newNote);
+    activeKillbookEntryId = newNote.id;
+    renderKillbookTimeline();
+    
+    // Focus the editor immediately and highlight text to overwrite
+    const editor = document.getElementById('killbookNotionEditor');
+    if (editor) {
+        editor.focus();
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+    }
+}
+
+function renderKillbookTimeline() {
+    const list = document.getElementById('killbookTimelineList');
+    list.innerHTML = '';
+    
+    if (killbookDb.length === 0) {
+        // Initialize default note if empty so there is always a workspace note to write in
+        const defaultNote = {
+            id: 'ev_' + Date.now(),
+            title: 'Pentest Session Notes',
+            timestamp: new Date().toISOString(),
+            target: activeTarget || 'NO ACTIVE TARGET',
+            panel: 'Killbook',
+            screenshot: null,
+            note: '<p>Type "/" for commands or just start typing notes here...</p>',
+            tags: []
+        };
+        killbookDb.push(defaultNote);
+    }
+
+    if (!activeKillbookEntryId && killbookDb.length > 0) {
+        activeKillbookEntryId = killbookDb[0].id;
+    }
+
+    killbookDb.forEach(ev => {
+        const div = document.createElement('div');
+        div.className = `p-4 bg-white/5 border border-white/10 rounded cursor-pointer hover:bg-white/10 transition-all space-y-2 ${activeKillbookEntryId === ev.id ? 'border-primary bg-primary/5' : ''}`;
+        
+        const tagSpans = ev.tags.map(t => `<span class="px-1.5 py-0.5 border border-primary/30 text-primary text-[7px] uppercase font-bold rounded">${t}</span>`).join(' ');
+        
+        div.innerHTML = `
+            <div class="flex justify-between items-center text-[8px] text-white/40">
+                <div class="flex items-center gap-1.5 text-white/40">
+                    <span>${ev.timestamp.split('T')[1].substring(0, 8)} // ${ev.panel}</span>
+                    ${ev.screenshot ? `<span class="material-symbols-outlined text-[10px] text-primary" title="Screenshot Attached">photo_library</span>` : ''}
+                </div>
+                <span class="text-primary font-bold uppercase truncate max-w-[100px]">${ev.target}</span>
+            </div>
+            <div id="timeline_title_${ev.id}" class="font-bold text-[10px] text-white truncate">${ev.title || 'Untitled Note'}</div>
+            <p id="timeline_preview_${ev.id}" class="text-[9px] text-white/55 line-clamp-1">${ev.note ? ev.note.replace(/<[^>]*>/g, '').substring(0, 50) : '[No descriptive text notes]'}</p>
+            <div class="flex justify-between items-center pt-2 border-t border-white/5">
+                <span class="text-[8px] text-white/30 truncate max-w-[150px]">${ev.screenshot ? path.basename(ev.screenshot) : 'No Image'}</span>
+                <div class="flex gap-1">${tagSpans}</div>
+            </div>
+        `;
+        div.onclick = () => viewKillbookDetail(ev);
+        list.appendChild(div);
+    });
+
+    const activeNote = killbookDb.find(e => e.id === activeKillbookEntryId) || killbookDb[0];
+    if (activeNote) {
+        viewKillbookDetail(activeNote);
+    }
+}
+
+function viewKillbookDetail(ev) {
+    activeKillbookEntryId = ev.id;
+    
+    // Highlight correct timeline item
+    document.querySelectorAll('#killbookTimelineList > div').forEach((child, index) => {
+        const targetEntry = killbookDb[index];
+        if (targetEntry && targetEntry.id === ev.id) {
+            child.classList.add('border-primary', 'bg-primary/5');
+        } else {
+            child.classList.remove('border-primary', 'bg-primary/5');
+        }
+    });
+
+    // Hide static view panel, show Notion workspace
+    const detailViewer = document.getElementById('killbookDetailViewer');
+    if (detailViewer) detailViewer.classList.add('hidden');
+    
+    const workspace = document.getElementById('killbookWorkspace');
+    if (workspace) workspace.classList.remove('hidden');
+    
+    const titleInput = document.getElementById('killbookNotionTitle');
+    if (titleInput && document.activeElement !== titleInput) {
+        titleInput.value = ev.title || '';
+    }
+    
+    const metaSpan = document.getElementById('killbookNotionMeta');
+    if (metaSpan) {
+        metaSpan.innerText = `Target: ${ev.target} // Panel: ${ev.panel}`;
+    }
+    
+    const dateSpan = document.getElementById('killbookNotionDate');
+    if (dateSpan) {
+        dateSpan.innerText = new Date(ev.timestamp).toLocaleString();
+    }
+    
+    const editor = document.getElementById('killbookNotionEditor');
+    if (editor && document.activeElement !== editor) {
+        editor.innerHTML = ev.note || '<p><br></p>';
+    }
+    
+    const bundleBtn = document.getElementById('killbookBundleBtn');
+    if (bundleBtn) {
+        if (ev.screenshot) {
+            bundleBtn.classList.remove('hidden');
+            bundleBtn.onclick = () => openKillbookLightbox(ev.screenshot);
+        } else {
+            bundleBtn.classList.add('hidden');
+        }
+    }
+    
+    const tagsContainer = document.getElementById('killbookTagsContainer');
+    if (tagsContainer) {
+        tagsContainer.innerHTML = ev.tags.map(t => `<span class="px-2 py-0.5 border border-primary text-primary text-[8px] uppercase font-bold rounded">${t}</span>`).join(' ');
+    }
+}
+
+function clearKillbook() {
+    if (confirm('Are you sure you want to clear the Killbook evidence? This will not delete saved images on disk.')) {
+        killbookDb = [];
+        activeKillbookEntryId = null;
+        renderKillbookTimeline();
+        
+        const detailViewer = document.getElementById('killbookDetailViewer');
+        if (detailViewer) {
+            detailViewer.classList.remove('hidden');
+            detailViewer.innerHTML = 'Select an entry from the timeline to open the Notion-style workspace.';
+        }
+        
+        const workspace = document.getElementById('killbookWorkspace');
+        if (workspace) workspace.classList.add('hidden');
+        
+        pushActivity('Killbook evidence database purged', 'info');
+    }
+}
+
+// Notion-style slash commands and rich formatting helpers
+function handleNotionEditorInput(e) {
+    const editor = document.getElementById('killbookNotionEditor');
+    
+    // Track cursor text context
+    const selection = window.getSelection();
+    if (!selection.rangeCount) return;
+    
+    const range = selection.getRangeAt(0);
+    const node = range.startContainer;
+    
+    let blockNode = node;
+    while (blockNode && blockNode.parentNode !== editor) {
+        blockNode = blockNode.parentNode;
+    }
+    
+    if (!blockNode) return;
+    
+    const blockText = blockNode.textContent || '';
+    
+    // Slash commands checking
+    if (blockText.endsWith('/h1 ')) {
+        e.preventDefault();
+        transformCurrentBlock(blockNode, 'h1');
+    } else if (blockText.endsWith('/h2 ')) {
+        e.preventDefault();
+        transformCurrentBlock(blockNode, 'h2');
+    } else if (blockText.endsWith('/h3 ')) {
+        e.preventDefault();
+        transformCurrentBlock(blockNode, 'h3');
+    } else if (blockText.endsWith('/bullet ')) {
+        e.preventDefault();
+        transformCurrentBlock(blockNode, 'bullet');
+    } else if (blockText.endsWith('/code ')) {
+        e.preventDefault();
+        transformCurrentBlock(blockNode, 'code');
+    } else if (blockText.endsWith('/quote ')) {
+        e.preventDefault();
+        transformCurrentBlock(blockNode, 'quote');
+    }
+    
+    // Pop up list if user ends line with /
+    const slashMenu = document.getElementById('killbookSlashMenu');
+    if (blockText.endsWith('/')) {
+        positionSlashMenu(range, slashMenu);
+    } else {
+        if (slashMenu) slashMenu.classList.add('hidden');
+    }
+    
+    saveActiveNotionNote();
+}
+
+function transformCurrentBlock(blockNode, type) {
+    let cleanText = blockNode.textContent.replace(/\/h1\s*|\/h2\s*|\/h3\s*|\/bullet\s*|\/code\s*|\/quote\s*/gi, '').trim();
+    if (cleanText === '') cleanText = ' ';
+    
+    let newElement;
+    if (type === 'h1') {
+        newElement = document.createElement('h1');
+        newElement.textContent = cleanText;
+    } else if (type === 'h2') {
+        newElement = document.createElement('h2');
+        newElement.textContent = cleanText;
+    } else if (type === 'h3') {
+        newElement = document.createElement('h3');
+        newElement.textContent = cleanText;
+    } else if (type === 'bullet') {
+        newElement = document.createElement('ul');
+        const li = document.createElement('li');
+        li.textContent = cleanText;
+        newElement.appendChild(li);
+    } else if (type === 'code') {
+        newElement = document.createElement('pre');
+        newElement.textContent = cleanText;
+    } else if (type === 'quote') {
+        newElement = document.createElement('blockquote');
+        newElement.textContent = cleanText;
+    } else {
+        newElement = document.createElement('div');
+        newElement.textContent = cleanText;
+    }
+    
+    blockNode.parentNode.replaceChild(newElement, blockNode);
+    
+    // Set focus inside the new element
+    const selection = window.getSelection();
+    const range = document.createRange();
+    
+    if (newElement.firstChild && newElement.firstChild.nodeType === Node.ELEMENT_NODE) {
+        range.selectNodeContents(newElement.firstChild);
+    } else {
+        range.selectNodeContents(newElement);
+    }
+    
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    
+    const slashMenu = document.getElementById('killbookSlashMenu');
+    if (slashMenu) slashMenu.classList.add('hidden');
+    
+    saveActiveNotionNote();
+}
+
+function insertNotionBlock(type) {
+    const editor = document.getElementById('killbookNotionEditor');
+    editor.focus();
+    
+    const selection = window.getSelection();
+    if (!selection.rangeCount) return;
+    
+    const range = selection.getRangeAt(0);
+    const node = range.startContainer;
+    
+    let blockNode = node;
+    while (blockNode && blockNode.parentNode !== editor) {
+        blockNode = blockNode.parentNode;
+    }
+    
+    if (!blockNode) {
+        const p = document.createElement('p');
+        p.textContent = '/';
+        editor.appendChild(p);
+        blockNode = p;
+    }
+    
+    transformCurrentBlock(blockNode, type);
+}
+
+function positionSlashMenu(range, menu) {
+    if (!menu) return;
+    
+    const rect = range.getBoundingClientRect();
+    const editor = document.getElementById('killbookNotionEditor');
+    const editorRect = editor.getBoundingClientRect();
+    
+    const top = rect.bottom - editorRect.top + editor.scrollTop + 8;
+    const left = rect.left - editorRect.left;
+    
+    menu.style.top = `${top}px`;
+    menu.style.left = `${left}px`;
+    menu.classList.remove('hidden');
+}
+
+function saveActiveNotionNote() {
+    if (activeKillbookEntryId) {
+        const entry = killbookDb.find(e => e.id === activeKillbookEntryId);
+        if (entry) {
+            entry.note = document.getElementById('killbookNotionEditor').innerHTML;
+        }
+    }
+}
+
+function openKillbookLightbox(screenshotPath) {
+    const lightbox = document.getElementById('killbookLightboxModal');
+    const img = document.getElementById('killbookLightboxImage');
+    const pathText = document.getElementById('killbookLightboxPath');
+    
+    if (lightbox && img) {
+        img.src = `file://${screenshotPath}`;
+        if (pathText) {
+            pathText.innerText = `Path: ${screenshotPath}`;
+        }
+        lightbox.classList.remove('hidden');
+    }
+}
+
+function closeKillbookLightbox() {
+    const lightbox = document.getElementById('killbookLightboxModal');
+    if (lightbox) {
+        lightbox.classList.add('hidden');
+    }
+}
+
+function htmlToMarkdown(html) {
+    if (!html) return '';
+    let md = html;
+    md = md.replace(/<h1>([\s\S]*?)<\/h1>/gi, '# $1\n');
+    md = md.replace(/<h2>([\s\S]*?)<\/h2>/gi, '## $1\n');
+    md = md.replace(/<h3>([\s\S]*?)<\/h3>/gi, '### $1\n');
+    md = md.replace(/<blockquote>([\s\S]*?)<\/blockquote>/gi, '> $1\n');
+    md = md.replace(/<pre>([\s\S]*?)<\/pre>/gi, '```text\n$1\n```\n');
+    md = md.replace(/<ul>([\s\S]*?)<\/ul>/gi, '$1');
+    md = md.replace(/<li>([\s\S]*?)<\/li>/gi, '- $1\n');
+    md = md.replace(/<p>([\s\S]*?)<\/p>/gi, '$1\n');
+    md = md.replace(/<div>([\s\S]*?)<\/div>/gi, '$1\n');
+    md = md.replace(/<br\s*\/?>/gi, '\n');
+    md = md.replace(/<[^>]*>/g, '');
+    
+    // Clean up empty lines or duplicate spaces
+    md = md.split('\n').map(line => line.trim()).filter((line, i, arr) => {
+        return line !== '' || (i > 0 && arr[i-1] !== '');
+    }).join('\n');
+    
+    const txt = document.createElement('textarea');
+    txt.innerHTML = md;
+    return txt.value.trim();
+}
+
+function exportKillbookReport() {
+    if (killbookDb.length === 0) {
+        alert('Killbook database is empty. No findings to export.');
+        return;
+    }
+
+    let report = `# HELLHOUND VULNERABILITY PENTEST REPORT\n`;
+    report += `Generated: ${new Date().toLocaleString()}\n`;
+    report += `Target: ${activeTarget || 'Multiple Targets'}\n\n`;
+    report += `---\n\n`;
+
+    killbookDb.forEach(ev => {
+        report += `### [${ev.panel}] Finding - ${ev.id}\n`;
+        report += `- **Timestamp:** ${ev.timestamp}\n`;
+        report += `- **Active Host:** ${ev.target}\n`;
+        report += `- **Tags:** ${ev.tags.join(', ') || 'None'}\n\n`;
+        
+        const markdownNotes = htmlToMarkdown(ev.note);
+        report += `#### Findings Notes\n${markdownNotes || 'No notes description provided.'}\n\n`;
+        
+        if (ev.screenshot) {
+            report += `#### Captured Evidence\n![Evidence Screenshot](file://${ev.screenshot})\n\n`;
+        }
+        report += `---\n\n`;
+    });
+
+    ipcRenderer.send('export-session', {
+        filename: `Killbook_Report_${Date.now()}.md`,
+        content: report
+    });
+    pushActivity('Pushed Killbook evidence to Markdown report', 'success');
+}
+
+// ── STRIKE CAST CONTROLLER ──
+function executeStrikeCast() {
+    const input = document.getElementById('strikeCastInput').value.trim();
+    if (!input) return;
+
+    const headersArea = document.getElementById('strikeCastHeaders');
+    const bodyArea = document.getElementById('strikeCastBody');
+
+    headersArea.innerText = 'Routing native requests...';
+    bodyArea.innerText = 'Blasting TCP payload packet streams...';
+
+    // Parse command line
+    let method = 'GET';
+    let url = '';
+    let body = '';
+    const headers = {};
+
+    const methodMatch = input.match(/^(GET|POST|PUT|DELETE|OPTIONS|HEAD|PATCH|TRACE)\b/i);
+    let restOfLine = input;
+    if (methodMatch) {
+        method = methodMatch[1].toUpperCase();
+        restOfLine = input.substring(methodMatch[0].length).trim();
+    }
+
+    // Extract -H headers
+    const headerRegex = /-H\s+['"]([^'"]+)['"]/g;
+    let match;
+    const headerLines = [];
+    while ((match = headerRegex.exec(input)) !== null) {
+        headerLines.push(match[1]);
+    }
+    // Remove headers from parse URL line
+    restOfLine = restOfLine.replace(/-H\s+['"]([^'"]+)['"]/g, '').trim();
+
+    // Extract -d body
+    const bodyMatch = restOfLine.match(/-d\s+['"]([^'"]+)['"]/);
+    if (bodyMatch) {
+        body = bodyMatch[1];
+        restOfLine = restOfLine.replace(/-d\s+['"]([^'"]+)['"]/, '').trim();
+    } else {
+        const bodyMatchNoQuote = restOfLine.match(/-d\s+(\S+)/);
+        if (bodyMatchNoQuote) {
+            body = bodyMatchNoQuote[1];
+            restOfLine = restOfLine.replace(/-d\s+(\S+)/, '').trim();
+        }
+    }
+
+    // URL is whatever is left
+    url = restOfLine.trim().split(/\s+/)[0];
+    // Remove trailing quotes if URL was wrapped
+    url = url.replace(/^['"]|['"]$/g, '');
+
+    if (!url) {
+        headersArea.innerText = 'Error parsing parameters';
+        bodyArea.innerText = 'Could not isolate destination target URL.';
+        return;
+    }
+
+    // Append standard headers
+    headerLines.forEach(line => {
+        const parts = line.split(':');
+        if (parts.length >= 2) {
+            headers[parts[0].trim()] = parts.slice(1).join(':').trim();
+        }
+    });
+
+    // Native requests engine using Node http/https
+    try {
+        const urlObj = new URL(url);
+        const isHttps = urlObj.protocol === 'https:';
+        const client = isHttps ? require('https') : require('http');
+
+        const requestOptions = {
+            method: method,
+            hostname: urlObj.hostname,
+            port: urlObj.port || (isHttps ? 443 : 80),
+            path: urlObj.pathname + urlObj.search,
+            headers: headers
+        };
+
+        if (body) {
+            requestOptions.headers['Content-Length'] = Buffer.byteLength(body);
+        }
+
+        const req = client.request(requestOptions, (res) => {
+            let resBody = '';
+            
+            res.on('data', (chunk) => { resBody += chunk; });
+            
+            res.on('end', () => {
+                let responseHeadersText = `HTTP/${res.httpVersion} ${res.statusCode} ${res.statusMessage}\n`;
+                for (const [k, v] of Object.entries(res.headers)) {
+                    responseHeadersText += `${k}: ${v}\n`;
+                }
+
+                headersArea.innerText = responseHeadersText;
+                
+                try {
+                    const parsed = JSON.parse(resBody);
+                    bodyArea.innerText = JSON.stringify(parsed, null, 2);
+                } catch (_) {
+                    bodyArea.innerText = resBody;
+                }
+
+                currentStrikeCastResponse = {
+                    request: {
+                        method: method,
+                        url: url,
+                        headers: headers,
+                        body: body
+                    },
+                    response: {
+                        status: res.statusCode,
+                        headers: res.headers,
+                        body: resBody
+                    }
+                };
+
+                // Add to history
+                strikeCastHistory.unshift({
+                    input: input,
+                    timestamp: new Date().toISOString()
+                });
+            });
+        });
+
+        req.on('error', (err) => {
+            headersArea.innerText = 'Connection Error';
+            bodyArea.innerText = err.message;
+        });
+
+        if (body) {
+            req.write(body);
+        }
+        req.end();
+
+    } catch (e) {
+        headersArea.innerText = 'Parsing failure';
+        bodyArea.innerText = e.message;
+    }
+}
+
+function sendStrikeCastToKillbook() {
+    if (!currentStrikeCastResponse) {
+        alert('No response loaded inside Strike Cast. Blast a target first.');
+        return;
+    }
+
+    const note = `### STRIKE CAST Blast log\n` +
+                 `**Command Input:** \`${document.getElementById('strikeCastInput').value}\`\n\n` +
+                 `#### Request details:\n` +
+                 `- **Method:** ${currentStrikeCastResponse.request.method}\n` +
+                 `- **URL:** ${currentStrikeCastResponse.request.url}\n` +
+                 `- **Payload:** \`${currentStrikeCastResponse.request.body || 'None'}\`\n\n` +
+                 `#### Response status: ${currentStrikeCastResponse.response.status}\n` +
+                 `\`\`\`json\n${currentStrikeCastResponse.response.body.substring(0, 1000)}\n\`\`\``;
+
+    const evidence = {
+        id: 'ev_' + Date.now(),
+        timestamp: new Date().toISOString(),
+        target: activeTarget || 'Strike Cast Host',
+        panel: 'STRIKE CAST',
+        screenshot: '',
+        note: note,
+        tags: ['PoC']
+    };
+
+    killbookDb.unshift(evidence);
+    renderKillbookTimeline();
+    pushActivity('Strike Cast session findings exported to Killbook', 'success');
+}
+
+function saveStrikeCastAsTestCase() {
+    if (!currentStrikeCastResponse) {
+        alert('Blast a target first before saving as test case!');
+        return;
+    }
+
+    const namePrompt = prompt('Enter a name for this regression test case:', `Retest ${currentStrikeCastResponse.request.method} - ${currentStrikeCastResponse.request.url.substring(0,30)}`);
+    if (!namePrompt) return;
+
+    const testCase = {
+        name: namePrompt,
+        request: currentStrikeCastResponse.request,
+        expected: {
+            status: currentStrikeCastResponse.response.status,
+            body: currentStrikeCastResponse.response.body
+        },
+        matchRule: 'status',
+        matchValue: String(currentStrikeCastResponse.response.status),
+        target: activeTarget || 'Default Target'
+    };
+
+    ghostProofCases.push(testCase);
+    renderGhostProofSuite();
+    pushActivity(`Saved Ghost Proof regression test case: ${namePrompt}`, 'success');
+}
+
+// ── PAYLOAD LOOM CONTROLLER ──
+function syncPayloadLoomFindings() {
+    const list = document.getElementById('payloadLoomFindingsList');
+    list.innerHTML = '';
+
+    if (!lastIntelTargets || lastIntelTargets.length === 0) {
+        list.innerHTML = '<div class="text-white/20 italic text-[10px] font-data-mono">No vulnerabilities detected inside Intel Center.</div>';
+        return;
+    }
+
+    lastIntelTargets.forEach(t => {
+        const div = document.createElement('div');
+        const isSelected = selectedLoomFinding && selectedLoomFinding.id === t.id;
+        
+        div.className = `p-3 bg-white/5 border border-white/10 rounded cursor-pointer hover:bg-white/10 transition-all ${isSelected ? 'border-primary' : ''}`;
+        div.innerHTML = `
+            <div class="flex justify-between items-center text-[8px] text-white/30">
+                <span>${t.module}</span>
+                <span class="text-primary font-bold uppercase">${t.severity}</span>
+            </div>
+            <h4 class="text-[10px] text-white uppercase font-bold mt-1">${t.type}</h4>
+            <p class="text-[9px] text-white/50 truncate">${t.url}</p>
+        `;
+        div.onclick = () => selectLoomFinding(t, div);
+        list.appendChild(div);
+    });
+}
+
+function selectLoomFinding(t, element) {
+    selectedLoomFinding = t;
+    
+    document.querySelectorAll('#payloadLoomFindingsList > div').forEach(div => {
+        div.classList.remove('border-primary');
+    });
+    if (element) element.classList.add('border-primary');
+
+    // Correlate parameters and construct exploit
+    let method = 'GET';
+    let url = t.url;
+    let postData = '';
+    let sessionVar = 'session=forged_admin_token';
+    let csrfVar = 'csrf_token_value';
+
+    // Parse template structures
+    let compiledCurl = `curl -X ${method} '${url}' \\\n  -H 'Cookie: ${sessionVar}' \\\n  -H 'X-CSRF-Token: ${csrfVar}'`;
+    if (method === 'POST') {
+        compiledCurl += ` \\\n  --data '${postData}'`;
+    }
+
+    document.getElementById('payloadLoomEditor').value = compiledCurl;
+    pushActivity(`Compiled exploit template for ${t.type}`, 'info');
+}
+
+function testCompiledPayload() {
+    const cmd = document.getElementById('payloadLoomEditor').value;
+    const outputArea = document.getElementById('payloadLoomOutput');
+
+    outputArea.innerText = 'Executing exploit test vector...';
+
+    // Parse curl command dynamically
+    let method = 'GET';
+    const methodMatch = cmd.match(/-X\s+(\S+)/);
+    if (methodMatch) method = methodMatch[1].replace(/['"]/g, '').toUpperCase();
+
+    let url = '';
+    const urlMatches = cmd.match(/(?:['"])(https?:\/\/[^\s'"]+)/) || cmd.match(/(https?:\/\/[^\s'"]+)/);
+    if (urlMatches) url = urlMatches[1];
+
+    if (!url) {
+        outputArea.innerText = 'Could not parse target URL from exploit template.';
+        return;
+    }
+
+    const headers = {};
+    const headerRegex = /-H\s+['"]([^'"]+)['"]/g;
+    let match;
+    while ((match = headerRegex.exec(cmd)) !== null) {
+        const parts = match[1].split(':');
+        if (parts.length >= 2) {
+            headers[parts[0].trim()] = parts.slice(1).join(':').trim();
+        }
+    }
+
+    let data = '';
+    const dataMatch = cmd.match(/--data\s+['"]([^'"]+)['"]/);
+    if (dataMatch) data = dataMatch[1];
+
+    try {
+        const urlObj = new URL(url);
+        const isHttps = urlObj.protocol === 'https:';
+        const client = isHttps ? require('https') : require('http');
+
+        const options = {
+            method: method,
+            hostname: urlObj.hostname,
+            port: urlObj.port || (isHttps ? 443 : 80),
+            path: urlObj.pathname + urlObj.search,
+            headers: headers
+        };
+
+        const req = client.request(options, (res) => {
+            let resBody = '';
+            res.on('data', (c) => { resBody += c; });
+            res.on('end', () => {
+                outputArea.innerText = `[Exploit response] Status: ${res.statusCode}\n\n${resBody.substring(0, 2000)}`;
+            });
+        });
+
+        req.on('error', (err) => {
+            outputArea.innerText = `Connection failed: ${err.message}`;
+        });
+
+        if (data) req.write(data);
+        req.end();
+
+    } catch (e) {
+        outputArea.innerText = `Error compiling request details: ${e.message}`;
+    }
+}
+
+function saveLoomExploitToKillbook() {
+    const editorVal = document.getElementById('payloadLoomEditor').value;
+    const outputVal = document.getElementById('payloadLoomOutput').innerText;
+
+    if (!editorVal) {
+        alert('Exploit editor is empty.');
+        return;
+    }
+
+    const note = `### Compiled Exploit Vector\n` +
+                 `\`\`\`shell\n${editorVal}\n\`\`\`\n\n` +
+                 `#### Test Response Output:\n` +
+                 `\`\`\`text\n${outputVal}\n\`\`\``;
+
+    const evidence = {
+        id: 'ev_' + Date.now(),
+        timestamp: new Date().toISOString(),
+        target: activeTarget || 'Loom Exploit Target',
+        panel: 'PAYLOAD LOOM',
+        screenshot: '',
+        note: note,
+        tags: ['PoC', 'Critical']
+    };
+
+    killbookDb.unshift(evidence);
+    renderKillbookTimeline();
+    pushActivity('Loom exploit vector compiled directly to Killbook', 'success');
+}
+
+// ── TOKEN STALKER CONTROLLER ──
+function stalkTokens() {
+    const text = document.getElementById('tokenStalkerInput').value;
+    const list = document.getElementById('stalkerTokensGrid');
+    list.innerHTML = '';
+
+    const discovered = [];
+
+    // JWT regex
+    const jwtRegex = /\bey[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b/g;
+    let match;
+    while ((match = jwtRegex.exec(text)) !== null) {
+        discovered.push({ type: 'JWT', raw: match[0] });
+    }
+
+    // Base64 regex
+    const b64Regex = /\b[a-zA-Z0-9+/]{40,}=*\b/g;
+    while ((match = b64Regex.exec(text)) !== null) {
+        discovered.push({ type: 'Base64', raw: match[0] });
+    }
+
+    // Hex strings
+    const hexRegex = /\b[a-fA-F0-9]{32,64}\b/g;
+    while ((match = hexRegex.exec(text)) !== null) {
+        discovered.push({ type: 'Hex', raw: match[0] });
+    }
+
+    // Cookies
+    const cookieRegex = /(?:cookie|set-cookie):\s*([^;\r\n]+)/gi;
+    while ((match = cookieRegex.exec(text)) !== null) {
+        discovered.push({ type: 'Cookie', raw: match[1] });
+    }
+
+    if (discovered.length === 0) {
+        list.innerHTML = '<div class="text-white/20 italic text-[10px] font-data-mono">No structures isolated in pasted input text.</div>';
+        return;
+    }
+
+    discovered.forEach((item, index) => {
+        const div = document.createElement('div');
+        div.className = 'p-3 bg-white/5 border border-white/10 rounded cursor-pointer hover:bg-white/10 transition-all';
+        div.innerHTML = `
+            <div class="flex justify-between items-center text-[8px]">
+                <span class="text-[#00ffc4] uppercase font-bold">${item.type}</span>
+            </div>
+            <p class="font-data-mono text-[9px] text-white/70 truncate mt-1">${item.raw}</p>
+        `;
+        div.onclick = () => decodeStalkerToken(item, index);
+        list.appendChild(div);
+    });
+}
+
+function decodeStalkerToken(item, index) {
+    selectedStalkerTokenIndex = index;
+    const decodedArea = document.getElementById('stalkerDecoded');
+    const encodedArea = document.getElementById('stalkerEncoded');
+
+    try {
+        if (item.type === 'JWT') {
+            const parts = item.raw.split('.');
+            const header = Buffer.from(parts[0], 'base64').toString('utf8');
+            const payload = Buffer.from(parts[1], 'base64').toString('utf8');
+            
+            const structured = {
+                header: JSON.parse(header),
+                payload: JSON.parse(payload)
+            };
+            decodedArea.value = JSON.stringify(structured, null, 2);
+        } else if (item.type === 'Base64') {
+            decodedArea.value = Buffer.from(item.raw, 'base64').toString('utf8');
+        } else if (item.type === 'Hex') {
+            decodedArea.value = Buffer.from(item.raw, 'hex').toString('utf8');
+        } else {
+            decodedArea.value = item.raw;
+        }
+    } catch (e) {
+        decodedArea.value = `Decoding failure: ${e.message}\nRaw: ${item.raw}`;
+    }
+    encodedArea.value = '';
+}
+
+function reencodeStalkerToken() {
+    const decoded = document.getElementById('stalkerDecoded').value;
+    const encodedArea = document.getElementById('stalkerEncoded');
+
+    try {
+        // Simple base64 re-encode fallback
+        const base64url = (str) => Buffer.from(str).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+        
+        // Attempt parsing JSON
+        try {
+            const parsed = JSON.parse(decoded);
+            if (parsed.header && parsed.payload) {
+                // Construct forged JWT none
+                const forgedHdr = base64url(JSON.stringify(Object.assign({}, parsed.header, { alg: 'none' })));
+                const forgedPay = base64url(JSON.stringify(parsed.payload));
+                encodedArea.value = `${forgedHdr}.${forgedPay}.`;
+                return;
+            }
+        } catch (_) {}
+
+        encodedArea.value = Buffer.from(decoded).toString('base64');
+        pushActivity('Token re-encoded to output buffer', 'success');
+
+    } catch (e) {
+        encodedArea.value = 'Failed encoding: ' + e.message;
+    }
+}
+
+function sendStalkerTokenToStrikeCast() {
+    const val = document.getElementById('stalkerEncoded').value.trim();
+    if (!val) {
+        alert('Sign or Re-encode a token first!');
+        return;
+    }
+
+    showSection('strikecast', document.querySelector('[onclick*="showSection(\'strikecast\'"]'));
+    document.getElementById('strikeCastInput').value = `GET ${activeTarget || 'https://target.com/'} -H "Cookie: session=${val}"`;
+    pushActivity('Stalker cookie injected to Strike Cast input line', 'info');
+}
+
+// ── GREY ZONE CONTROLLER ──
+function syncGreyZoneTable() {
+    const tbody = document.getElementById('greyZoneTableBody');
+    tbody.innerHTML = '';
+
+    const filterVal = document.getElementById('greyZoneFilter').value;
+
+    if (!lastIntelTargets || lastIntelTargets.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="5" class="py-6 text-center text-white/20 italic">No targets cataloged inside Intel Center.</td></tr>`;
+        return;
+    }
+
+    lastIntelTargets.forEach(t => {
+        // Sync state map key
+        if (!greyZoneStatus[t.id]) {
+            greyZoneStatus[t.id] = { status: 'Not Tested', notes: '' };
+        }
+
+        const state = greyZoneStatus[t.id];
+
+        if (filterVal === 'PENDING' && state.status !== 'Not Tested') {
+            return;
+        }
+
+        const row = document.createElement('div');
+        row.className = 'grid grid-cols-12 gap-4 px-6 py-4 hover:bg-white/5 items-center transition-all';
+        row.innerHTML = `
+            <div class="col-span-3 text-white uppercase font-bold text-[10px] truncate" title="${t.type}">${t.type}</div>
+            <div class="col-span-1 text-[9px] uppercase font-bold tracking-widest text-primary">${t.severity}</div>
+            <div class="col-span-3 text-white/50 truncate text-[9px]" title="${t.url}">${t.url}</div>
+            <div class="col-span-2">
+                <select onchange="updateGreyZoneStatus('${t.id}', this.value)" class="bg-black border border-white/10 font-label-surgical text-[9px] text-white/80 p-1.5 rounded focus:outline-none w-full">
+                    <option value="Not Tested" ${state.status === 'Not Tested' ? 'selected' : ''}>Not Tested</option>
+                    <option value="Tested - Exploitable" ${state.status === 'Tested - Exploitable' ? 'selected' : ''}>Tested - Exploitable</option>
+                    <option value="Tested - Not Exploitable" ${state.status === 'Tested - Not Exploitable' ? 'selected' : ''}>Tested - Not Exploitable</option>
+                    <option value="False Positive" ${state.status === 'False Positive' ? 'selected' : ''}>False Positive</option>
+                    <option value="Needs Retest" ${state.status === 'Needs Retest' ? 'selected' : ''}>Needs Retest</option>
+                </select>
+            </div>
+            <div class="col-span-3 flex gap-2">
+                <input type="text" value="${state.notes}" onchange="updateGreyZoneNotes('${t.id}', this.value)" class="bg-black/40 border border-white/5 font-data-mono text-[9px] text-white/80 px-2 py-1 focus:outline-none rounded flex-grow" placeholder="Add validation logs...">
+                <button onclick="launchPayloadLoomFromGrey('${t.id}')" class="text-[#00ffc4] hover:underline uppercase text-[8px] font-label-surgical">Loom</button>
+            </div>
+        `;
+        tbody.appendChild(row);
+    });
+}
+
+function updateGreyZoneStatus(id, val) {
+    if (!greyZoneStatus[id]) greyZoneStatus[id] = { status: 'Not Tested', notes: '' };
+    greyZoneStatus[id].status = val;
+    pushActivity(`Vulnerability verification status updated`, 'info');
+}
+
+function updateGreyZoneNotes(id, val) {
+    if (!greyZoneStatus[id]) greyZoneStatus[id] = { status: 'Not Tested', notes: '' };
+    greyZoneStatus[id].notes = val;
+}
+
+function launchPayloadLoomFromGrey(id) {
+    const finding = lastIntelTargets.find(t => t.id === id);
+    if (!finding) return;
+
+    showSection('payloadloom', document.querySelector('[onclick*="showSection(\'payloadloom\'"]'));
+    selectLoomFinding(finding);
+}
+
+function exportGreyZoneReport() {
+    let report = `# GREY ZONE - MANUAL TEST COVERAGE REPORT\n`;
+    report += `Audit Date: ${new Date().toLocaleDateString()}\n`;
+    report += `Scope Target: ${activeTarget || 'Hellhound Pentest Target'}\n\n`;
+    report += `| Finding | Severity | Target URL | Verification Status | Verification Notes |\n`;
+    report += `| --- | --- | --- | --- | --- |\n`;
+
+    lastIntelTargets.forEach(t => {
+        const state = greyZoneStatus[t.id] || { status: 'Not Tested', notes: '' };
+        report += `| ${t.type} | ${t.severity} | ${t.url} | **${state.status}** | ${state.notes || 'N/A'} |\n`;
+    });
+
+    ipcRenderer.send('export-session', {
+        filename: `GreyZone_Coverage_Report_${Date.now()}.md`,
+        content: report
+    });
+    pushActivity('Pushed Grey Zone verification coverage report', 'success');
+}
+
+// ── KILLCHAIN LOOM CONTROLLER ──
+function addKillchainStep() {
+    const list = document.getElementById('killchainStepsList');
+    const stepIndex = killchainSteps.length + 1;
+
+    const div = document.createElement('div');
+    div.className = 'p-4 bg-white/5 border border-white/10 rounded flex flex-col gap-3 relative';
+    div.id = `killchainStep_${stepIndex}`;
+    
+    div.innerHTML = `
+        <div class="flex justify-between items-center" style="flex-shrink:0;">
+            <span class="font-h2-tactical text-[9px] text-[#00ffc4] uppercase tracking-wider">Step ${stepIndex}</span>
+            <button onclick="removeKillchainStep(${stepIndex})" class="text-white/20 hover:text-primary transition-colors material-symbols-outlined text-[14px]">delete</button>
+        </div>
+        <div class="flex flex-col gap-2">
+            <input type="text" class="bg-black border border-white/5 font-data-mono text-[9px] text-white px-2 py-1.5 focus:outline-none rounded w-full" placeholder="POST https://example.com/api/login" id="killchainMethodUrl_${stepIndex}">
+            <textarea class="bg-black border border-white/5 font-data-mono text-[9px] text-white/80 p-2 focus:outline-none rounded w-full h-12 resize-none" placeholder="Headers (e.g. Content-Type: application/json)" id="killchainHeaders_${stepIndex}"></textarea>
+            <input type="text" class="bg-black border border-white/5 font-data-mono text-[9px] text-white/80 px-2 py-1.5 focus:outline-none rounded w-full" placeholder="Request body / parameters (e.g. user=admin)" id="killchainBody_${stepIndex}">
+            <input type="text" class="bg-black/60 border border-white/5 font-data-mono text-[9px] text-[#00ffc4] px-2 py-1 focus:outline-none rounded w-full" placeholder="JSON regex capture expression (e.g. token: '([^']+)')" id="killchainRegex_${stepIndex}">
+        </div>
+    `;
+
+    list.appendChild(div);
+    killchainSteps.push({
+        index: stepIndex,
+        methodUrl: '',
+        headers: '',
+        body: '',
+        regex: ''
+    });
+}
+
+function removeKillchainStep(index) {
+    const el = document.getElementById(`killchainStep_${index}`);
+    if (el) el.remove();
+    killchainSteps = killchainSteps.filter(s => s.index !== index);
+}
+
+async function runKillchainLoom() {
+    const consoleLog = document.getElementById('killchainConsole');
+    consoleLog.innerHTML = '<div>Initialising orchestrator pipeline runner...</div>';
+
+    let extractedVariables = {};
+
+    for (let i = 0; i < killchainSteps.length; i++) {
+        const step = killchainSteps[i];
+        const idx = step.index;
+
+        let rawMethodUrl = document.getElementById(`killchainMethodUrl_${idx}`).value.trim();
+        let rawHeaders = document.getElementById(`killchainHeaders_${idx}`).value.trim();
+        let rawBody = document.getElementById(`killchainBody_${idx}`).value.trim();
+        let regexVal = document.getElementById(`killchainRegex_${idx}`).value.trim();
+
+        if (!rawMethodUrl) {
+            consoleLog.innerHTML += `<div class="text-primary mt-2">Error: Step ${idx} url is undefined. Execution aborted.</div>`;
+            return;
+        }
+
+        // Apply string variable translations
+        for (const [k, v] of Object.entries(extractedVariables)) {
+            const pattern = new RegExp(`{${k}}`, 'g');
+            rawMethodUrl = rawMethodUrl.replace(pattern, v);
+            rawHeaders = rawHeaders.replace(pattern, v);
+            rawBody = rawBody.replace(pattern, v);
+        }
+
+        consoleLog.innerHTML += `<div class="text-white/40 mt-3">// Executing Step ${idx}: ${rawMethodUrl}</div>`;
+
+        let method = 'GET';
+        let url = rawMethodUrl;
+        const methodMatch = rawMethodUrl.match(/^(GET|POST|PUT|DELETE)\b/i);
+        if (methodMatch) {
+            method = methodMatch[1].toUpperCase();
+            url = rawMethodUrl.substring(methodMatch[0].length).trim();
+        }
+
+        // Send HTTP request
+        try {
+            const res = await dispatchLoomRequest(method, url, rawHeaders, rawBody);
+            consoleLog.innerHTML += `<div>Step ${idx} complete status code: <span class="text-white">${res.statusCode}</span></div>`;
+
+            // Regex extraction
+            if (regexVal) {
+                const reg = new RegExp(regexVal);
+                const regMatch = res.body.match(reg);
+                if (regMatch && regMatch[1]) {
+                    extractedVariables[`output_${idx}`] = regMatch[1];
+                    consoleLog.innerHTML += `<div class="text-[#00ffc4]">Step ${idx} variable correlation extracted {output_${idx}}: ${regMatch[1]}</div>`;
+                } else {
+                    consoleLog.innerHTML += `<div class="text-yellow-400">Warning: Step ${idx} regex match yielded no captures.</div>`;
+                }
+            }
+        } catch (err) {
+            consoleLog.innerHTML += `<div class="text-primary mt-1">Step ${idx} Connection Error: ${err.message}</div>`;
+            return;
+        }
+    }
+    consoleLog.innerHTML += `<div class="text-[#00ffc4] font-bold mt-4">Pipeline execution successfully completed.</div>`;
+}
+
+function dispatchLoomRequest(method, url, rawHeaders, body) {
+    return new Promise((resolve, reject) => {
+        try {
+            const urlObj = new URL(url);
+            const isHttps = urlObj.protocol === 'https:';
+            const client = isHttps ? require('https') : require('http');
+
+            const headers = {};
+            if (rawHeaders) {
+                rawHeaders.split('\n').forEach(line => {
+                    const p = line.split(':');
+                    if (p.length >= 2) headers[p[0].trim()] = p.slice(1).join(':').trim();
+                });
+            }
+
+            const options = {
+                method: method,
+                hostname: urlObj.hostname,
+                port: urlObj.port || (isHttps ? 443 : 80),
+                path: urlObj.pathname + urlObj.search,
+                headers: headers
+            };
+
+            const req = client.request(options, (res) => {
+                let data = '';
+                res.on('data', (c) => data += c);
+                res.on('end', () => {
+                    resolve({ statusCode: res.statusCode, body: data });
+                });
+            });
+
+            req.on('error', (e) => reject(e));
+            if (body) req.write(body);
+            req.end();
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+function exportKillchainToKillbook() {
+    const timelineVal = document.getElementById('killchainConsole').innerText;
+    if (!timelineVal || timelineVal.includes('RUN CHAIN')) {
+        alert('Run the pipeline first to capture execution evidence.');
+        return;
+    }
+
+    const note = `### Visual Exploit Killchain Execution logs\n` +
+                 `\`\`\`text\n${timelineVal}\n\`\`\``;
+
+    const evidence = {
+        id: 'ev_' + Date.now(),
+        timestamp: new Date().toISOString(),
+        target: activeTarget || 'Killchain target',
+        panel: 'KILLCHAIN LOOM',
+        screenshot: '',
+        note: note,
+        tags: ['PoC']
+    };
+
+    killbookDb.unshift(evidence);
+    renderKillbookTimeline();
+    pushActivity('Visual exploit pipeline execution saved to Killbook', 'success');
+}
+
+// ── GHOST PROOF SUITE ──
+function renderGhostProofSuite() {
+    const list = document.getElementById('ghostProofCasesList');
+    list.innerHTML = '';
+
+    if (ghostProofCases.length === 0) {
+        list.innerHTML = '<div class="text-white/20 italic text-[10px] font-data-mono">No regression tests saved yet. Save a case from Strike Cast.</div>';
+        return;
+    }
+
+    ghostProofCases.forEach((tc, idx) => {
+        const div = document.createElement('div');
+        const isSelected = selectedGhostCaseIndex === idx;
+
+        div.className = `p-4 bg-white/5 border border-white/10 rounded hover:bg-white/10 transition-all cursor-pointer ${isSelected ? 'border-primary' : ''}`;
+        div.innerHTML = `
+            <div class="flex justify-between items-center text-[8px] text-white/30 mb-1">
+                <span>Rule: ${tc.matchRule}</span>
+                <span class="text-primary font-bold truncate max-w-[100px]">${tc.target}</span>
+            </div>
+            <h4 class="text-[10px] text-white font-bold uppercase truncate">${tc.name}</h4>
+            <p class="text-[9px] text-[#00ffc4]/80 truncate mt-1">${tc.request.method} ${tc.request.url}</p>
+            <div class="flex gap-2 mt-3 pt-2 border-t border-white/5 justify-end">
+                <button onclick="event.stopPropagation(); executeGhostRetest(${idx})" class="text-[#00ffc4] hover:underline uppercase text-[8px]">Retest</button>
+            </div>
+        `;
+        div.onclick = () => selectGhostCase(idx);
+        list.appendChild(div);
+    });
+}
+
+function selectGhostCase(idx) {
+    selectedGhostCaseIndex = idx;
+    
+    document.querySelectorAll('#ghostProofCasesList > div').forEach((div, i) => {
+        if (i === idx) div.classList.add('border-primary');
+        else div.classList.remove('border-primary');
+    });
+
+    const tc = ghostProofCases[idx];
+    document.getElementById('ghostMatchRule').value = tc.matchRule;
+    document.getElementById('ghostMatchValue').value = tc.matchValue;
+
+    document.getElementById('ghostProofDiffOutput').innerText = `Active Test Case: ${tc.name}\nExpected status code: ${tc.expected.status}\nExpected assertion pattern: ${tc.matchValue}`;
+}
+
+function updateSelectedGhostCaseRule() {
+    if (selectedGhostCaseIndex === null) return;
+    ghostProofCases[selectedGhostCaseIndex].matchRule = document.getElementById('ghostMatchRule').value;
+}
+
+function updateSelectedGhostCaseMatchVal() {
+    if (selectedGhostCaseIndex === null) return;
+    ghostProofCases[selectedGhostCaseIndex].matchValue = document.getElementById('ghostMatchValue').value;
+}
+
+function executeGhostRetest(idx) {
+    const tc = ghostProofCases[idx];
+    const diffArea = document.getElementById('ghostProofDiffOutput');
+
+    diffArea.innerText = `[Running Retest] Blasting request packet flow for: ${tc.name}...`;
+
+    try {
+        const urlObj = new URL(tc.request.url);
+        const isHttps = urlObj.protocol === 'https:';
+        const client = isHttps ? require('https') : require('http');
+
+        const options = {
+            method: tc.request.method,
+            hostname: urlObj.hostname,
+            port: urlObj.port || (isHttps ? 443 : 80),
+            path: urlObj.pathname + urlObj.search,
+            headers: tc.request.headers
+        };
+
+        const req = client.request(options, (res) => {
+            let body = '';
+            res.on('data', (c) => body += c);
+            res.on('end', () => {
+                let assertionPassed = false;
+                let reason = '';
+
+                if (tc.matchRule === 'status') {
+                    assertionPassed = String(res.statusCode) === String(tc.matchValue);
+                    reason = `Expected status: ${tc.matchValue}, Got: ${res.statusCode}`;
+                } else if (tc.matchRule === 'contains') {
+                    assertionPassed = body.includes(tc.matchValue);
+                    reason = `Expected body substring: "${tc.matchValue}" in response body.`;
+                } else {
+                    assertionPassed = body.trim() === tc.expected.body.trim();
+                    reason = `Exact body string checks.`;
+                }
+
+                if (assertionPassed) {
+                    diffArea.innerHTML = `<span class="text-[#00ffc4] font-bold">✅ RETEST PASSED</span>\n\n` +
+                                         `Assertion Rule: ${tc.matchRule}\n` +
+                                         `Verdict detail: ${reason}\n\n` +
+                                         `Response body preview:\n${body.substring(0, 1000)}`;
+                } else {
+                    diffArea.innerHTML = `<span class="text-primary font-bold">⚠️ RETEST FAILED - PATTERN DEVIATION</span>\n\n` +
+                                         `Assertion Rule: ${tc.matchRule}\n` +
+                                         `Verdict detail: ${reason}\n\n` +
+                                         `Response body preview:\n${body.substring(0, 1000)}`;
+                }
+            });
+        });
+
+        req.on('error', (err) => {
+            diffArea.innerText = `Retest execution failed: ${err.message}`;
+        });
+
+        if (tc.request.body) req.write(tc.request.body);
+        req.end();
+
+    } catch (e) {
+        diffArea.innerText = `Failed to execute: ${e.message}`;
+    }
+}

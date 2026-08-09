@@ -54,6 +54,9 @@ class PlainEmit:
         self._send(f"[✓] {msg}")
 
     # Visual / structural
+    def banner(self, title):
+        self._send(f"\n[=== {title} ===]")
+
     def section(self, title):
         self._send(f"\n── {title} ──")
 

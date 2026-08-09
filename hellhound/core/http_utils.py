@@ -89,14 +89,24 @@ def merge_global_context(options: dict, runtime_headers: dict = None) -> dict:
     Safely handles BugBounty headers and WAF bypasses.
     """
     headers = runtime_headers or {}
-    
-    # 1. Apply Global Headers (Bug Bounty IDs, etc.)
+
+    # 1. Check for researcher handle to inject X-Bugbounty header
+    handle = options.get("researcher_handle")
+    if not handle:
+        from hellhound.core.ai_utils import load_config
+        cfg = load_config()
+        handle = cfg.get("researcher_handle", "")
+    if handle and "X-Bugbounty" not in headers:
+        headers["X-Bugbounty"] = handle
+
+    # 2. Apply Global Headers (Bug Bounty IDs, etc.)
     gt = options.get("global_headers", {})
     if gt:
         headers.update(gt)
     
-    # 2. Apply WAF Bypasses if requested
+    # 3. Apply WAF Bypasses if requested
     if options.get("enable_waf_bypass"):
         headers.update(get_waf_bypass_header())
         
     return headers
+

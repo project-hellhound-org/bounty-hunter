@@ -225,35 +225,28 @@ def _render_vulns(module_name, intel):
         for v in vulns: _vuln_block(v)
     _render_remaining_intel(intel, ["vulnerabilities"])
 
-def _render_jwt(intel):
-    jwts = intel.get("jwts", [])
-    if not jwts: return
-    _section(f"JWTdetector — JWT Analysis ({len(jwts)})")
-    for j in jwts:
-        print(f"\n      {CY}[JWT]{R} {CW}Source: {j.get('source', 'unknown')}{R}")
-        
-        # TOP: Original Token Data
-        for key in ("original_header", "original_payload"):
-            if j.get(key):
-                print(f"        {CC}{key.title().replace('_', ' ')}:{R}")
-                print(_pretty_data(j[key], indent=12))
+def _render_agent_findings(intel, risk_score=0):
+    """Renders structured findings identified and confirmed by the AI reasoning loop."""
+    findings = intel.get("findings", []) or intel.get("vulnerabilities", [])
+    if isinstance(intel, list):
+        findings = intel
+    if not findings:
+        return
+    _section(f"Agent Findings — Validated Triage ({len(findings)})")
+    
+    # Group findings by severity
+    by_sev = defaultdict(list)
+    for f in findings:
+        if isinstance(f, dict):
+            sev = str(f.get("severity", f.get("confidence", "INFO"))).upper()
+            by_sev[sev].append(f)
+        else:
+            by_sev["INFO"].append({"finding_type": str(f), "severity": "INFO"})
 
-        # MIDDLE: Vulnerabilities Found
-        if j.get("vulnerabilities"):
-            print(f"        {CR}Vulnerabilities:{R}")
-            for v in j["vulnerabilities"]: _bullet(v, indent=10, color=CR)
-        
-        # PROOF: Active Exploits
-        if j.get("active_verifications"):
-             print(f"        {CC}Active Verifications (Exploits):{R}")
-             print(_pretty_data(j["active_verifications"], indent=12))
-
-        # END: Sensitive Information
-        if j.get("sensitive_claims"):
-            print(f"        {CY}Sensitive Claims Discovery:{R}")
-            print(_pretty_data(j["sensitive_claims"], indent=12))
-
-    _render_remaining_intel(intel, ["jwts"])
+    for sev_level in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        items = by_sev.get(sev_level, [])
+        for item in items:
+            _vuln_block(item)
 
 def _render_blob(intel):
     files = intel.get("reconstructed", intel.get("recovered_files", intel.get("files", [])))
@@ -284,13 +277,6 @@ def _render_source_auditor(intel):
         for f in findings: _vuln_block(f)
     _render_remaining_intel(intel, ["vulnerabilities", "findings", "reconstructed_files"])
 
-def _render_idor(intel):
-    findings = intel.get("vulnerabilities", [])
-    if findings:
-        _section("IDORdetector — Findings")
-        for f in findings: _vuln_block(f)
-    _render_remaining_intel(intel, ["vulnerabilities"])
-
 def _render_generic(module_name, intel):
     _section(f"{module_name} — Intelligence")
     _render_remaining_intel(intel, [])
@@ -300,20 +286,15 @@ def _render_generic(module_name, intel):
 # ═══════════════════════════════════════════════════════════════════════
 
 MODULE_RENDERERS = {
+    "agent":            lambda intel, rs: _render_agent_findings(intel, rs),
+    "agent_findings":   lambda intel, rs: _render_agent_findings(intel, rs),
     "spider":           lambda intel, rs: _render_spider(intel, rs),
     "corsbuster":       lambda intel, rs: _render_vulns("CORSbuster", intel),
-    "xsstrike":         lambda intel, rs: _render_vulns("XSStrike", intel),
-    "sqlidetector":     lambda intel, rs: _render_vulns("SQLIdetector", intel),
-    "ssrfdetector":     lambda intel, rs: _render_vulns("SSRFdetector", intel),
-    "sstidetector":     lambda intel, rs: _render_vulns("SSTIdetector", intel),
-    "csrfdetector":     lambda intel, rs: _render_vulns("CSRFdetector", intel),
-    "pathtraveller":    lambda intel, rs: _render_vulns("PATHtraveller", intel),
-    "openredirect":     lambda intel, rs: _render_vulns("OpenRedirect", intel),
-    "xxedetector":      lambda intel, rs: _render_vulns("XXEdetector", intel),
-    "idordetector":     lambda intel, rs: _render_idor(intel),
-    "jwtdetector":      lambda intel, rs: _render_jwt(intel),
     "sourceauditor":    lambda intel, rs: _render_source_auditor(intel),
+    "surfaceauditor":   lambda intel, rs: _render_generic("SurfaceAuditor", intel),
     "blobunpacker":     lambda intel, rs: _render_blob(intel),
+    "wafbuster":        lambda intel, rs: _render_generic("WAFbuster", intel),
+    "exmap":            lambda intel, rs: _render_generic("Exmap", intel),
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -333,7 +314,7 @@ def render_loot(target, all_results):
         if not isinstance(output, dict): continue
         intel = output.get("intel", {})
         total_risk += output.get("risk_score", 0)
-        for vk in ("vulnerabilities", "findings", "cors_vulnerabilities", "cves", "jwts"):
+        for vk in ("vulnerabilities", "findings", "cors_vulnerabilities", "cves", "agent_findings"):
             vlist = intel.get(vk, [])
             if isinstance(vlist, list): total_vulns += len(vlist)
 
@@ -341,7 +322,7 @@ def render_loot(target, all_results):
     _kv("Issues Found", f"{total_vulns}")
     _kv("Modules Run", f"{len(all_results)}")
 
-    prio = ["spider", "stalk", "fuzzhunter", "techprofiler", "wafbuster"]
+    prio = ["agent", "agent_findings", "spider", "stalk", "fuzzhunter", "techprofiler", "wafbuster", "surfaceauditor", "exmap"]
     sorted_mods = sorted(all_results.keys(), key=lambda x: prio.index(x) if x in prio else 99)
 
     for mod in sorted_mods:
@@ -360,7 +341,6 @@ def render_loot(target, all_results):
     w = get_w()
     print(f"\n{CR}{'=' * w}{R}")
     print(f"  {CW}Use 'loot --json' for raw export  |  'loot --export' to save report{R}")
-    print(f"  {CW}Use 'howl' for AI-powered attack chain correlation{R}")
     print(f"{CR}{'=' * w}{R}\n")
 
 def process_framework_results(results_dict):
@@ -369,7 +349,7 @@ def process_framework_results(results_dict):
         if not isinstance(output, dict): continue
         intel = output.get("intel", {})
         for vk in ("vulnerabilities", "findings", "cors_vulnerabilities", 
-                    "cves", "cmdinj_vulnerabilities", "jwts", "assets", "secrets"):
+                    "cves", "assets", "secrets", "agent_findings"):
             items = intel.get(vk, [])
             if isinstance(items, list):
                 for item in items:

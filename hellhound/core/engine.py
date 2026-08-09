@@ -133,16 +133,22 @@ class HellhoundEngine:
         self.emit.success(f"External module '{name}' completed")
         return output
 
-    # =================================================
-    # Module Loader
-    # =================================================
-
     def load_module(self, name):
+        norm_target = name.lower().replace("_", "").replace("-", "")
         for category in self.module_categories:
             try:
-                return importlib.import_module(
-                    f"hellhound.modules.{category}.{name}"
-                )
+                # Direct match attempt
+                return importlib.import_module(f"hellhound.modules.{category}.{name}")
             except ModuleNotFoundError:
+                pass
+            
+            # Case-insensitive / normalized lookup
+            try:
+                cat_pkg = importlib.import_module(f"hellhound.modules.{category}")
+                for _, mod_name, _ in pkgutil.iter_modules(cat_pkg.__path__):
+                    if mod_name.lower().replace("_", "").replace("-", "") == norm_target:
+                        return importlib.import_module(f"hellhound.modules.{category}.{mod_name}")
+            except Exception:
                 continue
+
         raise ImportError(f"Module '{name}' not found")

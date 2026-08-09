@@ -65,7 +65,7 @@ IMPACT_SCORES = {
 ATTACK_CHAINS = {
     "OBJECT_IDENTIFIER": {
         "chains": ["IDOR", "BOLA", "Mass Assignment", "Insecure Direct Reference"],
-        "auditor": "idordetector",
+        "auditor": "idor_analysis",
         "impact_path": "Object enumeration → unauthorized data access → PII/account takeover",
         "questions": [
             "Is this ID predictable/sequential?",
@@ -75,7 +75,7 @@ ATTACK_CHAINS = {
     },
     "EXTERNAL_SINK": {
         "chains": ["Open Redirect", "SSRF", "OAuth Token Theft", "Phishing"],
-        "auditor": "redirector",
+        "auditor": "redirect_analysis",
         "impact_path": "Open redirect → OAuth flow hijack → account takeover",
         "questions": [
             "Is this in an OAuth callback flow?",
@@ -85,7 +85,7 @@ ATTACK_CHAINS = {
     },
     "PATH_REFERENCE": {
         "chains": ["LFI", "Path Traversal", "RFI", "Template Injection"],
-        "auditor": "pathtraveller",
+        "auditor": "path_traversal_analysis",
         "impact_path": "Path traversal → /etc/passwd → SSH keys → RCE",
         "questions": [
             "Does the server reflect file content?",
@@ -95,7 +95,7 @@ ATTACK_CHAINS = {
     },
     "ADMIN_FLAG": {
         "chains": ["Privilege Escalation", "RBAC Bypass", "Mass Assignment"],
-        "auditor": "rbac",
+        "auditor": "privilege_analysis",
         "impact_path": "Boolean flag flip → admin access → full account control",
         "questions": [
             "Is this sent in a POST body or header?",
@@ -105,7 +105,7 @@ ATTACK_CHAINS = {
     },
     "AUTH_PARAM": {
         "chains": ["Token Leakage", "Session Fixation", "JWT Attack", "Replay Attack"],
-        "auditor": "jwt_analyzer",
+        "auditor": "auth_analysis",
         "impact_path": "Credential in URL/param → logged → replayed → account takeover",
         "questions": [
             "Is this value logged server-side in plaintext?",
@@ -115,7 +115,7 @@ ATTACK_CHAINS = {
     },
     "GRAPHQL_INTROSPECTABLE": {
         "chains": ["Schema Disclosure", "Batch Query Abuse", "IDOR via aliases", "Mutation Injection"],
-        "auditor": "graphql_auditor",
+        "auditor": "graphql_analysis",
         "impact_path": "Introspection → full schema → IDOR mutations → data exfiltration",
         "questions": [
             "Is introspection enabled in production?",
@@ -125,7 +125,7 @@ ATTACK_CHAINS = {
     },
     "HIGH_ENTROPY": {
         "chains": ["Token Brute Force", "Hash Cracking", "Predictable Secret"],
-        "auditor": "entropy_auditor",
+        "auditor": "entropy_analysis",
         "impact_path": "Weak random → predictable token → account takeover without authentication",
         "questions": [
             "Is this a reset token or invite link?",
@@ -585,7 +585,7 @@ class HydraEngine:
                         "urls":        urls,
                         "impact":      IMPACT_SCORES["BOLA_CHAIN"],
                         "description": f"ID param '{norm_name}' straddles authenticated and unauthenticated endpoints — classic BOLA surface.",
-                        "auditor":     "idordetector",
+                        "auditor":     "idor_analysis",
                     })
 
             # ── Redirect Chain — URL param near auth/OAuth ───────────────────
@@ -598,7 +598,7 @@ class HydraEngine:
                         "urls":        urls,
                         "impact":      IMPACT_SCORES["OAUTH_CALLBACK_SINK"],
                         "description": f"Redirect param '{norm_name}' appears in auth/OAuth flow — open redirect → token theft → ATO.",
-                        "auditor":     "redirector",
+                        "auditor":     "redirect_analysis",
                     })
                 else:
                     logic_findings.append({
@@ -607,7 +607,7 @@ class HydraEngine:
                         "urls":        urls,
                         "impact":      IMPACT_SCORES["EXTERNAL_SINK"],
                         "description": f"Redirect param '{norm_name}' appears across {len(urls)} endpoints — test for open redirect and SSRF.",
-                        "auditor":     "redirector",
+                        "auditor":     "redirect_analysis",
                     })
 
             # ── Privilege Chain — admin/role param on user-facing endpoint ───
@@ -618,7 +618,7 @@ class HydraEngine:
                     "urls":        urls,
                     "impact":      IMPACT_SCORES["PRIVILEGE_CHAIN"],
                     "description": f"Admin/role param '{norm_name}' visible on {len(urls)} endpoints — test for mass assignment and privilege escalation.",
-                    "auditor":     "rbac",
+                    "auditor":     "privilege_analysis",
                 })
 
             # ── Generic Cross-Context for remaining high-impact roles ─────────
@@ -629,7 +629,7 @@ class HydraEngine:
                     "urls":        urls,
                     "impact":      IMPACT_SCORES["SENSITIVE_DATA"],
                     "description": f"Sensitive param '{norm_name}' appears across {len(urls)} endpoints — check for token reuse and session fixation.",
-                    "auditor":     "jwt_analyzer",
+                    "auditor":     "auth_analysis",
                 })
 
         # Sort logic findings by impact descending
@@ -777,13 +777,13 @@ async def _run_async(target, emit, options=None):
     # Build signals list cleanly (no None pollution)
     signals = ["SURFACE_MAPPED"]
     auditor_signals = {
-        "idordetector":     "IDOR_SURFACE_FOUND",
-        "pathtraveller":    "LFI_SURFACE_FOUND",
-        "redirector":       "OPEN_REDIRECT_SURFACE_FOUND",
-        "rbac":             "PRIVILEGE_SURFACE_FOUND",
-        "jwt_analyzer":     "AUTH_SURFACE_FOUND",
-        "graphql_auditor":  "GRAPHQL_SURFACE_FOUND",
-        "entropy_auditor":  "HIGH_ENTROPY_SURFACE_FOUND",
+        "idor_analysis":            "IDOR_SURFACE_FOUND",
+        "path_traversal_analysis":   "LFI_SURFACE_FOUND",
+        "redirect_analysis":        "OPEN_REDIRECT_SURFACE_FOUND",
+        "privilege_analysis":       "PRIVILEGE_SURFACE_FOUND",
+        "auth_analysis":            "AUTH_SURFACE_FOUND",
+        "graphql_analysis":         "GRAPHQL_SURFACE_FOUND",
+        "entropy_analysis":         "HIGH_ENTROPY_SURFACE_FOUND",
     }
     seen_auditors = set(f.get("recommended_auditor") for f in all_findings if f.get("recommended_auditor"))
     for auditor_name, signal in auditor_signals.items():
