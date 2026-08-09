@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
-  <a href="https://github.com/project-hellhound-org/Hellhound-Pentest/releases"><img src="https://img.shields.io/badge/Release-Bounty%20Hunter-red?style=flat-square" alt="Release Version"/></a>
+  <a href="https://github.com/project-hellhound-org/bounty-hunter/releases"><img src="https://img.shields.io/badge/Release-Bounty%20Hunter-red?style=flat-square" alt="Release Version"/></a>
   <img src="https://img.shields.io/badge/AI--Powered-Gemini%20%7C%20NVIDIA%20NIM%20%7C%20Ollama-red?style=flat-square" alt="AI Support"/>
   <img src="https://img.shields.io/badge/Recon-Shuffledns%20%7C%20FFUF%20%7C%20Subfinder%20%7C%20HTTPX-orange?style=flat-square" alt="Recon Toolchain"/>
   <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License"/>
@@ -71,7 +71,7 @@ Hellhound is engineered for high-performance operations across multiple environm
 
 ```bash
 # Clone the repository into bounty-hunter directory
-git clone https://github.com/project-hellhound-org/Hellhound-Pentest.git bounty-hunter
+git clone https://github.com/project-hellhound-org/bounty-hunter.git
 cd bounty-hunter
 
 # Run the installer
