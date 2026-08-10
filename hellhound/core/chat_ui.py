@@ -70,22 +70,34 @@ def render_banner_card(target_name: Optional[str] = None):
         recent_targets = [curr_target]
     recent_str = ", ".join(recent_targets) if recent_targets else "No recent targets"
 
-    title = " Hellhound Bounty Hunter "
+    title = " Bounty Hunter "
     # Top line total inner span = col1_w + col2_w + 5
     top_dashes = (col1_w + col2_w + 5) - len(title) - 1
     top_line = f"╭─{C_RED_MAIN}{title}{C_RED_ACCENT}" + ("─" * max(0, top_dashes)) + "╮"
 
     # Column 1 Lines (Left Pane)
+    def center_ansi(text: str, width: int) -> str:
+        raw_len = len(re_strip_ansi(text))
+        if raw_len >= width:
+            return text
+        pad = (width - raw_len) // 2
+        rem = width - raw_len - pad
+        return (" " * pad) + text + (" " * rem)
+
     c1_lines = [
         "",
-        f"{C_TEXT_WHITE}Welcome back, Researcher!{RST}".center(col1_w + 9),
+        center_ansi(f"{C_TEXT_WHITE}Welcome back, Researcher!{RST}", col1_w),
         "",
-        f"{C_RED_MAIN}▲   ▲{RST}".center(col1_w + 9),
-        f"{C_RED_ACCENT}(▼ ᴥ ▼){RST}".center(col1_w + 9),
-        f"{C_RED_MAIN}/ █ \\{RST}".center(col1_w + 9),
+        center_ansi(f"{C_RED_MAIN}▲                 ▲{RST}", col1_w),
+        center_ansi(f"{C_RED_ACCENT}/█\\   .───────.   /█\\{RST}", col1_w),
+        center_ansi(f"{C_RED_MAIN}/███\\_/  ▄   ▄  \\_/███\\{RST}", col1_w),
+        center_ansi(f"{C_RED_ACCENT}< ◥███   {C_TEXT_WHITE}(●) (●){C_RED_ACCENT}   ███◤ >{RST}", col1_w),
+        center_ansi(f"{C_RED_MAIN}\\ ◥██    \\___/    ██◤ /{RST}", col1_w),
+        center_ansi(f"{C_RED_ACCENT}\\__ \\_  ▲ ▲ ▲  _/ __/{RST}", col1_w),
+        center_ansi(f"{C_RED_MAIN}\\__\\ ▼ ▼ ▼ /__/{RST}", col1_w),
         "",
-        f"{C_TEXT_DIM}{active_model} ({active_prov}){handle_str}{RST}".center(col1_w + 14),
-        f"{C_TEXT_DIM}Target: {C_TEXT_WHITE}{curr_target[:18]}{C_TEXT_DIM} • {C_CYAN}{scope_status}{RST}".center(col1_w + 24),
+        center_ansi(f"{C_TEXT_DIM}{active_model} ({active_prov}){handle_str}{RST}", col1_w),
+        center_ansi(f"{C_TEXT_DIM}Target: {C_TEXT_WHITE}{curr_target[:18]}{C_TEXT_DIM} • {C_CYAN}{scope_status}{RST}", col1_w),
         ""
     ]
 
@@ -138,22 +150,17 @@ def re_strip_ansi(text: str) -> str:
 
 
 def render_response_bubble(response_text: str, sender: str = "HELLHOUND"):
-    w = get_terminal_width()
-    card_w = min(w - 4, 96)
-    inner_w = card_w - 4
-    
-    print(f"\n {C_RED_ACCENT}┌── {C_TEXT_WHITE}{sender}{C_RED_ACCENT} " + ("─" * max(0, card_w - len(sender) - 6)) + f"┐{RST}")
-    for line in response_text.strip().splitlines():
-        clean = re_strip_ansi(line)
-        if not clean.strip():
-            print(f" {C_RED_ACCENT}│{RST}  {' ' * inner_w} {C_RED_ACCENT}│{RST}")
-            continue
-        wrapped = textwrap.wrap(line, width=inner_w, break_long_words=True, break_on_hyphens=False) if clean.strip() else [""]
-        for wl in wrapped:
-            vis_len = len(re_strip_ansi(wl))
-            pad = " " * max(0, inner_w - vis_len)
-            print(f" {C_RED_ACCENT}│{RST}  {wl}{pad} {C_RED_ACCENT}│{RST}")
-    print(f" {C_RED_ACCENT}└" + ("─" * (card_w - 2)) + f"┘{RST}\n")
+    if not response_text or not response_text.strip():
+        return
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        console = Console()
+        print()
+        console.print(Markdown(response_text.strip()))
+        print()
+    except Exception:
+        print(f"\n{response_text.strip()}\n")
 
 
 def start_chat_session(initial_target: Optional[str] = None):

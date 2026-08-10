@@ -130,157 +130,8 @@ function classifyLine(line) {
     return null;
 }
 
-// ── CONSOLE ENGINE CLASS ────────────────────────────────────────────────────
-// Each engine is an independent hellhound console process with its own
-// command queue. opsEngine handles strikes; intelEngine handles AI.
-// They never block each other.
-
-class ConsoleEngine {
-    constructor(name, onReady, onLine, onExit) {
-        this.name = name;
-        this.onReady = onReady;  // () => void
-        this.onLine = onLine;    // (filteredLine) => void — streaming output
-        this.onExit = onExit;    // (code) => void
-
-        this.proc = null;
-        this.ready = false;
-        this.queue = [];
-        this.busy = false;
-        this.current = null;
-        this.buffer = ''; // Stream buffer for prompt detection
-        this.captureBuffer = '';
-        this.promptsSeen = 0;
-        this.currentTarget = '';
-    }
-
-    spawn() {
-        const bin = getHellhoundBin();
-        this.proc = spawn(bin, ['console'], {
-            env: { ...process.env, PYTHONUNBUFFERED: '1' },
-            stdio: ['pipe', 'pipe', 'pipe']
-        });
-
-        this.proc.stdout.on('data', (data) => this._handleData(data));
-        this.proc.stderr.on('data', (data) => {
-            const filtered = filterLine(data.toString().replace(ANSI_RE, '').replace(/\r/g, '').trim());
-            if (filtered && this.current?.streaming && this.onLine) {
-                this.onLine(filtered);
-            }
-        });
-        this.proc.on('close', (code) => {
-            this.ready = false;
-            this.proc = null;
-            if (this.onExit) this.onExit(code);
-        });
-    }
-
-    _handleData(data) {
-        this.buffer += data.toString();
-        
-        // Handle streaming output for active tasks
-        if (this.current?.streaming && this.onLine) {
-            const lines = this.buffer.split('\n');
-            this.buffer = lines.pop(); // Hold incomplete tail
-            lines.forEach(l => {
-                const filtered = filterLine(l.replace(ANSI_RE, '').replace(/\r/g, '').trim());
-                if (filtered) this.onLine(filtered);
-            });
-        }
-
-        // Dynamic prompt detection (Console Path)
-        if (PROMPT_RE.test(this.buffer.trimEnd())) {
-            const out = this.buffer;
-            this.buffer = '';
-            
-            if (!this.ready) {
-                this.ready = true;
-                if (this.onReady) this.onReady(this.name);
-                this._drain();
-            }
-
-            if (this.current) {
-                this.promptsSeen++;
-                if (this.promptsSeen >= this.current.promptsExpected) {
-                    const task = this.current;
-                    this.current = null;
-                    this.busy = false;
-                    this.promptsSeen = 0;
-                    if (task.onDone) task.onDone(out);
-                    this._drain();
-                }
-            }
-        }
-    }
-
-    enqueue(entry) {
-        if (!entry.promptsExpected) entry.promptsExpected = entry.lines.length;
-        this.queue.push(entry);
-        this._drain();
-    }
-
-    _drain() {
-        if (this.busy || this.queue.length === 0 || !this.ready) return;
-        this.busy = true;
-        this.current = this.queue.shift();
-        this.promptsSeen = 0;
-        this.current.lines.forEach(l => this.write(l));
-    }
-
-    write(line) {
-        if (this.proc && this.proc.stdin.writable) {
-            this.proc.stdin.write(line + '\n');
-        }
-    }
-
-    setPrey(target) {
-        if (target && target !== this.currentTarget) {
-            this.currentTarget = target;
-            this.enqueue({ lines: [`prey ${target}`], promptsExpected: 1, streaming: false });
-        }
-    }
-
-    kill() {
-        if (this.proc) {
-            try { this.proc.kill('SIGINT'); } catch (_) {}
-        }
-    }
-
-    isReady() { return this.ready && !!this.proc; }
-}
-
-// ── DUAL ENGINE INSTANCES ──────────────────────────────────────────────────
-let opsEngine = null;    // strikes, options, repro
-let intelEngine = null;  // ask, analyze, howl, handshake
-
-function spawnEngines() {
-    opsEngine = new ConsoleEngine(
-        'ops',
-        (name) => {
-            safeSend('console-ready', { engine: name });
-        },
-        (line) => {
-            // Streaming ops output → ops feed + telemetry classifier
-            safeSend('proc-out', { pid: opsEngine.proc?.pid || -1, data: line + '\n' });
-            const ev = classifyLine(line);
-            if (ev) safeSend('telemetry-event', ev);
-        },
-        (code) => {
-            safeSend('proc-exit', { pid: -1, code: code || 0 });
-        }
-    );
-
-    intelEngine = new ConsoleEngine(
-        'intel',
-        (name) => {
-            safeSend('console-ready', { engine: name });
-        },
-        null, // intel never streams — always capture
-        null
-    );
-
-    opsEngine.spawn();
-    intelEngine.spawn();
-}
+// ── STATELESS STRIKE TRACKER ────────────────────────────────────────────────
+let activeStrikeProcess = null;
 
 // ── WINDOW ─────────────────────────────────────────────────────────────────
 function createWindow() {
@@ -297,26 +148,29 @@ function createWindow() {
     });
     mainWindow.loadFile('app.html');
     
-    // Force a micro-resize to trigger repaint on Linux compositor
+    // Force a micro-resize to trigger repaint on Linux compositor and signal readiness
     mainWindow.webContents.on('did-finish-load', () => {
         setTimeout(() => {
             if (mainWindow) {
                 const [w, h] = mainWindow.getSize();
                 mainWindow.setSize(w + 1, h);
                 mainWindow.setSize(w, h);
+                safeSend('console-ready', { engine: 'ops' });
+                safeSend('console-ready', { engine: 'intel' });
             }
         }, 150);
     });
 
     mainWindow.on('closed', () => { mainWindow = null; });
-    spawnEngines();
 }
 
 app.whenReady().then(createWindow);
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', () => {
-    if (opsEngine) { try { opsEngine.write('exit'); opsEngine.kill(); } catch (_) {} }
-    if (intelEngine) { try { intelEngine.write('exit'); intelEngine.kill(); } catch (_) {} }
+    if (activeStrikeProcess) {
+        try { activeStrikeProcess.kill('SIGKILL'); } catch (_) {}
+        activeStrikeProcess = null;
+    }
 });
 
 // ── IPC HANDLERS ───────────────────────────────────────────────────────────
@@ -353,9 +207,14 @@ ipcMain.on('strike-confirmed', (event, payload) => {
     
     event.reply('proc-started', { pid: 1, module: module });
     
+    if (activeStrikeProcess) {
+        try { activeStrikeProcess.kill('SIGINT'); } catch (_) {}
+    }
+
     const child = spawn(bin, ['--print', `/scan ${module} ${target}`], {
         env: { ...process.env, PYTHONUNBUFFERED: '1' }
     });
+    activeStrikeProcess = child;
     
     child.stdout.on('data', (data) => {
         const str = data.toString();
@@ -372,32 +231,27 @@ ipcMain.on('strike-confirmed', (event, payload) => {
     });
     
     child.on('close', (code) => {
+        if (activeStrikeProcess === child) activeStrikeProcess = null;
         safeSend('proc-exit', { pid: child.pid, code: code || 0 });
     });
 });
 
 // 4. Abort
 ipcMain.on('abort-strike', () => {
-    opsEngine.enqueue({ lines: ['release'], promptsExpected: 1, streaming: false });
+    if (activeStrikeProcess) {
+        try { activeStrikeProcess.kill('SIGINT'); } catch (_) {}
+        activeStrikeProcess = null;
+    }
+    safeSend('proc-exit', { pid: -1, code: 0 });
 });
 
 // 5. Kill running strike
 ipcMain.on('kill-proc', () => {
-    if (opsEngine) {
-        opsEngine.kill();
-        setTimeout(() => {
-            opsEngine = new ConsoleEngine('ops',
-                () => safeSend('console-ready', { engine: 'ops' }),
-                (line) => {
-                    safeSend('proc-out', { pid: -1, data: line + '\n' });
-                    const ev = classifyLine(line);
-                    if (ev) safeSend('telemetry-event', ev);
-                },
-                null
-            );
-            opsEngine.spawn();
-        }, 500);
+    if (activeStrikeProcess) {
+        try { activeStrikeProcess.kill('SIGKILL'); } catch (_) {}
+        activeStrikeProcess = null;
     }
+    safeSend('proc-exit', { pid: -1, code: 0 });
 });
 
 // 6. Loot Polling — recursive scan to find nested loot files
@@ -638,9 +492,6 @@ ipcMain.on('save-target', (event, url) => {
         fs.writeFileSync(HISTORY_FILE, JSON.stringify(history.slice(0, 20)));
     }
     event.reply('history-data', history);
-    // Sync prey to both engines when target changes
-    if (opsEngine) opsEngine.setPrey(url);
-    if (intelEngine) intelEngine.setPrey(url);
 });
 
 ipcMain.on('get-history', (event) => {
@@ -649,27 +500,37 @@ ipcMain.on('get-history', (event) => {
     }
 });
 
-// 8. Repro — routed to opsEngine
+// 8. Repro
 ipcMain.on('run-repro', (event, { cmd }) => {
-    opsEngine.enqueue({
-        lines: [cmd],
-        promptsExpected: 1,
-        streaming: true,
-        onDone: () => safeSend('repro-done', { code: 0 })
+    const bin = getHellhoundBin();
+    exec(`${bin} --print "${cmd}"`, (error, stdout, stderr) => {
+        const out = stdout || stderr || '';
+        safeSend('proc-out', { pid: 0, data: out + '\n' });
+        safeSend('repro-done', { code: error ? 1 : 0 });
     });
 });
 
-// 9. Settings sync — each command queued individually on both engines
+// 9. Settings sync
 ipcMain.on('sync-settings-to-console', (event, settings) => {
-    const cmds = [];
-    if (settings.proxy)     cmds.push(`proxy ${settings.proxy}`);
-    if (settings.oob)       cmds.push(`setg oob ${settings.oob}`);
-    if (settings.bugbounty) cmds.push(`setg bugbounty ${settings.bugbounty}`);
-    // AI is handled exclusively via ai-handshake channel — do NOT set here
-    cmds.forEach(cmd => {
-        if (opsEngine)   opsEngine.enqueue({   lines: [cmd], promptsExpected: 1, streaming: false });
-        if (intelEngine) intelEngine.enqueue({ lines: [cmd], promptsExpected: 1, streaming: false });
-    });
+    const configPath = path.join(process.env.HOME || '', '.hellhound', 'config.json');
+    try {
+        let config = {};
+        if (fs.existsSync(configPath)) {
+            config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        }
+        if (settings.bugbounty) config.researcher_handle = settings.bugbounty;
+        if (settings.ai_provider) config.ai_provider = settings.ai_provider.toLowerCase();
+        if (settings.ai_key && settings.ai_key !== 'local') config.api_key = settings.ai_key;
+        if (settings.proxy) config.proxy = settings.proxy;
+        if (settings.oob) config.oob = settings.oob;
+        if (settings.wafbypass) config.wafbypass = settings.wafbypass;
+        
+        const dir = path.dirname(configPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+    } catch (e) {
+        console.error("Failed to persist settings:", e);
+    }
 });
 
 ipcMain.on('exec-repro', (event, payload) => {
@@ -711,8 +572,6 @@ ipcMain.on('exec-repro', (event, payload) => {
     });
 });
 
-// ── AI HANDLERS — all via intelEngine (never blocks opsEngine) ─────────────
-
 // ── AI HANDLERS ────────────────────────────────────────────────────────────
 ipcMain.on('ai-handshake', (event, payload) => {
     let key = typeof payload === 'string' ? payload : (payload.key || 'local');
@@ -734,7 +593,7 @@ ipcMain.on('ai-ask', (event, question) => {
 ipcMain.on('ai-analyze', (event, target) => {
     const sanitizedTarget = (target || '').replace(/\r?\n/g, ' ').trim();
     const bin = getHellhoundBin();
-    exec(`${bin} --print "/howl"`, { maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
+    exec(`${bin} --print "/howl ${sanitizedTarget}"`, { maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
         const out = stdout || stderr || 'Analysis complete.';
         event.reply('ai-response', deepCleanOutput(out));
     });
@@ -761,43 +620,34 @@ ipcMain.on('get-attack-graph', (event) => {
 });
 
 ipcMain.on('get-arsenal', (event) => {
-    opsEngine.enqueue({
-        lines: ['arsenal'],
-        promptsExpected: 1,
-        streaming: false,
-        onDone: (out) => event.reply('arsenal-data', out)
+    const bin = getHellhoundBin();
+    exec(`${bin} --print "/help"`, (error, stdout) => {
+        event.reply('arsenal-data', stdout || '');
     });
 });
 
 ipcMain.on('get-status', (event) => {
-    opsEngine.enqueue({
-        lines: ['status'],
-        promptsExpected: 1,
-        streaming: false,
-        onDone: (out) => event.reply('status-data', out)
+    const bin = getHellhoundBin();
+    exec(`${bin} --print "/setup"`, (error, stdout) => {
+        event.reply('status-data', stdout || '');
     });
 });
 
 // Intel selection — send selection number(s) as analyze argument
 ipcMain.on('intel-selection-confirmed', (event, selection) => {
-    intelEngine.enqueue({
-        lines: [`analyze ${selection}`],
-        promptsExpected: 1,
-        streaming: false,
-        onDone: (out) => safeSend('ai-response', out || 'Analysis complete.')
+    const bin = getHellhoundBin();
+    const sanitizedSelection = (selection || '').replace(/\r?\n/g, ' ').replace(/"/g, '\\"');
+    exec(`${bin} --print "/ask Analyze these findings in detail: ${sanitizedSelection}"`, { maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
+        const out = stdout || stderr || 'Analysis complete.';
+        safeSend('ai-response', deepCleanOutput(out));
     });
 });
 
-
 ipcMain.on('check-ai-status', (event) => {
-    if (!intelEngine || !intelEngine.isReady()) {
-        event.reply('ai-status-result', '[!] Intel engine not ready yet.'); return;
-    }
-    if (intelEngine.busy) {
-        event.reply('ai-status-result', '[*] Engine busy (AI activation in progress). Try again shortly.'); return;
-    }
-    // Use direct 'options' command for actual status
-    intelEngine.enqueue({ lines: ['options'], promptsExpected: 1, streaming: false, onDone: (out) => event.reply('ai-status-result', out || '') });
+    const bin = getHellhoundBin();
+    exec(`${bin} --print "/setup"`, { maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
+        event.reply('ai-status-result', stdout || stderr || '');
+    });
 });
 
 // Intel Center — build structured finding cards from synced session data
@@ -876,7 +726,7 @@ ipcMain.on('get-intel-targets', (event) => {
     }
 });
 
-// 11. Export session
+// 11. Export session & Save Loot
 ipcMain.on('export-session', (event, { filename, content }) => {
     try {
         if (!fs.existsSync(LOOT_DIR)) fs.mkdirSync(LOOT_DIR, { recursive: true });
@@ -884,6 +734,15 @@ ipcMain.on('export-session', (event, { filename, content }) => {
         fs.writeFileSync(outputPath, content, 'utf8');
         safeSend('export-done', { path: outputPath });
     } catch (e) { console.error('Export failed:', e); }
+});
+
+ipcMain.on('save-loot-file', (event, { filename, content }) => {
+    try {
+        if (!fs.existsSync(LOOT_DIR)) fs.mkdirSync(LOOT_DIR, { recursive: true });
+        const outputPath = path.join(LOOT_DIR, filename);
+        fs.writeFileSync(outputPath, content, 'utf8');
+        event.reply('save-loot-file-done', { path: outputPath });
+    } catch (e) { console.error('Save loot failed:', e); }
 });
 
 ipcMain.on('open-loot-dir', () => {

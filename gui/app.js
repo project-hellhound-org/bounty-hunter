@@ -171,7 +171,7 @@ function switchIntelTab(tabId, el) {
 // ── INTEL CENTER LOGIC ────────────────────────────────────────────────
 let selectedIntelTargets = new Set();
 let lastIntelTargets = [];
-const SPIDER_DEPENDENT_MODULES = ['Hydra', 'IDORdetector', 'RBACdetector', 'CORSbuster', 'SQLI_Tester', 'PATHtraveller', 'JWTdetector', 'Spider_Analyzer'];
+const SPIDER_DEPENDENT_MODULES = ['Hydra', 'CORSbuster', 'SurfaceAuditor', 'SourceAuditor'];
 
 function showNotification(title, message, actionText = '', actionFn = null) {
     const notify = document.getElementById('notificationBox');

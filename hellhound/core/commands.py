@@ -625,6 +625,46 @@ def handle_ask(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
     return {"status": "success", "question": question, "response": answer}
 
 
+def handle_howl(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """
+    /howl [--graph]
+    AI attack correlation and attack graph synthesis.
+    """
+    is_json = "--json" in args or getattr(emit, "json_mode", False)
+    is_graph = "--graph" in args or "-g" in args
+    target_name = _extract_target_from_args(args, session_context)
+
+    results = {}
+    target_obj = create_or_load_target(target_name)
+    if target_obj and target_obj.modules:
+        for m_name, m_data in target_obj.modules.items():
+            results[m_name] = m_data.get("output", {})
+    
+    if not results:
+        legacy_sync = os.path.join(os.getcwd(), "storage", "sync", "session_sync.json")
+        if os.path.exists(legacy_sync):
+            try:
+                with open(legacy_sync, "r", encoding="utf-8") as f:
+                    results = json.load(f)
+            except Exception:
+                pass
+
+    if is_graph:
+        graph_data = build_graph(results)
+        if not is_json:
+            emit(json.dumps(graph_data, indent=2))
+        return {"status": "success", "graph": graph_data}
+
+    agent = get_agent(target_name)
+    prompt = f"Correlate all attack findings and construct attack chains for target {target_name}."
+    answer = agent.handle_message(prompt, session_context=session_context, emit=emit)
+
+    if not is_json:
+        emit(answer)
+
+    return {"status": "success", "target": target_name, "response": answer}
+
+
 def handle_help(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
     /help
@@ -729,6 +769,77 @@ register_command(Command(
     description="Query AI assistant with session context and tool access",
     usage="/ask <question>",
     handler=handle_ask
+))
+
+register_command(Command(
+    name="/howl",
+    aliases=["/correlate", "/graph"],
+    description="Correlate discoveries or generate visual attack graph",
+    usage="/howl [--graph] [target] [--json]",
+    handler=handle_howl
+))
+
+def handle_skills(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """
+    /skills [search_query] [--json]
+    Lists discovered skills or searches skill repository.
+    """
+    from hellhound.core.skills import discover_skills, search_skills, load_skill_body
+    is_json = "--json" in args or getattr(emit, "json_mode", False)
+    clean_args = [a for a in args if a not in ("--json", "-j")]
+
+    if not clean_args:
+        skills = discover_skills()
+        if not is_json:
+            emit.banner(f"HELLHOUND SKILL LIBRARY ({len(skills)} Available)")
+            for name, s in sorted(skills.items()):
+                tag = " (user)" if s.is_user_defined else ""
+                emit.info(f"• [bold cyan]{name}[/bold cyan]{tag}: {s.description[:110]}...")
+        return {
+            "status": "success",
+            "skills": [
+                {
+                    "name": s.name,
+                    "description": s.description,
+                    "is_user_defined": s.is_user_defined,
+                    "path": s.path,
+                    "has_references": bool(s.references_dir)
+                }
+                for s in skills.values()
+            ]
+        }
+
+    query = " ".join(clean_args)
+    results = search_skills(query, max_results=5)
+    if not is_json:
+        emit.banner(f"SKILL SEARCH RESULTS FOR: '{query}'")
+        if not results:
+            emit.warn("No matching skills found.")
+        for s in results:
+            tag = " (user)" if s.is_user_defined else ""
+            emit.info(f"• [bold green]{s.name}[/bold green]{tag}: {s.description[:130]}...")
+
+    return {
+        "status": "success",
+        "query": query,
+        "results": [
+            {
+                "name": s.name,
+                "description": s.description,
+                "is_user_defined": s.is_user_defined,
+                "path": s.path
+            }
+            for s in results
+        ]
+    }
+
+
+register_command(Command(
+    name="/skills",
+    aliases=["/skill"],
+    description="List or search loaded methodology skills and checklists",
+    usage="/skills [query] [--json]",
+    handler=handle_skills
 ))
 
 register_command(Command(

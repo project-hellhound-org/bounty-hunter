@@ -7,14 +7,16 @@ in ~/.hellhound/targets/<target>/task.json.
 """
 
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
+from pathlib import Path
 import re
 from typing import Dict, Any, List, Optional, Callable
 from urllib.parse import urlparse
 
 from hellhound.core.scope import ScopeRules, parse_program_rules
+from hellhound.core.rotation import rotate_if_needed
 
 
 def _get_targets_dir() -> str:
@@ -46,8 +48,8 @@ class Target:
     scope_raw: str = ""
     scope_rules: ScopeRules = field(default_factory=ScopeRules)
     scope_summary: str = ""
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    last_active: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    last_active: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     notes: Optional[str] = ""
     findings: List[Dict[str, Any]] = field(default_factory=list)
     state: Dict[str, Any] = field(default_factory=dict)
@@ -82,8 +84,8 @@ class Target:
             scope_raw=str(data.get("scope_raw", "")),
             scope_rules=scope_rules,
             scope_summary=str(data.get("scope_summary", "")),
-            created_at=str(data.get("created_at", datetime.utcnow().isoformat())),
-            last_active=str(data.get("last_active", datetime.utcnow().isoformat())),
+            created_at=str(data.get("created_at", datetime.now(timezone.utc).isoformat())),
+            last_active=str(data.get("last_active", datetime.now(timezone.utc).isoformat())),
             notes=data.get("notes", ""),
             findings=list(data.get("findings", [])),
             state=dict(data.get("state", {})),
@@ -98,9 +100,10 @@ def get_target_path(target_name: str) -> str:
 
 
 def save_target(target: Target) -> None:
-    target.last_active = datetime.utcnow().isoformat()
+    target.last_active = datetime.now(timezone.utc).isoformat()
     path = get_target_path(target.name)
     try:
+        rotate_if_needed(Path(path))
         with open(path, "w", encoding="utf-8") as f:
             json.dump(target.to_dict(), f, indent=2, ensure_ascii=False)
     except Exception as e:

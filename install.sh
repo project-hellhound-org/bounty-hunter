@@ -103,6 +103,10 @@ success "Virtual environment ready at $VENV_DIR"
 # ── 3. Core Engine ────────────────────────────────────
 start_animation "DECRYPTING DEPENDENCIES"
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
+# Clean any stale editable artifacts or old version metadata to avoid site-packages loader conflicts
+rm -rf "$VENV_DIR"/lib/python*/site-packages/__editable__* 2>/dev/null || true
+rm -rf "$VENV_DIR"/lib/python*/site-packages/hellhound*.dist-info 2>/dev/null || true
+"$VENV_DIR/bin/pip" uninstall -y hellhound --quiet 2>/dev/null || true
 "$VENV_DIR/bin/pip" install --quiet -e "$PROJECT_ROOT"
 stop_animation
 success "HELLHOUND core engine installed"

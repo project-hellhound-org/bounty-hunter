@@ -3,6 +3,7 @@ import json
 import logging
 import concurrent.futures
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -10,6 +11,24 @@ from typing import Optional, Dict, Any, List, Tuple
 # Path to persistent Hellhound configuration
 CONFIG_DIR = Path.home() / ".hellhound"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+def strip_thinking_tags(text: str) -> str:
+    """
+    Strips chain-of-thought/reasoning blocks (<think>...</think>, <thinking>...</thinking>,
+    <reasoning>...</reasoning>) from model output while preserving actual answers.
+    Falls back to original unstripped text if stripping leaves an empty string.
+    """
+    if not text or not isinstance(text, str):
+        return text or ""
+    
+    # Strip complete blocks (non-greedy, case-insensitive, DOTALL)
+    cleaned = re.sub(r'<(?:think|thinking|reasoning)>[\s\S]*?</(?:think|thinking|reasoning)>', '', text, flags=re.IGNORECASE).strip()
+    
+    # Strip trailing unclosed opening tags (in case response was truncated)
+    if re.search(r'<(?:think|thinking|reasoning)>', cleaned, flags=re.IGNORECASE):
+        cleaned = re.sub(r'<(?:think|thinking|reasoning)>[\s\S]*$', '', cleaned, flags=re.IGNORECASE).strip()
+        
+    return cleaned if cleaned else text.strip()
 
 def load_config() -> Dict[str, Any]:
     """Loads persistent Hellhound configuration from ~/.hellhound/config.json."""
@@ -19,6 +38,7 @@ def load_config() -> Dict[str, Any]:
             "ai_model": "",
             "api_key": "ollama",
             "researcher_handle": "",
+            "max_response_tokens": 8192,
             "api_keys": {},
             "global_headers": {},
             "scope": {
@@ -230,15 +250,17 @@ def render_session_footer():
     print(f"{HR}{'█' * padding}{W}{label}{HR}{'█' * (cols - padding - len(label))}{RST}\n")
 
 def render_chat_bubble(text: str, sender: str = "HELLHOUND"):
-    cols    = _cols()
-    max_w   = cols - 10
-    import textwrap
-    wrapped = textwrap.wrap(text.strip(), width=max_w) or [text.strip()]
-
-    print(f"\n  {HR}┌ {sender} {DIM}{'─' * (cols - len(sender) - 6)}{RST}")
-    for line in wrapped:
-        print(f"  {HR}│{RST}  {W}{line}{RST}")
-    print(f"  {HR}└{'─' * (cols - 4)}{RST}\n")
+    if not text or not text.strip():
+        return
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        console = Console()
+        print()
+        console.print(Markdown(text.strip()))
+        print()
+    except Exception:
+        print(f"\n{text.strip()}\n")
 
 class ThinkingIndicator:
     """Thread-safe 6-dot floating loader supporting dynamic step emission and clean shutdown."""
@@ -305,6 +327,9 @@ class ThinkingIndicator:
 
     def warn(self, msg: str):
         self.print_step("!", msg, "\033[38;5;220;1m")
+
+    def warning(self, msg: str):
+        self.warn(msg)
 
     def error(self, msg: str):
         self.print_step("✗", msg, "\033[38;5;196;1m")
@@ -481,7 +506,7 @@ def list_available_models() -> List[Dict[str, Any]]:
 
     return models_list
 
-def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None) -> Optional[str]:
+def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
     """Unified dispatcher for all supported AI providers."""
     provider = (provider or "ollama").lower().strip()
     
@@ -492,17 +517,19 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
     active_model = model or get_default_model(provider)
 
     if provider in ("nvidia", "nim"):
-        return call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt)
+        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens)
     elif provider == "openai":
-        return call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt)
+        res = call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens)
     elif provider == "anthropic":
-        return call_anthropic(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt)
+        res = call_anthropic(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens)
     elif provider == "gemini":
-        return ask_gemini(api_key, active_model, system_prompt, prompt, timeout=timeout, history=history)
+        res = ask_gemini(api_key, active_model, system_prompt, prompt, max_tokens=max_tokens, timeout=timeout, history=history, thinking=thinking)
     else: # Ollama / Local
-        return call_ollama(prompt, model=active_model, system_prompt=system_prompt, timeout=timeout, history=history)
+        res = call_ollama(prompt, model=active_model, system_prompt=system_prompt, timeout=timeout, history=history, thinking=thinking, max_tokens=max_tokens)
 
-def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300) -> Optional[str]:
+    return strip_thinking_tags(res) if res else res
+
+def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
     """Config-aware wrapper to query the configured AI provider/model."""
     cfg = load_config()
     provider = cfg.get("ai_provider", "ollama")
@@ -524,9 +551,9 @@ def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, t
         or cfg.get("api_key", "ollama")
     )
 
-    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt)
+    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens)
 
-def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None) -> Optional[str]:
+def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
     """REST call to NVIDIA NIM OpenAI-compatible API."""
     try:
         url = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -541,21 +568,26 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             messages.extend(history)
         messages.append({"role": "user", "content": prompt})
 
+        cfg = load_config()
+        resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
+
         payload = {
             "model": model,
             "messages": messages,
             "temperature": 0.5,
-            "max_tokens": 4096
+            "max_tokens": resolved_max_tokens,
+            "chat_template_kwargs": {"thinking": thinking}
         }
         r = requests.post(url, headers=headers, json=payload, timeout=timeout)
         if r.status_code != 200:
             return f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:100]}"
         data = r.json()
-        return data["choices"][0]["message"]["content"] if "choices" in data else None
+        raw_content = data["choices"][0]["message"]["content"] if "choices" in data else None
+        return strip_thinking_tags(raw_content) if raw_content else None
     except Exception as e:
         return f"Error: NVIDIA NIM connection failed ({str(e)})"
 
-def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int = 30, history: list = None, system_prompt: str = None) -> Optional[str]:
+def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
     """REST call to OpenAI Chat Completions API."""
     try:
         url = "https://api.openai.com/v1/chat/completions"
@@ -568,16 +600,20 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
             messages.extend(history)
         messages.append({"role": "user", "content": prompt})
 
-        payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 4096}
+        cfg = load_config()
+        resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
+
+        payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": resolved_max_tokens}
         r = requests.post(url, headers=headers, json=payload, timeout=timeout)
         if r.status_code != 200:
             return f"Error: OpenAI API returned {r.status_code}"
         data = r.json()
-        return data["choices"][0]["message"]["content"] if "choices" in data else None
+        raw_content = data["choices"][0]["message"]["content"] if "choices" in data else None
+        return strip_thinking_tags(raw_content) if raw_content else None
     except Exception as e:
         return f"Error: OpenAI connection failed ({str(e)})"
 
-def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20240620", timeout: int = 30, history: list = None, system_prompt: str = None) -> Optional[str]:
+def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20240620", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
     """REST call to Anthropic Messages API."""
     try:
         url = "https://api.anthropic.com/v1/messages"
@@ -588,10 +624,13 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
             messages.extend(history)
         messages.append({"role": "user", "content": prompt})
 
+        cfg = load_config()
+        resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
+
         payload = {
             "model": model,
             "messages": messages,
-            "max_tokens": 4096,
+            "max_tokens": resolved_max_tokens,
             "temperature": 0.7
         }
         if system_prompt:
@@ -600,11 +639,12 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
         if r.status_code != 200:
             return f"Error: Anthropic API returned {r.status_code}"
         data = r.json()
-        return data["content"][0]["text"] if "content" in data else None
+        raw_content = data["content"][0]["text"] if "content" in data else None
+        return strip_thinking_tags(raw_content) if raw_content else None
     except Exception as e:
         return f"Error: Anthropic connection failed ({str(e)})"
 
-def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = 4096, timeout: int = 20, history: list = None) -> Optional[str]:
+def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = None, timeout: int = 20, history: list = None, thinking: bool = False) -> Optional[str]:
     """Gemini API caller."""
     try:
         contents = []
@@ -614,11 +654,14 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
                 contents.append({"role": role, "parts": [{"text": turn["content"]}]})
         contents.append({"role": "user", "parts": [{"text": user_message}]})
 
+        cfg = load_config()
+        resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
+
         payload = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
             "contents": contents,
             "generationConfig": {
-                "maxOutputTokens": max_tokens,
+                "maxOutputTokens": resolved_max_tokens,
                 "temperature": 0.85,
                 "topP": 0.9
             }
@@ -635,7 +678,8 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
             return f"Error: No candidates in response"
         parts = data["candidates"][0]["content"]["parts"]
         text = "".join(part["text"] for part in parts if "text" in part)
-        return text.strip() if text.strip() else "Error: Empty response text"
+        cleaned = strip_thinking_tags(text.strip())
+        return cleaned if cleaned else "Error: Empty response text"
     except Exception as e:
         return f"Error: Gemini connection failed ({str(e)})"
 
@@ -643,7 +687,7 @@ def call_gemini(prompt: str, api_key: str, model: str = "gemini-2.0-flash", time
     res = ask_gemini(api_key, model, ASK_PERSONA, prompt, timeout=timeout)
     return res if res else "Error: AI analysis failed."
 
-def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None) -> Optional[str]:
+def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
     """REST call to local Ollama API using chat endpoint."""
     try:
         model = model or get_default_model("ollama")
@@ -655,6 +699,9 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
             messages.extend(history)
         messages.append({"role": "user", "content": prompt})
         
+        cfg = load_config()
+        resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
+
         payload = {
             "model": model,
             "messages": messages,
@@ -662,9 +709,11 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
             "options": {
                 "temperature": 0.7,
                 "top_p": 0.9,
-                "num_predict": 4096
+                "num_predict": resolved_max_tokens
             }
         }
+        if not thinking:
+            payload["think"] = False
         
         r = requests.post(url, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:
@@ -684,7 +733,8 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
                     continue
 
         result = "".join(full_response).strip()
-        return result if result else "Error: Ollama returned an empty response."
+        cleaned = strip_thinking_tags(result)
+        return cleaned if cleaned else "Error: Ollama returned an empty response."
 
     except requests.exceptions.Timeout:
         return "Error: Local AI (Ollama) timed out."

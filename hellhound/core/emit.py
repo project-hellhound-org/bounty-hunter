@@ -40,6 +40,14 @@ class PlainEmit:
     def warn(self, msg):
         self._send(f"[!] {msg}")
 
+    def warning(self, msg):
+        """Compatibility alias for warn."""
+        self.warn(msg)
+
+    def set_label(self, label: str):
+        """Update active status label if supported."""
+        pass
+
     def success(self, msg):
         self._send(f"[✓] {msg}")
 

@@ -21,15 +21,36 @@ import requests
 
 from hellhound.core.scope import ScopeRules, is_in_scope, check_module_against_rules
 from hellhound.core.tasks import Target, create_or_load_target, save_target, set_scope
+from hellhound.core.guard import AutopilotGuard
 from hellhound.core.ai_utils import (
     load_config,
     call_ai,
     ask_neural_core,
     thinking_animation,
     render_chat_bubble,
-    render_ai_box
 )
 from hellhound.core.http_utils import merge_global_context
+from hellhound.core.skills import get_relevant_skills_prompt, discover_skills, search_skills, load_skill_body, is_ctf_lab_context
+
+
+def _load_baseline_rules() -> str:
+    """Load always-on baseline doctrine rules from core baseline_rules.md."""
+    rules_file = Path(__file__).resolve().parent / "baseline_rules.md"
+    if rules_file.exists():
+        try:
+            return rules_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return (
+        "BASELINE DOCTRINE:\n"
+        "1. Verify target scope before network actions.\n"
+        "2. Reconnaissance & factual triage only — non-destructive, no exploitation.\n"
+        "3. Never record theoretical bugs; require concrete reproducible evidence.\n"
+        "4. Qualify dead attack surfaces quickly."
+    )
+
+
+BASELINE_RULES_PROMPT = _load_baseline_rules()
 
 
 logger = logging.getLogger("hellhound.agent")
@@ -283,8 +304,8 @@ def _execute_subfinder(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
 
     subdomains = set()
 
-    # 1. Try local subfinder binary if available
-    subfinder_bin = shutil.which("subfinder")
+    # Try local subfinder binary if available
+    subfinder_bin = _find_binary("subfinder") or shutil.which("subfinder")
     if subfinder_bin:
         try:
             cmd = [subfinder_bin, "-d", domain, "-silent", "-all"]
@@ -296,24 +317,6 @@ def _execute_subfinder(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
                         subdomains.add(sub)
         except Exception as e:
             logger.warning(f"subfinder execution failed: {e}")
-
-    # 2. Fallback to crt.sh certificate transparency lookup
-    if not subdomains:
-        try:
-            url = f"https://crt.sh/?q=%25.{domain}&output=json"
-            r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                data = r.json()
-                for entry in data:
-                    name = entry.get("name_value", "")
-                    for item in name.splitlines():
-                        item = item.strip().lower()
-                        if item.startswith("*."):
-                            item = item[2:]
-                        if item and domain in item and "." in item:
-                            subdomains.add(item)
-        except Exception as e:
-            logger.warning(f"crt.sh lookup failed: {e}")
 
     sub_list = sorted(list(subdomains))
     # Update target state
@@ -331,6 +334,291 @@ def _execute_subfinder(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     }
 
 
+def _execute_port_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Port scanning via naabu to discover open TCP/UDP ports and non-standard web services."""
+    raw_target = args.get("hosts") or args.get("target") or args.get("host") or target.name
+    targets_to_scan = []
+    if isinstance(raw_target, list):
+        targets_to_scan = [str(t).strip() for t in raw_target if str(t).strip()]
+    elif isinstance(raw_target, str) and "," in raw_target:
+        targets_to_scan = [t.strip() for t in raw_target.split(",") if t.strip()]
+    else:
+        targets_to_scan = [str(raw_target).strip()]
+
+    cleaned_targets = []
+    for t in targets_to_scan:
+        if t.startswith(("http://", "https://")):
+            t = urlparse(t).netloc.split(":")[0]
+        if t:
+            cleaned_targets.append(t)
+
+    if not cleaned_targets:
+        return {"error": "No valid hosts provided for port scan."}
+
+    binary = _find_binary("naabu")
+    if not binary:
+        return {
+            "error": "naabu not installed",
+            "hint": "go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
+        }
+
+    ports = str(args.get("ports", "top-100")).strip().lower()
+    exclude_ports = args.get("exclude_ports")
+
+    cmd = [binary, "-j", "-silent"]
+    if ports in ("top-100", "top100", "100"):
+        cmd.extend(["-tp", "100"])
+    elif ports in ("top-1000", "top1000", "1000"):
+        cmd.extend(["-tp", "1000"])
+    elif ports in ("full", "all", "top-full"):
+        cmd.extend(["-tp", "full"])
+    else:
+        cmd.extend(["-p", ports])
+
+    if exclude_ports:
+        cmd.extend(["-exclude-ports", str(exclude_ports)])
+
+    open_ports = []
+    try:
+        input_data = "\n".join(cleaned_targets)
+        proc = subprocess.run(cmd, input=input_data, capture_output=True, text=True, timeout=120)
+        if proc.stdout.strip():
+            for line in proc.stdout.splitlines():
+                if line.strip():
+                    try:
+                        item = json.loads(line.strip())
+                        open_ports.append({
+                            "host": item.get("host"),
+                            "ip": item.get("ip", ""),
+                            "port": item.get("port"),
+                            "protocol": item.get("protocol", "tcp"),
+                            "tls": item.get("tls", False)
+                        })
+                    except Exception:
+                        pass
+    except Exception as e:
+        return {"error": f"naabu execution failed: {e}", "hosts": cleaned_targets}
+
+    # Update target state
+    if "open_ports" not in target.state:
+        target.state["open_ports"] = []
+    for p in open_ports:
+        if p not in target.state["open_ports"]:
+            target.state["open_ports"].append(p)
+
+    return {
+        "hosts_scanned": cleaned_targets,
+        "count": len(open_ports),
+        "open_ports": open_ports
+    }
+
+
+def _execute_permute_subdomains(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Generate subdomain wordlist mutations and permutations using alterx."""
+    raw_subdomains = args.get("subdomains") or args.get("domains") or target.state.get("subdomains") or [target.name]
+    if isinstance(raw_subdomains, list):
+        sub_list = [str(s).strip().lower() for s in raw_subdomains if str(s).strip()]
+    elif isinstance(raw_subdomains, str) and "," in raw_subdomains:
+        sub_list = [s.strip().lower() for s in raw_subdomains.split(",") if s.strip()]
+    else:
+        sub_list = [str(raw_subdomains).strip().lower()]
+
+    cleaned = []
+    for s in sub_list:
+        if s.startswith(("http://", "https://")):
+            s = urlparse(s).netloc.split(":")[0]
+        if s:
+            cleaned.append(s)
+
+    if not cleaned:
+        return {"error": "No subdomains provided for permutation generation."}
+
+    binary = _find_binary("alterx")
+    if not binary:
+        return {
+            "error": "alterx not installed",
+            "hint": "go install github.com/projectdiscovery/alterx/cmd/alterx@latest"
+        }
+
+    limit = int(args.get("limit", 500))
+    cmd = [binary, "-silent", "-limit", str(limit)]
+
+    candidates = []
+    try:
+        input_data = "\n".join(cleaned)
+        proc = subprocess.run(cmd, input=input_data, capture_output=True, text=True, timeout=60)
+        candidates = [l.strip().lower() for l in proc.stdout.splitlines() if l.strip() and "." in l]
+    except Exception as e:
+        return {"error": f"alterx execution failed: {e}"}
+
+    return {
+        "count": len(candidates),
+        "candidates": candidates[:100],  # Return first 100 in context
+        "total_generated": len(candidates)
+    }
+
+
+def _execute_resolve_candidates(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Bulk-resolve and filter candidate domain names using dnsx."""
+    raw_candidates = args.get("candidates") or args.get("domains") or args.get("subdomains")
+    if isinstance(raw_candidates, list):
+        cand_list = [str(c).strip().lower() for c in raw_candidates if str(c).strip()]
+    elif isinstance(raw_candidates, str) and "," in raw_candidates:
+        cand_list = [c.strip().lower() for c in raw_candidates.split(",") if c.strip()]
+    elif isinstance(raw_candidates, str) and raw_candidates.strip():
+        cand_list = [raw_candidates.strip().lower()]
+    else:
+        cand_list = target.state.get("subdomains", [target.name])
+
+    cleaned = []
+    for c in cand_list:
+        if c.startswith(("http://", "https://")):
+            c = urlparse(c).netloc.split(":")[0]
+        if c:
+            cleaned.append(c)
+
+    if not cleaned:
+        return {"error": "No candidate domains provided for resolution."}
+
+    binary = _find_binary("dnsx")
+    if not binary:
+        return {
+            "error": "dnsx not installed",
+            "hint": "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
+        }
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+        f.write("\n".join(cleaned) + "\n")
+        tmp_path = f.name
+
+    resolved = []
+    try:
+        resolvers = _resolve_resolvers_path()
+        cmd = [binary, "-l", tmp_path, "-silent", "-json", "-a", "-cname", "-resp"]
+        if resolvers and os.path.exists(resolvers):
+            cmd.extend(["-r", resolvers])
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.stdout.strip():
+            for line in proc.stdout.splitlines():
+                if line.strip():
+                    try:
+                        item = json.loads(line.strip())
+                        host = item.get("host")
+                        if host:
+                            resolved.append({
+                                "host": host,
+                                "a": item.get("a", []),
+                                "cname": item.get("cname", []),
+                                "status_code": item.get("status_code", "NOERROR")
+                            })
+                    except Exception:
+                        pass
+    except Exception as e:
+        return {"error": f"dnsx resolution failed: {e}"}
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    # Update target state
+    if "subdomains" not in target.state:
+        target.state["subdomains"] = []
+    for r in resolved:
+        h = r["host"]
+        if h not in target.state["subdomains"]:
+            target.state["subdomains"].append(h)
+
+    return {
+        "count": len(resolved),
+        "resolved": resolved[:100],
+        "total_resolved": len(resolved)
+    }
+
+
+def _execute_tls_cert_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Scan and parse TLS/SSL certificate SANs and CNs using tlsx to discover related infrastructure."""
+    raw_target = args.get("hosts") or args.get("target") or args.get("domains") or target.name
+    targets_to_scan = []
+    if isinstance(raw_target, list):
+        targets_to_scan = [str(t).strip() for t in raw_target if str(t).strip()]
+    elif isinstance(raw_target, str) and "," in raw_target:
+        targets_to_scan = [t.strip() for t in raw_target.split(",") if t.strip()]
+    else:
+        targets_to_scan = [str(raw_target).strip()]
+
+    cleaned_targets = []
+    for t in targets_to_scan:
+        if t.startswith(("http://", "https://")):
+            t = urlparse(t).netloc.split(":")[0]
+        if t:
+            cleaned_targets.append(t)
+
+    if not cleaned_targets:
+        return {"error": "No valid hosts provided for TLS certificate scan."}
+
+    binary = _find_binary("tlsx")
+    if not binary:
+        return {
+            "error": "tlsx not installed",
+            "hint": "go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest"
+        }
+
+    port = str(args.get("port", "443")).strip()
+    cmd = [binary, "-san", "-cn", "-so", "-silent", "-json", "-p", port]
+
+    results = []
+    discovered_sans = set()
+    try:
+        input_data = "\n".join(cleaned_targets)
+        proc = subprocess.run(cmd, input=input_data, capture_output=True, text=True, timeout=60)
+        if proc.stdout.strip():
+            for line in proc.stdout.splitlines():
+                if line.strip():
+                    try:
+                        item = json.loads(line.strip())
+                        host = item.get("host")
+                        cn = item.get("subject_cn", "")
+                        sans = item.get("subject_an", [])
+                        results.append({
+                            "host": host,
+                            "ip": item.get("ip", ""),
+                            "subject_cn": cn,
+                            "subject_an": sans,
+                            "issuer_org": item.get("issuer_org", []),
+                            "tls_version": item.get("tls_version", ""),
+                            "wildcard": item.get("wildcard_certificate", False)
+                        })
+                        if cn and "." in cn and not cn.startswith("*"):
+                            discovered_sans.add(cn.lower())
+                        for s in sans:
+                            clean_s = s.lower().lstrip("*.")
+                            if clean_s and "." in clean_s:
+                                discovered_sans.add(clean_s)
+                    except Exception:
+                        pass
+    except Exception as e:
+        return {"error": f"tlsx execution failed: {e}", "hosts": cleaned_targets}
+
+    # Update target state with discovered SAN names matching root domain if available
+    san_list = sorted(list(discovered_sans))
+    if "subdomains" not in target.state:
+        target.state["subdomains"] = []
+    for s in san_list:
+        if target.name in s and s not in target.state["subdomains"]:
+            target.state["subdomains"].append(s)
+
+    return {
+        "hosts_scanned": cleaned_targets,
+        "count": len(results),
+        "certificates": results,
+        "discovered_domains": san_list[:50]
+    }
+
+
 def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     raw_target = args.get("target") or target.name
     targets_to_probe = []
@@ -342,11 +630,11 @@ def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
     live_hosts = []
 
     # 1. Try local httpx binary
-    httpx_bin = shutil.which("httpx")
+    httpx_bin = _find_binary("httpx") or shutil.which("httpx")
     if httpx_bin:
         try:
             input_data = "\n".join(targets_to_probe)
-            cmd = [httpx_bin, "-silent", "-status-code", "-title", "-tech-detect", "-json"]
+            cmd = [httpx_bin, "-silent", "-status-code", "-title", "-tech-detect", "-cl", "-location", "-json"]
             proc = subprocess.run(cmd, input=input_data, capture_output=True, text=True, timeout=60)
             if proc.returncode == 0:
                 for line in proc.stdout.splitlines():
@@ -358,7 +646,9 @@ def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
                                 "status_code": item.get("status_code"),
                                 "title": item.get("title", ""),
                                 "tech": item.get("tech", []),
-                                "webserver": item.get("webserver", "")
+                                "webserver": item.get("webserver", ""),
+                                "content_length": item.get("content_length"),
+                                "location": item.get("location", "")
                             })
                         except Exception:
                             pass
@@ -381,7 +671,9 @@ def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
                         "status_code": r.status_code,
                         "title": re.search(r'<title>(.*?)</title>', r.text, re.I).group(1).strip() if re.search(r'<title>(.*?)</title>', r.text, re.I) else "",
                         "tech": [r.headers.get("Server")] if r.headers.get("Server") else [],
-                        "webserver": r.headers.get("Server", "")
+                        "webserver": r.headers.get("Server", ""),
+                        "content_length": len(r.content) if r.content is not None else 0,
+                        "location": r.headers.get("Location", "")
                     })
                     break
                 except Exception:
@@ -777,6 +1069,57 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_ffuf_vhost
     ),
+    "port_scan": ToolSpec(
+        name="port_scan",
+        description="Active TCP/UDP port scanner via naabu to discover open ports and non-standard web service ports.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "hosts": {"type": "string", "description": "Target host, IP, domain, or comma-separated list of hosts to scan ports for."},
+                "ports": {"type": "string", "description": "Ports to scan (e.g. 'top-100', 'top-1000', 'full', '80,443,8000-9000')", "default": "top-100"}
+            },
+            "required": ["hosts"]
+        },
+        executor=_execute_port_scan
+    ),
+    "permute_subdomains": ToolSpec(
+        name="permute_subdomains",
+        description="Generate subdomain mutations and permutations via alterx based on known subdomains or patterns.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "subdomains": {"type": "array", "items": {"type": "string"}, "description": "List of discovered subdomains to generate permutations from."},
+                "limit": {"type": "integer", "description": "Maximum number of candidate permutations to generate (default: 500)", "default": 500}
+            },
+            "required": ["subdomains"]
+        },
+        executor=_execute_permute_subdomains
+    ),
+    "resolve_candidates": ToolSpec(
+        name="resolve_candidates",
+        description="Fast bulk DNS resolution and filtering via dnsx to identify live resolvable domains and IP mappings.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "candidates": {"type": "array", "items": {"type": "string"}, "description": "List of candidate domain names or permutations to resolve."}
+            },
+            "required": ["candidates"]
+        },
+        executor=_execute_resolve_candidates
+    ),
+    "tls_cert_scan": ToolSpec(
+        name="tls_cert_scan",
+        description="Scan TLS/SSL certificates and extract Subject Alternative Names (SANs) and Common Names (CNs) via tlsx.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "hosts": {"type": "string", "description": "Target host, domain, or comma-separated list of hosts to inspect TLS certificates for."},
+                "port": {"type": "string", "description": "Port to connect for TLS handshake (default: 443)", "default": "443"}
+            },
+            "required": ["hosts"]
+        },
+        executor=_execute_tls_cert_scan
+    ),
     "content_discovery": ToolSpec(
         name="content_discovery",
         description="Active path and directory discovery fuzzing via ffuf on live web endpoints to reveal hidden routes and assets.",
@@ -800,23 +1143,33 @@ class Agent:
     def __init__(self, target: Optional[Target] = None):
         self.target = target or create_or_load_target("default")
         self.history: List[Dict[str, str]] = []
+        self.guard = AutopilotGuard(
+            circuit_threshold=5,
+            circuit_cooldown=60.0,
+            recon_rps=10.0,
+            test_rps=1.0,
+            safe_methods_only=True
+        )
 
     def set_target(self, target_name: str) -> Target:
         self.target = create_or_load_target(target_name)
         return self.target
 
     def _extract_target_from_args(self, args: Dict[str, Any]) -> str:
-        for key in ("domain", "target", "url", "subdomain", "host"):
+        for key in ("domain", "domains", "target", "url", "subdomain", "subdomains", "host", "hosts", "candidates"):
             if key in args and args[key]:
                 val = args[key]
                 if isinstance(val, list) and val:
                     return str(val[0])
+                if isinstance(val, str) and "," in val:
+                    return str(val.split(",")[0].strip())
                 return str(val)
         return self.target.name
 
     def execute_tool_call(self, tool_name: str, args: Dict[str, Any], emit: Any = None) -> Dict[str, Any]:
         """
-        Executes a tool with hard code-level scope validation before invocation.
+        Executes a tool with hard code-level scope validation, safe method policy,
+        circuit breaker checking, and rate-limiting pacing.
         """
         spec = TOOL_REGISTRY.get(tool_name)
         if not spec:
@@ -824,20 +1177,20 @@ class Agent:
 
         target_candidate = self._extract_target_from_args(args)
 
-        # Enforce code-level Scope Gate
+        # 1. Enforce code-level Scope Gate
         if self.target and self.target.scope_rules and self.target.scope_rules.in_scope:
             allowed, reason = is_in_scope(target_candidate, self.target.scope_rules)
             if not allowed:
                 msg = f"[!] SCOPE REFUSAL: Action on '{target_candidate}' blocked. Reason: {reason}"
-                if emit and hasattr(emit, "warning"):
-                    emit.warning(msg)
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(msg)
                 return {
                     "error": f"SCOPE_VIOLATION: {reason}",
                     "target": target_candidate,
                     "blocked": True
                 }
 
-        # Check for disallowed module flags
+        # 2. Check for disallowed module flags
         if self.target and self.target.scope_rules:
             allowed, reason = check_module_against_rules(tool_name, self.target.scope_rules)
             if not allowed:
@@ -846,9 +1199,38 @@ class Agent:
                     "blocked": True
                 }
 
+        # 3. Autopilot Guard (CircuitBreaker + SafeMethodPolicy)
+        method = str(args.get("method", "GET")).upper()
+        url = args.get("url") or (target_candidate if target_candidate.startswith(("http://", "https://")) else f"https://{target_candidate}")
+        guard_result = self.guard.check_request(method, url)
+
+        if guard_result.get("decision") == "block":
+            reason = guard_result.get("reason", "Target host blocked by circuit breaker")
+            if emit and hasattr(emit, "warn"):
+                emit.warn(f"[!] GUARD BLOCKED: {reason}")
+            return {"error": f"blocked: {reason}", "blocked": True}
+
+        if guard_result.get("decision") == "require_approval":
+            reason = guard_result.get("reason", "Method requires human approval")
+            if emit and hasattr(emit, "warn"):
+                emit.warn(f"[!] GUARD APPROVAL REQUIRED: {reason}")
+            return {"error": f"requires human approval: {reason}", "requires_approval": True}
+
+        # 4. Rate Limiter (Pacing)
+        is_recon = tool_name in ("subfinder", "dns_bruteforce", "httpx", "dig", "subzy", "vhost_fuzz")
+        host = self.guard._extract_host(url)
+        self.guard._limiter.wait(host, is_recon=is_recon)
+
+        # 5. Tool Execution & Circuit Breaker status tracking
         try:
-            return spec.executor(args, self.target, emit)
+            result = spec.executor(args, self.target, emit)
+            if isinstance(result, dict) and result.get("error"):
+                self.guard.record_failure(host)
+            else:
+                self.guard.record_success(host)
+            return result
         except Exception as e:
+            self.guard.record_failure(host)
             return {"error": f"Tool execution failed: {str(e)}"}
 
     def handle_message(self, user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, max_iterations: int = 15) -> str:
@@ -866,7 +1248,7 @@ class Agent:
         has_recon_intent = any(rw in lower_text for rw in recon_words)
         
         # Check if there is a target defined in the prompt or active context
-        domain_match = re.search(r'([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,})', user_text)
+        domain_match = re.search(r'([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.[a-zA-Z]{2,})', user_text)
         if domain_match:
             detected_domain = domain_match.group(1).lower().lstrip("*.")
             if self.target.name == "default" or (self.target.name != detected_domain and "." in detected_domain):
@@ -875,6 +1257,16 @@ class Agent:
             primary_domain = self.target.scope_rules.in_scope[0].lstrip("*.")
             if primary_domain and "." in primary_domain:
                 self.set_target(primary_domain)
+
+        # Auto-scope shortcut when CTF/lab context is detected
+        if domain_match and is_ctf_lab_context(user_text):
+            if not self.target.scope_raw or not self.target.scope_rules.in_scope:
+                set_scope(self.target, "")  # empty raw_text auto-populates in_scope with [*.target, target]
+                if emit and hasattr(emit, "info"):
+                    emit.info(
+                        f"[*] CTF/lab context detected — auto-scoping to "
+                        f"{self.target.name} (no manual /scope needed for lab targets)"
+                    )
 
         # Scope enforcement gate for fresh un-scoped network recon requests
         if has_recon_intent:
@@ -895,6 +1287,18 @@ class Agent:
         if self.target.scope_rules.in_scope:
             scope_summary = f"IN-SCOPE: {self.target.scope_rules.in_scope} | OUT-OF-SCOPE: {self.target.scope_rules.out_scope}"
 
+        # Dynamic Skill-Aware Reasoning Injection
+        cfg = load_config()
+        ai_prov = (cfg.get("ai_provider") or "ollama").lower()
+        is_small = (ai_prov == "ollama")
+        skills_block = get_relevant_skills_prompt(
+            user_text=user_text,
+            history_len=len(self.history),
+            has_target=(self.target.name != "default"),
+            is_small_model=is_small,
+            max_skills=2
+        )
+
         system_prompt = f"""\
 You are HELLHOUND, an autonomous bug bounty reconnaissance and triage assistant.
 Your role: Automate subdomain enumeration, live host discovery, tech detection, takeover verification, endpoint discovery, and triage.
@@ -904,12 +1308,17 @@ TARGET: {self.target.name}
 SCOPE CONSTRAINTS: {scope_summary}
 CURRENT FINDINGS: {len(self.target.findings)} verified findings
 
+=== ALWAYS-ON BASELINE DOCTRINE ===
+{BASELINE_RULES_PROMPT}
+
+{skills_block}
 IMPORTANT BEHAVIORAL RULES:
 1. ONLY call tools when the user explicitly requests reconnaissance, scanning, enumeration, or analysis of a target.
 2. For greetings ("hello", "hi", "hey"), casual conversation, general questions, or status inquiries, respond conversationally WITHOUT calling any tools.
 3. Never run recon tools unless the user mentions a specific target or asks for enumeration/scanning.
 4. If a message is ambiguous, ask the user to clarify rather than launching tools.
-5. If subfinder/passive enumeration returns few or no results, consider running dns_bruteforce — this is especially important for internal, private, or non-publicly-indexed targets (lab environments, CTF infrastructure, internal tools) where certificate transparency and passive aggregators have nothing indexed. If a target IP is known but subdomain enumeration is coming up empty, consider vhost_fuzz — CTF infrastructure in particular often runs multiple challenges as virtual hosts on one shared IP with no individual DNS entry.
+5. If the user explicitly requests "active recon" or "active enumeration" (as opposed to generic recon), skip passive tools (subfinder) entirely and go straight to active tools: dns_bruteforce (and vhost_fuzz if an IP is known).
+6. If subfinder/passive enumeration returns few or no results, consider running dns_bruteforce — this is especially important for internal, private, or non-publicly-indexed targets (lab environments, CTF infrastructure, internal tools) where certificate transparency and passive aggregators have nothing indexed. If a target IP is known but subdomain enumeration is coming up empty, consider vhost_fuzz — CTF infrastructure in particular often runs multiple challenges as virtual hosts on one shared IP with no individual DNS entry.
 
 AVAILABLE RECON/TRIAGE TOOLS:
 {tools_summary}
@@ -929,6 +1338,9 @@ If you do not need to run a tool, or after analyzing tool output, provide a clea
 
         # Iteration loop for multi-step reasoning / tool calls
         for iteration in range(max_iterations):
+            if emit and hasattr(emit, "set_label"):
+                emit.set_label("HELLHOUND IS THINKING")
+
             # Format history for inference
             ai_resp = ask_neural_core(
                 prompt=user_text if iteration == 0 else "Continue analysis based on tool results.",
@@ -936,6 +1348,8 @@ If you do not need to run a tool, or after analyzing tool output, provide a clea
             )
 
             if not ai_resp or not ai_resp.strip():
+                if emit and hasattr(emit, "set_label"):
+                    emit.set_label("FINALIZING RESPONSE")
                 return "Analysis completed. No further actions required."
 
             # Check for JSON tool invocation in the response
@@ -960,10 +1374,16 @@ If you do not need to run a tool, or after analyzing tool output, provide a clea
                 t_name = tool_call["tool"]
                 t_args = tool_call.get("args", {})
                 
+                if emit and hasattr(emit, "set_label"):
+                    emit.set_label(f"EXECUTING: {t_name}")
+
                 if emit and hasattr(emit, "info"):
                     emit.info(f"[*] Executing tool: {t_name} with args: {t_args}")
 
                 tool_result = self.execute_tool_call(t_name, t_args, emit)
+
+                if emit and hasattr(emit, "set_label"):
+                    emit.set_label("ANALYZING RESULTS")
 
                 # Feed result back to conversation
                 self.history.append({"role": "assistant", "content": ai_resp})
@@ -975,7 +1395,23 @@ If you do not need to run a tool, or after analyzing tool output, provide a clea
                 user_text = f"Tool '{t_name}' returned:\n{json.dumps(tool_result, indent=2)}\nEvaluate these findings."
                 continue
 
+            elif tool_call:
+                # Hallucinated or unregistered tool name
+                unregistered_name = tool_call.get("tool", "unknown")
+                if emit and hasattr(emit, "set_label"):
+                    emit.set_label("ANALYZING RESULTS")
+
+                self.history.append({"role": "assistant", "content": ai_resp})
+                self.history.append({
+                    "role": "user",
+                    "content": f"[TOOL ERROR] '{unregistered_name}' is not a valid tool. Available tools: {', '.join(TOOL_REGISTRY.keys())}"
+                })
+                user_text = f"Tool '{unregistered_name}' is invalid. Please select from available tools: {', '.join(TOOL_REGISTRY.keys())}"
+                continue
+
             # No tool call; return final answer
+            if emit and hasattr(emit, "set_label"):
+                emit.set_label("FINALIZING RESPONSE")
             self.history.append({"role": "assistant", "content": ai_resp})
             save_target(self.target)
             return ai_resp
