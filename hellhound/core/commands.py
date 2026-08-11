@@ -25,6 +25,7 @@ from hellhound.core.engine import HellhoundEngine
 from hellhound.core.emit import PlainEmit, ConsoleEmit
 from hellhound.core.http_utils import merge_global_context
 from hellhound.core.nodes import build_graph
+from hellhound.core.toolcheck import check_all_tools, try_install, ensure_tool, install_hint
 
 
 @dataclass
@@ -33,6 +34,7 @@ class Command:
     aliases: List[str] = field(default_factory=list)
     description: str = ""
     usage: str = ""
+    category: str = "general"
     handler: Optional[Callable[[List[str], Dict[str, Any], Any], Dict[str, Any]]] = None
 
 
@@ -120,7 +122,16 @@ def handle_recon(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         return {"status": "error", "error": "missing_target", "message": msg}
 
     target_obj = create_or_load_target(target)
-    scope_rules = target_obj.scope_rules if target_obj.scope_rules.in_scope else _ensure_scope(session_context)
+    if not target_obj.scope_rules.in_scope and not target_obj.scope_raw:
+        scope_rules = _ensure_scope(session_context)
+        if not scope_rules or not scope_rules.in_scope:
+            msg = f"No authorized scope is defined for '{target}'. Set scope with /scope before running reconnaissance."
+            if not is_json:
+                emit.error(f"[SECURITY] {msg}")
+            return {"status": "error", "error": "scope_required", "target": target, "message": msg}
+    else:
+        scope_rules = target_obj.scope_rules
+
     allowed, reason = is_in_scope(target, scope_rules)
     if not allowed:
         if not is_json:
@@ -341,9 +352,9 @@ def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) ->
 
 def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
-    /model [set-key <provider> <api_key>] | [<provider> <model_name>] | [<model_name>] | [--session-only]
-    Inspects or switches the active local/cloud AI model with dynamic model discovery.
-    Supports explicit API key configuration and provider-qualified model switching.
+    /model [orchestrator|synthesizer] [<provider> <model_name>] | [<provider/model_name>]
+    /model [set-key <provider> <api_key>] | [--session-only]
+    Inspects or switches the active local/cloud AI model for orchestrator/synthesizer roles.
     """
     KNOWN_PROVIDERS = ("nvidia", "openai", "anthropic", "gemini", "ollama")
     is_json = "--json" in args or getattr(emit, "json_mode", False)
@@ -351,8 +362,10 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
     clean_args = [a for a in args if a not in ("--json", "-j", "--session-only")]
 
     cfg = load_config()
-    current_model = session_context.get("options", {}).get("ai_model") or cfg.get("ai_model", "")
-    current_provider = session_context.get("options", {}).get("ai_provider") or cfg.get("ai_provider", "ollama")
+    current_orch_prov = session_context.get("options", {}).get("orchestrator_provider") or cfg.get("orchestrator_provider", "ollama")
+    current_orch_model = session_context.get("options", {}).get("orchestrator_model") or cfg.get("orchestrator_model", "")
+    current_synth_prov = session_context.get("options", {}).get("synthesizer_provider") or cfg.get("synthesizer_provider", "nvidia")
+    current_synth_model = session_context.get("options", {}).get("synthesizer_model") or cfg.get("synthesizer_model", "nvidia/nemotron-3-super-120b-a12b")
 
     # ── Subcommand: /model set-key <provider> <api_key> ──────────────
     if clean_args and clean_args[0] == "set-key":
@@ -382,37 +395,57 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
     if not clean_args:
         models = list_available_models()
         if not is_json:
-            emit.banner("HELLHOUND AI MODELS")
-            emit.info(f"Active Provider: {current_provider} | Active Model: {current_model or '(default)'}\n")
+            emit.banner("HELLHOUND TWO-TIER AI ROUTING")
+            emit.info(f"Orchestrator (Tool Selection): [{current_orch_prov.upper()}] {current_orch_model or '(default)'}")
+            emit.info(f"Synthesizer  (Deep Analysis):  [{current_synth_prov.upper()}] {current_synth_model or '(default)'}\n")
             if models:
+                emit.info("Available Models:")
                 for m in models:
-                    curr_flag = " \033[92m(current)\033[0m" if m.get("current") else ""
+                    curr_flag = ""
+                    if m.get("provider") == current_orch_prov and (m.get("name") == current_orch_model or (not current_orch_model and m.get("current"))):
+                        curr_flag += " \033[96m[orchestrator]\033[0m"
+                    if m.get("provider") == current_synth_prov and (m.get("name") == current_synth_model or (not current_synth_model and m.get("current"))):
+                        curr_flag += " \033[92m[synthesizer]\033[0m"
                     emit(f"  • [{m['provider'].upper()}] {m['name']}{curr_flag}")
             else:
                 emit.warn("No local Ollama models or cloud API keys configured.")
             # Usage hint
             emit(f"")
-            emit.info("To add a cloud provider:  /model set-key <provider> <api_key>")
-            emit.info("  Providers: nvidia, openai, anthropic, gemini")
-            emit.info("To switch models:         /model <provider> <model_name>")
-            emit.info("  e.g. /model nvidia nemotron-3-super-120b-a12b")
+            emit.info("To add a cloud provider:          /model set-key <provider> <api_key>")
+            emit.info("To switch orchestrator (tools):   /model orchestrator <provider> <model_name>")
+            emit.info("To switch synthesizer (analysis): /model synthesizer <provider> <model_name>")
+            emit.info("To switch both tiers:             /model <provider> <model_name>")
         return {
             "status": "success",
-            "current_model": current_model,
-            "provider": current_provider,
+            "orchestrator_provider": current_orch_prov,
+            "orchestrator_model": current_orch_model,
+            "synthesizer_provider": current_synth_prov,
+            "synthesizer_model": current_synth_model,
             "models": models
         }
 
-    # ── Explicit provider form: /model <provider> <model_name> ───────
+    # ── Check for role-specific prefix: orchestrator vs synthesizer ──
+    target_role = None
+    if clean_args[0].lower() in ("orchestrator", "orch", "tools"):
+        target_role = "orchestrator"
+        clean_args = clean_args[1:]
+    elif clean_args[0].lower() in ("synthesizer", "synth", "analysis"):
+        target_role = "synthesizer"
+        clean_args = clean_args[1:]
+
+    if not clean_args:
+        if not is_json:
+            emit.error(f"Usage: /model {target_role} <provider> <model_name> or /model {target_role} <model_name>")
+        return {"status": "error", "error": "missing_model_spec"}
+
+    # ── Resolve provider and model ───────────────────────────────────
     if len(clean_args) >= 2 and clean_args[0].lower() in KNOWN_PROVIDERS:
         prov_hint = clean_args[0].lower()
         new_model = clean_args[1]
     else:
         new_model = clean_args[0]
-        # Auto-detect provider from model name prefix
         prov_hint = None
         if "/" in new_model:
-            # Slash-namespaced models are cloud models
             if any(kw in new_model for kw in ("llama", "mistral", "deepseek", "nemotron", "nvidia")):
                 prov_hint = "nvidia"
         if prov_hint is None:
@@ -423,17 +456,14 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
             elif new_model.startswith("gemini-"):
                 prov_hint = "gemini"
 
-        # If we still couldn't detect, check if it's a known Ollama model
         if prov_hint is None:
             installed_ollama = {m["name"] for m in list_available_models() if m["provider"] == "ollama"}
             if new_model in installed_ollama:
                 prov_hint = "ollama"
             else:
-                # Ambiguous — warn and refuse
                 if not is_json:
                     emit.warn(f"'{new_model}' is not an installed Ollama model and the provider could not be determined.")
-                    emit.info(f"Specify the provider explicitly:  /model <provider> {new_model}")
-                    emit.info(f"  e.g. /model nvidia {new_model}")
+                    emit.info(f"Specify the provider explicitly:  /model {f'{target_role} ' if target_role else ''}<provider> {new_model}")
                 return {"status": "error", "error": "ambiguous_provider", "model": new_model}
 
     # Validate that the target provider has credentials configured (unless it's ollama)
@@ -442,11 +472,9 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         legacy_key = cfg.get("api_key", "")
         has_key = bool(api_keys.get(prov_hint))
         if not has_key and legacy_key and legacy_key != "ollama":
-            # Check if legacy key matches this provider
             detected_prov, _ = detect_ai_config(legacy_key)
             if detected_prov == prov_hint:
                 has_key = True
-        # Also check environment variables
         env_map = {"nvidia": "NVIDIA_API_KEY", "openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
         if not has_key and os.environ.get(env_map.get(prov_hint, ""), ""):
             has_key = True
@@ -456,19 +484,30 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
                 emit.info(f"Set one first:  /model set-key {prov_hint} <your_api_key>")
             return {"status": "error", "error": "no_api_key", "provider": prov_hint}
 
+    roles_to_update = [target_role] if target_role else ["orchestrator", "synthesizer"]
+
+    for r in roles_to_update:
+        session_context.setdefault("options", {})[f"{r}_model"] = new_model
+        session_context.setdefault("options", {})[f"{r}_provider"] = prov_hint
+        if not session_only:
+            cfg[f"{r}_model"] = new_model
+            cfg[f"{r}_provider"] = prov_hint
+
+    # Also update legacy keys for general backward compatibility
     session_context.setdefault("options", {})["ai_model"] = new_model
     session_context.setdefault("options", {})["ai_provider"] = prov_hint
-
     if not session_only:
         cfg["ai_model"] = new_model
         cfg["ai_provider"] = prov_hint
         save_config(cfg)
 
+    role_desc = f"{target_role.capitalize()}" if target_role else "Both Orchestrator & Synthesizer"
     if not is_json:
-        emit.success(f"AI model updated to: {new_model} (Provider: {prov_hint}) {'[Session Only]' if session_only else '[Persistent]'}")
+        emit.success(f"{role_desc} updated to: {new_model} (Provider: {prov_hint}) {'[Session Only]' if session_only else '[Persistent]'}")
 
     return {
         "status": "success",
+        "role": target_role or "all",
         "model": new_model,
         "provider": prov_hint,
         "persisted": not session_only
@@ -560,12 +599,54 @@ def handle_report(args: List[str], session_context: Dict[str, Any], emit: Any) -
 
 def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
-    /setup
-    Interactive or automated environment and AI connectivity verification.
+    /setup [tools [auto-install on|off]]
+    Interactive or automated environment, AI connectivity, and binary tool availability verification.
     """
     is_json = "--json" in args or getattr(emit, "json_mode", False)
+    clean_args = [a for a in args if a not in ("--json", "-j")]
     cfg = load_config()
 
+    # ── Subcommands: /setup tools auto-install on|off or /setup auto-install on|off ──
+    if clean_args:
+        first = clean_args[0].lower()
+        if first in ("auto-install", "autoinstall") or (first == "tools" and len(clean_args) > 1 and clean_args[1].lower() in ("auto-install", "autoinstall")):
+            action = clean_args[-1].lower()
+            if action in ("on", "true", "1", "enable", "enabled"):
+                cfg["auto_install_missing_tools"] = True
+                save_config(cfg)
+                if not is_json:
+                    emit.success("Tool auto-installation ENABLED. Missing tools will be installed automatically during execution.")
+                return {"status": "success", "auto_install_missing_tools": True}
+            elif action in ("off", "false", "0", "disable", "disabled"):
+                cfg["auto_install_missing_tools"] = False
+                save_config(cfg)
+                if not is_json:
+                    emit.success("Tool auto-installation DISABLED. Missing tools will prompt with manual installation instructions.")
+                return {"status": "success", "auto_install_missing_tools": False}
+            else:
+                if not is_json:
+                    emit.warn("Usage: /setup tools auto-install [on|off]")
+                return {"status": "error", "error": "invalid_option", "message": "Usage: /setup tools auto-install [on|off]"}
+
+        if first in ("install-all", "install") or (first == "tools" and len(clean_args) > 1 and clean_args[1].lower() in ("install-all", "install")):
+            tool_status = check_all_tools()
+            missing_pd = tool_status.get("missing_pd", [])
+            missing_other = tool_status.get("missing_other", [])
+            if not missing_pd and not missing_other:
+                if not is_json:
+                    emit.success("All binary tools are already installed.")
+                return {"status": "success", "message": "All tools already installed"}
+
+            if not is_json:
+                emit.banner("INSTALLING MISSING TOOLS")
+            for t in missing_pd + missing_other:
+                try_install(t, emit=emit)
+            tool_status = check_all_tools()
+            if not is_json:
+                emit.success(f"Installation complete. Installed {tool_status['installed_count']}/{tool_status['total_tools']} tools.")
+            return {"status": "success", "tools": tool_status}
+
+    # ── Full Environment & Tool Status Check ───────────────────────
     ollama_ok = ping_ollama()
     models = list_available_models()
     nv_key = os.environ.get("NVIDIA_API_KEY") or (cfg.get("api_keys", {}).get("nvidia") if isinstance(cfg.get("api_keys"), dict) else "") or (cfg.get("api_key") if str(cfg.get("api_key", "")).startswith("nvapi-") else "")
@@ -573,30 +654,52 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
     openai_key = os.environ.get("OPENAI_API_KEY") or (cfg.get("api_keys", {}).get("openai") if isinstance(cfg.get("api_keys"), dict) else "") or (cfg.get("api_key") if str(cfg.get("api_key", "")).startswith("sk-") and not str(cfg.get("api_key", "")).startswith("sk-ant-") else "")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY") or (cfg.get("api_keys", {}).get("anthropic") if isinstance(cfg.get("api_keys"), dict) else "") or (cfg.get("api_key") if str(cfg.get("api_key", "")).startswith("sk-ant-") else "")
 
+    tool_status = check_all_tools()
+    auto_install_enabled = bool(cfg.get("auto_install_missing_tools", False))
+
     status = {
         "ollama_connected": ollama_ok,
         "researcher_handle": cfg.get("researcher_handle", ""),
         "active_model": cfg.get("ai_model", ""),
         "active_provider": cfg.get("ai_provider", "ollama"),
         "available_models_count": len(models),
+        "auto_install_missing_tools": auto_install_enabled,
         "providers": {
             "ollama": ollama_ok,
             "nvidia": bool(nv_key),
             "gemini": bool(gemini_key),
             "openai": bool(openai_key),
             "anthropic": bool(anthropic_key)
-        }
+        },
+        "tools": tool_status
     }
 
     if not is_json:
-        emit.banner("HELLHOUND ENVIRONMENT STATUS")
+        emit.banner("HELLHOUND ENVIRONMENT & TOOL STATUS")
         emit(f"  Local Ollama: {'\033[92m[✓] Connected\033[0m' if ollama_ok else '\033[91m[x] Offline\033[0m'}")
         emit(f"  Researcher Handle: {status['researcher_handle'] or '(not set)'}")
         emit(f"  Active Model: {status['active_model'] or '(dynamic default)'} (Provider: {status['active_provider']})")
-        emit(f"  Configured Providers:")
+        emit(f"  Configured AI Providers:")
         for prov, has_key in status["providers"].items():
             state_str = "\033[92mConfigured\033[0m" if has_key else "\033[90mNot Set\033[0m"
             emit(f"    - {prov.upper()}: {state_str}")
+
+        emit("\n  Binary Recon Dependencies:")
+        for tool_name, info in tool_status["tools"].items():
+            if info["available"]:
+                emit(f"    \033[92m[✓]\033[0m {tool_name:<14} ({info['type']}) -> {info['path']}")
+            else:
+                emit(f"    \033[91m[✗]\033[0m {tool_name:<14} ({info['type']}) -> Missing! Install: {info['install']}")
+
+        if tool_status["missing_pd"]:
+            emit(f"\n  \033[93m[*] Bulk ProjectDiscovery Install:\033[0m `{tool_status['combined_pd_install']}`")
+        if tool_status["missing_other"]:
+            emit("  \033[93m[*] Standalone Installs:\033[0m")
+            for t in tool_status["missing_other"]:
+                emit(f"    - {t}: `{tool_status['tools'][t]['install']}`")
+
+        auto_state = "\033[92mON\033[0m" if auto_install_enabled else "\033[90mOFF\033[0m"
+        emit(f"\n  Auto-Install Missing Tools: {auto_state} (Toggle: `/setup tools auto-install on|off`)")
 
     return {"status": "success", "setup": status}
 
@@ -668,7 +771,7 @@ def handle_howl(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
 def handle_help(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
     /help
-    Displays reference table for all available slash commands.
+    Displays reference table for all available slash commands grouped by category.
     """
     is_json = "--json" in args or getattr(emit, "json_mode", False)
 
@@ -681,16 +784,58 @@ def handle_help(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
         catalog.append({
             "command": cmd.name,
             "aliases": cmd.aliases,
+            "category": getattr(cmd, "category", "general"),
             "usage": cmd.usage,
             "description": cmd.description
         })
 
     if not is_json:
-        emit.banner("HELLHOUND UNIFIED SLASH COMMANDS")
+        try:
+            from rich.markup import escape
+        except Exception:
+            def escape(t): return t
+
+        category_titles = {
+            "hunting": "RECONNAISSANCE & HUNTING",
+            "config": "CONFIGURATION & TARGET SCOPE",
+            "session": "SESSION & REPORTING",
+            "general": "GENERAL UTILITIES"
+        }
+        category_order = ["hunting", "config", "session", "general"]
+
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
         for item in catalog:
-            aliases_str = f" (Aliases: {', '.join(item['aliases'])})" if item['aliases'] else ""
-            emit.info(f"{item['command']}{aliases_str} — {item['description']}")
-            emit(f"  Usage: {item['usage']}\n")
+            cat = item.get("category", "general").lower()
+            grouped.setdefault(cat, []).append(item)
+
+        emit.banner("HELLHOUND UNIFIED SLASH COMMANDS")
+        for cat_key in category_order:
+            if cat_key not in grouped:
+                continue
+            cat_title = category_titles.get(cat_key, cat_key.upper())
+            emit(f"\n[bold red]─── {cat_title} ───[/bold red]")
+            for item in grouped[cat_key]:
+                aliases_str = f" [dim](Aliases: {', '.join(item['aliases'])})[/dim]" if item['aliases'] else ""
+                desc_str = escape(item['description'])
+                emit.info(f"• [bold cyan]{item['command']}[/bold cyan]{aliases_str} — {desc_str}")
+                usage_lines = [u.strip() for u in item['usage'].split("\n") if u.strip()]
+                for u in usage_lines:
+                    emit(f"    [dim]Usage:[/dim] [yellow]{escape(u)}[/yellow]")
+            emit("")
+
+        # Handle any uncategorized or extra categories
+        for cat_key, items in grouped.items():
+            if cat_key in category_order:
+                continue
+            emit(f"\n[bold red]─── {cat_key.upper()} ───[/bold red]")
+            for item in items:
+                aliases_str = f" [dim](Aliases: {', '.join(item['aliases'])})[/dim]" if item['aliases'] else ""
+                desc_str = escape(item['description'])
+                emit.info(f"• [bold cyan]{item['command']}[/bold cyan]{aliases_str} — {desc_str}")
+                usage_lines = [u.strip() for u in item['usage'].split("\n") if u.strip()]
+                for u in usage_lines:
+                    emit(f"    [dim]Usage:[/dim] [yellow]{escape(u)}[/yellow]")
+            emit("")
 
     return {"status": "success", "commands": catalog}
 
@@ -704,6 +849,7 @@ register_command(Command(
     aliases=["/surface", "/spider"],
     description="Run target reconnaissance pipeline with scope verification",
     usage="/recon <target> [--json]",
+    category="hunting",
     handler=handle_recon
 ))
 
@@ -712,6 +858,7 @@ register_command(Command(
     aliases=["/strike"],
     description="Execute a specific discovery/analysis module against target",
     usage="/scan <module> [target] [--json] [key=val...]",
+    category="hunting",
     handler=handle_scan
 ))
 
@@ -720,55 +867,8 @@ register_command(Command(
     aliases=["/auto"],
     description="Execute an autonomous, scope-aware multi-stage hunt and triage",
     usage="/hunt [target] [--json]",
+    category="hunting",
     handler=handle_hunt
-))
-
-register_command(Command(
-    name="/scope",
-    aliases=["/rules"],
-    description="Inspect, clear, or configure program scope rules for target",
-    usage="/scope [show | clear | <rules_text>]",
-    handler=handle_scope
-))
-
-register_command(Command(
-    name="/model",
-    aliases=["/ai"],
-    description="Inspect or set persistent AI model and provider",
-    usage="/model [model_name] [--session-only]",
-    handler=handle_model
-))
-
-register_command(Command(
-    name="/headers",
-    aliases=["/head"],
-    description="Manage global custom HTTP request headers and BugBounty handle",
-    usage="/headers [Header: Value | --clear]",
-    handler=handle_headers
-))
-
-register_command(Command(
-    name="/report",
-    aliases=["/loot"],
-    description="Generate structured bug bounty reconnaissance report",
-    usage="/report [--format html|json]",
-    handler=handle_report
-))
-
-register_command(Command(
-    name="/setup",
-    aliases=["/health"],
-    description="Verify local Ollama, cloud API keys, and environment",
-    usage="/setup",
-    handler=handle_setup
-))
-
-register_command(Command(
-    name="/ask",
-    aliases=["/chat"],
-    description="Query AI assistant with session context and tool access",
-    usage="/ask <question>",
-    handler=handle_ask
 ))
 
 register_command(Command(
@@ -776,6 +876,7 @@ register_command(Command(
     aliases=["/correlate", "/graph"],
     description="Correlate discoveries or generate visual attack graph",
     usage="/howl [--graph] [target] [--json]",
+    category="hunting",
     handler=handle_howl
 ))
 
@@ -785,6 +886,11 @@ def handle_skills(args: List[str], session_context: Dict[str, Any], emit: Any) -
     Lists discovered skills or searches skill repository.
     """
     from hellhound.core.skills import discover_skills, search_skills, load_skill_body
+    try:
+        from rich.markup import escape
+    except Exception:
+        def escape(t): return t
+
     is_json = "--json" in args or getattr(emit, "json_mode", False)
     clean_args = [a for a in args if a not in ("--json", "-j")]
 
@@ -794,7 +900,8 @@ def handle_skills(args: List[str], session_context: Dict[str, Any], emit: Any) -
             emit.banner(f"HELLHOUND SKILL LIBRARY ({len(skills)} Available)")
             for name, s in sorted(skills.items()):
                 tag = " (user)" if s.is_user_defined else ""
-                emit.info(f"• [bold cyan]{name}[/bold cyan]{tag}: {s.description[:110]}...")
+                desc_str = escape(s.description[:110])
+                emit.info(f"• [bold cyan]{name}[/bold cyan]{tag}: {desc_str}...")
         return {
             "status": "success",
             "skills": [
@@ -817,7 +924,8 @@ def handle_skills(args: List[str], session_context: Dict[str, Any], emit: Any) -
             emit.warn("No matching skills found.")
         for s in results:
             tag = " (user)" if s.is_user_defined else ""
-            emit.info(f"• [bold green]{s.name}[/bold green]{tag}: {s.description[:130]}...")
+            desc_str = escape(s.description[:130])
+            emit.info(f"• [bold green]{s.name}[/bold green]{tag}: {desc_str}...")
 
     return {
         "status": "success",
@@ -839,7 +947,62 @@ register_command(Command(
     aliases=["/skill"],
     description="List or search loaded methodology skills and checklists",
     usage="/skills [query] [--json]",
+    category="hunting",
     handler=handle_skills
+))
+
+register_command(Command(
+    name="/scope",
+    aliases=["/rules"],
+    description="Inspect, clear, or configure program scope rules for target",
+    usage="/scope [show | clear | <rules_text>]",
+    category="config",
+    handler=handle_scope
+))
+
+register_command(Command(
+    name="/model",
+    aliases=["/ai"],
+    description="Inspect, switch active AI model for orchestrator/synthesizer, or configure API keys",
+    usage="/model [orchestrator|synthesizer] <provider/model-id>  e.g. /model orchestrator ollama qwen2.5:3b-instruct  /model synthesizer nvidia/nemotron-3-super-120b-a12b\n/model set-key <provider> <key>",
+    category="config",
+    handler=handle_model
+))
+
+register_command(Command(
+    name="/headers",
+    aliases=["/head"],
+    description="Manage global custom HTTP request headers and BugBounty handle",
+    usage="/headers [Header: Value | --clear]",
+    category="config",
+    handler=handle_headers
+))
+
+register_command(Command(
+    name="/setup",
+    aliases=["/health", "/doctor"],
+    description="Verify AI connectivity, external tool dependencies, and auto-install settings",
+    usage="/setup [tools [auto-install on|off]]\n/setup tools install-all",
+    category="config",
+    handler=handle_setup
+))
+
+register_command(Command(
+    name="/report",
+    aliases=["/loot"],
+    description="Generate structured bug bounty reconnaissance report",
+    usage="/report [--format html|json]",
+    category="session",
+    handler=handle_report
+))
+
+register_command(Command(
+    name="/ask",
+    aliases=["/chat"],
+    description="Query AI assistant with session context and tool access",
+    usage="/ask <question>",
+    category="session",
+    handler=handle_ask
 ))
 
 register_command(Command(
@@ -847,6 +1010,7 @@ register_command(Command(
     aliases=["/?"],
     description="Show all available slash commands and usage",
     usage="/help",
+    category="general",
     handler=handle_help
 ))
 
@@ -880,35 +1044,31 @@ def dispatch(raw_input: str, session_context: Dict[str, Any], emit: Any = None) 
     args = tokens[1:]
 
     # Check for registered slash command
-    command = get_command(cmd_token)
-    if command and command.handler:
-        result = command.handler(args, session_context, emit)
-        if "--json" in tokens or getattr(emit, "json_mode", False):
-            print(json.dumps(result, indent=2))
-        return result
+    if cmd_token.startswith("/"):
+        command = get_command(cmd_token)
+        if command and command.handler:
+            result = command.handler(args, session_context, emit)
+            if "--json" in tokens or getattr(emit, "json_mode", False):
+                print(json.dumps(result, indent=2))
+            return result
+        emit.warn(f"Unknown command '{cmd_token}'. Type /help for available commands.")
+        return {"status": "error", "error": "unknown_command", "command": cmd_token}
 
-    # Check if user typed bare command name (e.g. 'help', 'setup', 'model', 'scope', or short 'recon <domain>')
-    if not cmd_token.startswith("/"):
-        conversational_words = {"this", "the", "target", "and", "see", "find", "what", "how", "why", "is", "can", "we", "if", "please", "check", "audit", "run", "do"}
-        is_conversational = len(tokens) > 2 or any(t.lower() in conversational_words for t in tokens)
+    # Built-in utility commands allowed without slash (e.g. 'help', 'exit', 'quit', 'clear')
+    if cmd_token.lower() in ("help", "exit", "quit", "clear", "?"):
+        command = get_command("/" + cmd_token)
+        if command and command.handler:
+            result = command.handler(args, session_context, emit)
+            if "--json" in tokens or getattr(emit, "json_mode", False):
+                print(json.dumps(result, indent=2))
+            return result
 
-        if not is_conversational:
-            command_fallback = get_command("/" + cmd_token)
-            if command_fallback and command_fallback.handler:
-                result = command_fallback.handler(args, session_context, emit)
-                if "--json" in tokens or getattr(emit, "json_mode", False):
-                    print(json.dumps(result, indent=2))
-                return result
-
-        # Plain natural language input -> Route directly to Agent Reasoning Loop
-        response = agent_handle_message(raw_clean, session_context=session_context, emit=emit)
-        if "--json" in tokens or getattr(emit, "json_mode", False):
-            res_dict = {"status": "success", "response": response}
-            print(json.dumps(res_dict, indent=2))
-            return res_dict
-        else:
-            emit(response)
-            return {"status": "success", "response": response}
-
-    emit.warn(f"Unknown command '{cmd_token}'. Type /help for available commands.")
-    return {"status": "error", "error": "unknown_command", "command": cmd_token}
+    # Plain natural language input -> Route directly to Agent Reasoning Loop
+    response = agent_handle_message(raw_clean, session_context=session_context, emit=emit)
+    if "--json" in tokens or getattr(emit, "json_mode", False):
+        res_dict = {"status": "success", "response": response}
+        print(json.dumps(res_dict, indent=2))
+        return res_dict
+    else:
+        emit(response)
+        return {"status": "success", "response": response}

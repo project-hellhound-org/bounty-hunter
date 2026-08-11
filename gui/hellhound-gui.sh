@@ -1,23 +1,13 @@
 #!/usr/bin/env bash
-# Apex-King HUD Launcher (Portable)
-# Detects its own location and environment dynamically.
+# HELLHOUND // Modern PyWebView GUI Launcher
 
-# Get the directory where this script is located
-HUD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$DIR")"
 
-if [ -d "$HUD_DIR" ]; then
-    cd "$HUD_DIR"
-    # Ensure node_modules exists
-    if [ ! -d "node_modules" ]; then
-        echo "[!] GUI dependencies missing. Running npm install..."
-        npm install --quiet
-    fi
-    # Launch Electron
-    nohup npm start > /dev/null 2>&1 &
-    echo "[+] Hellhound Apex-King HUD launched in background."
-else
-    if command -v notify-send &>/dev/null; then
-        notify-send "Hellhound Error" "Could not find HUD directory."
-    fi
-    exit 1
+# Activate Virtual Environment if present
+if [ -d "$HOME/.hellhound-env" ]; then
+    source "$HOME/.hellhound-env/bin/activate"
 fi
+
+echo "[*] Launching HELLHOUND PyWebView GUI..."
+python3 -m hellhound.gui_app "$@"

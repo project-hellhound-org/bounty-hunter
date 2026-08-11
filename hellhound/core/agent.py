@@ -30,7 +30,15 @@ from hellhound.core.ai_utils import (
     render_chat_bubble,
 )
 from hellhound.core.http_utils import merge_global_context
-from hellhound.core.skills import get_relevant_skills_prompt, discover_skills, search_skills, load_skill_body, is_ctf_lab_context
+from hellhound.core.skills import (
+    get_relevant_skills_prompt,
+    discover_skills,
+    search_skills,
+    load_skill_body,
+    is_ctf_lab_context,
+    is_ctf_auto_scope_eligible,
+)
+from hellhound.core.toolcheck import ensure_tool, get_binary_path, is_available
 
 
 def _load_baseline_rules() -> str:
@@ -74,16 +82,7 @@ class ToolSpec:
 
 def _find_binary(name: str) -> Optional[str]:
     """Find binary in system PATH as well as standard user Go binary directories."""
-    custom_paths = [
-        "/home/joe/.pdtm/go/bin",
-        "/home/joe/go/bin",
-        "/usr/local/bin",
-        "/usr/bin",
-        str(Path.home() / ".pdtm" / "go" / "bin"),
-        str(Path.home() / "go" / "bin")
-    ]
-    path_env = os.environ.get("PATH", "") + ":" + ":".join(custom_paths)
-    return shutil.which(name, path=path_env)
+    return get_binary_path(name)
 
 
 def _resolve_resolvers_path() -> str:
@@ -113,12 +112,18 @@ def _execute_shuffledns(args: Dict[str, Any], target: Target, emit: Any) -> Dict
     if domain.startswith(("http://", "https://")):
         domain = urlparse(domain).netloc.split(":")[0]
 
-    binary = _find_binary("shuffledns")
-    if not binary:
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("shuffledns", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
         return {
             "error": "shuffledns not installed",
-            "hint": "go install github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest"
+            "message": check["message"],
+            "hint": "pdtm -i shuffledns"
         }
+
+    binary = get_binary_path("shuffledns") or "shuffledns"
 
     # Resolve wordlist path
     repo_root = Path(__file__).resolve().parent.parent
@@ -172,12 +177,18 @@ def _execute_ffuf_vhost(args: Dict[str, Any], target: Target, emit: Any) -> Dict
         domain = urlparse(domain).netloc.split(":")[0]
 
     target_ip = args.get("target_ip", "").strip() or domain
-    binary = _find_binary("ffuf")
-    if not binary:
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("ffuf", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
         return {
             "error": "ffuf not installed",
+            "message": check["message"],
             "hint": "go install github.com/ffuf/ffuf/v2@latest"
         }
+
+    binary = get_binary_path("ffuf") or "ffuf"
 
     repo_root = Path(__file__).resolve().parent.parent
     wordlist_candidates = [
@@ -238,12 +249,18 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
-    binary = _find_binary("ffuf")
-    if not binary:
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("ffuf", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
         return {
             "error": "ffuf not installed",
+            "message": check["message"],
             "hint": "go install github.com/ffuf/ffuf/v2@latest"
         }
+
+    binary = get_binary_path("ffuf") or "ffuf"
 
     repo_root = Path(__file__).resolve().parent.parent
     wordlist_candidates = [
@@ -302,21 +319,30 @@ def _execute_subfinder(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     if domain.startswith("http://") or domain.startswith("https://"):
         domain = urlparse(domain).netloc.split(":")[0]
 
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("subfinder", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
+        return {
+            "error": "subfinder not installed",
+            "message": check["message"],
+            "hint": "pdtm -i subfinder"
+        }
+
+    subfinder_bin = get_binary_path("subfinder") or "subfinder"
     subdomains = set()
 
-    # Try local subfinder binary if available
-    subfinder_bin = _find_binary("subfinder") or shutil.which("subfinder")
-    if subfinder_bin:
-        try:
-            cmd = [subfinder_bin, "-d", domain, "-silent", "-all"]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if proc.returncode == 0:
-                for line in proc.stdout.splitlines():
-                    sub = line.strip().lower()
-                    if sub and "." in sub:
-                        subdomains.add(sub)
-        except Exception as e:
-            logger.warning(f"subfinder execution failed: {e}")
+    try:
+        cmd = [subfinder_bin, "-d", domain, "-silent", "-all"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                sub = line.strip().lower()
+                if sub and "." in sub:
+                    subdomains.add(sub)
+    except Exception as e:
+        logger.warning(f"subfinder execution failed: {e}")
 
     sub_list = sorted(list(subdomains))
     # Update target state
@@ -355,12 +381,18 @@ def _execute_port_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     if not cleaned_targets:
         return {"error": "No valid hosts provided for port scan."}
 
-    binary = _find_binary("naabu")
-    if not binary:
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("naabu", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
         return {
             "error": "naabu not installed",
-            "hint": "go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
+            "message": check["message"],
+            "hint": "pdtm -i naabu"
         }
+
+    binary = get_binary_path("naabu") or "naabu"
 
     ports = str(args.get("ports", "top-100")).strip().lower()
     exclude_ports = args.get("exclude_ports")
@@ -433,12 +465,18 @@ def _execute_permute_subdomains(args: Dict[str, Any], target: Target, emit: Any)
     if not cleaned:
         return {"error": "No subdomains provided for permutation generation."}
 
-    binary = _find_binary("alterx")
-    if not binary:
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("alterx", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
         return {
             "error": "alterx not installed",
-            "hint": "go install github.com/projectdiscovery/alterx/cmd/alterx@latest"
+            "message": check["message"],
+            "hint": "pdtm -i alterx"
         }
+
+    binary = get_binary_path("alterx") or "alterx"
 
     limit = int(args.get("limit", 500))
     cmd = [binary, "-silent", "-limit", str(limit)]
@@ -480,12 +518,18 @@ def _execute_resolve_candidates(args: Dict[str, Any], target: Target, emit: Any)
     if not cleaned:
         return {"error": "No candidate domains provided for resolution."}
 
-    binary = _find_binary("dnsx")
-    if not binary:
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("dnsx", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
         return {
             "error": "dnsx not installed",
-            "hint": "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
+            "message": check["message"],
+            "hint": "pdtm -i dnsx"
         }
+
+    binary = get_binary_path("dnsx") or "dnsx"
 
     import tempfile
     with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
@@ -560,12 +604,18 @@ def _execute_tls_cert_scan(args: Dict[str, Any], target: Target, emit: Any) -> D
     if not cleaned_targets:
         return {"error": "No valid hosts provided for TLS certificate scan."}
 
-    binary = _find_binary("tlsx")
-    if not binary:
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("tlsx", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
         return {
             "error": "tlsx not installed",
-            "hint": "go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest"
+            "message": check["message"],
+            "hint": "pdtm -i tlsx"
         }
+
+    binary = get_binary_path("tlsx") or "tlsx"
 
     port = str(args.get("port", "443")).strip()
     cmd = [binary, "-san", "-cn", "-so", "-silent", "-json", "-p", port]
@@ -627,10 +677,16 @@ def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
     else:
         targets_to_probe = [raw_target]
 
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("httpx", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
+
     live_hosts = []
 
-    # 1. Try local httpx binary
-    httpx_bin = _find_binary("httpx") or shutil.which("httpx")
+    # 1. Try local httpx binary if available
+    httpx_bin = get_binary_path("httpx") if check["available"] else None
     if httpx_bin:
         try:
             input_data = "\n".join(targets_to_probe)
@@ -655,7 +711,7 @@ def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
         except Exception as e:
             logger.warning(f"httpx binary failed: {e}")
 
-    # 2. Fallback to lightweight HTTP probe
+    # 2. Fallback to lightweight HTTP probe (runs if binary unavailable or returned no hosts)
     if not live_hosts:
         for t in targets_to_probe[:20]:
             host = t.strip()
@@ -1258,8 +1314,8 @@ class Agent:
             if primary_domain and "." in primary_domain:
                 self.set_target(primary_domain)
 
-        # Auto-scope shortcut when CTF/lab context is detected
-        if domain_match and is_ctf_lab_context(user_text):
+        # Auto-scope shortcut ONLY when CTF/lab target criteria are met
+        if domain_match and is_ctf_auto_scope_eligible(self.target.name, user_text):
             if not self.target.scope_raw or not self.target.scope_rules.in_scope:
                 set_scope(self.target, "")  # empty raw_text auto-populates in_scope with [*.target, target]
                 if emit and hasattr(emit, "info"):
@@ -1271,11 +1327,12 @@ class Agent:
         # Scope enforcement gate for fresh un-scoped network recon requests
         if has_recon_intent:
             if not self.target.scope_rules.in_scope and not self.target.scope_raw:
-                if self.target.name == "default" and not domain_match:
-                    return (
-                        "No target or scope is currently set. Please specify a target domain and authorized scope "
-                        "(e.g., using `/scope <rules>` or `target: example.com`) before starting reconnaissance."
-                    )
+                return (
+                    f"No authorized scope is defined for '{self.target.name}'. "
+                    f"I won't start reconnaissance without it — testing outside scope "
+                    f"risks chasing something that's actually disallowed. Provide the "
+                    f"program's in-scope/out-of-scope rules first (e.g. `/scope <paste>`)."
+                )
 
         # Build System Prompt with registered tools and current target scope
         tools_summary = "\n".join([
@@ -1287,9 +1344,9 @@ class Agent:
         if self.target.scope_rules.in_scope:
             scope_summary = f"IN-SCOPE: {self.target.scope_rules.in_scope} | OUT-OF-SCOPE: {self.target.scope_rules.out_scope}"
 
-        # Dynamic Skill-Aware Reasoning Injection
+        # Dynamic Skill-Aware Reasoning Injection (for Synthesizer)
         cfg = load_config()
-        ai_prov = (cfg.get("ai_provider") or "ollama").lower()
+        ai_prov = (cfg.get("synthesizer_provider") or cfg.get("ai_provider") or "ollama").lower()
         is_small = (ai_prov == "ollama")
         skills_block = get_relevant_skills_prompt(
             user_text=user_text,
@@ -1299,10 +1356,33 @@ class Agent:
             max_skills=2
         )
 
-        system_prompt = f"""\
+        # ── 1. Minimal Orchestrator System Prompt (Fast Tool Selection) ─────────
+        orchestrator_system_prompt = f"""\
+You are HELLHOUND Orchestrator. Your sole job is to evaluate if a tool should be executed next or if tool execution is complete.
+
+TARGET: {self.target.name}
+SCOPE: {scope_summary}
+
+AVAILABLE TOOLS:
+{tools_summary}
+
+RULES:
+1. ONLY call tools when the user explicitly requests reconnaissance, scanning, enumeration, or analysis of a target.
+2. For greetings, casual questions, or general discussion, do NOT call any tools. Output "DONE".
+3. To call a tool, respond ONLY with JSON:
+```json
+{{
+  "tool": "<tool_name>",
+  "args": {{ ... }}
+}}
+```
+4. If no further tools are needed, or after inspecting tool findings, respond with "DONE".
+"""
+
+        # ── 2. Comprehensive Synthesizer System Prompt (Deep Reasoning & Synthesis)
+        synthesizer_system_prompt = f"""\
 You are HELLHOUND, an autonomous bug bounty reconnaissance and triage assistant.
-Your role: Automate subdomain enumeration, live host discovery, tech detection, takeover verification, endpoint discovery, and triage.
-You operate strictly within authorized engagement scope and verify findings factually.
+Your role: Provide the researcher with deep, factual analysis, evidence evaluation, severity classification, and actionable bug bounty triage recommendations.
 
 TARGET: {self.target.name}
 SCOPE CONSTRAINTS: {scope_summary}
@@ -1312,45 +1392,30 @@ CURRENT FINDINGS: {len(self.target.findings)} verified findings
 {BASELINE_RULES_PROMPT}
 
 {skills_block}
-IMPORTANT BEHAVIORAL RULES:
-1. ONLY call tools when the user explicitly requests reconnaissance, scanning, enumeration, or analysis of a target.
-2. For greetings ("hello", "hi", "hey"), casual conversation, general questions, or status inquiries, respond conversationally WITHOUT calling any tools.
-3. Never run recon tools unless the user mentions a specific target or asks for enumeration/scanning.
-4. If a message is ambiguous, ask the user to clarify rather than launching tools.
-5. If the user explicitly requests "active recon" or "active enumeration" (as opposed to generic recon), skip passive tools (subfinder) entirely and go straight to active tools: dns_bruteforce (and vhost_fuzz if an IP is known).
-6. If subfinder/passive enumeration returns few or no results, consider running dns_bruteforce — this is especially important for internal, private, or non-publicly-indexed targets (lab environments, CTF infrastructure, internal tools) where certificate transparency and passive aggregators have nothing indexed. If a target IP is known but subdomain enumeration is coming up empty, consider vhost_fuzz — CTF infrastructure in particular often runs multiple challenges as virtual hosts on one shared IP with no individual DNS entry.
 
-AVAILABLE RECON/TRIAGE TOOLS:
-{tools_summary}
-
-TOOL CALLING FORMAT:
-To execute one or more tools, respond with a JSON code block:
-```json
-{{
-  "tool": "<tool_name>",
-  "args": {{ ... }}
-}}
-```
-If you do not need to run a tool, or after analyzing tool output, provide a clear, concise final answer to the researcher.
+INSTRUCTIONS:
+- Review the entire conversation history, executed tools, and gathered evidence.
+- Produce a clear, concise, and structured synthesis of all findings.
+- Highlight actionable security observations, open attack surfaces, and logical next triage steps.
 """
 
         self.history.append({"role": "user", "content": user_text})
 
-        # Iteration loop for multi-step reasoning / tool calls
+        # ── 3. Orchestrator Iteration Loop (Thinking=False, Fast Local/Tool Calls) ──
         for iteration in range(max_iterations):
             if emit and hasattr(emit, "set_label"):
                 emit.set_label("HELLHOUND IS THINKING")
 
-            # Format history for inference
             ai_resp = ask_neural_core(
-                prompt=user_text if iteration == 0 else "Continue analysis based on tool results.",
-                system_prompt=system_prompt
+                prompt=user_text if iteration == 0 else "Continue analysis based on tool results. Choose next tool or output 'DONE'.",
+                system_prompt=orchestrator_system_prompt,
+                role="orchestrator",
+                thinking=False,
+                history=self.history
             )
 
             if not ai_resp or not ai_resp.strip():
-                if emit and hasattr(emit, "set_label"):
-                    emit.set_label("FINALIZING RESPONSE")
-                return "Analysis completed. No further actions required."
+                break
 
             # Check for JSON tool invocation in the response
             tool_call = None
@@ -1375,12 +1440,17 @@ If you do not need to run a tool, or after analyzing tool output, provide a clea
                 t_args = tool_call.get("args", {})
                 
                 if emit and hasattr(emit, "set_label"):
-                    emit.set_label(f"EXECUTING: {t_name}")
+                    emit.set_label(f"EXECUTING {t_name.upper()}")
 
-                if emit and hasattr(emit, "info"):
+                if emit and hasattr(emit, "tool_start"):
+                    emit.tool_start(t_name, t_args)
+                elif emit and hasattr(emit, "info"):
                     emit.info(f"[*] Executing tool: {t_name} with args: {t_args}")
 
                 tool_result = self.execute_tool_call(t_name, t_args, emit)
+
+                if emit and hasattr(emit, "tool_result"):
+                    emit.tool_result(t_name, tool_result)
 
                 if emit and hasattr(emit, "set_label"):
                     emit.set_label("ANALYZING RESULTS")
@@ -1391,7 +1461,6 @@ If you do not need to run a tool, or after analyzing tool output, provide a clea
                     "role": "user",
                     "content": f"[TOOL RESULT: {t_name}]\n{json.dumps(tool_result, indent=2)}"
                 })
-                # Update loop prompt for next iteration
                 user_text = f"Tool '{t_name}' returned:\n{json.dumps(tool_result, indent=2)}\nEvaluate these findings."
                 continue
 
@@ -1409,15 +1478,29 @@ If you do not need to run a tool, or after analyzing tool output, provide a clea
                 user_text = f"Tool '{unregistered_name}' is invalid. Please select from available tools: {', '.join(TOOL_REGISTRY.keys())}"
                 continue
 
-            # No tool call; return final answer
-            if emit and hasattr(emit, "set_label"):
-                emit.set_label("FINALIZING RESPONSE")
-            self.history.append({"role": "assistant", "content": ai_resp})
-            save_target(self.target)
-            return ai_resp
+            # Non-tool response / "DONE" / conversational output from orchestrator -> exit tool loop
+            if ai_resp.strip().upper() != "DONE":
+                # If the orchestrator provided a direct conversational answer (e.g. greeting or direct question answer)
+                # and no tools were run, we can also let synthesizer refine or synthesize directly
+                pass
+            break
 
+        # ── 4. Exactly One Synthesizer Call (Thinking=True, Deep Synthesis) ───────
+        if emit and hasattr(emit, "set_label"):
+            emit.set_label("FINALIZING RESPONSE")
+
+        final_answer = ask_neural_core(
+            prompt="Based on all context, evidence, and tool results gathered, provide the researcher's final answer.",
+            system_prompt=synthesizer_system_prompt,
+            role="synthesizer",
+            thinking=True,
+            history=self.history
+        )
+
+        final_response = final_answer or ai_resp or "Analysis completed. No further actions required."
+        self.history.append({"role": "assistant", "content": final_response})
         save_target(self.target)
-        return "Reached maximum analysis iterations."
+        return final_response
 
 
 # Global singleton agent instance for active session

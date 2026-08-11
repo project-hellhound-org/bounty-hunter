@@ -22,10 +22,17 @@ init(autoreset=True)
 # No colors — safe for headless / socketio / logging use.
 # ══════════════════════════════════════════════════════
 
+try:
+    from rich.console import Console
+    _rich_console = Console()
+except Exception:
+    _rich_console = None
+
+
 class PlainEmit:
     """
-    Colorless emit. Used by engine in headless mode.
-    Defines the complete emit contract every module can rely on.
+    Standard emit backed by Rich Console for vibrant terminal formatting,
+    with fallback to plain stdout and WebSocket support.
     """
 
     def __init__(self, socketio=None):
@@ -35,10 +42,10 @@ class PlainEmit:
         self._send(msg)
 
     def info(self, msg):
-        self._send(f"[*] {msg}")
+        self._send(f"[bold cyan][*][/bold cyan] {msg}")
 
     def warn(self, msg):
-        self._send(f"[!] {msg}")
+        self._send(f"[bold yellow][!][/bold yellow] {msg}")
 
     def warning(self, msg):
         """Compatibility alias for warn."""
@@ -48,31 +55,40 @@ class PlainEmit:
         """Update active status label if supported."""
         pass
 
+    def tool_start(self, tool_name: str, args: dict):
+        """Emits start of tool execution."""
+        args_str = ", ".join(f"{k}={repr(v)}" for k, v in (args or {}).items())
+        self._send(f"[bold cyan][*][/bold cyan] Executing tool: [bold white]{tool_name}[/bold white]({args_str})")
+
+    def tool_result(self, tool_name: str, result: any):
+        """Emits tool execution result."""
+        pass
+
     def success(self, msg):
-        self._send(f"[✓] {msg}")
+        self._send(f"[bold green][✓][/bold green] {msg}")
 
     def error(self, msg):
-        self._send(f"[✗] {msg}")
+        self._send(f"[bold red][✗][/bold red] {msg}")
 
     # Always-visible methods (not gated by verbose)
     def always_info(self, msg):
-        self._send(f"[*] {msg}")
+        self.info(msg)
 
     def always_success(self, msg):
-        self._send(f"[✓] {msg}")
+        self.success(msg)
 
     # Visual / structural
     def banner(self, title):
-        self._send(f"\n[=== {title} ===]")
+        self._send(f"\n[bold red]═══ {title} ═══[/bold red]")
 
     def section(self, title):
-        self._send(f"\n── {title} ──")
+        self._send(f"\n[bold red]── {title} ──[/bold red]")
 
     def row(self, key, value, **kwargs):
-        self._send(f"{key}: {value}")
+        self._send(f"[bold white]{key}:[/bold white] {value}")
 
     def finding(self, *args):
-        self._send(f"[!] {' '.join(map(str, args))}")
+        self._send(f"[bold red][!][/bold red] {' '.join(map(str, args))}")
 
     def endpoint_row(self, ep):
         self._send(ep.get("url", ""))
@@ -101,7 +117,13 @@ class PlainEmit:
         pass
 
     def _send(self, msg):
-        print(msg)
+        if _rich_console:
+            try:
+                _rich_console.print(msg)
+            except Exception:
+                print(msg)
+        else:
+            print(msg)
         if self.socketio:
             self.socketio.emit("log", {"message": msg})
 

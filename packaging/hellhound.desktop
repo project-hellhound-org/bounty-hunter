@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=HELLHOUND
+Comment=Autonomous bug bounty recon & triage assistant
+Exec=hellhound --gui
+Icon=/absolute/path/replaced/at/install/time/logo.png
+Terminal=false
+Categories=Security;Development;Utility;
+StartupNotify=true

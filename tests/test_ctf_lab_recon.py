@@ -13,6 +13,8 @@ from hellhound.core.agent import Agent
 from hellhound.core.skills import (
     discover_skills,
     is_ctf_lab_context,
+    is_ctf_domain_pattern,
+    is_ctf_auto_scope_eligible,
     get_relevant_skills_prompt,
     search_skills,
     load_skill_body
@@ -34,6 +36,37 @@ class TestCtfLabReconSkill(unittest.TestCase):
         self.assertIn("dns_bruteforce", body)
         self.assertIn("vhost_fuzz", body)
         self.assertIn("TRIVIAL SCOPE DOCTRINE", body)
+
+    def test_is_ctf_domain_pattern(self):
+        self.assertTrue(is_ctf_domain_pattern("topaz.ctfio.com"))
+        self.assertTrue(is_ctf_domain_pattern("indium.ctfio.com"))
+        self.assertTrue(is_ctf_domain_pattern("machine.htb"))
+        self.assertTrue(is_ctf_domain_pattern("target.tryhackme.com"))
+        self.assertTrue(is_ctf_domain_pattern("box.vulnhub.com"))
+        self.assertTrue(is_ctf_domain_pattern("ctf.example.org"))
+        self.assertTrue(is_ctf_domain_pattern("localhost"))
+        self.assertTrue(is_ctf_domain_pattern("127.0.0.1"))
+        self.assertTrue(is_ctf_domain_pattern("192.168.1.100"))
+
+        self.assertFalse(is_ctf_domain_pattern("discover.com"))
+        self.assertFalse(is_ctf_domain_pattern("example.com"))
+        self.assertFalse(is_ctf_domain_pattern("hackerone.com"))
+        self.assertFalse(is_ctf_domain_pattern("google.com"))
+
+    def test_is_ctf_auto_scope_eligible(self):
+        # Real targets without CTF pattern or explicit isolation phrases
+        self.assertFalse(is_ctf_auto_scope_eligible("discover.com", "recon discover.com"))
+        self.assertFalse(is_ctf_auto_scope_eligible("discover.com", "let's test my approach in a lab environment for discover.com"))
+        self.assertFalse(is_ctf_auto_scope_eligible("example.com", "scan example.com"))
+
+        # Genuine CTF domain patterns
+        self.assertTrue(is_ctf_auto_scope_eligible("indium.ctfio.com", "recon indium.ctfio.com"))
+        self.assertTrue(is_ctf_auto_scope_eligible("topaz.ctfio.com", "find subdomains"))
+        self.assertTrue(is_ctf_auto_scope_eligible("machine.htb", "recon"))
+
+        # Explicit multi-word isolation authorization phrases
+        self.assertTrue(is_ctf_auto_scope_eligible("target.internal", "this is a training range, recon target.internal"))
+        self.assertTrue(is_ctf_auto_scope_eligible("target.org", "check this isolated target"))
 
     def test_is_ctf_lab_context_detector(self):
         # Positive matches
@@ -87,6 +120,26 @@ class TestCtfLabReconSkill(unittest.TestCase):
             "[*] CTF/lab context detected — auto-scoping to topaz.ctfio.com (no manual /scope needed for lab targets)"
         )
 
+    def test_scope_refusal_on_unscoped_real_target(self):
+        target = Target(name="default", scope_rules=ScopeRules(in_scope=[], out_scope=[], disallowed=[]))
+        agent = Agent(target=target)
+        mock_emit = MagicMock()
+
+        # 1. Bare recon request against unscoped domain
+        res1 = agent.handle_message("recon discover.com", emit=mock_emit)
+        self.assertEqual(agent.target.name, "discover.com")
+        self.assertEqual(agent.target.scope_rules.in_scope, [])
+        self.assertIn("No authorized scope is defined for 'discover.com'", res1)
+        self.assertIn("I won't start reconnaissance without it", res1)
+
+        # 2. Recon request with 'lab' in query against regular public domain
+        agent2 = Agent(target=Target(name="default", scope_rules=ScopeRules(in_scope=[], out_scope=[], disallowed=[])))
+        res2 = agent2.handle_message("let's test my approach in a lab environment for discover.com", emit=mock_emit)
+        self.assertEqual(agent2.target.name, "discover.com")
+        self.assertEqual(agent2.target.scope_rules.in_scope, [])
+        self.assertIn("No authorized scope is defined for 'discover.com'", res2)
+        self.assertIn("I won't start reconnaissance without it", res2)
+
     @patch("hellhound.core.agent.ask_neural_core")
     def test_normal_bug_bounty_does_not_auto_scope_with_ctf_message(self, mock_ask):
         mock_ask.return_value = "Proceeding with standard engagement recon"
@@ -95,14 +148,16 @@ class TestCtfLabReconSkill(unittest.TestCase):
 
         mock_emit = MagicMock()
         # Message with domain but NO CTF context
-        user_msg = "recon example.com for our engagement"
+        user_msg = "recon unscoped-bounty-corp.com for our engagement"
         res = agent.handle_message(user_msg, emit=mock_emit)
 
         # Target name updated from domain match
-        self.assertEqual(agent.target.name, "example.com")
+        self.assertEqual(agent.target.name, "unscoped-bounty-corp.com")
         # CTF auto-scoping emit notification should NOT have been called
         for call_args in mock_emit.info.call_args_list:
             self.assertNotIn("CTF/lab context detected", call_args[0][0])
+        # Returns scope refusal message
+        self.assertIn("No authorized scope is defined for 'unscoped-bounty-corp.com'", res)
 
 
 if __name__ == "__main__":

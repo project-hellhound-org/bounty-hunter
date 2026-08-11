@@ -122,12 +122,8 @@ def create_or_load_target(name: str) -> Target:
         except Exception:
             pass
 
-    # Create new target
+    # Create new target with clean empty scope
     target = Target(name=name)
-    # Default initial in_scope rule to the target itself if valid domain
-    if name and "." in name:
-        target.scope_rules.in_scope.append(f"*.{name.lstrip('*.')}")
-        target.scope_rules.in_scope.append(name.lstrip("*."))
     save_target(target)
     return target
 

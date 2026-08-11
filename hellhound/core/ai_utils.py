@@ -32,29 +32,51 @@ def strip_thinking_tags(text: str) -> str:
 
 def load_config() -> Dict[str, Any]:
     """Loads persistent Hellhound configuration from ~/.hellhound/config.json."""
-    if not CONFIG_FILE.exists():
-        return {
-            "ai_provider": "ollama",
-            "ai_model": "",
-            "api_key": "ollama",
-            "researcher_handle": "",
-            "max_response_tokens": 8192,
-            "api_keys": {},
-            "global_headers": {},
-            "scope": {
-                "in_scope": [],
-                "out_scope": [],
-                "disallowed": [],
-                "raw_text": ""
-            }
+    default_config: Dict[str, Any] = {
+        "ai_provider": "ollama",
+        "ai_model": "",
+        "orchestrator_provider": "ollama",
+        "orchestrator_model": "",
+        "synthesizer_provider": "nvidia",
+        "synthesizer_model": "nvidia/nemotron-3-super-120b-a12b",
+        "api_key": "ollama",
+        "researcher_handle": "",
+        "max_response_tokens": 8192,
+        "auto_install_missing_tools": False,
+        "api_keys": {},
+        "global_headers": {},
+        "scope": {
+            "in_scope": [],
+            "out_scope": [],
+            "disallowed": [],
+            "raw_text": ""
         }
+    }
+    if not CONFIG_FILE.exists():
+        return default_config
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return data if isinstance(data, dict) else {}
+            if isinstance(data, dict):
+                # Ensure defaults for newly introduced keys
+                if "auto_install_missing_tools" not in data:
+                    data["auto_install_missing_tools"] = False
+                # Two-tier model backward compatibility fallbacks
+                legacy_prov = data.get("ai_provider", "ollama")
+                legacy_model = data.get("ai_model", "")
+                if "orchestrator_provider" not in data:
+                    data["orchestrator_provider"] = legacy_prov
+                if "orchestrator_model" not in data:
+                    data["orchestrator_model"] = legacy_model
+                if "synthesizer_provider" not in data:
+                    data["synthesizer_provider"] = "nvidia" if ("api_keys" in data and "nvidia" in data.get("api_keys", {})) else legacy_prov
+                if "synthesizer_model" not in data:
+                    data["synthesizer_model"] = "nvidia/nemotron-3-super-120b-a12b" if data.get("synthesizer_provider") == "nvidia" else legacy_model
+                return data
+            return default_config
     except Exception as e:
         logging.warning(f"Failed to load config from {CONFIG_FILE}: {e}")
-        return {}
+        return default_config
 
 def save_config(config: Dict[str, Any]) -> bool:
     """Saves persistent Hellhound configuration to ~/.hellhound/config.json."""
@@ -263,7 +285,7 @@ def render_chat_bubble(text: str, sender: str = "HELLHOUND"):
         print(f"\n{text.strip()}\n")
 
 class ThinkingIndicator:
-    """Thread-safe 6-dot floating loader supporting dynamic step emission and clean shutdown."""
+    """Thread-safe floating loader supporting dynamic step emission, tool action trees, and clean shutdown."""
     def __init__(self, label="HELLHOUND IS ANALYZING & EXECUTING"):
         self.label = label
         self.stop_event = threading.Event()
@@ -309,18 +331,90 @@ class ThinkingIndicator:
             except Exception:
                 pass
 
+    def tool_start(self, tool_name: str, args: Dict[str, Any]):
+        """Prints a Claude Code-style action bullet for tool execution."""
+        formatted_name = tool_name.replace("_", " ").title().replace(" ", "")
+        args_items = []
+        for k, v in (args or {}).items():
+            val_str = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+            if len(val_str) > 35:
+                val_str = val_str[:32] + "..."
+            args_items.append(f"{k}={val_str}")
+        args_str = ", ".join(args_items)
+        if len(args_str) > 75:
+            args_str = args_str[:72] + "..."
+        with self.lock:
+            try:
+                if sys.stdout and not sys.stdout.closed:
+                    sys.stdout.write("\r\033[2K\r")
+                    sys.stdout.write(f" \033[38;5;203;1m●\033[0m \033[1;97m{formatted_name}\033[0m\033[38;5;244m({args_str})\033[0m\n")
+                    sys.stdout.flush()
+            except Exception:
+                pass
+
+    def tool_result(self, tool_name: str, result: Any):
+        """Prints a nested branch summarizing tool results."""
+        summary = self._summarize_result(tool_name, result)
+        with self.lock:
+            try:
+                if sys.stdout and not sys.stdout.closed:
+                    sys.stdout.write("\r\033[2K\r")
+                    sys.stdout.write(f"   \033[38;5;240m└\033[0m \033[38;5;250m{summary}\033[0m\n")
+                    sys.stdout.flush()
+            except Exception:
+                pass
+
+    def _summarize_result(self, tool_name: str, result: Any) -> str:
+        if not isinstance(result, dict):
+            return str(result)[:80]
+        if result.get("blocked"):
+            return f"\033[38;5;220mBlocked:\033[0m {result.get('error', 'Scope refusal')}"
+        if result.get("error"):
+            return f"\033[38;5;196mError:\033[0m {result['error']}"
+
+        if tool_name == "port_scan":
+            ports = result.get("open_ports", [])
+            return f"Discovered {len(ports)} open port(s): {', '.join(map(str, ports[:8]))}{'...' if len(ports) > 8 else ''}"
+        elif tool_name == "permute_subdomains":
+            count = result.get("permutation_count", len(result.get("candidates", [])))
+            return f"Generated {count} candidate permutation(s)"
+        elif tool_name == "resolve_candidates":
+            resolved = result.get("resolved", [])
+            return f"Resolved {len(resolved)} live host(s) across DNS"
+        elif tool_name == "subfinder":
+            subs = result.get("subdomains", [])
+            return f"Discovered {len(subs)} subdomain(s) via passive CT sources"
+        elif tool_name == "httpx":
+            live = result.get("live_hosts", [])
+            return f"Probed {len(live)} live HTTP/HTTPS service(s)"
+        elif tool_name == "spider":
+            eps = result.get("endpoints_found", 0)
+            return f"Crawled application — found {eps} endpoint(s)"
+        elif tool_name == "tls_cert_scan":
+            names = result.get("subject_names", [])
+            return f"Extracted {len(names)} SAN/CN record(s) from TLS certificate"
+
+        keys = [k for k in result.keys() if k not in ("target", "state")]
+        if keys:
+            first_key = keys[0]
+            val = result[first_key]
+            if isinstance(val, list):
+                return f"Processed {len(val)} {first_key}"
+            return f"{first_key}: {str(val)[:60]}"
+        return "Operation completed successfully"
+
     def print_step(self, icon: str, msg: str, color: str = "\033[38;5;203;1m"):
         with self.lock:
             try:
                 if sys.stdout and not sys.stdout.closed:
                     sys.stdout.write("\r\033[2K\r")
-                    sys.stdout.write(f" {color}[{icon}]\033[0m \033[38;5;250m{msg}\033[0m\n")
+                    sys.stdout.write(f"   \033[38;5;240m└\033[0m {color}[{icon}]\033[0m \033[38;5;250m{msg}\033[0m\n")
                     sys.stdout.flush()
             except Exception:
                 pass
 
     def info(self, msg: str):
-        self.print_step("⚡", msg, "\033[38;5;203;1m")
+        self.print_step("*", msg, "\033[38;5;203;1m")
 
     def success(self, msg: str):
         self.print_step("✓", msg, "\033[38;5;46;1m")
@@ -529,11 +623,11 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
 
     return strip_thinking_tags(res) if res else res
 
-def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
-    """Config-aware wrapper to query the configured AI provider/model."""
+def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, role: str = "orchestrator", thinking: bool = False, max_tokens: int = None, history: list = None) -> Optional[str]:
+    """Config-aware wrapper to query the configured AI provider/model for a specific role (orchestrator vs synthesizer)."""
     cfg = load_config()
-    provider = cfg.get("ai_provider", "ollama")
-    active_model = model or cfg.get("ai_model") or get_default_model(provider)
+    provider = cfg.get(f"{role}_provider") or cfg.get("ai_provider", "ollama")
+    active_model = model or cfg.get(f"{role}_model") or cfg.get("ai_model") or get_default_model(provider)
 
     # Resolve API key: api_keys[provider] → environment variable → legacy api_key field
     api_keys = cfg.get("api_keys", {})
@@ -548,10 +642,23 @@ def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, t
     api_key = (
         api_keys.get(provider)
         or os.environ.get(env_map.get(provider, ""), "")
-        or cfg.get("api_key", "ollama")
+        or (cfg.get("api_key") if cfg.get("ai_provider") == provider else "")
+        or ("ollama" if provider == "ollama" else "")
     )
+    if not api_key and provider != "ollama":
+        legacy_key = cfg.get("api_key", "")
+        if legacy_key and legacy_key != "ollama":
+            api_key = legacy_key
 
-    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens)
+    # Graceful fallback: If cloud provider is requested but has no API key configured, route to local orchestrator
+    if provider != "ollama" and not api_key:
+        fallback_prov = cfg.get("orchestrator_provider") or cfg.get("ai_provider", "ollama")
+        if fallback_prov == "ollama" or api_keys.get(fallback_prov) or os.environ.get(env_map.get(fallback_prov, ""), ""):
+            provider = fallback_prov
+            active_model = cfg.get("orchestrator_model") or cfg.get("ai_model") or get_default_model(provider)
+            api_key = api_keys.get(provider) or os.environ.get(env_map.get(provider, ""), "") or "ollama"
+
+    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens)
 
 def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
     """REST call to NVIDIA NIM OpenAI-compatible API."""

@@ -19,21 +19,27 @@ import click
 )
 @click.option("--print", "-p", "print_cmd", default=None, help="Execute a slash command in headless mode and print output")
 @click.option("--json", "-j", "json_output", is_flag=True, default=False, help="Force structured JSON output for automation")
-@click.option("--classic", is_flag=True, default=False, help="Launch legacy Metasploit-style console instead of chat UI")
-@click.version_option("12.5.0", prog_name="HELLHOUND")
+@click.option("--gui", is_flag=True, default=False, help="Launch PyWebView graphical user interface")
+@click.option("--classic", is_flag=True, default=False, hidden=True, help="Launch legacy Metasploit-style console instead of chat UI")
+@click.version_option("12.6.0", prog_name="HELLHOUND")
 @click.pass_context
-def cli(ctx, print_cmd, json_output, classic):
+def cli(ctx, print_cmd, json_output, gui, classic):
     """
-    HELLHOUND — Modular Web Offensive Framework
+    HELLHOUND — Autonomous bug bounty recon & triage assistant
 
-    Run without arguments to launch the interactive console.
+    Run without arguments to launch the interactive chat console.
 
       hellhound                     → interactive console
-      hellhound --print "/recon example.com"
-      hellhound -p "/howl --json"
+      hellhound gui                 → launch PyWebView GUI
+      hellhound --print "/scope show --json"
+      hellhound -p "/recon example.com"
     """
     if print_cmd:
         _execute_headless(print_cmd, json_output)
+        return
+
+    if gui:
+        _launch_gui()
         return
 
     if ctx.invoked_subcommand is None:
@@ -84,6 +90,17 @@ def console():
 
 
 # -------------------------------------------------
+# GUI subcommand (PyWebView chat-archive interface)
+# -------------------------------------------------
+@cli.command()
+@click.argument("target", required=False, default=None)
+@click.option("--debug", is_flag=True, default=False, help="Enable webview developer tools")
+def gui(target, debug):
+    """Launch the modern PyWebView GUI interface"""
+    _launch_gui(target=target, debug=debug)
+
+
+# -------------------------------------------------
 # Upgrade subcommand
 # -------------------------------------------------
 @cli.command()
@@ -128,6 +145,18 @@ def _launch_console(classic: bool = False):
         sys.exit(0)
     except Exception as e:
         click.echo(f"[!] Failed to start console: {e}")
+        sys.exit(1)
+
+
+def _launch_gui(target=None, debug: bool = False):
+    try:
+        from hellhound.gui_app import launch_gui
+        launch_gui(target=target, debug=debug)
+    except KeyboardInterrupt:
+        click.echo("\n[+] Exiting HELLHOUND GUI.")
+        sys.exit(0)
+    except Exception as e:
+        click.echo(f"[!] Failed to start GUI: {e}")
         sys.exit(1)
 
 

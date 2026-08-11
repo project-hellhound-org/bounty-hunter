@@ -172,6 +172,93 @@ SPECIFICITY_KEYWORDS: Dict[str, List[str]] = {
 }
 
 
+# Known CTF / Lab platform domain patterns & suffixes
+CTF_DOMAIN_PATTERNS = (
+    ".ctfio.com",
+    ".ctfio",
+    ".hackthebox.com",
+    ".hackthebox.eu",
+    ".htb",
+    ".tryhackme.com",
+    ".thm",
+    ".vulnhub.com",
+    ".root-me.org",
+    ".pwnable.kr",
+    ".pwnable.tw",
+    ".pwnable.xyz",
+    ".ctfd.io",
+    ".overthewire.org",
+    ".portswigger-labs.net",
+    ".pentesterlab.com",
+    ".challs.io",
+    ".chal.pw",
+    ".ctf.live",
+    ".local",
+    ".test",
+    ".internal",
+)
+
+
+def is_ctf_domain_pattern(domain: str) -> bool:
+    """
+    Checks if a domain/host matches known CTF or lab platform domain patterns.
+    """
+    if not domain or not domain.strip():
+        return False
+    d = domain.lower().strip().lstrip("*.")
+    if d in ("localhost", "127.0.0.1"):
+        return True
+    for suffix in CTF_DOMAIN_PATTERNS:
+        clean_suf = suffix.lstrip(".")
+        if d == clean_suf or d.endswith(suffix) or d.endswith("." + clean_suf):
+            return True
+    if re.search(r'(^|\.)ctf[\.-]', d):
+        return True
+    try:
+        import ipaddress
+        ip = ipaddress.ip_address(d)
+        if ip.is_private or ip.is_loopback:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_ctf_auto_scope_eligible(target_name: str, user_text: str = "") -> bool:
+    """
+    Determines whether a target is eligible for automatic scoping without manual /scope.
+    Requires:
+      1. Target domain matches verified CTF/lab platform infrastructure (e.g. .ctfio.com, .htb, .tryhackme.com, localhost)
+         AND context or domain confirms CTF/lab nature.
+      OR
+      2. User text contains explicit high-confidence multi-word authorization phrases
+         ('training range', 'isolated target', 'private target', 'non-indexed target', 'non-indexed lab').
+
+    A bare token like 'lab' or 'test' alone against a regular public domain (e.g. 'discover.com')
+    will NEVER qualify for auto-scoping.
+    """
+    if not target_name:
+        return False
+
+    # 1. Target domain matches CTF domain patterns
+    if is_ctf_domain_pattern(target_name):
+        return True
+
+    # 2. Check for explicit multi-word isolation authorization phrases in user text
+    q_lower = user_text.lower() if user_text else ""
+    explicit_phrases = [
+        "training range",
+        "isolated target",
+        "private target",
+        "non-indexed target",
+        "non-indexed lab"
+    ]
+    if any(phrase in q_lower for phrase in explicit_phrases):
+        return True
+
+    return False
+
+
 def is_ctf_lab_context(user_text: str) -> bool:
     """
     Checks if the user's message indicates a CTF, lab environment, training range,

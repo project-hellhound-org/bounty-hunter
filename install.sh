@@ -115,14 +115,14 @@ success "HELLHOUND core engine installed"
 stop_animation
 info "Mounting SPA Engine..."
 
-    if [ -f /etc/debian_version ] || grep -q "Kali" /etc/os-release 2>/dev/null; then
-        info "Debian/Kali detected — applying dependency patches..."
-        # Fix for Kali's t64 transition and missing Ubuntu font packages
-        DUMMY_DIR=$(mktemp -d)
-        
-        # 1. Dummy ttf-unifont -> fonts-unifont
-        mkdir -p "$DUMMY_DIR/ttf-unifont/DEBIAN"
-        cat <<EOF > "$DUMMY_DIR/ttf-unifont/DEBIAN/control"
+if [ -f /etc/debian_version ] || grep -q "Kali" /etc/os-release 2>/dev/null; then
+    info "Debian/Kali detected — applying dependency patches..."
+    # Fix for Kali's t64 transition and missing Ubuntu font packages
+    DUMMY_DIR=$(mktemp -d)
+    
+    # 1. Dummy ttf-unifont -> fonts-unifont
+    mkdir -p "$DUMMY_DIR/ttf-unifont/DEBIAN"
+    cat <<EOF > "$DUMMY_DIR/ttf-unifont/DEBIAN/control"
 Package: ttf-unifont
 Version: 1:99.0
 Section: fonts
@@ -131,11 +131,11 @@ Architecture: all
 Depends: fonts-unifont
 Description: Dummy package for ttf-unifont
 EOF
-        dpkg-deb --build "$DUMMY_DIR/ttf-unifont" "$DUMMY_DIR/ttf-unifont.deb" &>/dev/null
-        
-        # 2. Dummy libasound2 -> libasound2t64
-        mkdir -p "$DUMMY_DIR/libasound2/DEBIAN"
-        cat <<EOF > "$DUMMY_DIR/libasound2/DEBIAN/control"
+    dpkg-deb --build "$DUMMY_DIR/ttf-unifont" "$DUMMY_DIR/ttf-unifont.deb" &>/dev/null
+    
+    # 2. Dummy libasound2 -> libasound2t64
+    mkdir -p "$DUMMY_DIR/libasound2/DEBIAN"
+    cat <<EOF > "$DUMMY_DIR/libasound2/DEBIAN/control"
 Package: libasound2
 Version: 1:99.0
 Section: libs
@@ -144,11 +144,11 @@ Architecture: all
 Depends: libasound2t64
 Description: Dummy package for libasound2
 EOF
-        dpkg-deb --build "$DUMMY_DIR/libasound2" "$DUMMY_DIR/libasound2.deb" &>/dev/null
+    dpkg-deb --build "$DUMMY_DIR/libasound2" "$DUMMY_DIR/libasound2.deb" &>/dev/null
 
-        # 3. Dummy ttf-ubuntu-font-family -> fonts-liberation
-        mkdir -p "$DUMMY_DIR/ttf-ubuntu-font-family/DEBIAN"
-        cat <<EOF > "$DUMMY_DIR/ttf-ubuntu-font-family/DEBIAN/control"
+    # 3. Dummy ttf-ubuntu-font-family -> fonts-liberation
+    mkdir -p "$DUMMY_DIR/ttf-ubuntu-font-family/DEBIAN"
+    cat <<EOF > "$DUMMY_DIR/ttf-ubuntu-font-family/DEBIAN/control"
 Package: ttf-ubuntu-font-family
 Version: 1:99.0
 Section: fonts
@@ -157,15 +157,15 @@ Architecture: all
 Depends: fonts-liberation
 Description: Dummy package for ttf-ubuntu-font-family
 EOF
-        dpkg-deb --build "$DUMMY_DIR/ttf-ubuntu-font-family" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null
-        
-        if command -v sudo &>/dev/null; then
-            sudo dpkg -i "$DUMMY_DIR/ttf-unifont.deb" "$DUMMY_DIR/libasound2.deb" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null || true
-        else
-            dpkg -i "$DUMMY_DIR/ttf-unifont.deb" "$DUMMY_DIR/libasound2.deb" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null || true
-        fi
-        rm -rf "$DUMMY_DIR"
+    dpkg-deb --build "$DUMMY_DIR/ttf-ubuntu-font-family" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null
+    
+    if command -v sudo &>/dev/null; then
+        sudo dpkg -i "$DUMMY_DIR/ttf-unifont.deb" "$DUMMY_DIR/libasound2.deb" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null || true
+    else
+        dpkg -i "$DUMMY_DIR/ttf-unifont.deb" "$DUMMY_DIR/libasound2.deb" "$DUMMY_DIR/ttf-ubuntu-font-family.deb" &>/dev/null || true
     fi
+    rm -rf "$DUMMY_DIR"
+fi
 
 # Suppress redundant 'BEWARE' warnings on Kali to keep output clean
 info "Fetching Chromium (this may take a minute)..."
@@ -209,22 +209,33 @@ chmod +x "$PROJECT_ROOT/install.sh"
 stop_animation
 success "System integration complete"
 
-# ── 6. Ollama + Local SLM (AI Engine) ─────────────────
-# Ollama provides local AI (gemma2:2b) for unlimited pentesting
-# without API tokens. Skip with: SKIP_OLLAMA=1 ./install.sh
+# ── 6. Ollama + Local Model Setup ─────────────────────
+# HELLHOUND can use a local model (via Ollama) or a cloud provider (NVIDIA NIM, OpenAI, etc.).
+# Skip with: SKIP_OLLAMA=1 ./install.sh
 
+OLLAMA_MODEL=""
 if [ "${SKIP_OLLAMA:-0}" = "1" ]; then
     warn "Skipping Ollama install (SKIP_OLLAMA=1)"
 else
     echo ""
-    info "Ollama provides local AI (gemma2:2b) for unlimited pentesting without API tokens."
-    read -p "$(echo -e "${CYN}[?]${RST} Do you want to install Ollama and the gemma2:2b model? [Y/n]: ")" -r PROMPT_REPLY
+    info "HELLHOUND can use a local model (via Ollama) or a cloud provider (NVIDIA NIM, OpenAI, etc.)."
+    read -p "$(echo -e "${CYN}[?]${RST} Set up a local model now? [Y/n]: ")" -r PROMPT_REPLY
     
     if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
-        warn "Skipping Ollama install as requested by user."
-        warn "Hellhound will still work with Gemini API keys without local AI."
+        info "Skipping local model setup. Configure a cloud provider via /model after first launch."
     else
-        info "Setting up Local AI Engine (Ollama + gemma2:2b)..."
+        echo -e "${CYN}[?]${RST} Which local model?"
+        echo "  1) qwen2.5:3b-instruct   (recommended — fast, ~2GB, good tool-calling reliability)"
+        echo "  2) gemma2:2b             (smaller, ~1.6GB)"
+        echo "  3) custom (enter Ollama model name)"
+        read -p "Choice [1]: " MODEL_CHOICE
+        case "$MODEL_CHOICE" in
+            2) OLLAMA_MODEL="gemma2:2b" ;;
+            3) read -p "Ollama model name: " OLLAMA_MODEL ;;
+            *) OLLAMA_MODEL="qwen2.5:3b-instruct" ;;
+        esac
+
+        info "Setting up Local AI Engine (Ollama + $OLLAMA_MODEL)..."
         
         if command -v ollama &>/dev/null; then
             success "Ollama already installed: $(ollama --version 2>/dev/null || echo 'unknown')"
@@ -234,89 +245,88 @@ else
                 success "Ollama installed successfully"
             else
                 warn "Ollama install failed — you can install it manually: https://ollama.com/download"
-                warn "Hellhound will still work with Gemini API keys without local AI."
+                warn "Hellhound will still work with cloud API keys without local AI."
             fi
         fi
 
-        # Pull the default SLM model if Ollama is available
-        if command -v ollama &>/dev/null; then
-            # Check if gemma2:2b is already pulled
-            if ollama list 2>/dev/null | grep -q "gemma2:2b"; then
-                success "Model gemma2:2b already available"
+        # Pull the chosen model if Ollama is available
+        if command -v ollama &>/dev/null && [ -n "$OLLAMA_MODEL" ]; then
+            # Check if model is already pulled
+            if ollama list 2>/dev/null | grep -q "^$OLLAMA_MODEL"; then
+                success "Model $OLLAMA_MODEL already available"
             else
-                info "Pulling gemma2:2b (~1.6 GB, this may take a few minutes)..."
-                start_animation "DOWNLOADING SLM"
-                if ollama pull gemma2:2b 2>&1 | tail -1; then
+                info "Pulling $OLLAMA_MODEL (this may take a few minutes)..."
+                start_animation "DOWNLOADING MODEL"
+                if ollama pull "$OLLAMA_MODEL" 2>&1 | tail -1; then
                     stop_animation
-                    success "gemma2:2b model ready for local AI pentesting"
+                    success "$OLLAMA_MODEL model ready for local AI pentesting"
                 else
                     stop_animation
-                    warn "Failed to pull gemma2:2b — you can pull it later: ollama pull gemma2:2b"
+                    warn "Failed to pull $OLLAMA_MODEL — you can pull it later: ollama pull $OLLAMA_MODEL"
                 fi
             fi
+
+            # Set orchestrator_model in ~/.hellhound/config.json for fast local tool routing
+            mkdir -p "$HOME/.hellhound"
+            CONFIG_FILE="$HOME/.hellhound/config.json"
+            python3 -c "
+import json, os
+p = '$CONFIG_FILE'
+cfg = {}
+if os.path.exists(p):
+    try:
+        with open(p, 'r') as f:
+            cfg = json.load(f)
+    except: pass
+cfg['ai_provider'] = cfg.get('ai_provider', 'ollama')
+cfg['orchestrator_provider'] = 'ollama'
+cfg['orchestrator_model'] = '$OLLAMA_MODEL'
+cfg['ai_model'] = '$OLLAMA_MODEL'
+with open(p, 'w') as f:
+    json.dump(cfg, f, indent=2)
+" 2>/dev/null || true
         fi
     fi
 fi
 
-# ── 7. System GUI (Electron HUD) ──────────────────────
-# The high-fidelity desktop HUD for the Apex-King release.
+# ── 7. System GUI (PyWebView HUD) ──────────────────────
 echo ""
-info "Configuring Hellhound Apex-King HUD (System GUI)..."
+info "Registering HELLHOUND as a desktop application..."
+mkdir -p "$HOME/.local/share/applications" "$HOME/.local/share/hellhound"
 
-# Ensure logo.png is the source of truth
+# Ensure stable icon location (copied, not symlinked)
 if [ -f "$PROJECT_ROOT/Images/logo.png" ]; then
     ICON_SRC="$PROJECT_ROOT/Images/logo.png"
 else
     ICON_SRC="$PROJECT_ROOT/Images/hellhound.png"
 fi
+cp "$ICON_SRC" "$HOME/.local/share/hellhound/logo.png" 2>/dev/null || true
 
-if command -v npm &>/dev/null; then
-    start_animation "INITIALIZING HUD"
-    cd "$PROJECT_ROOT/gui" && npm install --quiet &>/dev/null || warn "Failed to install Electron dependencies. Manual fix: 'cd gui && npm install'"
-    cd "$PROJECT_ROOT"
-    stop_animation
-    success "GUI dependencies installed"
-    
-    chmod +x "$PROJECT_ROOT/gui/hellhound-gui.sh"
+# Register Icon in universal icon directory as well
+mkdir -p "$HOME/.local/share/icons"
+cp "$ICON_SRC" "$HOME/.local/share/icons/hellhound.png" 2>/dev/null || true
 
-    # Register Icon for System (Universal Linux Path)
-    mkdir -p "$HOME/.local/share/icons"
-    cp "$ICON_SRC" "$HOME/.local/share/icons/hellhound.png"
+chmod +x "$PROJECT_ROOT/gui/hellhound-gui.sh"
 
-    # Create Desktop Entry (Searchable in App Menu)
-    DESKTOP_FILE="$HOME/.local/share/applications/hellhound.desktop"
-    mkdir -p "$(dirname "$DESKTOP_FILE")"
-    
-    cat <<EOF > "$DESKTOP_FILE"
-[Desktop Entry]
-Name=Hellhound Bounty Hunter
-Comment=Autonomous AI Bug Bounty Reconnaissance & Triage Assistant
-Exec=$PROJECT_ROOT/gui/hellhound-gui.sh
-Icon=hellhound
-Terminal=false
-Type=Application
-Categories=Network;Security;
-Keywords=bounty-hunter;pentest;ai;hellhound;
-EOF
-    
-    # Update system desktop database for app menu visibility
-    if command -v update-desktop-database &>/dev/null; then
-        update-desktop-database "$HOME/.local/share/applications/" &>/dev/null || true
-    fi
-    
-    # Update system alias
-    GUI_ALIAS="alias hellhound-gui='$PROJECT_ROOT/gui/hellhound-gui.sh'"
-    if grep -qF "alias hellhound-gui=" "$SHELL_RC" 2>/dev/null; then
-        sed -i "s|alias hellhound-gui=.*|$GUI_ALIAS|" "$SHELL_RC"
-    else
-        echo "$GUI_ALIAS" >> "$SHELL_RC"
-    fi
-    
-    success "GUI Integrated: You can now launch 'Hellhound' from your system menu."
-else
-    warn "NPM/Node.js not found. Skipping GUI setup."
-    warn "To use the HUD, install Node.js and run 'npm install' in this directory."
+# Install .desktop file with resolved absolute icon path
+sed "s|Icon=.*|Icon=$HOME/.local/share/hellhound/logo.png|" \
+    "$PROJECT_ROOT/packaging/hellhound.desktop" \
+    > "$HOME/.local/share/applications/hellhound.desktop"
+
+# Update system desktop database for app menu visibility
+if command -v update-desktop-database &>/dev/null; then
+    update-desktop-database "$HOME/.local/share/applications/" &>/dev/null || true
 fi
+
+# Update system alias
+GUI_ALIAS="alias hellhound-gui='$VENV_DIR/bin/hellhound --gui'"
+if grep -qF "alias hellhound-gui=" "$SHELL_RC" 2>/dev/null; then
+    sed -i "s|alias hellhound-gui=.*|$GUI_ALIAS|" "$SHELL_RC"
+else
+    echo "$GUI_ALIAS" >> "$SHELL_RC"
+fi
+
+success "HELLHOUND registered — search for it in your application menu."
 
 # ── 8. Done ──────────────────────────────────────────
 echo ""
@@ -324,10 +334,12 @@ echo -e "  ${GRN}${BLD}HELLHOUND installed successfully.${RST}"
 echo -e "  Venv    : ${CYN}$VENV_DIR${RST}"
 echo -e "  Command : ${CYN}hellhound${RST}"
 echo -e "  GUI HUD : ${CYN}hellhound-gui${RST}"
-if command -v ollama &>/dev/null; then
-    echo -e "  Local AI: ${CYN}Ollama (gemma2:2b)${RST} — use ${YLW}set api_key ollama${RST} in console"
+if [ -n "$OLLAMA_MODEL" ] && command -v ollama &>/dev/null; then
+    echo -e "  Local AI: ${CYN}Ollama ($OLLAMA_MODEL)${RST} — configured as orchestrator"
+elif command -v ollama &>/dev/null; then
+    echo -e "  Local AI: ${CYN}Ollama${RST} — use ${YLW}/model orchestrator ollama <model>${RST}"
 else
-    echo -e "  Local AI: ${YLW}Not installed${RST} — use Gemini API key or install Ollama later"
+    echo -e "  Local AI: ${YLW}Not installed${RST} — configure cloud providers via /model"
 fi
 echo ""
 echo -e "  ${YLW}Activate now:${RST}"

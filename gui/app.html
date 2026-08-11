@@ -3,1796 +3,377 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HELLHOUND // APEX-KING HUD</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Syncopate:wght@400;700&family=Michroma&family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap">
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" />
+    <title>HELLHOUND // BOUNTY HUNTER</title>
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Michroma&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="app.css">
-    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/3d-force-graph@1.73.0/dist/3d-force-graph.min.js"></script>
-
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        primary: '#ff2244',
-                        background: '#020204',
-                        surface: '#0e0e13',
-                        'on-surface': '#e4e1e8',
-                    },
-                    fontFamily: {
-                        'h1-visor': ['Syncopate', 'sans-serif'],
-                        'h2-tactical': ['Michroma', 'sans-serif'],
-                        'data-mono': ['Space Grotesk', 'monospace'],
-                        'label-surgical': ['Michroma', 'sans-serif'],
-                        'body-standard': ['Inter', 'sans-serif'],
-                    }
-                }
-            }
-        }
-    </script>
-    <style>
-        .resize-handle { position: absolute; z-index: 602; background: transparent; pointer-events: auto; }
-        .rh-n { top: -4px; left: 12px; right: 12px; height: 8px; cursor: ns-resize; }
-        .rh-s { bottom: -4px; left: 12px; right: 12px; height: 8px; cursor: ns-resize; }
-        .rh-e { right: -4px; top: 12px; bottom: 12px; width: 8px; cursor: ew-resize; }
-        .rh-w { left: -4px; top: 12px; bottom: 12px; width: 8px; cursor: ew-resize; }
-        .rh-ne { top: -4px; right: -4px; width: 12px; height: 12px; cursor: nesw-resize; }
-        .rh-nw { top: -4px; left: -4px; width: 12px; height: 12px; cursor: nwse-resize; }
-        .rh-se { bottom: -4px; right: -4px; width: 12px; height: 12px; cursor: nwse-resize; }
-        .rh-sw { bottom: -4px; left: -4px; width: 12px; height: 12px; cursor: nesw-resize; }
-        /* Repro output scrollbar — wide enough to actually grab */
-        #reproOutput::-webkit-scrollbar { width: 12px; }
-        #reproOutput::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
-        #reproOutput::-webkit-scrollbar-thumb { background: #ff2244; border-radius: 2px; border: 2px solid rgba(0,0,0,0.5); }
-        #reproOutput::-webkit-scrollbar-thumb:hover { background: #ff4466; shadow: 0 0 10px #ff2244; }
-        
-        /* Universal big scrollbar for all scrollable containers */
-        .custom-scrollbar::-webkit-scrollbar { width: 12px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; border: 2px solid transparent; background-clip: content-box; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #ff2244; shadow: 0 0 15px #ff2244; }
-
-        /* ── LIGHT THEME ─────────────────────────────────────────────────── */
-        body.theme-light { --primary: #cc0022; --background: #f0f0f4; --surface: #e2e2e8; }
-        body.theme-light { background-color: #f0f0f4; color: #111; }
-        header { background: #0c0c18 !important; border-bottom: 1px solid rgba(255,255,255,0.08) !important; }
-        body.theme-light header { background: #e8e8f0 !important; border-color: rgba(0,0,0,0.1) !important; border-bottom: 1px solid rgba(0,0,0,0.1) !important; }
-        body.theme-light .panel { background: rgba(255,255,255,0.85) !important; border-color: rgba(0,0,0,0.08) !important; }
-        body.theme-light .text-white { color: #111 !important; }
-        body.theme-light .text-white\/80, body.theme-light .text-white\/70, body.theme-light .text-white\/60 { color: #333 !important; }
-        body.theme-light .text-white\/50, body.theme-light .text-white\/40, body.theme-light .text-white\/30, body.theme-light .text-white\/20 { color: #888 !important; }
-        body.theme-light .bg-white\/5, body.theme-light .bg-white\/10 { background: rgba(0,0,0,0.04) !important; }
-        body.theme-light .border-white\/10, body.theme-light .border-white\/5 { border-color: rgba(0,0,0,0.1) !important; }
-        body.theme-light #opsOutput, body.theme-light #reproOutput { background: #1a1a2e !important; color: #fff !important; }
-        body.theme-light .bg-black\/40, body.theme-light .bg-black\/60, body.theme-light .bg-black\/80, body.theme-light .bg-black\/90, body.theme-light .bg-black\/95 { background: rgba(255,255,255,0.9) !important; }
-        body.theme-light .nav-item { color: #444 !important; }
-        body.theme-light .nav-item.active { color: var(--primary) !important; }
-        body.theme-light #activityFeed span { color: #555; }
-        /* Kill-chain phase states */
-        .kill-node.done { border-color: var(--primary); background: rgba(255,34,68,0.15); }
-        .kill-node.done span { color: var(--primary); }
-        .kill-node.active { border-color: var(--primary); background: rgba(255,34,68,0.1); animation: kill-pulse 1.5s ease-in-out infinite; }
-        .kill-node.active span { color: var(--primary); }
-        .kill-line.done { background: var(--primary); box-shadow: 0 0 6px rgba(255,34,68,0.4); }
-        @keyframes kill-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,34,68,0); } 50% { box-shadow: 0 0 0 6px rgba(255,34,68,0.2); } }
-        /* Engine status dots */
-        .engine-online { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
-        .engine-busy { background: var(--primary); box-shadow: 0 0 8px var(--primary); animation: pulse 1s ease-in-out infinite; }
-
-        /* ── INTEL CENTER STYLES ─────────────────────────────────────────── */
-        .intel-card {
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            position: relative;
-            overflow: hidden;
-        }
-        .intel-card:hover {
-            transform: scale(1.02) translateY(-4px);
-            filter: brightness(1.15);
-            box-shadow: 0 0 25px rgba(255, 34, 68, 0.2), inset 0 0 10px rgba(255, 34, 68, 0.1);
-            border-color: rgba(255, 34, 68, 0.4) !important;
-        }
-        .intel-card.selected {
-            border-color: var(--primary) !important;
-            background: rgba(255, 34, 68, 0.05) !important;
-            box-shadow: 0 0 30px rgba(255, 34, 68, 0.15);
-        }
-        .intel-card.selected .neon-indicator {
-            opacity: 1;
-        }
-        .neon-indicator {
-            position: absolute;
-            top: 12px;
-            right: 12px;
-            width: 8px;
-            height: 8px;
-            background: var(--primary);
-            border-radius: 50%;
-            box-shadow: 0 0 10px var(--primary);
-            opacity: 0;
-            transition: opacity 0.3s ease;
-        }
-
-        .pop-out-red {
-            transition: all 0.2s ease-out;
-            position: relative;
-        }
-        .pop-out-red:hover {
-            transform: scale(1.02) translateY(-2px);
-            border-color: #ff4466 !important;
-            background: rgba(255, 68, 102, 0.18) !important;
-            box-shadow: 0 4px 24px rgba(255, 68, 102, 0.3);
-            z-index: 10;
-        }
-
-        /* ── GRAPH INFO PANEL ───────────────────────────────────────────── */
-        #graphNodeInfo {
-            position: absolute;
-            top: 20px;
-            right: 20px;
-            width: 280px;
-            background: rgba(14, 14, 19, 0.95);
-            border: 1px solid rgba(255, 34, 68, 0.3);
-            backdrop-filter: blur(20px);
-            z-index: 100;
-            padding: 20px;
-            display: none;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.8), 0 0 20px rgba(255, 34, 68, 0.1);
-        }
-        #graphNodeInfo h4 {
-            font-family: 'Michroma', sans-serif;
-            font-size: 10px;
-            color: #ff2244;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-            margin-bottom: 12px;
-            border-bottom: 1px solid rgba(255,255,255,0.05);
-            padding-bottom: 8px;
-        }
-        .info-row {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 8px;
-            font-family: 'Space Grotesk', monospace;
-            font-size: 11px;
-        }
-        .info-label { color: rgba(255,255,255,0.3); text-transform: uppercase; font-size: 9px; }
-        .info-value { color: rgba(255,255,255,0.9); font-weight: bold; }
-        .severity-badge {
-            padding: 2px 8px;
-            border-radius: 2px;
-            font-size: 9px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-
-        /* Cytoscape canvas background */
-        #attackGraph canvas {
-            background: transparent !important;
-        }
-        /* Graph tooltip override — Cytoscape default tooltip disabled, we use the info panel */
-        .cy-tooltip { display: none !important; }
-        /* Node label text shadow for readability on dark bg */
-        #attackGraph .cy-node-label {
-            text-shadow: 0 1px 3px rgba(0,0,0,0.9);
-        }
-        .obsidian-tooltip {
-            background: rgba(10, 10, 15, 0.95);
-            border: 1px solid rgba(100, 150, 255, 0.3);
-            padding: 8px 12px;
-            pointer-events: none;
-            backdrop-filter: blur(10px);
-            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-            border-radius: 4px;
-        }
-    </style>
 </head>
-<body class="bg-background text-on-surface font-body-standard overflow-hidden">
-    
-    <!-- ── TACTICAL BACKGROUND ─────────────────────────────────────────── -->
-    <div class="fixed inset-0 z-0 pointer-events-none">
-        <div class="absolute inset-0 bg-center bg-cover opacity-30 pointer-events-none" style="background-image: url('../Images/hellhound.png')"></div>
-        <canvas id="particleCanvas" class="absolute inset-0 pointer-events-none"></canvas>
-        <div class="absolute inset-0 bg-gradient-to-b from-background/10 via-background/60 to-background"></div>
-        <div class="absolute inset-0 scanline opacity-30"></div>
+<body>
+    <!-- Ambient Background and Scanline -->
+    <div class="ambient-bg"></div>
+    <div class="scanline-overlay"></div>
+
+    <div id="appLayout">
+        <!-- ── LEFT SIDEBAR: TARGET ARCHIVE ───────────────────────── -->
+        <aside id="sidebar">
+            <div class="sidebar-header">
+                <div class="brand-wrapper">
+                    <img src="../Images/logo.png" alt="Hellhound Logo" class="brand-logo" onerror="this.style.display='none'">
+                    <div class="brand-title">
+                        HELLHOUND
+                        <span class="brand-subtitle">BOUNTY HUNTER</span>
+                    </div>
+                </div>
+                <div class="status-indicator">
+                    <span class="status-dot-pulse"></span>
+                    <span>ONLINE</span>
+                </div>
+            </div>
+
+            <div class="sidebar-action-bar">
+                <button id="newTargetBtn" class="btn-new-target">
+                    <span>+</span>
+                    <span>NEW TARGET</span>
+                </button>
+                <div class="target-search-box">
+                    <span class="target-search-icon">/</span>
+                    <input type="text" id="targetSearchInput" class="target-search-input" placeholder="Filter targets...">
+                </div>
+            </div>
+
+            <!-- Scrollable Target Archive List -->
+            <div id="targetList" class="target-list-section">
+                <!-- Target cards rendered dynamically -->
+            </div>
+
+            <div class="sidebar-footer">
+                <button id="settingsBtn" class="btn-sidebar-settings" title="System Configuration (Models, Tools, API Keys)">
+                    <span class="settings-gear-icon">⚙</span>
+                    <span class="settings-btn-label">SETTINGS</span>
+                </button>
+                <div id="systemModelTag" class="system-model-tag">
+                    <span class="model-indicator-tag">MODEL</span>
+                    <span id="modelLabel">Loading...</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- ── MAIN PANE: CHAT THREAD ─────────────────────────────── -->
+        <main id="mainPane">
+            <!-- Header Bar -->
+            <header class="main-header">
+                <div class="header-left-cluster">
+                    <div id="logoTrigger" class="header-logo-trigger" title="Hover to view target archive">
+                        <img src="../Images/logo.png" alt="Hellhound Logo" class="header-logo-img" onerror="this.style.display='none'">
+                    </div>
+
+                    <div class="header-divider"></div>
+
+                    <div class="current-target-info">
+                        <div id="currentTargetTitle" class="current-target-title">
+                            <span id="activeTargetNameDisplay">No Target Selected</span>
+                        </div>
+                        <div id="scopeSummaryBadge" class="scope-pill" title="Click to view/edit target scope">
+                            <span id="scopeRuleCount">0 in-scope</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Top Middle Title -->
+                <div class="header-center-title">
+                    <span class="header-center-label">BOUNTY HUNTER</span>
+                </div>
+
+                <div class="main-header-actions">
+                    <button id="findingsToggleBtn" class="btn-header btn-findings-toggle" title="View discovered findings for this target">
+                        <span>FINDINGS</span>
+                        <span id="headerFindingsCount" class="findings-count-badge">0</span>
+                    </button>
+                    <button id="scopeModalBtn" class="btn-header" title="Edit target scope rules">
+                        <span>SCOPE</span>
+                    </button>
+                    <button id="clearChatBtn" class="btn-header" title="Clear chat history for this target">
+                        <span>CLEAR</span>
+                    </button>
+                </div>
+            </header>
+
+            <!-- Scrollable Chat Conversation -->
+            <div id="chatThread">
+                <!-- Welcome Hero (shown when thread is empty) -->
+                <div id="welcomeHero" class="welcome-hero">
+                    <h2 class="welcome-title">AUTONOMOUS RECON ARCHIVE</h2>
+                    <p class="welcome-desc">
+                        Select an existing target from the archive sidebar or initialize a new engagement.
+                        Execute scope-aware slash commands or chat directly with the AI agent.
+                    </p>
+                    <div class="quick-prompts-grid">
+                        <div class="quick-prompt-card" data-cmd="/recon">
+                            <span class="quick-prompt-cmd">/recon [target]</span>
+                            <span class="quick-prompt-desc">Full reconnaissance pipeline & scope triage</span>
+                        </div>
+                        <div class="quick-prompt-card" data-cmd="/hunt">
+                            <span class="quick-prompt-cmd">/hunt</span>
+                            <span class="quick-prompt-desc">Autonomous multi-stage vulnerability triage</span>
+                        </div>
+                        <div class="quick-prompt-card" data-cmd="/scan spider">
+                            <span class="quick-prompt-cmd">/scan spider</span>
+                            <span class="quick-prompt-desc">Deep endpoint & secret spidering</span>
+                        </div>
+                        <div class="quick-prompt-card" data-cmd="/skills">
+                            <span class="quick-prompt-cmd">/skills</span>
+                            <span class="quick-prompt-desc">View loaded methodology skills</span>
+                        </div>
+                    </div>
+                </div>
+                <!-- Dynamic Chat Bubbles will be injected here -->
+            </div>
+
+            <!-- Chat Input Bar -->
+            <div class="chat-input-container">
+                <!-- Slash Command Dropdown -->
+                <div id="slashPalette">
+                    <!-- Populated dynamically as user types '/' -->
+                </div>
+
+                <div class="input-wrapper">
+                    <textarea id="chatInput" rows="1" placeholder="Type a message or /command (e.g. /recon, /hunt, /scope)..."></textarea>
+                    <div class="input-actions">
+                        <button id="stopBtn" class="btn-stop" title="Stop active task">
+                            <span>STOP</span>
+                        </button>
+                        <button id="sendBtn" class="btn-send" title="Send message (Enter)">
+                            <span>SEND</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- ── RIGHT SLIDE-OUT FINDINGS DRAWER ────────────────────── -->
+        <aside id="findingsDrawer">
+            <div class="findings-header">
+                <div>
+                    <div class="findings-title">TARGET FINDINGS</div>
+                    <div id="findingsTargetSubtitle" class="findings-subtitle">ISOLATED SCOPE</div>
+                </div>
+                <button id="closeFindingsBtn" class="btn-close-drawer" title="Close findings panel">✕</button>
+            </div>
+
+            <!-- Category Filter Tabs -->
+            <div id="findingsTabs" class="findings-tabs">
+                <button class="category-tab active" data-category="all">
+                    <span>ALL</span>
+                    <span id="badge-all" class="tab-badge">0</span>
+                </button>
+                <button class="category-tab" data-category="takeover_candidates">
+                    <span>TAKEOVERS</span>
+                    <span id="badge-takeover_candidates" class="tab-badge">0</span>
+                </button>
+                <button class="category-tab" data-category="subdomains">
+                    <span>SUBDOMAINS</span>
+                    <span id="badge-subdomains" class="tab-badge">0</span>
+                </button>
+                <button class="category-tab" data-category="open_ports">
+                    <span>PORTS</span>
+                    <span id="badge-open_ports" class="tab-badge">0</span>
+                </button>
+                <button class="category-tab" data-category="live_hosts">
+                    <span>LIVE HOSTS</span>
+                    <span id="badge-live_hosts" class="tab-badge">0</span>
+                </button>
+                <button class="category-tab" data-category="endpoints">
+                    <span>ENDPOINTS</span>
+                    <span id="badge-endpoints" class="tab-badge">0</span>
+                </button>
+                <button class="category-tab" data-category="vulnerabilities">
+                    <span>VULNS</span>
+                    <span id="badge-vulnerabilities" class="tab-badge">0</span>
+                </button>
+                <button class="category-tab" data-category="tls_info">
+                    <span>TLS</span>
+                    <span id="badge-tls_info" class="tab-badge">0</span>
+                </button>
+            </div>
+
+            <!-- Search inside Findings -->
+            <div class="findings-search-bar">
+                <input type="text" id="findingsSearchInput" class="findings-search-input" placeholder="Search target findings...">
+            </div>
+
+            <!-- Findings List View -->
+            <div id="findingsList">
+                <!-- Dynamically generated finding cards -->
+            </div>
+        </aside>
     </div>
 
-    <!-- ── SIDEBAR (Ghost Panel) ─────────────────────────────────────────── -->
-    <aside id="sidebar" class="fixed top-0 left-0 h-full w-72 bg-surface/98 border-r border-white/10 z-[500] -translate-x-full transition-all duration-500 backdrop-blur-3xl shadow-[50px_0_100px_rgba(0,0,0,0.9)] pointer-events-none">
-        <div class="p-8 space-y-12 h-full flex flex-col pointer-events-auto">
-            <div class="flex items-center gap-4">
-                <img src="../Images/logo.png" class="w-10 h-10 object-contain logo-pulse" alt="">
-                <div>
-                    <h2 class="font-h1-visor text-[12px] tracking-[0.3em] text-primary">HELLHOUND</h2>
-                    <p class="font-label-surgical text-[8px] text-white/30 uppercase">APEX-KING OPERATIVE</p>
-                </div>
-            </div>
-
-            <nav class="space-y-2 flex-1 overflow-y-auto no-scrollbar pr-2">
-                <div class="nav-item active flex items-center gap-4 p-4 border-l-4 border-primary bg-primary/10 cursor-pointer transition-all hover:bg-primary/20" onclick="showSection('dashboard', this)">
-                    <span class="material-symbols-outlined text-primary">grid_view</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Overview</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('arsenal', this)">
-                    <span class="material-symbols-outlined">token</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Arsenal</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('ops', this)">
-                    <span class="material-symbols-outlined">analytics</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Operations</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('repro', this)">
-                    <span class="material-symbols-outlined">terminal</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Repro Center</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('monitor', this)">
-                    <span class="material-symbols-outlined">visibility</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Monitor</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('intel', this)">
-                    <span class="material-symbols-outlined">hub</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Intel Center</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('loot', this)">
-                    <span class="material-symbols-outlined text-primary">database</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Loot Center</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('graph', this)">
-                    <span class="material-symbols-outlined">hub</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Neural Graph</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('repeater', this)">
-                    <span class="material-symbols-outlined text-primary">swap_horiz</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">HTTP Repeater</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('cookieforge', this)">
-                    <span class="material-symbols-outlined text-[#00ffc4]">cookie</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase font-bold">Cookie Forge</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('decaffeinator', this)">
-                    <span class="material-symbols-outlined text-[#00ffc4]">coffee</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase font-bold">De-Caffeinator</span>
-                </div>
-                <!-- Manual pentest modules start -->
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('killbook', this)">
-                    <span class="material-symbols-outlined text-primary">book</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Killbook</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('strikecast', this)">
-                    <span class="material-symbols-outlined text-[#00ffc4]">bolt</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Strike Cast</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('payloadloom', this)">
-                    <span class="material-symbols-outlined text-[#00ffc4]">construction</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Payload Loom</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('tokenstalker', this)">
-                    <span class="material-symbols-outlined text-[#00ffc4]">gps_fixed</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Token Stalker</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('greyzone', this)">
-                    <span class="material-symbols-outlined text-yellow-400">rule</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Grey Zone</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('killchainloom', this)">
-                    <span class="material-symbols-outlined text-[#00ffc4]">hub</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Killchain Loom</span>
-                </div>
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('ghostproof', this)">
-                    <span class="material-symbols-outlined text-[#00ffc4]">verified</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Ghost Proof</span>
-                </div>
-                <!-- Manual pentest modules end -->
-                <div class="nav-item flex items-center gap-4 p-4 text-white/30 hover:text-white hover:bg-white/5 cursor-pointer transition-all" onclick="showSection('settings', this)">
-                    <span class="material-symbols-outlined">settings_suggest</span>
-                    <span class="font-label-surgical text-[10px] tracking-widest uppercase">Settings</span>
-                </div>
-            </nav>
-        </div>
-    </aside>
-
-    <!-- ── TOP BAR (Header) ──────────────────────────────────────────────── -->
-    <header class="relative z-[400] h-16 border-b border-white/10 flex items-center justify-between px-4 pointer-events-auto select-none" style="-webkit-app-region: drag;">
-        <div class="flex items-center gap-4 h-full">
-            <div id="logoTrigger" class="flex items-center gap-3 cursor-pointer group h-full px-1" style="-webkit-app-region: no-drag;">
-                <div class="w-8 h-8 border border-white/20 flex items-center justify-center group-hover:border-primary transition-all duration-300">
-                    <img src="../Images/logo.png" class="w-5 h-5 object-contain opacity-60 group-hover:opacity-100 transition-opacity" alt="">
-                </div>
-                <div class="flex flex-col">
-                    <h1 class="font-h1-visor text-[10px] tracking-[0.5em] text-white group-hover:text-primary transition-colors">HELLHOUND</h1>
-                    <span id="headerTitle" class="font-label-surgical text-[7px] text-white/40 uppercase tracking-[0.2em]">APEX-KING OVERVIEW</span>
-                </div>
-            </div>
-            
-            <div class="h-6 w-px bg-white/10"></div>
-            
-            <div class="flex items-center gap-2">
-                <span class="font-label-surgical text-[8px] text-white/30 uppercase tracking-[0.2em] hidden sm:inline">Active_Target:</span>
-                <span id="headerTarget" class="font-data-mono text-[10px] text-primary font-bold uppercase tracking-widest cursor-pointer hover:bg-primary/10 px-2 py-0.5 transition-all border border-transparent hover:border-primary/40 max-w-[120px] truncate" style="-webkit-app-region: no-drag;" onclick="openTargetModal()">NO_TARGET_ENGAGED</span>
-                
-                <button id="monitorShortcut" style="-webkit-app-region: no-drag;" onclick="navigateMonitor()" class="hidden w-8 h-8 flex items-center justify-center bg-white/5 border border-white/10 text-white/40 hover:text-white hover:border-primary transition-all rounded shadow-lg group" title="Open Monitor">
-                    <span class="material-symbols-outlined text-[18px]">visibility</span>
-                </button>
+    <!-- ── NEW TARGET MODAL ───────────────────────────────────────── -->
+    <div id="newTargetModal" class="modal-overlay">
+        <div class="modal-box">
+            <div class="modal-title">CREATE NEW TARGET</div>
+            <p class="modal-desc">Enter the domain or program target to initialize an isolated recon thread.</p>
+            <input type="text" id="newTargetInput" class="modal-input" placeholder="e.g. example.com or app.target.org" autofocus>
+            <div class="modal-actions">
+                <button id="cancelNewTargetBtn" class="btn-modal-cancel">CANCEL</button>
+                <button id="confirmNewTargetBtn" class="btn-modal-primary">INITIALIZE</button>
             </div>
         </div>
+    </div>
 
-        <div class="flex items-center gap-3 h-full flex-shrink-0">
-            <div class="text-right hidden xl:block">
-                <span class="font-label-surgical text-[8px] text-white/30 uppercase block tracking-[0.2em]">Neural_Sync</span>
-                <span class="font-data-mono text-[10px] text-green-500 font-bold tracking-widest uppercase">ESTABLISHED</span>
-            </div>
-            
-            <div class="h-8 w-px bg-white/10 hidden xl:block"></div>
-            
-            <div class="flex items-center gap-1.5 pr-1 flex-shrink-0">
-                <!-- WAF Status Indicator -->
-                <div id="wafStatusBtn" style="-webkit-app-region: no-drag;" title="WAF Protection Status (Live checking via Repeater)"
-                    class="flex items-center gap-1 px-2 py-0.5 border border-white/10 bg-white/5 rounded">
-                    <span id="wafStatusIcon" class="material-symbols-outlined text-[10px] text-green-400">shield</span>
-                    <span id="wafStatusLabel" class="font-label-surgical text-[7px] text-green-400 uppercase tracking-widest">WAF: SAFE</span>
-                </div>
-                <!-- Heartbeat Monitor -->
-                <div id="heartbeatBtn" style="-webkit-app-region: no-drag;" title="Target Response Latency (Latest transaction)"
-                    class="flex items-center gap-1 px-2 py-0.5 border border-white/10 bg-white/5 rounded">
-                    <span class="material-symbols-outlined text-[10px] text-primary">analytics</span>
-                    <span id="heartbeatLabel" class="font-label-surgical text-[7px] text-primary uppercase tracking-widest font-bold">LATENCY: -- MS</span>
-                </div>
-                <!-- Proxy Status Indicator -->
-                <button onclick="checkProxyStatus()" id="proxyStatusBtn" style="-webkit-app-region: no-drag;" title="Proxy Status — click to check"
-                    class="flex items-center gap-1 px-2 py-0.5 border border-white/10 hover:border-white/30 transition-colors">
-                    <div id="proxyStatusDot" class="w-1.5 h-1.5 rounded-full bg-white/20"></div>
-                    <span id="proxyStatusLabel" class="font-label-surgical text-[7px] text-white/30 uppercase tracking-widest">PROXY</span>
-                </button>
-                <!-- Export Session -->
-                <button onclick="exportSession()" style="-webkit-app-region: no-drag;" title="Export session to markdown"
-                    class="w-8 h-8 flex items-center justify-center text-white/30 hover:text-white transition-colors">
-                    <span class="material-symbols-outlined text-[16px]">download</span>
-                </button>
-                <button id="aiTrigger" style="-webkit-app-region: no-drag;" class="w-10 h-10 flex items-center justify-center text-white/60 hover:text-primary transition-all" title="Hellhound">
-                    <span class="material-symbols-outlined text-[20px]">psychology</span>
-                </button>
-                <!-- Theme Toggle -->
-                <button id="themeToggleBtn" style="-webkit-app-region: no-drag;" onclick="toggleTheme()" title="Toggle Theme"
-                    class="w-8 h-8 flex items-center justify-center text-white/40 hover:text-white transition-colors">
-                    <span id="themeIcon" class="material-symbols-outlined text-[16px]">dark_mode</span>
-                </button>
-                <div class="w-px h-5 bg-white/20 mx-1"></div>
-                <button onclick="windowControl('minimize')" style="-webkit-app-region: no-drag;" class="w-8 h-8 flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition-all">
-                    <span class="material-symbols-outlined text-[16px]">remove</span>
-                </button>
-                <button onclick="windowControl('maximize')" style="-webkit-app-region: no-drag;" class="w-8 h-8 flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition-all">
-                    <span class="material-symbols-outlined text-[14px]">check_box_outline_blank</span>
-                </button>
-                <button onclick="windowControl('close')" style="-webkit-app-region: no-drag;" class="w-8 h-8 flex items-center justify-center text-white/40 hover:bg-primary hover:text-white transition-all group">
-                    <span class="material-symbols-outlined text-[16px]">close</span>
-                </button>
+    <!-- ── SCOPE RULES MODAL ──────────────────────────────────────── -->
+    <div id="scopeModal" class="modal-overlay">
+        <div class="modal-box" style="max-width: 600px;">
+            <div class="modal-title">TARGET SCOPE CONFIGURATION</div>
+            <p class="modal-desc">Configure scope boundaries, wildcards, or paste raw HackerOne/Bugcrowd policy markdown.</p>
+            <textarea id="scopeTextInput" class="modal-input" rows="8" placeholder="e.g.&#10;*.example.com&#10;api.example.com&#10;!admin.example.com (out of scope)"></textarea>
+            <div class="modal-actions">
+                <button id="cancelScopeBtn" class="btn-modal-cancel">CANCEL</button>
+                <button id="saveScopeBtn" class="btn-modal-primary">SAVE SCOPE</button>
             </div>
         </div>
-    </header>
+    </div>
 
-    <!-- ── MAIN CONTENT ───────────────────────────────────────────────────── -->
-    <main class="relative z-[100] h-[calc(100vh-4rem)] p-8 overflow-hidden pointer-events-auto">
-        
-        <!-- DASHBOARD -->
-        <section id="dashboard" class="content-area block h-full animate-fade-in pointer-events-auto">
-            <div class="grid grid-cols-12 gap-6 h-full">
-
-                <!-- LEFT col: Kill-chain + Findings chart -->
-                <div class="col-span-8 flex flex-col gap-6" style="min-height:0;">
-
-                    <!-- Hero bar -->
-                    <div class="panel bg-black/40 border border-white/5 px-8 py-5 flex items-center justify-between" style="flex-shrink:0;">
-                        <div>
-                            <h1 class="font-h1-visor text-[18px] tracking-[0.5em] text-white uppercase">HELLHOUND</h1>
-                            <p id="dashSubtitle" class="font-label-surgical text-[9px] text-white/30 uppercase tracking-[0.4em] mt-1">Apex-King Operative — Standby</p>
-                        </div>
-                        <div class="flex items-center gap-6">
-                            <!-- Engine status indicators -->
-                            <div class="flex items-center gap-3">
-                                <div class="flex items-center gap-2">
-                                    <div id="opsStatusDot" class="status-dot"></div>
-                                    <span class="font-label-surgical text-[8px] text-white/30 uppercase tracking-widest">OPS</span>
-                                </div>
-                                <div class="flex items-center gap-2">
-                                    <div id="intelStatusDot" class="status-dot"></div>
-                                    <span class="font-label-surgical text-[8px] text-white/30 uppercase tracking-widest">INTEL</span>
-                                </div>
-                            </div>
-                            <div class="h-6 w-px bg-white/10"></div>
-                            <div class="text-right">
-                                <span class="font-label-surgical text-[8px] text-white/20 uppercase block tracking-widest">Target</span>
-                                <div class="flex items-center gap-2 justify-end">
-                                    <span class="material-symbols-outlined text-[12px] text-primary">target</span>
-                                    <span id="targetLocation" class="font-data-mono text-[10px] text-white font-bold uppercase">NO_TARGET</span>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Kill-chain tracker -->
-                    <div class="panel bg-black/60 border border-white/10 px-8 py-6" style="flex-shrink:0;">
-                        <div class="flex items-center justify-between mb-5">
-                            <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em]">Mission_Kill_Chain</span>
-                            <span id="killChainPhaseLabel" class="font-label-surgical text-[9px] text-white/20 uppercase tracking-widest">STANDBY</span>
-                        </div>
-                        <div class="flex items-center gap-0">
-                            <!-- Phase nodes -->
-                            <div class="kill-phase flex-1 flex flex-col items-center gap-2" data-phase="RECON">
-                                <div class="kill-node w-8 h-8 rounded-full border-2 border-white/15 bg-black flex items-center justify-center transition-all duration-500">
-                                    <span class="material-symbols-outlined text-[14px] text-white/20">radar</span>
-                                </div>
-                                <span class="font-label-surgical text-[8px] text-white/25 uppercase tracking-widest">Recon</span>
-                            </div>
-                            <div class="kill-line flex-1 h-px bg-white/10 transition-all duration-700" data-after="RECON"></div>
-                            <div class="kill-phase flex-1 flex flex-col items-center gap-2" data-phase="VULN">
-                                <div class="kill-node w-8 h-8 rounded-full border-2 border-white/15 bg-black flex items-center justify-center transition-all duration-500">
-                                    <span class="material-symbols-outlined text-[14px] text-white/20">bug_report</span>
-                                </div>
-                                <span class="font-label-surgical text-[8px] text-white/25 uppercase tracking-widest">Vuln</span>
-                            </div>
-                            <div class="kill-line flex-1 h-px bg-white/10 transition-all duration-700" data-after="VULN"></div>
-                            <div class="kill-phase flex-1 flex flex-col items-center gap-2" data-phase="EXPLOIT">
-                                <div class="kill-node w-8 h-8 rounded-full border-2 border-white/15 bg-black flex items-center justify-center transition-all duration-500">
-                                    <span class="material-symbols-outlined text-[14px] text-white/20">bolt</span>
-                                </div>
-                                <span class="font-label-surgical text-[8px] text-white/25 uppercase tracking-widest">Exploit</span>
-                            </div>
-                            <div class="kill-line flex-1 h-px bg-white/10 transition-all duration-700" data-after="EXPLOIT"></div>
-                            <div class="kill-phase flex-1 flex flex-col items-center gap-2" data-phase="ANALYSIS">
-                                <div class="kill-node w-8 h-8 rounded-full border-2 border-white/15 bg-black flex items-center justify-center transition-all duration-500">
-                                    <span class="material-symbols-outlined text-[14px] text-white/20">psychology</span>
-                                </div>
-                                <span class="font-label-surgical text-[8px] text-white/25 uppercase tracking-widest">Analysis</span>
-                            </div>
-                        </div>
-                        <!-- Phase detail -->
-                        <div id="killChainDetail" class="mt-4 font-label-surgical text-[8px] text-white/20 uppercase tracking-widest text-center">No modules executed this session</div>
-                    </div>
-
-                    <!-- Findings Breakdown -->
-                    <div class="panel flex-1 bg-black/60 border border-white/10 p-8 flex flex-col" style="min-height:0; overflow:hidden;">
-                        <div class="flex items-center justify-between mb-5" style="flex-shrink:0;">
-                            <div class="flex items-center gap-4">
-                                <div class="w-2 h-2 rounded-full bg-primary animate-pulse shadow-[0_0_10px_#ff2244]"></div>
-                                <h3 class="font-label-surgical text-[10px] text-white font-bold uppercase tracking-[0.4em]">Intelligence Breakdown</h3>
-                            </div>
-                            <span id="chartStatusBadge" class="font-label-surgical text-[8px] text-white/20 uppercase tracking-widest border border-white/10 px-3 py-1">SURGICAL DATA</span>
-                        </div>
-                        
-                        <div class="flex-1 relative" style="min-height:0;">
-                            <!-- Category Bar Chart -->
-                            <div id="findingsChart" class="absolute inset-0 flex flex-col justify-center overflow-hidden"></div>
-                        </div>
-
-                        <div id="chartDisclaimer" class="mt-4 pt-3 border-t border-white/5" style="flex-shrink:0;">
-                            <p class="font-label-surgical text-[9px] text-white/20 uppercase tracking-widest text-center">
-                                ↑ Real intelligence data will populate after first strike execution
-                            </p>
-                        </div>
-                    </div>
+    <!-- ── SYSTEM SETTINGS & CONFIGURATION MODAL ──────────────────── -->
+    <div id="settingsModal" class="modal-overlay">
+        <div class="modal-box settings-modal-box">
+            <div class="settings-modal-header">
+                <div class="settings-modal-title">
+                    <span class="settings-modal-icon">⚙</span>
+                    <span>HELLHOUND // SYSTEM CONFIGURATION</span>
                 </div>
-
-                <!-- RIGHT col: Stats + Activity -->
-                <div class="col-span-4 flex flex-col gap-6" style="min-height:0;">
-
-                    <!-- Live stats grid -->
-                    <div class="panel bg-black/80 border border-white/10 p-6" style="flex-shrink:0;">
-                        <h3 class="font-label-surgical text-[10px] text-primary font-bold tracking-[0.4em] uppercase mb-5">Mission_Status</h3>
-                        <div class="grid grid-cols-2 gap-4 mb-4">
-                            <div class="bg-white/5 p-4 border-l-2 border-blue-400">
-                                <span class="font-label-surgical text-[8px] text-white/40 block mb-1 uppercase tracking-widest">Endpoints</span>
-                                <span id="endpointCount" class="font-data-mono text-2xl text-white font-bold">0</span>
-                            </div>
-                            <div class="bg-white/5 p-4 border-l-2 border-primary">
-                                <span class="font-label-surgical text-[8px] text-white/40 block mb-1 uppercase tracking-widest">Findings</span>
-                                <span id="findingCount" class="font-data-mono text-2xl text-primary font-bold">0</span>
-                            </div>
-                            <div class="bg-white/5 p-4 border-l-2 border-red-500">
-                                <span class="font-label-surgical text-[8px] text-white/40 block mb-1 uppercase tracking-widest">Criticals</span>
-                                <span id="criticalCount" class="font-data-mono text-2xl text-red-400 font-bold">0</span>
-                            </div>
-                            <div class="bg-white/5 p-4 border-l-2 border-yellow-500">
-                                <span class="font-label-surgical text-[8px] text-white/40 block mb-1 uppercase tracking-widest">Modules Run</span>
-                                <span id="modulesRunCount" class="font-data-mono text-2xl text-yellow-400 font-bold">0</span>
-                            </div>
-                        </div>
-                        <!-- Last module run indicator -->
-                        <div class="bg-white/3 border border-white/5 p-3 flex items-center gap-3">
-                            <div id="lastModuleDot" class="w-1.5 h-1.5 rounded-full bg-white/20 flex-shrink-0"></div>
-                            <div class="flex-1 min-w-0">
-                                <span class="font-label-surgical text-[7px] text-white/20 uppercase tracking-widest block">Last Module</span>
-                                <span id="lastModuleLabel" class="font-data-mono text-[10px] text-white/50 truncate block">NONE</span>
-                            </div>
-                            <span id="lastModuleStatus" class="font-label-surgical text-[7px] uppercase tracking-widest text-white/20">IDLE</span>
-                        </div>
-                    </div>
-
-                    <!-- Secrets/highlights panel -->
-                    <div class="panel bg-black/80 border border-white/10 p-6" style="flex-shrink:0;">
-                        <div class="flex items-center justify-between mb-4">
-                            <h3 class="font-label-surgical text-[10px] text-white font-bold tracking-[0.4em] uppercase">Top_Findings</h3>
-                            <button onclick="showSection('ops')" class="font-label-surgical text-[8px] text-white/20 hover:text-white/60 uppercase tracking-widest transition-colors">VIEW ALL →</button>
-                        </div>
-                        <div id="topFindingsList" class="space-y-2">
-                            <div class="font-label-surgical text-[9px] text-white/15 uppercase tracking-widest text-center py-4">No findings yet</div>
-                        </div>
-                    </div>
-
-                    <!-- Activity feed -->
-                    <div class="panel flex-1 bg-black/90 border border-white/10 p-6 flex flex-col" style="min-height:0;">
-                        <h3 class="font-label-surgical text-[10px] text-white font-bold tracking-[0.4em] uppercase mb-5" style="flex-shrink:0;">Live_Activity</h3>
-                        <div id="activityFeed" class="flex-1 space-y-3 overflow-y-auto custom-scrollbar pr-2" style="min-height:0;"></div>
-                    </div>
-                </div>
+                <button id="closeSettingsModalBtn" class="btn-modal-close" title="Close">✕</button>
             </div>
-        </section>
 
-        <!-- ARSENAL -->
-        <section id="arsenal" class="content-area hidden h-full flex gap-8 animate-fade-in pointer-events-auto">
-            <div class="w-2/5 flex flex-col gap-8">
-                <div class="panel flex-1 bg-black/95 border border-white/10 p-10 flex flex-col shadow-2xl overflow-hidden">
-                    <div class="flex items-center justify-between mb-8">
-                        <h2 class="font-h2-tactical text-xl text-white font-bold uppercase tracking-widest">Arsenal</h2>
-                        <div class="flex items-center gap-4">
-                            <!-- Search Bar -->
-                            <div class="relative">
-                                <input id="moduleSearch" type="text" placeholder="SEARCH AGENTS..." 
-                                    class="bg-white/5 border border-white/10 text-white font-data-mono text-[10px] px-4 py-2 uppercase outline-none focus:border-primary transition-all pr-10" 
-                                    oninput="renderArsenal()">
-                                <span class="material-symbols-outlined absolute right-3 top-1/2 -translate-y-1/2 text-white/20 text-[14px]">search</span>
-                            </div>
-                            <select id="phaseSelector" class="bg-white/5 border border-white/10 text-primary font-label-surgical text-[10px] px-4 py-2 uppercase outline-none focus:border-primary transition-all" onchange="renderArsenal()">
-                                <option value="ALL">ALL PHASES</option>
-                                <option value="RECON">RECONNAISSANCE</option>
-                                <option value="VULN">VULNERABILITY DETECTION</option>
-                                <option value="EXPLOIT">EXPLOITATION</option>
-                                <option value="ANALYSIS">ANALYSIS</option>
+            <!-- Settings Navigation Tabs -->
+            <div class="settings-tabs">
+                <button class="settings-tab active" data-settings-tab="models">AI MODELS & ROUTING</button>
+                <button class="settings-tab" data-settings-tab="apikeys">API KEYS</button>
+                <button class="settings-tab" data-settings-tab="tools">TOOL SUITE</button>
+                <button class="settings-tab" data-settings-tab="bounty">BUG BOUNTY & HEADERS</button>
+            </div>
+
+            <!-- Tab 1: AI Models & Two-Tier Routing -->
+            <div id="settings-tab-models" class="settings-tab-pane active">
+                <div class="settings-section">
+                    <div class="settings-section-header">
+                        <span class="settings-badge">ORCHESTRATOR</span>
+                        <span class="settings-section-title">Local SLM (Tool Calling & Autonomous Execution)</span>
+                    </div>
+                    <p class="settings-help">Fast local model responsible for tool routing, parameters, and tactical loop steps.</p>
+                    <div class="settings-grid">
+                        <div class="settings-field">
+                            <label>Provider</label>
+                            <select id="cfgOrchestratorProvider" class="settings-select">
+                                <option value="ollama">Ollama (Local)</option>
+                                <option value="local">Local Generic</option>
+                                <option value="nvidia">NVIDIA NIM</option>
+                                <option value="anthropic">Anthropic</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="openrouter">OpenRouter</option>
+                                <option value="groq">Groq</option>
                             </select>
                         </div>
-                    </div>
-                    <div id="moduleGrid" class="flex-1 overflow-y-auto pr-4 custom-scrollbar space-y-10"></div>
-                </div>
-            </div>
-
-            <div class="w-3/5 panel bg-primary/5 border border-primary/40 p-10 flex flex-col shadow-2xl overflow-hidden relative">
-                <div id="moduleForgeEmpty" class="absolute inset-0 flex flex-col p-16 animate-fade-in z-10 bg-black/40 backdrop-blur-sm">
-                    <h2 class="font-h1-visor text-2xl text-white font-bold uppercase tracking-[0.5em] mb-12">Recommended Modules</h2>
-                    <div class="grid grid-cols-2 gap-6 overflow-y-auto custom-scrollbar pr-4">
-                        <div class="p-5 bg-primary/10 border border-primary/30 hover:border-primary transition-all cursor-pointer group pop-out-red" onclick="openForge('Spider')">
-                            <h3 class="font-label-surgical text-primary text-[13px] font-bold uppercase tracking-widest mb-2 group-hover:text-white transition-colors">Spider</h3>
-                            <p class="font-data-mono text-[9px] text-white/40 leading-relaxed uppercase">Advanced reconnaissance and endpoint discovery engine.</p>
-                        </div>
-                        <div class="p-5 bg-white/5 border border-white/10 hover:border-primary/40 transition-all cursor-pointer group pop-out-red" onclick="openForge('Stalk')">
-                            <h3 class="font-label-surgical text-white text-[13px] font-bold uppercase tracking-widest mb-2 group-hover:text-primary transition-colors">Stalk</h3>
-                            <p class="font-data-mono text-[9px] text-white/40 leading-relaxed uppercase">High-velocity host discovery and recon aggregator.</p>
-                        </div>
-                        <div class="p-5 bg-white/5 border border-white/10 hover:border-primary/40 transition-all cursor-pointer group pop-out-red" onclick="openForge('RBACdetector')">
-                            <h3 class="font-label-surgical text-white text-[13px] font-bold uppercase tracking-widest mb-2 group-hover:text-primary transition-colors">RBAC Auditor</h3>
-                            <p class="font-data-mono text-[9px] text-white/40 leading-relaxed uppercase">Universal Logic Matrix Auditor for access flaws.</p>
-                        </div>
-                        <div class="p-5 bg-white/5 border border-white/10 hover:border-primary/40 transition-all cursor-pointer group pop-out-red" onclick="openForge('IDORdetector')">
-                            <h3 class="font-label-surgical text-white text-[13px] font-bold uppercase tracking-widest mb-2 group-hover:text-primary transition-colors">IDOR Probe</h3>
-                            <p class="font-data-mono text-[9px] text-white/40 leading-relaxed uppercase">Granular identifier-based authorization bypass tester.</p>
-                        </div>
-                        <div class="p-5 bg-white/5 border border-white/10 hover:border-primary/40 transition-all cursor-pointer group pop-out-red" onclick="openForge('CORSbuster')">
-                            <h3 class="font-label-surgical text-white text-[13px] font-bold uppercase tracking-widest mb-2 group-hover:text-primary transition-colors">CORS Buster</h3>
-                            <p class="font-data-mono text-[9px] text-white/40 leading-relaxed uppercase">Deep origin-reflection and misconfiguration auditor.</p>
-                        </div>
-                        <div class="p-5 bg-white/5 border border-white/10 hover:border-primary/40 transition-all cursor-pointer group pop-out-red" onclick="openForge('JWTdetector')">
-                            <h3 class="font-label-surgical text-white text-[13px] font-bold uppercase tracking-widest mb-2 group-hover:text-primary transition-colors">JWT Detector</h3>
-                            <p class="font-data-mono text-[9px] text-white/40 leading-relaxed uppercase">Token signature and claim-based vulnerability scanner.</p>
-                        </div>
-                    </div>
-                    <div class="mt-auto pt-10 border-t border-white/10 flex items-center gap-4">
-                        <span class="material-symbols-outlined text-primary text-[20px]">info</span>
-                        <p class="font-data-mono text-[10px] text-primary/60 uppercase tracking-widest">Select an agent from the arsenal to customize your strike parameters.</p>
-                    </div>
-                </div>
-                <div id="moduleForgeContent" class="flex flex-col h-full hidden">
-                    <div class="mb-10 pb-10 border-b border-primary/20">
-                        <h2 id="selectedModuleName" class="font-h2-tactical text-3xl text-white font-bold uppercase tracking-tighter mb-4">SELECT_PAYLOAD</h2>
-                        <p id="selectedModuleDesc" class="font-body-standard text-[15px] text-white/60 leading-relaxed italic">Intelligence data pending module selection.</p>
-                    </div>
-                <div class="flex-1 flex flex-col overflow-hidden">
-                    <h3 class="font-label-surgical text-[10px] text-primary font-bold uppercase tracking-[0.3em] mb-6">Module_Configuration</h3>
-                    <div id="forgeOptions" class="flex-1 space-y-8 overflow-y-auto pr-4 custom-scrollbar font-data-mono text-[13px]"></div>
-                </div>
-                <button id="strikeBtn" class="mt-10 w-full h-16 bg-primary text-background font-h1-visor text-[12px] tracking-[0.5em] font-bold hover:brightness-110 shadow-[0_0_30px_#ff2244]" onclick="initiateStrike()">INITIATE_STRIKE</button>
-            </div>
-        </section>
-
-        <!-- OPERATIONS -->
-        <section id="ops" class="content-area hidden h-full animate-fade-in pointer-events-auto">
-            <div class="grid grid-cols-12 gap-6 h-full">
-
-                <!-- LEFT: Telemetry (running state) + Session Log tabs -->
-                <div class="col-span-7 flex flex-col gap-0" style="min-height:0;">
-
-                    <!-- Tab bar -->
-                    <div class="flex border-b border-white/10 mb-0">
-                        <button onclick="switchOpsTab('telemetry', this)"
-                            id="tabTelemetry"
-                            class="ops-tab flex-1 py-4 font-label-surgical text-[10px] tracking-widest text-primary border-b-2 border-primary uppercase bg-black/60">
-                            Mission_Telemetry
-                        </button>
-                        <button onclick="switchOpsTab('sessionlog', this)"
-                            id="tabSessionLog"
-                            class="ops-tab flex-1 py-4 font-label-surgical text-[10px] tracking-widest text-white/30 uppercase bg-black/40 hover:text-white/60 transition-colors">
-                            Session_Log
-                        </button>
-                    </div>
-
-                    <!-- Telemetry panel — running state only -->
-                    <div id="opsTelemetryPanel" class="panel flex-1 bg-black/95 border border-white/10 border-t-0 p-10 flex flex-col shadow-2xl" style="min-height:0;">
-                        <!-- Module status block -->
-                        <div id="missionStatusBlock" class="mb-8 hidden">
-                            <div class="p-6 bg-white/5 border border-white/10 space-y-2">
-                                <div class="flex items-center gap-4">
-                                    <div id="missionRunningDot" class="w-2 h-2 rounded-full bg-primary animate-pulse shadow-[0_0_10px_#ff2244]"></div>
-                                    <span id="missionModuleLabel" class="font-h1-visor text-[14px] text-white uppercase tracking-[0.3em]">—</span>
-                                </div>
-                                <div class="font-data-mono text-[11px] text-white/40 pl-6">
-                                    TARGET: <span id="missionTargetLabel" class="text-white/70">—</span>
-                                </div>
-                                <div class="font-data-mono text-[11px] pl-6">
-                                    STATUS: <span id="missionStatusLabel" class="text-primary font-bold">IDLE</span>
-                                    <span id="missionElapsed" class="text-white/30 ml-4"></span>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Idle state -->
-                        <div id="missionIdleBlock" class="flex-1 flex items-center justify-center">
-                            <div class="text-center space-y-4">
-                                <div class="font-h1-visor text-[11px] text-white/10 uppercase tracking-[0.5em]">No Active Mission</div>
-                                <div class="font-label-surgical text-[9px] text-white/10 uppercase tracking-widest">Select a module from Arsenal and initiate a strike</div>
-                            </div>
-                        </div>
-
-                        <!-- Raw output - expandable -->
-                        <div id="rawOutputToggle" class="hidden mt-4 flex flex-col" style="min-height:0;">
-                            <button onclick="toggleRawOutput()" class="font-label-surgical text-[8px] text-white/20 hover:text-white/50 uppercase tracking-widest transition-colors text-left mb-2">
-                                ▶ SHOW RAW OUTPUT
-                            </button>
-                            <div id="opsOutput" class="hidden font-data-mono text-[12px] overflow-y-auto custom-scrollbar p-6 bg-black border border-white/10 text-white/80 whitespace-pre-wrap flex-1" style="min-height:0; max-height:60vh;"></div>
-                        </div>
-                    </div>
-
-                    <!-- Session Log panel — loot files from this session -->
-                    <div id="opsSessionLogPanel" class="panel flex-1 bg-black/95 border border-white/10 border-t-0 p-10 flex flex-col shadow-2xl hidden" style="min-height:0;">
-                        <div class="flex items-center justify-between mb-6">
-                            <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-widest">Findings from loot files — updated after each strike</span>
-                            <button onclick="refreshSessionLog()" class="font-label-surgical text-[8px] text-white/20 hover:text-white/60 uppercase tracking-widest transition-colors">↺ REFRESH</button>
-                        </div>
-                        <div id="sessionLogContent" class="flex-1 overflow-y-auto custom-scrollbar space-y-6 pr-2" style="min-height:0;"></div>
-                    </div>
-                </div>
-
-                <!-- RIGHT: High Value Findings -->
-                <div class="col-span-5 flex flex-col gap-6 h-full">
-                    <div class="panel flex-1 bg-black/90 border border-white/10 p-8 flex flex-col shadow-xl overflow-hidden" style="min-height:0;">
-                        <div class="flex items-start justify-between mb-6">
-                            <div class="flex items-center gap-4">
-                                <span class="material-symbols-outlined text-primary text-[22px]">analytics</span>
-                                <h2 class="font-h2-tactical text-xl text-primary font-bold uppercase tracking-widest">High_Value_Findings</h2>
-                            </div>
-                            <button onclick="clearFindings()" class="font-label-surgical text-[8px] text-white/20 hover:text-white/60 uppercase tracking-widest transition-colors mt-1">CLEAR</button>
-                        </div>
-                        <div id="opsFindings" class="relative flex-1 space-y-2 overflow-y-auto custom-scrollbar pr-1" style="min-height:0;">
-                            <!-- Findings populated here -->
-                        </div>
-                        <div class="mt-4 pt-4 border-t border-white/5 flex items-center justify-between">
-                            <span class="font-label-surgical text-[8px] text-white/20 uppercase">Tactical_Intelligence_Feed</span>
-                            <span class="material-symbols-outlined text-white/10 text-[14px]">sensors</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- REPRO CENTER -->
-        <section id="repro" class="content-area hidden h-full animate-fade-in pointer-events-auto">
-            <div class="grid grid-cols-12 gap-8 h-full">
-                <!-- LEFT: PoC Catalog -->
-                <div class="col-span-4 flex flex-col bg-black/95 border border-white/10 p-8 shadow-2xl h-full" style="min-height:0;">
-                    <div class="flex items-center justify-between mb-8 pb-4 border-b border-white/5">
-                        <div class="flex items-center gap-3">
-                            <span class="material-symbols-outlined text-primary text-[20px]">reorder</span>
-                            <h2 class="font-h2-tactical text-xl text-white font-bold uppercase tracking-widest">PoC_Catalog</h2>
-                        </div>
-                        <button onclick="clearReproCommands()" class="font-label-surgical text-[8px] text-white/20 hover:text-white/60 uppercase tracking-widest transition-colors">CLEAR</button>
-                    </div>
-                    
-                    <div id="reproCommandsList" class="flex-1 space-y-3 overflow-y-auto custom-scrollbar pr-2" style="min-height:0;">
-                        <div class="font-label-surgical text-[10px] text-white/10 uppercase tracking-[0.2em] text-center py-20 italic">
-                            No reproduction artifacts detected yet.<br>
-                            <span class="text-[8px] mt-2 block">Execute modules to harvest surgical PoCs.</span>
+                        <div class="settings-field">
+                            <label>Model ID</label>
+                            <input type="text" id="cfgOrchestratorModel" class="settings-input" placeholder="e.g. qwen2.5:3b-instruct">
                         </div>
                     </div>
                 </div>
 
-                <!-- RIGHT: Execution Hub -->
-                <div class="col-span-8 flex flex-col bg-black/95 border border-white/10 p-8 shadow-2xl h-full" style="min-height:0;">
-                    <div class="flex items-center justify-between mb-8 pb-4 border-b border-white/5">
-                        <div class="flex items-center gap-3">
-                            <span class="material-symbols-outlined text-primary text-[20px]">terminal</span>
-                            <h2 class="font-h2-tactical text-xl text-white font-bold uppercase tracking-widest">Surgical_Execution_Hub</h2>
-                        </div>
-                        <div class="flex items-center gap-6">
-                            <div class="flex items-center gap-3">
-                                <label class="font-label-surgical text-[9px] text-white/30 uppercase tracking-[0.2em]">Timeout</label>
-                                <input id="reproTimeout" type="number" value="10" min="1" max="60"
-                                    class="w-16 bg-white/5 border border-white/10 text-white font-data-mono text-[11px] px-3 py-1 focus:outline-none focus:border-primary transition-colors">
-                            </div>
-                            <div class="flex items-center gap-3">
-                                <label class="font-label-surgical text-[9px] text-white/30 uppercase tracking-[0.2em]">Delay</label>
-                                <input id="reproDelay" type="number" value="0.5" min="0" max="10" step="0.1"
-                                    class="w-16 bg-white/5 border border-white/10 text-white font-data-mono text-[11px] px-3 py-1 focus:outline-none focus:border-primary transition-colors">
-                            </div>
-                        </div>
+                <div class="settings-section">
+                    <div class="settings-section-header">
+                        <span class="settings-badge synthesizer-badge">SYNTHESIZER</span>
+                        <span class="settings-section-title">Cloud LLM (Deep Reasoning & Final Synthesis)</span>
                     </div>
-
-                    <!-- Repro Terminal View -->
-                    <div class="flex-1 flex flex-col bg-black/40 border border-white/5 rounded-sm p-6 relative overflow-hidden" style="min-height:0;">
-                        <div class="absolute top-0 left-0 w-1 h-full bg-primary/20"></div>
-                        <div id="reproTerminal" class="flex-1 font-data-mono text-[13px] text-white/80 overflow-y-auto custom-scrollbar whitespace-pre-wrap leading-relaxed">
-                            <div class="text-white/20 uppercase tracking-widest text-center py-40">Waiting for payload selection...</div>
-                        </div>
-                        
-                        <div class="mt-6 pt-6 border-t border-white/10 flex items-center justify-between">
-                            <div class="flex items-center gap-4">
-                                <button onclick="copyActivePoC()" class="px-6 py-2 border border-white/10 text-white/60 font-label-surgical text-[10px] tracking-widest hover:border-white/40 hover:text-white transition-all uppercase">Copy_PoC</button>
-                                <button onclick="saveActivePoC()" class="px-6 py-2 border border-white/10 text-white/60 font-label-surgical text-[10px] tracking-widest hover:border-white/40 hover:text-white transition-all uppercase">Save_Artifact</button>
-                                <button id="reproAllBtn" onclick="fireConsoleRepro()" class="px-6 py-2 border border-primary/30 text-primary/80 font-label-surgical text-[10px] tracking-widest hover:border-primary/60 hover:text-primary transition-all uppercase">Replay_All</button>
-                            </div>
-                            <button id="reproFireBtn" onclick="fireRepro()"
-                                class="px-10 py-3 bg-primary text-background font-h1-visor text-[12px] tracking-[0.3em] uppercase font-bold hover:brightness-110 shadow-[0_0_30px_#ff2244] transition-all flex items-center gap-3">
-                                <span class="material-symbols-outlined text-[18px]">replay</span>
-                                INITIATE_REPLAY
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- NEURAL ATTACK GRAPH PANEL -->
-        <section id="graph" class="content-area hidden h-full flex flex-col gap-8 animate-fade-in pointer-events-auto">
-            <div class="panel flex-1 bg-black/90 border border-white/10 p-10 flex flex-col shadow-2xl relative overflow-hidden">
-                <div class="flex items-center justify-between mb-8" style="flex-shrink:0;">
-                    <div class="flex items-center gap-5">
-                        <div class="w-10 h-10 border border-primary/40 flex items-center justify-center bg-primary/5">
-                            <span class="material-symbols-outlined text-primary text-[24px]">hub</span>
-                        </div>
-                        <div>
-                            <h2 class="font-h1-visor text-xl text-white font-bold uppercase tracking-[0.5em]">Neural Attack Graph</h2>
-                            <p class="font-data-mono text-[9px] text-white/40 uppercase tracking-widest mt-1">Real-time correlation of tactical findings and exploitation paths</p>
-                        </div>
-                    </div>
-                    <div class="flex items-center gap-4">
-                        <div class="flex border border-white/10 rounded overflow-hidden">
-                            <button id="graphModeSample" onclick="setGraphMode('sample')" class="px-4 py-2 font-label-surgical text-[10px] tracking-widest uppercase bg-primary text-background font-bold transition-all">Sample</button>
-                            <button id="graphModeLive" onclick="setGraphMode('live')" class="px-4 py-2 font-label-surgical text-[10px] tracking-widest uppercase text-white/40 hover:text-white transition-all">Live</button>
-                        </div>
-                        <span id="graphStatusBadge" class="font-label-surgical text-[10px] text-primary border border-primary/40 px-4 py-2 uppercase tracking-widest bg-primary/5">Cold Start // Standby</span>
-                        <!-- Layout Cycle Button -->
-                        <button onclick="toggleGraphLayout()" class="px-4 py-2 border border-white/10 hover:border-primary/50 hover:bg-primary/5 transition-all text-white/40 hover:text-white flex items-center justify-center gap-2" title="Cycle Projection Layout">
-                            <span class="material-symbols-outlined text-[18px]">account_tree</span>
-                        </button>
-                        <!-- Reset View Button -->
-                        <button onclick="resetGraphView()" class="px-4 py-2 border border-white/10 hover:border-primary/50 hover:bg-primary/5 transition-all text-white/40 hover:text-white flex items-center justify-center gap-2" title="Reset Viewport">
-                            <span class="material-symbols-outlined text-[18px]">fit_screen</span>
-                        </button>
-                        <button onclick="initAttackGraph()" class="px-4 py-2 border border-white/10 hover:border-primary transition-all text-white/40 hover:text-white material-symbols-outlined text-[18px]">refresh</button>
-                    </div>
-                </div>
-
-                <div class="flex-1 relative bg-[#0a0a0f] border border-white/5 rounded-lg overflow-hidden">
-                    <!-- The actual graph container -->
-                    <div id="attackGraph" class="absolute inset-0 z-10 transition-opacity duration-500"></div>
-
-                    <!-- Node Info Panel (Floating in graph) -->
-                    <div id="graphNodeInfo" class="animate-fade-in z-20" style="position:absolute; top:40px; right:40px; pointer-events:auto; display:none;">
-                        <div class="flex items-center justify-between mb-4">
-                            <div id="infoIcon" class="text-xl"></div>
-                            <button onclick="hideNodeInfo()" class="text-white/20 hover:text-white transition-colors">
-                                <span class="material-symbols-outlined text-[16px]">close</span>
-                            </button>
-                        </div>
-                        <h4 id="infoLabel">NODE_DETAILS</h4>
-                        <div id="infoDesc">Select a node to extract intelligence.</div>
-                        <div id="infoMeta"></div>
-                    </div>
-                    
-                    <!-- Graph Controls -->
-                    <div class="absolute bottom-10 left-10 z-30 flex flex-col gap-3">
-                        <button onclick="resetGraphView()" class="w-10 h-10 bg-black/80 border border-white/10 text-white/40 hover:text-primary hover:border-primary transition-all flex items-center justify-center rounded shadow-xl" title="Reset Camera">
-                            <span class="material-symbols-outlined text-[20px]">center_focus_strong</span>
-                        </button>
-                        <button id="togglePhysicsBtn" onclick="toggleGraphPhysics()" class="w-10 h-10 bg-black/80 border border-white/10 text-white/40 hover:text-primary hover:border-primary transition-all flex items-center justify-center rounded shadow-xl" title="Toggle Auto-Layout Physics">
-                            <span class="material-symbols-outlined text-[20px]">motion_sensor_active</span>
-                        </button>
-                    </div>
-                </div>
-
-                <div class="mt-8 pt-6 border-t border-white/10 flex items-center justify-between">
-                    <div class="flex items-center gap-6">
-                        <div class="flex items-center gap-2">
-                            <div class="w-2 h-2 rounded-full bg-[#dc2626]"></div>
-                            <span class="font-data-mono text-[9px] text-white/30 uppercase">VULN_CORE</span>
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <div class="w-2 h-2 rounded-full bg-[#f4a261]"></div>
-                            <span class="font-data-mono text-[9px] text-white/30 uppercase">INTEL_LAYER</span>
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <div class="w-2 h-2 rounded-full bg-[#00b4d8]"></div>
-                            <span class="font-data-mono text-[9px] text-white/30 uppercase">TARGET_LAYER</span>
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <div class="w-2 h-2 rounded-full bg-[#6c757d]"></div>
-                            <span class="font-data-mono text-[9px] text-white/30 uppercase">EXTERNAL_LAYER</span>
-                        </div>
-                    </div>
-                    <p class="font-label-surgical text-[9px] text-white/15 uppercase tracking-[0.2em]">Graph nodes are interactive // Drag to reorganize // Click for Intel</p>
-                </div>
-            </div>
-        </section>
-
-        <!-- INTEL CENTER (SPLIT: HOWL & ANALYZE) -->
-        <section id="intel" class="content-area hidden h-full flex flex-col gap-8 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase">Intel_Center</h2>
-                    <p id="intelSubtitle" class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Correlation Matrix // HOWL & ANALYZE PANELS</p>
-                </div>
-                <div class="flex border-b border-white/10">
-                    <button onclick="switchIntelTab('howl', this)" class="intel-tab px-8 py-3 font-label-surgical text-[10px] tracking-widest text-primary border-b-2 border-primary uppercase">HOWL_CORRELATION</button>
-                    <button onclick="switchIntelTab('analyze', this)" class="intel-tab px-8 py-3 font-label-surgical text-[10px] tracking-widest text-white/30 uppercase hover:text-white/60 transition-colors">SURGICAL_ANALYZE</button>
-                </div>
-            </div>
-
-            <!-- HOWL PANEL -->
-            <div id="howlPanel" class="intel-subpanel flex-1 flex flex-col gap-8">
-                <div class="flex items-center justify-between">
-                    <span class="font-label-surgical text-[11px] text-white/40 uppercase tracking-[0.3em]">Neural Pattern Correlation</span>
-                    <button onclick="runHowl()" class="px-10 py-4 bg-primary/10 border border-primary text-primary font-h1-visor text-[11px] tracking-[0.4em] hover:bg-primary/20 transition-all shadow-[0_0_20px_rgba(255,34,68,0.2)]">✧ INITIATE_HOWL_CORRELATION</button>
-                </div>
-                <div class="flex-1 panel bg-black/40 border border-white/5 p-10 overflow-y-auto custom-scrollbar">
-                    <div id="howlOutput" class="font-data-mono text-[13px] text-white/80 whitespace-pre-wrap leading-relaxed">Intelligence data pending HOWL initiation...</div>
-                </div>
-            </div>
-
-            <!-- ANALYZE PANEL -->
-            <div id="analyzePanel" class="intel-subpanel hidden flex-1 flex flex-col gap-8">
-                <div class="flex items-center justify-between">
-                    <div class="flex flex-col">
-                        <span class="font-label-surgical text-[11px] text-white/40 uppercase tracking-[0.3em]">Target Selection HUD</span>
-                        <span id="selectionCount" class="font-data-mono text-[10px] text-primary mt-1">0 ITEMS SELECTED</span>
-                    </div>
-                    <div class="flex items-center gap-4">
-                        <button onclick="refreshIntel()" class="px-4 py-3 border border-primary/20 hover:border-primary/50 text-primary/40 hover:text-primary font-label-surgical text-[8px] uppercase tracking-widest transition-all flex items-center gap-2">
-                            <span class="material-symbols-outlined text-[14px]">refresh</span> REFRESH_MATRIX
-                        </button>
-                        <button onclick="intelSelectAll()" class="px-4 py-3 border border-white/10 hover:border-white/30 text-white/40 hover:text-white font-label-surgical text-[8px] uppercase tracking-widest transition-all">SELECT_ALL</button>
-                        <button id="startAnalyzeBtn" onclick="analyzeSelectedTargets()" class="px-10 py-4 bg-primary text-background font-h1-visor text-[11px] tracking-[0.4em] font-bold shadow-[0_0_30px_#ff2244] hover:brightness-110 transition-all disabled:opacity-30" disabled>START_ANALYZE</button>
-                    </div>
-                </div>
-                <div class="flex-1 panel bg-black/40 border border-white/5 p-10 overflow-y-auto custom-scrollbar">
-                    <div id="intelGrid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
-                        <!-- Targets injected here -->
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- SETTINGS (ALL SETTINGS RESTORED) -->
-        <section id="settings" class="content-area hidden h-full max-w-5xl mx-auto animate-fade-in pointer-events-auto">
-            <div class="panel bg-black/98 border border-white/20 p-16 shadow-2xl overflow-y-auto max-h-full custom-scrollbar">
-                <h2 class="font-h1-visor text-2xl text-primary font-bold tracking-[0.6em] mb-16 uppercase">Global_Core_Config</h2>
-                <div class="grid grid-cols-2 gap-x-16 gap-y-10">
-                    <div class="space-y-4">
-                        <label class="font-label-surgical text-white text-[10px] font-bold uppercase tracking-widest">proxy</label>
-                        <input id="proxy" type="text" class="term-input w-full text-white font-bold" placeholder="http://127.0.0.1:8080">
-                    </div>
-                    <div class="space-y-4">
-                        <label class="font-label-surgical text-white text-[10px] font-bold uppercase tracking-widest">proxy_mode</label>
-                        <select id="proxy_mode" class="term-input w-full font-bold cursor-pointer">
-                            <option value="REPRO_ONLY">REPRO_ONLY</option>
-                            <option value="ALL">ALL</option>
-                        </select>
-                    </div>
-                    <div class="space-y-4">
-                        <label class="font-label-surgical text-white text-[10px] font-bold uppercase tracking-widest">bugbounty_id</label>
-                        <input id="bugbounty" type="text" class="term-input w-full font-bold" placeholder="ID">
-                    </div>
-                    <div class="space-y-4">
-                        <label class="font-label-surgical text-white text-[10px] font-bold uppercase tracking-widest">wafbypass</label>
-                        <select id="wafbypass" class="term-input w-full font-bold cursor-pointer">
-                            <option value="false">DISABLED</option>
-                            <option value="true">ENABLED</option>
-                        </select>
-                    </div>
-                    <div class="col-span-2 space-y-4">
-                        <label class="font-label-surgical text-white text-[10px] font-bold uppercase tracking-widest">oob_url</label>
-                        <input id="oob" type="text" class="term-input w-full font-bold" placeholder="https://interactsh.com/...">
-                    </div>
-                    
-                    <!-- AI SETTINGS (RESTORED) -->
-                    <div class="col-span-2 space-y-6 pt-10 border-t border-white/10">
-                        <h3 class="font-label-surgical text-primary text-[10px] font-bold uppercase tracking-widest mb-4">Neural_AI_Core</h3>
-                        <div class="grid grid-cols-2 gap-8">
-                            <div class="space-y-4">
-                                <label class="font-label-surgical text-white text-[9px] uppercase tracking-widest">ai_provider</label>
-                                <select id="ai_provider" class="term-input w-full font-bold" onchange="toggleAiKeyInput()">
-                                    <option value="LOCAL">LOCAL_SLM (Ollama / Gemma 2B)</option>
-                                    <option value="GEMINI">GEMINI_PRO (Cloud)</option>
-                                    <option value="OPENAI">OPENAI_GPT (Cloud)</option>
-                                    <option value="ANTHROPIC">ANTHROPIC_CLAUDE (Cloud)</option>
-                                </select>
-                            </div>
-                            <div id="aiKeyContainer" class="space-y-4 hidden">
-                                <label class="font-label-surgical text-white text-[9px] uppercase tracking-widest">api_key</label>
-                                <input id="ai_key" type="password" class="term-input w-full font-bold" placeholder="ENTER_KEY">
-                            </div>
-                        </div>
-                        <!-- AI Status feedback panel -->
-                        <div class="mt-4 space-y-3">
-                        <div class="mt-4 flex items-center gap-4">
-                            <button onclick="checkAIStatus()" class="px-6 py-2 border border-white/20 text-white/50 font-label-surgical text-[9px] uppercase tracking-widest hover:border-primary/50 hover:text-white transition-all">
-                                CHECK AI STATUS
-                            </button>
-                            <button onclick="syncAICore()" class="px-6 py-2 bg-primary/20 border border-primary/40 text-primary font-label-surgical text-[9px] uppercase tracking-widest hover:bg-primary hover:text-white transition-all">
-                                ACTIVATE HELLHOUND
-                            </button>
-                        </div>
-                            <div id="aiStatusPanel" class="hidden p-4 bg-white/3 border border-white/10 flex items-start gap-4">
-                                <div id="aiStatusDot" class="w-2 h-2 rounded-full bg-yellow-500 mt-1 flex-shrink-0"></div>
-                                <div class="flex-1">
-                                    <div class="font-label-surgical text-[8px] text-white/30 uppercase tracking-widest mb-1">Console Response</div>
-                                    <pre id="aiStatusMsg" class="font-data-mono text-[11px] text-white/70 whitespace-pre-wrap leading-relaxed"></pre>
-                                </div>
-                            </div>
-                        </div>
-                        <p class="font-label-surgical text-[8px] text-white/20 uppercase tracking-widest">
-                            Local SLM: ensure Ollama is running with <span class="text-white/40">gemma2:2b</span> pulled. Use INITIALIZE HELLHOUND HANDSHAKE in the AI panel to connect.
-                        </p>
-                    </div>
-                </div>
-                <button onclick="saveGlobalSettings()" class="mt-20 px-16 h-14 bg-white text-background font-h1-visor text-[11px] tracking-[0.5em] font-bold hover:bg-primary hover:text-white transition-all">SYNCHRONIZE_CONFIG</button>
-            </div>
-        </section>
-
-        <!-- MONITOR SECTION -->
-        <section id="monitor" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <div class="flex gap-6">
-                <input id="browserUrl" type="text" class="flex-1 term-input font-bold" placeholder="TARGET_URL">
-                <button onclick="navigateBrowser()" class="px-12 bg-primary text-background font-label-surgical text-[11px] font-bold uppercase">Navigate</button>
-            </div>
-            <div class="flex-1 panel bg-black border border-white/20 overflow-hidden shadow-2xl">
-                <webview id="tacticalWebview" src="about:blank" class="w-full h-full bg-black"></webview>
-            </div>
-        </section>
-        <!-- ── LOOT CENTER (RESTORED) ─────────────────────────────────────── -->
-        <section id="loot" class="content-area hidden h-full flex flex-col gap-8 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">Loot_Repository <span class="text-primary not-italic">/v4/</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Extracted Session Intelligence // Historical Data Nodes</p>
-                </div>
-                <div class="flex items-center gap-4">
-                    <button onclick="pollLoot()" class="px-6 py-3 border border-white/10 hover:border-primary/40 text-white/40 hover:text-white font-label-surgical text-[9px] uppercase tracking-widest transition-all">↻ REFRESH_LOOT</button>
-                    <button onclick="openLootDir()" class="px-6 py-3 border border-primary/20 bg-primary/5 text-primary font-label-surgical text-[9px] uppercase tracking-widest hover:bg-primary/10 transition-all italic">OPEN_DIR</button>
-                </div>
-            </div>
-
-            <div class="flex-1 panel bg-black/60 border border-white/5 p-10 overflow-hidden flex flex-col">
-                <div id="lootEmpty" class="flex-1 flex flex-col items-center justify-center space-y-6">
-                    <span class="material-symbols-outlined text-[64px] text-white/5">folder_zip</span>
-                    <div class="text-center">
-                        <p class="font-label-surgical text-[11px] text-white/40 uppercase tracking-[0.3em]">No loot files detected</p>
-                        <p class="font-body-standard text-[13px] text-white/20 mt-2">Historical data will populate here after modules successfully harvest intelligence.</p>
-                    </div>
-                </div>
-
-                <div id="lootGrid" class="hidden flex-1 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8 overflow-y-auto custom-scrollbar pr-4">
-                    <!-- Loot folders/files will be injected here -->
-                </div>
-            </div>
-        </section>
-
-        <!-- HTTP REPEATER SECTION -->
-        <section id="repeater" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <!-- Header bar -->
-            <div class="flex items-center justify-between" style="flex-shrink:0;">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">HTTP_REPEATER <span class="text-primary not-italic">// HUB</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Intercept, Modify, and Replay HTTP Requests // Live Pentest Traffic log</p>
-                </div>
-            </div>
-
-            <!-- Main grid -->
-            <div class="flex-1 grid grid-cols-12 gap-6 min-h-0">
-                <!-- Traffic Log Pane (Col-span-4) -->
-                <div class="col-span-4 panel bg-black/95 border border-white/10 p-6 flex flex-col min-h-0">
-                    <div class="flex items-center justify-between mb-4" style="flex-shrink:0;">
-                        <h3 class="font-label-surgical text-[10px] text-primary font-bold tracking-[0.4em] uppercase">Traffic_History</h3>
-                        <button onclick="addNewRepeaterTab()" class="px-3 py-1 bg-primary/10 border border-primary/30 hover:bg-primary/20 text-primary font-label-surgical text-[9px] uppercase tracking-widest transition-all rounded">
-                            + New Request
-                        </button>
-                    </div>
-                    <!-- Search inside Traffic History -->
-                    <div class="relative mb-4" style="flex-shrink:0;">
-                        <input id="trafficSearch" type="text" placeholder="FILTER HISTORY..." 
-                            class="w-full bg-white/5 border border-white/10 text-white font-data-mono text-[10px] px-4 py-2 uppercase outline-none focus:border-primary transition-all pr-10" 
-                            oninput="filterTrafficHistory()">
-                        <span class="material-symbols-outlined absolute right-3 top-1/2 -translate-y-1/2 text-white/20 text-[14px]">search</span>
-                    </div>
-                    <!-- Scrollable Traffic history list -->
-                    <div id="trafficHistoryList" class="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-1">
-                        <div class="text-white/30 italic text-[10px] text-center font-data-mono py-8">No traffic intercepted yet. Runs/strikes will stream here.</div>
-                    </div>
-                </div>
-
-                <!-- Repeater Workspace Pane (Col-span-8) -->
-                <div class="col-span-8 panel bg-black/90 border border-white/10 p-6 flex flex-col min-h-0">
-                    <!-- Tab Bar -->
-                    <div class="flex items-center justify-between border-b border-white/10 pb-2 mb-4" style="flex-shrink:0;">
-                        <div id="repeaterTabsHeader" class="flex items-center gap-2 overflow-x-auto select-none custom-scrollbar">
-                            <!-- Injected tabs dynamically -->
-                        </div>
-                    </div>
-
-                    <!-- Target Configuration Bar -->
-                    <div class="flex items-center gap-4 mb-4" style="flex-shrink:0;">
-                        <select id="repeaterMethod" class="bg-white/5 border border-white/10 text-primary font-data-mono text-[11px] font-bold px-3 py-2 uppercase outline-none focus:border-primary transition-all rounded">
-                            <option value="GET">GET</option>
-                            <option value="POST">POST</option>
-                            <option value="PUT">PUT</option>
-                            <option value="DELETE">DELETE</option>
-                            <option value="PATCH">PATCH</option>
-                            <option value="OPTIONS">OPTIONS</option>
-                            <option value="HEAD">HEAD</option>
-                        </select>
-                        <input id="repeaterTarget" type="text" placeholder="http://127.0.0.1:5000/api/admin" 
-                            class="flex-1 bg-white/5 border border-white/10 text-white font-data-mono text-[11px] px-4 py-2 outline-none focus:border-primary transition-all rounded">
-                        
-                        <button id="repeaterSendBtn" onclick="sendActiveRepeater()" class="px-6 py-2 bg-primary hover:bg-primary-hover text-background font-label-surgical text-[11px] font-bold uppercase tracking-widest transition-all rounded flex items-center gap-2 shadow-[0_0_15px_rgba(255,34,68,0.3)] hover:scale-102">
-                            <span>SEND</span><span class="material-symbols-outlined text-[14px]">send</span>
-                        </button>
-                        <button id="repeaterReproBtn" onclick="transmitToRepro()" class="px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/20 text-white font-label-surgical text-[11px] uppercase tracking-widest transition-all rounded flex items-center gap-2">
-                            <span>SEND TO REPRO</span><span class="material-symbols-outlined text-[14px]">terminal</span>
-                        </button>
-                    </div>
-
-                    <!-- Editor Workspace Split -->
-                    <div class="flex-1 grid grid-cols-2 gap-4 min-h-0">
-                        <!-- Request (Left) -->
-                        <div class="flex flex-col min-h-0">
-                            <div class="flex items-center justify-between mb-2">
-                                <span class="font-label-surgical text-[9px] text-white/40 uppercase tracking-widest font-bold">Raw Request Payload</span>
-                                <span class="font-data-mono text-[8px] text-white/20">Edit headers & body</span>
-                            </div>
-                            <textarea id="repeaterRawRequest" 
-                                class="flex-1 h-full bg-black/45 border border-white/10 text-white font-data-mono text-[12px] p-4 outline-none focus:border-primary/50 transition-all rounded resize-none w-full select-text leading-relaxed whitespace-pre" 
-                                placeholder="GET / HTTP/1.1&#10;Host: localhost&#10;User-Agent: Hellhound-Repeater/1.0&#10;&#10;"></textarea>
-                        </div>
-
-                        <!-- Response (Right) -->
-                        <div class="flex flex-col min-h-0 border-l border-white/5 pl-4">
-                            <div class="flex items-center justify-between mb-2">
-                                <span class="font-label-surgical text-[9px] text-white/40 uppercase tracking-widest font-bold">Response Stream</span>
-                                <div id="repeaterResponseMeta" class="flex gap-2">
-                                    <!-- Dynamic response details -->
-                                </div>
-                            </div>
-                            <!-- Response tab headers -->
-                            <div class="flex border-b border-white/10 mb-2 text-[10px] font-label-surgical tracking-widest uppercase">
-                                <button onclick="setResponseView('raw')" id="respTab-raw" class="px-3 py-1 text-white border-b-2 border-primary font-bold">Raw</button>
-                                <button onclick="setResponseView('headers')" id="respTab-headers" class="px-3 py-1 text-white/40 hover:text-white transition-colors">Headers</button>
-                                <button onclick="setResponseView('body')" id="respTab-body" class="px-3 py-1 text-white/40 hover:text-white transition-colors">Body</button>
-                            </div>
-                            
-                            <div id="repeaterResponseViewer" class="flex-1 bg-black/45 border border-white/10 text-white/80 font-data-mono text-[12px] p-4 rounded overflow-auto select-text leading-relaxed whitespace-pre-wrap select-text">
-                                <div class="text-white/20 italic text-[10px] text-center font-data-mono py-16">Send request to retrieve telemetry response stream</div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- COOKIE FORGE SECTION -->
-        <section id="cookieforge" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between" style="flex-shrink:0;">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">COOKIE_FORGE <span class="text-[#00ffc4] not-italic">// SESSION TAMPERER</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Forge, Tamper, and Re-sign Session Cookies and JWT Tokens</p>
-                </div>
-            </div>
-
-            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
-                <!-- Inputs & Controls Panel -->
-                <div class="col-span-5 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Token Inputs</span>
-                    
-                    <div class="flex flex-col gap-2">
-                        <label class="font-label-surgical text-[9px] text-white/40 uppercase">Cookie / Token Type</label>
-                        <select id="cookieForgeType" class="bg-white/5 border border-white/10 text-[#00ffc4] font-data-mono text-[11px] px-3 py-2 uppercase outline-none focus:border-primary transition-all rounded">
-                            <option value="jwt">JSON Web Token (JWT)</option>
-                            <option value="base64">Base64 Encoded Cookie</option>
-                            <option value="hex">Hex Encoded Value</option>
-                            <option value="url">URL Encoded Session</option>
-                        </select>
-                    </div>
-
-                    <div class="flex-grow flex flex-col min-h-0">
-                        <label class="font-label-surgical text-[9px] text-white/40 uppercase mb-2">Raw Value</label>
-                        <textarea id="cookieForgeInput" class="flex-grow bg-black text-white font-data-mono text-[12px] p-4 border border-white/10 resize-none focus:outline-none focus:border-[#00ffc4]/40 rounded select-text leading-relaxed" placeholder="Paste your raw cookie, JWT token, or session string here..."></textarea>
-                    </div>
-
-                    <div class="flex flex-col gap-2 flex-shrink-0">
-                        <label class="font-label-surgical text-[9px] text-white/40 uppercase">Secret Key / Salt (for signing/tampering)</label>
-                        <input id="cookieForgeSecret" type="text" placeholder="e.g. secret, key, private_key, or leave empty for None" class="bg-white/5 border border-white/10 text-white font-data-mono text-[11px] px-4 py-2 outline-none focus:border-[#00ffc4] transition-all rounded">
-                    </div>
-                </div>
-
-                <!-- Live Editor & Analysis Pane -->
-                <div class="col-span-7 flex flex-col gap-4 min-h-0 panel bg-black/80 border border-white/10 p-6">
-                    <div class="flex items-center justify-between" style="flex-shrink:0;">
-                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Analysis & Tampering Workbench</span>
-                        <div class="flex gap-2">
-                            <button onclick="cookieForgeAction('decode')" class="px-4 py-1.5 bg-[#00ffc4]/10 border border-[#00ffc4]/30 text-[#00ffc4] hover:bg-[#00ffc4]/20 font-label-surgical text-[9px] uppercase tracking-widest transition-all rounded">Decode & Load</button>
-                            <button onclick="cookieForgeAction('forge')" class="px-4 py-1.5 bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 font-label-surgical text-[9px] uppercase tracking-widest font-bold transition-all rounded">Forge Token</button>
-                        </div>
-                    </div>
-
-                    <div class="flex-grow grid grid-cols-2 gap-4 min-h-0">
-                        <!-- Payload Component tamperes -->
-                        <div class="flex flex-col min-h-0 gap-2">
-                            <label class="font-label-surgical text-[9px] text-white/40 uppercase">Header / Metadata</label>
-                            <textarea id="cookieForgeHeader" class="flex-1 bg-black text-[#00ffc4] font-data-mono text-[11px] p-3 border border-white/10 resize-none focus:outline-none focus:border-[#00ffc4]/40 rounded select-text" placeholder="{ &quot;alg&quot;: &quot;HS256&quot;, &quot;typ&quot;: &quot;JWT&quot; }"></textarea>
-
-                            <label class="font-label-surgical text-[9px] text-white/40 uppercase mt-2">Payload / Claims</label>
-                            <textarea id="cookieForgePayload" class="flex-1 bg-black text-[#00ffc4] font-data-mono text-[11px] p-3 border border-white/10 resize-none focus:outline-none focus:border-[#00ffc4]/40 rounded select-text" placeholder="{ &quot;user&quot;: &quot;admin&quot;, &quot;role&quot;: &quot;administrator&quot; }"></textarea>
-                        </div>
-
-                        <!-- Results and Tampering Actions -->
-                        <div class="flex flex-col min-h-0 gap-2">
-                            <label class="font-label-surgical text-[9px] text-white/40 uppercase">Forged Output Result</label>
-                            <div class="flex-1 flex flex-col min-h-0 border border-white/10 bg-black/45 p-4 rounded">
-                                <textarea id="cookieForgeOutput" readonly class="flex-grow bg-transparent text-white font-data-mono text-[11px] resize-none outline-none select-text border-none leading-relaxed" placeholder="Generated token will stream here..."></textarea>
-                                <button onclick="copyForgeOutput()" class="mt-2 w-full py-2 bg-white/5 hover:bg-white/10 border border-white/10 text-white font-label-surgical text-[9px] uppercase tracking-widest transition-all">Copy Forged Token</button>
-                            </div>
-
-                            <label class="font-label-surgical text-[9px] text-white/40 uppercase mt-2">Quick Tampering Preset Buttons</label>
-                            <div class="grid grid-cols-2 gap-2 flex-shrink-0">
-                                <button onclick="cookieForgePreset('jwt_none')" class="py-2 bg-white/5 border border-white/10 text-white/80 hover:bg-[#00ffc4]/15 hover:text-[#00ffc4] font-label-surgical text-[8px] uppercase tracking-widest transition-colors rounded">JWT None Alg</button>
-                                <button onclick="cookieForgePreset('jwt_jwks_bypass')" class="py-2 bg-white/5 border border-white/10 text-white/80 hover:bg-[#00ffc4]/15 hover:text-[#00ffc4] font-label-surgical text-[8px] uppercase tracking-widest transition-colors rounded">JWKS Key Spoof</button>
-                                <button onclick="cookieForgePreset('b64_admin')" class="py-2 bg-white/5 border border-white/10 text-white/80 hover:bg-[#00ffc4]/15 hover:text-[#00ffc4] font-label-surgical text-[8px] uppercase tracking-widest transition-colors rounded">B64 "admin" Force</button>
-                                <button onclick="cookieForgePreset('send_repeater')" class="py-2 bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 font-label-surgical text-[8px] uppercase tracking-widest font-bold transition-all rounded">Send to Repeater</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- DE-CAFFEINATOR JS AST SANDBOX SECTION -->
-        <section id="decaffeinator" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between" style="flex-shrink:0;">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">DE-CAFFEINATOR <span class="text-[#00ffc4] not-italic">// AST SANDBOX</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Static Script Analysis & Secret Mining // Deobfuscate AST Trees</p>
-                </div>
-            </div>
-            
-            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
-                <!-- Left Column: Source Input -->
-                <div class="col-span-5 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Source Script Input</span>
-                    <textarea id="decafInput" class="flex-grow term-input w-full font-data-mono text-[10px] p-4 bg-black border border-white/10 text-white/80 resize-none focus:outline-none focus:border-primary/50" placeholder="Paste obfuscated JS code here..."></textarea>
-                    
-                    <div class="flex gap-4" style="flex-shrink:0;">
-                        <button onclick="deobfuscateScript()" class="flex-1 py-3 bg-primary text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">Deobfuscate Script</button>
-                        <button onclick="mineScript()" class="flex-1 py-3 border border-[#00ffc4]/40 bg-[#00ffc4]/10 text-[#00ffc4] font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:bg-[#00ffc4]/20 transition-all rounded shadow-md">Mine Secrets & Endpoints</button>
-                    </div>
-                </div>
-                
-                <!-- Right Column: Outputs -->
-                <div class="col-span-7 flex flex-col gap-6 min-h-0">
-                    <!-- Beautified Script Preview -->
-                    <div class="flex-grow flex flex-col gap-3 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Beautified Script Preview</span>
-                        <div class="flex-grow overflow-hidden border border-white/5 bg-black/40 rounded">
-                            <textarea id="decafBeautified" readonly class="w-full h-full p-4 font-data-mono text-[10px] text-[#00ffc4]/90 bg-transparent resize-none focus:outline-none custom-scrollbar leading-relaxed" placeholder="Beautified preview will render here..."></textarea>
-                        </div>
-                    </div>
-                    
-                    <!-- Extracted Entities & Endpoints -->
-                    <div class="h-64 flex flex-col gap-3 min-h-0 panel bg-black/60 border border-white/10 p-6" style="flex-shrink:0;">
-                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Extracted Entities / Endpoints</span>
-                        <div id="decafEntitiesList" class="flex-grow overflow-y-auto border border-white/5 bg-black/40 p-4 space-y-2 custom-scrollbar text-[10px] font-data-mono rounded">
-                            <div class="text-white/20 italic">Run endpoint mining to extract paths and secrets.</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- 1. KILLBOOK SECTION -->
-        <section id="killbook" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between" style="flex-shrink:0;">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">KILLBOOK <span class="text-primary not-italic">// EVIDENCE DEPOT</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">No Friction Notes & Screenshot Log // Push directly to markdown report</p>
-                </div>
-                <div class="flex gap-4">
-                    <button onclick="createNewKillbookNote()" class="px-6 py-2.5 bg-white/5 border border-white/10 text-white/80 font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:bg-white/10 transition-all rounded shadow-md flex items-center gap-2">
-                        <span class="material-symbols-outlined text-[14px]">edit_note</span> New Note
-                    </button>
-                    <button onclick="exportKillbookReport()" class="px-6 py-2.5 bg-primary text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md flex items-center gap-2">
-                        <span class="material-symbols-outlined text-[14px]">download</span> Push to Report
-                    </button>
-                    <button onclick="clearKillbook()" class="px-6 py-2.5 border border-primary/20 text-primary font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:bg-primary/10 transition-all rounded shadow-md">
-                        Clear All
-                    </button>
-                </div>
-            </div>
-
-            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
-                <!-- Left: Chronological timeline list -->
-                <div class="col-span-4 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Timeline Entries</span>
-                    <div id="killbookTimelineList" class="flex-grow overflow-y-auto space-y-3 pr-2 custom-scrollbar">
-                        <div class="text-white/20 italic text-[10px] font-data-mono">Press F2 anywhere to capture screen or click a note card.</div>
-                    </div>
-                </div>
-
-                <!-- Right: Detailed expansion and previews -->
-                <div class="col-span-8 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6 relative">
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Workspace Note</span>
-                    
-                    <div id="killbookDetailViewer" class="flex-grow flex items-center justify-center text-white/20 italic font-data-mono text-[10px]">
-                        Select an entry from the timeline to open the Notion-style workspace.
-                    </div>
-                    
-                    <!-- Notion Editor Workspace container -->
-                    <div id="killbookWorkspace" class="flex-grow flex flex-col min-h-0 hidden relative">
-                        <!-- Workspace Header -->
-                        <div class="flex items-center justify-between border-b border-white/10 pb-4 mb-4" style="flex-shrink:0;">
-                            <div class="space-y-1 flex-1 mr-4">
-                                <input id="killbookNotionTitle" type="text" class="bg-transparent border-none text-base font-bold text-white tracking-wide focus:outline-none w-full" placeholder="Untitled Note">
-                                <div class="flex items-center gap-3 text-[9px] text-white/40 font-data-mono uppercase">
-                                    <span id="killbookNotionMeta">Target: Target // Panel: Overview</span>
-                                    <span class="h-3 w-px bg-white/10"></span>
-                                    <span id="killbookNotionDate">Date</span>
-                                </div>
-                            </div>
-                            
-                            <div class="flex items-center gap-3">
-                                <!-- Evidence Bundle Icon (Shown if screenshot exists) -->
-                                <button id="killbookBundleBtn" class="hidden px-3 py-1.5 bg-primary/10 border border-primary/30 text-primary hover:bg-primary/20 transition-all rounded flex items-center gap-1.5 text-[9px] font-label-surgical tracking-wider uppercase font-bold" title="View Evidence Screenshots">
-                                    <span class="material-symbols-outlined text-[14px]">photo_library</span>
-                                    <span>Evidence Stack (1)</span>
-                                </button>
-                                
-                                <div id="killbookTagsContainer" class="flex gap-1"></div>
-                            </div>
-                        </div>
-
-                        <!-- Notion Editor Contenteditable Workspace -->
-                        <div class="flex-grow relative overflow-y-auto pr-2 custom-scrollbar" style="min-height:0;">
-                            <div id="killbookNotionEditor" contenteditable="true" class="w-full min-h-full p-4 bg-black/20 border border-white/5 rounded focus:outline-none focus:border-white/15 text-white/90 font-sans text-[12px] leading-relaxed space-y-4 prose prose-invert" placeholder="Type '/' for commands or '/h1 ' for headings..."></div>
-                            
-                            <!-- Slash Commands Popover Menu -->
-                            <div id="killbookSlashMenu" class="hidden absolute bg-surface border border-white/15 rounded shadow-2xl p-1 z-50 w-48 text-[11px] font-sans pointer-events-auto">
-                                <div class="px-2.5 py-1.5 text-[9px] text-white/40 uppercase tracking-wider font-bold">Blocks</div>
-                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('h1')">
-                                    <span class="material-symbols-outlined text-[14px]">format_h1</span>
-                                    <span>Heading 1</span>
-                                </div>
-                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('h2')">
-                                    <span class="material-symbols-outlined text-[14px]">format_h2</span>
-                                    <span>Heading 2</span>
-                                </div>
-                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('h3')">
-                                    <span class="material-symbols-outlined text-[14px]">format_h3</span>
-                                    <span>Heading 3</span>
-                                </div>
-                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('bullet')">
-                                    <span class="material-symbols-outlined text-[14px]">format_list_bulleted</span>
-                                    <span>Bulleted List</span>
-                                </div>
-                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('code')">
-                                    <span class="material-symbols-outlined text-[14px]">code</span>
-                                    <span>Code Block</span>
-                                </div>
-                                <div class="slash-item flex items-center gap-2 px-2.5 py-1.5 hover:bg-white/5 cursor-pointer text-white/80 rounded" onclick="insertNotionBlock('quote')">
-                                    <span class="material-symbols-outlined text-[14px]">format_quote</span>
-                                    <span>Blockquote</span>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- 2. STRIKE CAST SECTION -->
-        <section id="strikecast" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between" style="flex-shrink:0;">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">STRIKE CAST <span class="text-[#00ffc4] not-italic">// AD-HOC BLAST</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Instant command-line curl requests // Ctrl+Enter to blast</p>
-                </div>
-            </div>
-
-            <div class="flex-grow flex flex-col gap-6 min-h-0">
-                <!-- Single-line blast loader -->
-                <div class="panel bg-black/60 border border-white/10 p-6 flex flex-col gap-4" style="flex-shrink:0;">
-                    <div class="flex items-center gap-4">
-                        <input id="strikeCastInput" type="text" class="flex-grow bg-black border border-white/10 px-4 py-3 font-data-mono text-[11px] text-[#00ffc4] focus:outline-none focus:border-[#00ffc4]/50" placeholder="GET https://example.com/api -H 'Host: spoofed.com' -d 'key=val'" onkeydown="if(event.ctrlKey && event.key==='Enter') executeStrikeCast()">
-                        <button onclick="executeStrikeCast()" class="px-8 py-3 bg-[#00ffc4] text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">BLAST</button>
-                    </div>
-                    <div class="flex justify-between items-center text-[9px] font-label-surgical text-white/40 tracking-wider">
-                        <span>EXPLAIN: GET/POST url, -H for custom headers, -d for request payloads. Press Ctrl+Enter to send.</span>
-                        <button onclick="saveStrikeCastAsTestCase()" class="text-[#00ffc4] hover:underline uppercase">Save as Test Case (Ghost Proof)</button>
-                    </div>
-                </div>
-
-                <!-- Responses display -->
-                <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
-                    <!-- Left: Metadata/Headers -->
-                    <div class="col-span-4 flex flex-col gap-3 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                        <div class="flex justify-between items-center">
-                            <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Response Headers</span>
-                            <button onclick="sendStrikeCastToKillbook()" class="text-[9px] font-label-surgical text-primary hover:underline uppercase">Send to Killbook</button>
-                        </div>
-                        <div class="flex-grow overflow-auto border border-white/5 bg-black/40 p-4 rounded custom-scrollbar">
-                            <pre id="strikeCastHeaders" class="font-data-mono text-[10px] text-white/70 whitespace-pre-wrap">Headers appear here...</pre>
-                        </div>
-                    </div>
-
-                    <!-- Right: Response Body -->
-                    <div class="col-span-8 flex flex-col gap-3 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Body Payload</span>
-                        <div class="flex-grow overflow-auto border border-white/5 bg-black/40 p-4 rounded custom-scrollbar">
-                            <pre id="strikeCastBody" class="font-data-mono text-[10px] text-[#00ffc4]/90 whitespace-pre-wrap">Body matches appear here...</pre>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- 3. PAYLOAD LOOM SECTION -->
-        <section id="payloadloom" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between" style="flex-shrink:0;">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">PAYLOAD LOOM <span class="text-[#00ffc4] not-italic">// EXPLOIT BUILDER</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Generate working exploit curl instructions dynamically from targets and findings</p>
-                </div>
-            </div>
-
-            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
-                <!-- Left panel: Finding selection & mapping sources -->
-                <div class="col-span-4 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Target Findings (Intel Center)</span>
-                    <div id="payloadLoomFindingsList" class="flex-grow overflow-y-auto space-y-2 pr-2 custom-scrollbar">
-                        <div class="text-white/20 italic text-[10px] font-data-mono">Select a vulnerability from Intel Center to map variables.</div>
-                    </div>
-                </div>
-
-                <!-- Right panel: Interactive generation workbench -->
-                <div class="col-span-8 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <div class="flex justify-between items-center">
-                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Exploit Compiler Template</span>
-                        <div class="flex gap-3">
-                            <button onclick="testCompiledPayload()" class="px-4 py-1.5 bg-[#00ffc4] text-background font-label-surgical text-[9px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">TEST</button>
-                            <button onclick="saveLoomExploitToKillbook()" class="px-4 py-1.5 border border-primary/20 text-primary font-label-surgical text-[9px] tracking-widest uppercase font-bold hover:bg-primary/10 transition-all rounded shadow-md">SAVE TO KILLBOOK</button>
-                        </div>
-                    </div>
-                    
-                    <div class="flex flex-col gap-3 flex-grow min-h-0">
-                        <textarea id="payloadLoomEditor" class="flex-grow w-full font-data-mono text-[11px] p-4 bg-black border border-white/10 text-white/80 resize-none focus:outline-none focus:border-primary/50" placeholder="curl template compilation deck..."></textarea>
-                        
-                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Loom Response Output</span>
-                        <div class="h-48 overflow-auto border border-white/5 bg-black/40 p-4 rounded custom-scrollbar">
-                            <pre id="payloadLoomOutput" class="font-data-mono text-[10px] text-[#00ffc4] whitespace-pre-wrap">Response logs appear here...</pre>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- 4. TOKEN STALKER SECTION -->
-        <section id="tokenstalker" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between" style="flex-shrink:0;">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">TOKEN STALKER <span class="text-[#00ffc4] not-italic">// RECON STRUCT</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Extract, Decode, Sign, Hex-edit, and Modify raw strings and headers</p>
-                </div>
-            </div>
-
-            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
-                <!-- Paste and extract section -->
-                <div class="col-span-5 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Input Raw Text or Header Response</span>
-                    <textarea id="tokenStalkerInput" class="h-44 w-full font-data-mono text-[10px] p-4 bg-black border border-white/10 text-white/80 resize-none focus:outline-none focus:border-[#00ffc4]/50" placeholder="Paste response content or header payloads here..." oninput="stalkTokens()"></textarea>
-                    
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Discovered Leaked Tokens</span>
-                    <div id="stalkerTokensGrid" class="flex-grow overflow-y-auto space-y-2 pr-2 custom-scrollbar">
-                        <div class="text-white/20 italic text-[10px] font-data-mono">Awaiting text paste logic inputs...</div>
-                    </div>
-                </div>
-
-                <!-- Decoding / Re-signing workspace -->
-                <div class="col-span-7 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <div class="flex justify-between items-center">
-                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Token Cryptanalysis Workbench</span>
-                        <div class="flex gap-3">
-                            <button onclick="reencodeStalkerToken()" class="px-4 py-1.5 bg-[#00ffc4] text-background font-label-surgical text-[9px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">Re-encode</button>
-                            <button onclick="sendStalkerTokenToStrikeCast()" class="px-4 py-1.5 border border-primary/20 text-primary font-label-surgical text-[9px] tracking-widest uppercase font-bold hover:bg-primary/10 transition-all rounded shadow-md">Send to Strike Cast</button>
-                        </div>
-                    </div>
-                    <div class="flex-grow flex flex-col gap-4 min-h-0">
-                        <div class="flex-1 flex flex-col gap-2">
-                            <span class="font-label-surgical text-[9px] text-white/30 uppercase font-bold">Decoded JSON payload / string</span>
-                            <textarea id="stalkerDecoded" class="flex-grow w-full font-data-mono text-[10px] p-4 bg-black border border-white/5 text-[#00ffc4] resize-none focus:outline-none" placeholder="Decoded string context..."></textarea>
-                        </div>
-                        <div class="flex-1 flex flex-col gap-2">
-                            <span class="font-label-surgical text-[9px] text-white/30 uppercase font-bold">Encoded modified Output</span>
-                            <textarea id="stalkerEncoded" readonly class="flex-grow w-full font-data-mono text-[10px] p-4 bg-black border border-white/5 text-primary resize-none focus:outline-none" placeholder="Re-encoded output will print here..."></textarea>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- 5. GREY ZONE SECTION -->
-        <section id="greyzone" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between" style="flex-shrink:0;">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">GREY ZONE <span class="text-yellow-400 not-italic">// TEST COVERAGE</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Track manual testing checklists versus automated agent output telemetry</p>
-                </div>
-                <div class="flex gap-4">
-                    <button onclick="exportGreyZoneReport()" class="px-6 py-2.5 bg-yellow-400 text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">
-                        Export Coverage Report
-                    </button>
-                </div>
-            </div>
-
-            <!-- Table filter header -->
-            <div class="panel bg-black/60 border border-white/10 p-6 flex flex-col gap-4 flex-grow min-h-0">
-                <div class="flex justify-between items-center" style="flex-shrink:0;">
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Verification Matrix</span>
-                    <div class="flex items-center gap-3">
-                        <span class="font-label-surgical text-[9px] text-white/40 uppercase">Filter:</span>
-                        <select id="greyZoneFilter" onchange="syncGreyZoneTable()" class="bg-black border border-white/10 font-label-surgical text-[9px] text-white/80 p-2 rounded focus:outline-none">
-                            <option value="ALL">Show All findings</option>
-                            <option value="PENDING">Hide "Tested" (Pending checks)</option>
-                        </select>
-                    </div>
-                </div>
-
-                <!-- Grid findings checklist -->
-                <div class="flex-grow overflow-y-auto border border-white/5 bg-black/40 rounded custom-scrollbar text-[10px] font-data-mono">
-                    <div class="grid grid-cols-12 gap-4 px-6 py-3 border-b border-white/10 bg-white/5 sticky top-0 uppercase tracking-widest text-white/50 text-[9px]">
-                        <span class="col-span-3">Finding</span>
-                        <span class="col-span-1">Severity</span>
-                        <span class="col-span-3">Target URL</span>
-                        <span class="col-span-2">Manual Status</span>
-                        <span class="col-span-3">Notes</span>
-                    </div>
-                    <div id="greyZoneTableBody" class="divide-y divide-white/5">
-                        <div class="px-6 py-8 text-center text-white/20 italic">Awaiting findings synchronization...</div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- 6. KILLCHAIN LOOM SECTION -->
-        <section id="killchainloom" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between" style="flex-shrink:0;">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">KILLCHAIN LOOM <span class="text-[#00ffc4] not-italic">// STEP CHAINER</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Visual multi-step HTTP request pipelines. Propagate outputs using {output_N} tags.</p>
-                </div>
-                <div class="flex gap-4">
-                    <button onclick="runKillchainLoom()" class="px-6 py-2.5 bg-[#00ffc4] text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">
-                        RUN CHAIN
-                    </button>
-                    <button onclick="exportKillchainToKillbook()" class="px-6 py-2.5 border border-primary/20 text-primary font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:bg-primary/10 transition-all rounded shadow-md">
-                        Export to Killbook
-                    </button>
-                </div>
-            </div>
-
-            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
-                <!-- Left steps column -->
-                <div class="col-span-6 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <div class="flex justify-between items-center">
-                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Execution Steps List</span>
-                        <button onclick="addKillchainStep()" class="text-[9px] font-label-surgical text-[#00ffc4] hover:underline uppercase">Add Step</button>
-                    </div>
-                    <div id="killchainStepsList" class="flex-grow overflow-y-auto space-y-4 pr-2 custom-scrollbar">
-                        <!-- Step blocks here -->
-                    </div>
-                </div>
-
-                <!-- Right output timeline console -->
-                <div class="col-span-6 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Execution Timeline Log</span>
-                    <div id="killchainConsole" class="flex-grow overflow-y-auto border border-white/5 bg-black/40 p-4 rounded custom-scrollbar text-[10px] font-data-mono text-white/80 space-y-3">
-                        <div class="text-white/20 italic">Click "RUN CHAIN" to execute sequential pipeline steps.</div>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- 7. GHOST PROOF SECTION -->
-        <section id="ghostproof" class="content-area hidden h-full flex flex-col gap-6 animate-fade-in pointer-events-auto">
-            <div class="flex items-center justify-between" style="flex-shrink:0;">
-                <div>
-                    <h2 class="font-h1-visor text-2xl text-white tracking-[0.4em] uppercase italic">GHOST PROOF <span class="text-[#00ffc4] not-italic">// REGRESSION SUITE</span></h2>
-                    <p class="font-label-surgical text-[10px] text-white/30 uppercase tracking-[0.3em] mt-2">Maintain and execute regression test cases to verify vulnerability patches</p>
-                </div>
-            </div>
-
-            <div class="flex-grow grid grid-cols-12 gap-6 min-h-0">
-                <!-- Left Test Cases List -->
-                <div class="col-span-5 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Stored Test Suites</span>
-                    <div id="ghostProofCasesList" class="flex-grow overflow-y-auto space-y-2 pr-2 custom-scrollbar">
-                        <div class="text-white/20 italic text-[10px] font-data-mono">No regression tests saved yet. Save a case from Strike Cast.</div>
-                    </div>
-                </div>
-
-                <!-- Right Match Config & Diff View -->
-                <div class="col-span-7 flex flex-col gap-4 min-h-0 panel bg-black/60 border border-white/10 p-6">
-                    <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-[0.3em] font-bold">Assertion Rules & Diff</span>
-                    
-                    <div class="grid grid-cols-2 gap-4 bg-black/40 p-4 border border-white/5 rounded" style="flex-shrink:0;">
-                        <div>
-                            <label class="font-label-surgical text-[9px] text-white/40 uppercase tracking-widest block mb-2">Matching Criterion</label>
-                            <select id="ghostMatchRule" onchange="updateSelectedGhostCaseRule()" class="w-full bg-black border border-white/10 font-label-surgical text-[9px] text-white/80 p-2 rounded focus:outline-none">
-                                <option value="status">Status Code Only</option>
-                                <option value="contains">Body Contains Text</option>
-                                <option value="exact">Exact Body Match</option>
+                    <p class="settings-help">Reasoning model for complex triage, vulnerability verification, and report synthesis.</p>
+                    <div class="settings-grid">
+                        <div class="settings-field">
+                            <label>Provider</label>
+                            <select id="cfgSynthesizerProvider" class="settings-select">
+                                <option value="nvidia">NVIDIA NIM</option>
+                                <option value="anthropic">Anthropic</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="openrouter">OpenRouter</option>
+                                <option value="groq">Groq</option>
+                                <option value="ollama">Ollama (Local)</option>
                             </select>
                         </div>
-                        <div>
-                            <label class="font-label-surgical text-[9px] text-white/40 uppercase tracking-widest block mb-2">Assertion Pattern</label>
-                            <input id="ghostMatchValue" type="text" oninput="updateSelectedGhostCaseMatchVal()" class="w-full bg-black border border-white/10 font-data-mono text-[9px] text-white px-3 py-2 rounded focus:outline-none" placeholder="Expected status (e.g. 200) or body substring...">
-                        </div>
-                    </div>
-
-                    <div class="flex-grow flex flex-col min-h-0">
-                        <span class="font-label-surgical text-[9px] text-white/30 uppercase font-bold mb-2">Diff Results / Console Logs</span>
-                        <div class="flex-grow overflow-auto border border-white/5 bg-black/40 p-4 rounded custom-scrollbar text-[10px] font-data-mono">
-                            <pre id="ghostProofDiffOutput" class="text-white/70 whitespace-pre-wrap leading-relaxed">Select a regression test card and click "Retest" to see assertion results...</pre>
+                        <div class="settings-field">
+                            <label>Model ID</label>
+                            <input type="text" id="cfgSynthesizerModel" class="settings-input" placeholder="e.g. nvidia/nemotron-3-super-120b-a12b">
                         </div>
                     </div>
                 </div>
             </div>
-        </section>
 
-        <!-- Global F2 Screenshot Capture Modal Dialog overlay -->
-        <div id="killbookCaptureModal" class="hidden fixed inset-0 z-[800] flex items-center justify-center pointer-events-auto">
-            <div class="absolute inset-0 bg-black/85 backdrop-blur-sm" onclick="closeKillbookModal()"></div>
-            <div class="relative panel bg-[#0c0c16] border border-primary/50 shadow-[0_0_80px_rgba(255,34,68,0.25)] w-[580px] z-10 flex flex-col">
-                <div class="flex items-center justify-between px-6 py-4 border-b border-white/10 bg-white/5">
-                    <span class="font-h2-tactical text-[11px] text-white uppercase tracking-[0.3em]">Capture Evidence note</span>
-                    <button onclick="closeKillbookModal()" class="text-white/20 hover:text-white transition-colors material-symbols-outlined text-[16px]">close</button>
+            <!-- Tab 2: API Keys -->
+            <div id="settings-tab-apikeys" class="settings-tab-pane">
+                <p class="settings-help">API keys are securely stored in ~/.hellhound/config.json.</p>
+                <div class="settings-field">
+                    <label>NVIDIA NIM API Key</label>
+                    <input type="password" id="cfgKeyNvidia" class="settings-input" placeholder="nvapi-...">
                 </div>
-                
-                <div class="px-6 py-4 space-y-4">
-                    <!-- Image snapshot preview -->
-                    <div id="killbookShotPreviewContainer" class="h-36 border border-white/10 bg-black/50 overflow-hidden flex items-center justify-center relative rounded">
-                        <img id="killbookShotPreview" src="" class="max-h-full max-w-full object-contain" alt="">
-                        <div class="absolute bottom-2 left-2 bg-black/80 px-2 py-0.5 rounded border border-white/10 font-data-mono text-[8px] text-white/55 uppercase" id="killbookShotPathText"></div>
-                    </div>
-                    
-                    <div class="grid grid-cols-2 gap-4 text-[9px] font-data-mono text-white/55">
-                        <div>
-                            <span class="text-white/30 uppercase tracking-widest block">Active Target</span>
-                            <span id="killbookTargetVal" class="text-white/90"></span>
-                        </div>
-                        <div>
-                            <span class="text-white/30 uppercase tracking-widest block">Panel Context</span>
-                            <span id="killbookPanelVal" class="text-white/90"></span>
-                        </div>
-                    </div>
-
-                    <div>
-                        <label class="font-label-surgical text-[9px] text-white/30 uppercase tracking-widest block mb-1">Add note</label>
-                        <textarea id="killbookNoteVal" class="w-full h-20 bg-black border border-white/10 p-3 font-data-mono text-[10px] text-white focus:outline-none focus:border-primary/50 resize-none rounded" placeholder="Type custom notes..."></textarea>
-                    </div>
-
-                    <div>
-                        <label class="font-label-surgical text-[9px] text-white/30 uppercase tracking-widest block mb-2">Category Tags</label>
-                        <div class="flex gap-3">
-                            <label class="flex items-center gap-1.5 cursor-pointer text-[9px] font-label-surgical text-white/60 hover:text-white uppercase"><input type="checkbox" name="killbookTag" value="PoC" class="accent-primary"> PoC</label>
-                            <label class="flex items-center gap-1.5 cursor-pointer text-[9px] font-label-surgical text-white/60 hover:text-white uppercase"><input type="checkbox" name="killbookTag" value="Critical" class="accent-primary"> Critical</label>
-                            <label class="flex items-center gap-1.5 cursor-pointer text-[9px] font-label-surgical text-white/60 hover:text-white uppercase"><input type="checkbox" name="killbookTag" value="Retest" class="accent-primary"> Retest</label>
-                            <label class="flex items-center gap-1.5 cursor-pointer text-[9px] font-label-surgical text-white/60 hover:text-white uppercase"><input type="checkbox" name="killbookTag" value="False Positive" class="accent-primary"> False Positive</label>
-                        </div>
-                    </div>
+                <div class="settings-field">
+                    <label>Anthropic API Key</label>
+                    <input type="password" id="cfgKeyAnthropic" class="settings-input" placeholder="sk-ant-...">
                 </div>
-
-                <div class="flex gap-3 px-6 py-4 border-t border-white/10">
-                    <button onclick="closeKillbookModal()" class="flex-1 py-3 border border-white/20 text-white/60 font-label-surgical text-[10px] tracking-widest uppercase hover:text-white transition-all rounded">Cancel</button>
-                    <button onclick="saveKillbookEvidence()" class="flex-1 py-3 bg-primary text-background font-label-surgical text-[10px] tracking-widest uppercase font-bold hover:brightness-110 transition-all rounded shadow-md">Save Note</button>
+                <div class="settings-field">
+                    <label>OpenAI API Key</label>
+                    <input type="password" id="cfgKeyOpenai" class="settings-input" placeholder="sk-...">
                 </div>
-        </div>
-        
-        <!-- Evidence Bundle Lightbox Modal -->
-        <div id="killbookLightboxModal" class="hidden fixed inset-0 z-[900] flex items-center justify-center pointer-events-auto">
-            <div class="absolute inset-0 bg-black/90 backdrop-blur-md" onclick="closeKillbookLightbox()"></div>
-            <div class="relative max-w-[90%] max-h-[90%] z-10 flex flex-col items-center gap-4">
-                <button onclick="closeKillbookLightbox()" class="absolute -top-10 right-0 text-white/50 hover:text-white transition-colors flex items-center gap-1.5 text-[10px] font-label-surgical tracking-widest uppercase font-bold">
-                    <span class="material-symbols-outlined text-[16px]">close</span> Close
-                </button>
-                <img id="killbookLightboxImage" src="" class="max-w-full max-h-[80vh] object-contain border border-white/10 rounded shadow-2xl" alt="">
-                <span id="killbookLightboxPath" class="text-[9px] font-data-mono text-white/40 uppercase tracking-widest bg-black/80 px-3 py-1 rounded border border-white/5">Path: screenshot_path</span>
-            </div>
-        </div>
-
-    </main>
-
-    <!-- ── REPRO SHELL (Universal Resize Handles Restored) ──────────────── -->
-    <div id="reproPanel" class="fixed w-[600px] h-[400px] bg-black/98 border border-primary/40 shadow-[0_0_80px_rgba(0,0,0,0.9)] flex flex-col z-[600] backdrop-blur-3xl rounded-lg hidden pointer-events-auto" style="bottom:24px;left:24px;">
-        <div id="reproHeader" class="flex items-center justify-between px-6 py-3 border-b border-white/10 bg-white/5 cursor-move">
-            <div class="flex items-center gap-3">
-                <span class="material-symbols-outlined text-primary text-[18px] font-bold">terminal</span>
-                <span class="font-label-surgical text-[10px] text-white font-bold uppercase tracking-[0.2em]">Repro_Shell</span>
-            </div>
-            <button onclick="toggleRepro()" class="text-white/40 hover:text-primary transition-colors"><span class="material-symbols-outlined text-[20px]">close</span></button>
-        </div>
-        
-        <div class="resize-handle rh-n" data-dir="n"></div>
-        <div class="resize-handle rh-s" data-dir="s"></div>
-        <div class="resize-handle rh-e" data-dir="e"></div>
-        <div class="resize-handle rh-w" data-dir="w"></div>
-        <div class="resize-handle rh-ne" data-dir="ne"></div>
-        <div class="resize-handle rh-nw" data-dir="nw"></div>
-        <div class="resize-handle rh-se" data-dir="se"></div>
-        <div class="resize-handle rh-sw" data-dir="sw"></div>
-        
-        <div id="reproOutput" class="flex-1 p-6 font-data-mono overflow-y-auto overflow-x-hidden text-white w-full flex flex-col" style="font-size:13px; scrollbar-width:thin; scrollbar-color:#ff2244 rgba(255,255,255,0.03);">
-            <pre class="panel-repro-pre font-data-mono text-[13px] text-white/90 whitespace-pre-wrap break-all w-full select-text"></pre>
-            <div id="reproCommandLine" class="flex items-start w-full mt-1 hidden">
-                <span id="reproPrompt" class="text-green-400 font-data-mono font-bold mr-2 select-none" style="margin-top: 2px;"></span>
-                <textarea id="reproInput" rows="1" class="flex-1 bg-transparent border-none focus:outline-none text-white font-data-mono p-0 m-0 resize-none h-6 leading-6 custom-scrollbar" style="font-size: 13px; outline: none; border: none; box-shadow: none;" placeholder="" onkeydown="handleRepro(event)"></textarea>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Shell Trigger -->
-    <div id="reproTrigger" class="fixed bottom-6 left-6 z-[600] pointer-events-auto">
-        <button onclick="toggleRepro()" class="w-14 h-14 bg-primary text-background rounded-full flex items-center justify-center shadow-[0_0_30px_rgba(255,34,68,0.5)] hover:scale-110 transition-all">
-            <span class="material-symbols-outlined text-[28px] font-bold">terminal</span>
-        </button>
-    </div>
-
-    <!-- ── OVERLAY: AI NEURAL CORE (ASK/ANALYZE/HOWL RESTORED) ───────────── -->
-    <div id="aiContainer" class="fixed top-16 right-0 h-[calc(100vh-64px)] w-[450px] bg-surface/98 border-l border-white/10 z-[550] translate-x-full transition-transform duration-500 backdrop-blur-3xl shadow-[-50px_0_100px_rgba(0,0,0,0.9)] flex flex-col pointer-events-none">
-        <!-- Left edge drag handle for resizing -->
-        <div id="aiResizeHandle" style="position:absolute;left:-4px;top:0;width:8px;height:100%;cursor:ew-resize;z-index:10;background:transparent;" title="Drag to resize"></div>
-        <div class="p-10 flex-1 flex flex-col overflow-hidden">
-            <div class="flex items-center justify-between mb-8">
-                <h3 class="font-h1-visor text-[12px] tracking-[0.3em] text-primary uppercase">Hellhound</h3>
-                <div class="flex items-center gap-4">
-                    <div id="neuralStatus" class="flex items-center justify-center px-2 py-1">
-                        <div class="w-3 h-3 rounded-full bg-red-500 shadow-[0_0_12px_rgba(255,0,0,0.8)]"></div>
-                    </div>
-                    <button id="copyAllBtn" onclick="copyAllChat()" class="font-label-surgical text-[10px] uppercase tracking-widest text-white/20 hover:text-white/60 transition-colors px-2 py-1">COPY ALL</button>
-                    <button onclick="clearAIHistory()" class="font-label-surgical text-[10px] uppercase tracking-widest text-white/20 hover:text-white/60 transition-colors px-2 py-1">CLEAR</button>
-                    <button onclick="closeAI()" class="text-white/20 hover:text-white transition-colors ml-2">
-                        <span class="material-symbols-outlined text-[24px]">close</span>
-                    </button>
+                <div class="settings-field">
+                    <label>OpenRouter API Key</label>
+                    <input type="password" id="cfgKeyOpenrouter" class="settings-input" placeholder="sk-or-...">
+                </div>
+                <div class="settings-field">
+                    <label>Groq API Key</label>
+                    <input type="password" id="cfgKeyGroq" class="settings-input" placeholder="gsk_...">
                 </div>
             </div>
 
-            <!-- AI TABS -->
-            <div class="flex border-b border-white/10 mb-8">
-                <button class="flex-1 py-4 font-label-surgical text-[10px] tracking-widest text-primary border-b-2 border-primary uppercase">Neural_Assistant</button>
+            <!-- Tab 3: Tool Suite -->
+            <div id="settings-tab-tools" class="settings-tab-pane">
+                <div class="tools-header-actions">
+                    <div class="auto-install-toggle-wrap">
+                        <label class="switch-label">
+                            <input type="checkbox" id="cfgAutoInstallTools">
+                            <span class="switch-slider"></span>
+                        </label>
+                        <span class="switch-text">Auto-install missing ProjectDiscovery tools when scanning</span>
+                    </div>
+                    <button id="installMissingToolsBtn" class="btn-install-tools">INSTALL MISSING TOOLS</button>
+                </div>
+                <div id="toolsStatusGrid" class="tools-status-grid">
+                    <!-- Populated dynamically -->
+                </div>
             </div>
 
-            <button onclick="initializeNeuralHandshake()" class="w-full py-4 border border-primary/20 bg-primary/5 text-primary font-label-surgical text-[11px] tracking-widest uppercase mb-8 logo-pulse">INITIALIZE NEURAL HANDSHAKE</button>
-
-            <!-- Chat history — selectable text, scrollable -->
-            <div id="ask-history" class="flex-1 overflow-y-auto space-y-3 pr-2 custom-scrollbar" style="user-select:text;"></div>
-
-            <!-- Input area — textarea grows with content, Shift+Enter for newline -->
-            <div class="mt-6 relative">
-                <textarea id="aiInput"
-                    class="w-full bg-white/5 border border-white/10 p-4 pr-14 text-white font-bold focus:outline-none focus:border-primary/40 transition-colors resize-y"
-                    style="min-height:80px; max-height:220px;"
-                    placeholder="NEURAL_QUERY...  (Enter to send, Shift+Enter for newline)"></textarea>
-                <button onclick="sendAI()" class="absolute bottom-4 right-4 p-2 bg-primary text-background hover:brightness-110 transition-all">
-                    <span class="material-symbols-outlined">bolt</span>
-                </button>
+            <!-- Tab 4: Bug Bounty & Headers -->
+            <div id="settings-tab-bounty" class="settings-tab-pane">
+                <div class="settings-field">
+                    <label>Researcher Handle / Nickname</label>
+                    <input type="text" id="cfgResearcherHandle" class="settings-input" placeholder="e.g. L4ZZ3RJ0D or bugbounty_handle">
+                </div>
+                <div class="settings-field">
+                    <label>Global Custom HTTP Headers (One per line: Header: Value)</label>
+                    <textarea id="cfgGlobalHeaders" class="settings-input" rows="4" placeholder="X-HackerOne-Handle: L4ZZ3RJ0D&#10;User-Agent: Hellhound-BountyHunter/12.6"></textarea>
+                </div>
             </div>
-            <p class="font-label-surgical text-[8px] text-white/15 uppercase tracking-widest mt-2 text-center">
-                Hover message → COPY button • Select text freely • COPY ALL exports full session
-            </p>
-        </div>
-    </div>
 
-    <!-- TARGET MODAL -->
-    <div id="targetModal" class="fixed inset-0 z-[700] hidden flex items-center justify-center bg-background/95 backdrop-blur-xl pointer-events-auto">
-        <div class="panel w-[500px] bg-surface border-2 border-primary/50 p-12 shadow-[0_0_150px_rgba(255,34,68,0.4)]">
-            <h3 class="font-h1-visor text-xs tracking-[0.5em] text-primary mb-10 uppercase text-center font-bold">Engage_Target</h3>
-            <input id="modalTargetInput" type="text" class="term-input w-full text-center text-xl mb-10" placeholder="IP_OR_DOMAIN" autofocus>
-            <div class="flex gap-6">
-                <button onclick="closeModal('targetModal')" class="flex-1 h-14 border border-white/10 text-white/40 font-label-surgical text-[11px] uppercase">Abort</button>
-                <button onclick="confirmTarget()" class="flex-1 h-14 bg-primary text-background font-h1-visor text-[11px] tracking-[0.2em] uppercase">Confirm_Link</button>
+            <div class="settings-modal-footer">
+                <span id="settingsSaveStatus" class="settings-save-status"></span>
+                <div class="modal-actions">
+                    <button id="cancelSettingsBtn" class="btn-modal-cancel">CANCEL</button>
+                    <button id="saveSettingsBtn" class="btn-modal-primary">SAVE CONFIGURATION</button>
+                </div>
             </div>
         </div>
     </div>
 
+    <!-- Main JavaScript Logic -->
     <script src="app.js"></script>
-        <!-- STRIKE CONFIRMATION MODAL -->
-        <div id="strikeConfirmModal" class="hidden fixed inset-0 z-[900] flex items-center justify-center">
-            <div class="absolute inset-0 bg-black/80 backdrop-blur-sm" onclick="abortStrike()"></div>
-            <div class="relative panel bg-[#08080f] border border-primary/60 shadow-[0_0_60px_rgba(255,34,68,0.2)] w-[600px] max-h-[80vh] flex flex-col z-10">
-                <div class="flex items-center justify-between px-8 py-6 border-b border-white/10">
-                    <div class="flex items-center gap-4">
-                        <div class="w-2 h-2 rounded-full bg-primary animate-pulse shadow-[0_0_10px_#ff2244]"></div>
-                        <span class="font-h2-tactical text-[13px] text-white uppercase tracking-[0.4em]">Strike_Confirmation</span>
-                    </div>
-                    <button onclick="abortStrike()" class="text-white/20 hover:text-white transition-colors material-symbols-outlined text-[18px]">close</button>
-                </div>
-                <div class="flex-1 overflow-y-auto px-8 py-6 custom-scrollbar">
-                    <div id="confirmLoading" class="flex items-center gap-4 py-8">
-                        <span class="material-symbols-outlined text-primary text-[20px] animate-spin">refresh</span>
-                        <span class="font-label-surgical text-[10px] text-white/40 uppercase tracking-widest">Verifying configuration with console...</span>
-                    </div>
-                    <div id="confirmOptionsTable" class="hidden space-y-1">
-                        <p class="font-label-surgical text-[9px] text-white/30 uppercase tracking-widest mb-6">Console verified — module configuration as registered:</p>
-                        <div class="grid grid-cols-3 gap-4 px-4 py-2 bg-white/5 mb-px">
-                            <span class="font-label-surgical text-[9px] text-primary uppercase tracking-widest">Option</span>
-                            <span class="font-label-surgical text-[9px] text-primary uppercase tracking-widest">Value</span>
-                            <span class="font-label-surgical text-[9px] text-primary uppercase tracking-widest">Status</span>
-                        </div>
-                        <div id="confirmRows" class="space-y-px"></div>
-                    </div>
-                    <div id="confirmError" class="hidden py-6">
-                        <p class="font-label-surgical text-[10px] text-primary uppercase tracking-widest">Could not retrieve options from console.</p>
-                    </div>
-                </div>
-                <div class="flex gap-4 px-8 py-6 border-t border-white/10">
-                    <button onclick="abortStrike()"
-                        class="flex-1 py-4 border border-white/20 text-white/60 font-h1-visor text-[10px] tracking-[0.4em] uppercase hover:border-white/40 hover:text-white transition-all">
-                        ABORT
-                    </button>
-                    <button id="confirmStrikeBtn" onclick="confirmStrike()" disabled
-                        class="flex-1 py-4 bg-primary text-background font-h1-visor text-[10px] tracking-[0.5em] uppercase font-bold opacity-40 transition-all shadow-[0_0_20px_rgba(255,34,68,0.3)] flex items-center justify-center gap-2">
-                        <span class="material-symbols-outlined text-[16px]">bolt</span>
-                        CONFIRM_STRIKE
-                    </button>
-                </div>
-            </div>
-        </div>
-
-    <!-- ── NOTIFICATION SYSTEM (RESTORED/ENHANCED) ─────────────────────── -->
-    <div id="notificationBox" class="fixed bottom-10 right-10 w-96 bg-black/95 border border-primary/50 shadow-[0_0_50px_rgba(255,34,68,0.3)] p-8 z-[1000] translate-y-full opacity-0 transition-all duration-500 pointer-events-auto">
-        <div class="flex items-start gap-5">
-            <div class="w-10 h-10 rounded bg-primary/20 flex items-center justify-center flex-shrink-0">
-                <span class="material-symbols-outlined text-primary animate-pulse">priority_high</span>
-            </div>
-            <div class="flex-1">
-                <h4 id="notifyTitle" class="font-h1-visor text-[12px] text-primary tracking-[0.3em] uppercase mb-2">Notification</h4>
-                <p id="notifyMsg" class="font-data-mono text-[11px] text-white/60 leading-relaxed uppercase"></p>
-                <div class="mt-6 flex gap-4">
-                    <button id="notifyAction" class="flex-1 py-2 bg-primary text-background font-label-surgical text-[10px] font-bold uppercase tracking-widest hover:brightness-110 transition-all">Action</button>
-                    <button onclick="hideNotification()" class="px-4 py-2 border border-white/10 text-white/30 font-label-surgical text-[10px] uppercase tracking-widest hover:text-white transition-all">Dismiss</button>
-                </div>
-            </div>
-        </div>
-    </div>
 </body>
 </html>

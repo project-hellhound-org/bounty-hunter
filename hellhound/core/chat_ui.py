@@ -3,23 +3,31 @@ hellhound/core/chat_ui.py
 
 Claude Code-style Terminal Chat Interface for Hellhound Bounty Hunter.
 Provides a modern, double-pane dashboard card, pixel mascot, recent activity tracker,
-and unified conversational chat prompt.
+interactive slash command palette with live autocomplete dropdown via prompt_toolkit,
+and clean response bubbles.
 """
 
 import os
 import sys
 import shutil
 import textwrap
-import readline
+import html
+import re
 from typing import Optional, Dict, Any, List
 
 from colorama import Fore, Back, Style, init
 init(autoreset=True)
 
+from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.styles import Style as PTStyle
+
 from hellhound.core.tasks import list_targets, create_or_load_target, Target
-from hellhound.core.ai_utils import load_config, detect_ai_config, thinking_animation
+from hellhound.core.ai_utils import load_config
 from hellhound.core.agent import get_agent
-from hellhound.core.commands import dispatch, get_command
+from hellhound.core.commands import dispatch, get_command, COMMAND_REGISTRY
 
 
 # -------------------------------------------------------------
@@ -35,10 +43,118 @@ C_TEXT_DIM   = "\033[38;5;244m"     # Dim Secondary Text
 C_BG_PROMPT  = "\033[48;5;234m"     # Dark Slate Prompt Highlight
 RST          = Style.RESET_ALL
 
+PT_CUSTOM_STYLE = PTStyle.from_dict({
+    'prompt': '#ff2244 bold',
+    'completion-menu': 'bg:#1e1e1e #cccccc',
+    'completion-menu.completion': 'bg:#1e1e1e #cccccc',
+    'completion-menu.completion.current': 'bg:#880000 #ffffff bold',
+    'completion-menu.meta': 'bg:#141414 #888888',
+    'completion-menu.meta.current': 'bg:#550000 #ffffff',
+    'scrollbar.background': 'bg:#1e1e1e',
+    'scrollbar.button': 'bg:#444444',
+})
+
 
 def get_terminal_width() -> int:
     cols = shutil.get_terminal_size((90, 24)).columns
     return max(60, cols)
+
+
+def re_strip_ansi(text: str) -> str:
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+
+# -------------------------------------------------------------
+# Slash Command Palette Completer
+# -------------------------------------------------------------
+class HellhoundCompleter(Completer):
+    """
+    Dynamic prompt_toolkit completer reading directly from COMMAND_REGISTRY.
+    Displays slash commands with inline descriptions and usage syntax in an interactive dropdown.
+    """
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+
+        tokens = text.split()
+        if not tokens:
+            return
+
+        # 1. Base command completion
+        if len(tokens) == 1 and not text.endswith(" "):
+            target = tokens[0].lower()
+            seen = set()
+            for name, cmd in COMMAND_REGISTRY.items():
+                if not name.startswith("/"):
+                    continue
+                if name in seen or name != cmd.name.lower():
+                    continue
+                seen.add(name)
+                if name.startswith(target):
+                    meta_parts = []
+                    if cmd.description:
+                        meta_parts.append(cmd.description)
+                    if cmd.usage:
+                        primary_usage = cmd.usage.split("\n")[0].strip()
+                        meta_parts.append(f"[{primary_usage}]")
+                    display_meta = " — ".join(meta_parts)
+                    yield Completion(
+                        cmd.name,
+                        start_position=-len(target),
+                        display=cmd.name,
+                        display_meta=display_meta,
+                    )
+            return
+
+        # 2. Subcommand & argument hints for specific commands
+        cmd_name = tokens[0].lower()
+        arg_text = text[len(tokens[0]):].lstrip()
+        word_before = document.get_word_before_cursor()
+
+        if cmd_name in ("/model", "/ai"):
+            sub_suggestions = [
+                ("orchestrator", "Configure fast local tool-selection model"),
+                ("synthesizer", "Configure deep cloud-reasoning analysis model"),
+                ("nvidia/nemotron-3-super-120b-a12b", "Nvidia Nemotron 120B (Synthesizer Cloud)"),
+                ("anthropic/claude-3-5-sonnet", "Claude 3.5 Sonnet (Synthesizer Cloud)"),
+                ("openai/gpt-4o", "GPT-4o (Synthesizer Cloud)"),
+                ("deepseek/deepseek-chat", "DeepSeek V3 (Synthesizer Cloud)"),
+                ("qwen2.5:3b-instruct-q4_0", "Local Ollama Model (Orchestrator)"),
+                ("set-key", "Configure API key for provider (e.g. /model set-key nvidia <key>)"),
+                ("--session-only", "Apply model to current session without saving config"),
+            ]
+            for val, meta in sub_suggestions:
+                if val.lower().startswith(word_before.lower()):
+                    yield Completion(val, start_position=-len(word_before), display=val, display_meta=meta)
+
+        elif cmd_name in ("/setup", "/health", "/doctor"):
+            sub_suggestions = [
+                ("tools auto-install on", "Enable automated binary dependency installation"),
+                ("tools auto-install off", "Disable automated binary dependency installation"),
+                ("tools install-all", "Install all missing tool dependencies via pdtm"),
+            ]
+            for val, meta in sub_suggestions:
+                if val.lower().startswith(arg_text.lower()):
+                    yield Completion(val, start_position=-len(arg_text), display=val, display_meta=meta)
+
+        elif cmd_name in ("/scope", "/rules"):
+            sub_suggestions = [
+                ("show", "View current target scope rules"),
+                ("clear", "Clear active scope rules"),
+            ]
+            for val, meta in sub_suggestions:
+                if val.lower().startswith(word_before.lower()):
+                    yield Completion(val, start_position=-len(word_before), display=val, display_meta=meta)
+
+        elif cmd_name in ("/report", "/loot"):
+            sub_suggestions = [
+                ("--format html", "Generate interactive HTML report"),
+                ("--format json", "Generate structured JSON report"),
+            ]
+            for val, meta in sub_suggestions:
+                if val.lower().startswith(arg_text.lower()):
+                    yield Completion(val, start_position=-len(arg_text), display=val, display_meta=meta)
 
 
 def render_banner_card(target_name: Optional[str] = None):
@@ -144,23 +260,43 @@ def render_banner_card(target_name: Optional[str] = None):
     print(f"  {C_TEXT_DIM}/model to switch models  •  /scope to configure target scope  •  /hunt for auto triage{RST}\n")
 
 
-def re_strip_ansi(text: str) -> str:
-    import re
-    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+def prompt_user_input(agent, session: PromptSession) -> Optional[str]:
+    """
+    Renders clean input prompt using prompt_toolkit PromptSession with inline autocompletion dropdown.
+    """
+    full_w = get_terminal_width()
+    div_w = min(full_w - 4, 96)
+
+    # Top horizontal divider
+    print(f" {C_GRAY_BOX}{'─' * div_w}{RST}")
+
+    prompt_str = HTML("<ansired><b>&gt;</b></ansired> ")
+    try:
+        user_input = session.prompt(prompt_str).strip()
+        return user_input
+    except (KeyboardInterrupt, EOFError):
+        return None
 
 
 def render_response_bubble(response_text: str, sender: str = "HELLHOUND"):
+    """
+    Renders AI findings and assistant responses in a visually distinct bordered block
+    with a crimson left-margin indicator.
+    """
     if not response_text or not response_text.strip():
         return
-    try:
-        from rich.console import Console
-        from rich.markdown import Markdown
-        console = Console()
-        print()
-        console.print(Markdown(response_text.strip()))
-        print()
-    except Exception:
-        print(f"\n{response_text.strip()}\n")
+
+    clean_sender = html.escape(re_strip_ansi(sender))
+    print_formatted_text(HTML(f"<ansired><b>┃</b></ansired> <b><ansired>{clean_sender}</ansired></b>"))
+
+    for line in response_text.strip().split("\n"):
+        clean_line = re_strip_ansi(line)
+        escaped_line = html.escape(clean_line)
+        if escaped_line:
+            print_formatted_text(HTML(f"<ansired>┃</ansired> {escaped_line}"))
+        else:
+            print_formatted_text(HTML("<ansired>┃</ansired>"))
+    print()
 
 
 def start_chat_session(initial_target: Optional[str] = None):
@@ -169,13 +305,15 @@ def start_chat_session(initial_target: Optional[str] = None):
     """
     target = initial_target or "default"
     agent = get_agent(target)
-    
-    # Configure readline history
+
+    # Configure prompt session with persistent history, completer, and custom styling
     history_file = os.path.expanduser("~/.hellhound_history")
-    try:
-        readline.read_history_file(history_file)
-    except FileNotFoundError:
-        pass
+    session = PromptSession(
+        completer=HellhoundCompleter(),
+        history=FileHistory(history_file),
+        complete_while_typing=True,
+        style=PT_CUSTOM_STYLE,
+    )
 
     # Clear terminal cleanly for fresh Claude Code aesthetic
     os.system("clear" if os.name == "posix" else "cls")
@@ -185,14 +323,10 @@ def start_chat_session(initial_target: Optional[str] = None):
 
     while True:
         try:
-            full_w = get_terminal_width()
-            line_w = max(40, full_w - 2)
-            # Top divider line spanning the full terminal width
-            print(f" {C_GRAY_BOX}{'─' * line_w}{RST}")
-            
-            # Interactive prompt line (like Claude Code '> ')
-            prompt_str = f" {C_RED_MAIN}>{RST} "
-            user_input = input(prompt_str).strip()
+            user_input = prompt_user_input(agent, session=session)
+            if user_input is None:
+                print(f" {C_RED_MAIN}[+] Exiting Hellhound Bounty Hunter. Happy Hunting!{RST}\n")
+                break
 
             if not user_input:
                 continue
@@ -248,7 +382,7 @@ def start_chat_session(initial_target: Optional[str] = None):
             finally:
                 indicator.stop()
 
-            # Render clean response card
+            # Render response in distinct chat bubble
             render_response_bubble(ai_response)
 
         except (KeyboardInterrupt, EOFError):
@@ -256,10 +390,3 @@ def start_chat_session(initial_target: Optional[str] = None):
             break
         except Exception as e:
             print(f"\n {Fore.RED}[x] Error: {e}{RST}\n")
-
-    # Save command history
-    try:
-        readline.set_history_length(1000)
-        readline.write_history_file(history_file)
-    except Exception:
-        pass

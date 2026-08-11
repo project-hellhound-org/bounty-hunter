@@ -6,3 +6,8 @@ pyyaml
 colorama
 aiohttp
 rich
+prompt_toolkit
+pywebview
+qtpy
+PyQt6
+PyQt6-WebEngine

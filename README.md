@@ -2,279 +2,324 @@
   <img src="Images/hellhound.png" alt="Hellhound Bounty Hunter" width="100%"/>
 </p>
 
-<h1 align="center">HELLHOUND BOUNTY HUNTER</h1>
-<h1 align="center">Autonomous AI Recon & Triage Framework</h1>
+<h1 align="center">HELLHOUND : BOUNTY HUNTER</h1>
+<p align="center">
+  <b>Autonomous AI Bug Bounty Framework by Project Hellhound</b>
+  <br>
+  <i>Target enumeration, two-tier neural reasoning, 16 methodology skills, live SPA crawling, and zero-bypass scope guardrails — from recon to submission-ready report.</i>
+</p>
 
 <p align="center">
-  <b>High-performance autonomous bug bounty reconnaissance and triage assistant with integrated neural intelligence.</b>
-  <br>
-  <br>
-  <code style="color: #ff2244; font-weight: bold;">[ UNDER ACTIVE DEVELOPMENT ]</code>
-  <br>
-  <i>Drop a target. Define your scope. Let the neural co-pilot hunt.</i>
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#two-tier-model-routing">Two-Tier AI Routing</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#the-recon--triage-arsenal">Arsenal</a> ·
+  <a href="#what-it-finds">What It Finds</a> ·
+  <a href="#hunting-methodology-skills">Skills</a> ·
+  <a href="#desktop-gui-app">Desktop GUI</a> ·
+  <a href="#installation">Installation</a> ·
+  <a href="#license">License</a>
 </p>
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
   <a href="https://github.com/project-hellhound-org/bounty-hunter/releases"><img src="https://img.shields.io/badge/Release-v13.21-red?style=flat-square" alt="Release Version"/></a>
-  <img src="https://img.shields.io/badge/AI--Powered-Gemini%20%7C%20NVIDIA%20NIM%20%7C%20Ollama%20%7C%20Claude-red?style=flat-square" alt="AI Support"/>
+  <img src="https://img.shields.io/badge/AI--Powered-Ollama%20%7C%20NVIDIA%20NIM%20%7C%20Claude%20%7C%20Gemini%20%7C%20OpenAI-red?style=flat-square" alt="AI Support"/>
   <img src="https://img.shields.io/badge/Recon-Shuffledns%20%7C%20AlterX%20%7C%20DNSX%20%7C%20Naabu%20%7C%20HTTPX%20%7C%20FFUF%20%7C%20TLSX-orange?style=flat-square" alt="Recon Toolchain"/>
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20WSL2-lightgrey?style=flat-square" alt="Platform"/>
-  <img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="License"/>
+  <img src="https://img.shields.io/badge/License-GPLv3-blue?style=flat-square" alt="License"/>
 </p>
 
 ---
 
-## The Bounty Hunter Advantage
+## What Is This?
 
-**Hellhound** is an autonomous reconnaissance and triage framework engineered for bug bounty hunters, penetration testers, and CTF researchers. It automates high-speed target enumeration, asset verification, subdomain mutation generation, live service fingerprinting, port scanning, dangling DNS takeover checks, and SPA crawling—all governed by strict, code-level engagement scope boundaries.
+**Bounty Hunter** is the autonomous bug bounty reconnaissance and vulnerability triage framework developed by **Project Hellhound**. Built for security researchers, penetration testers, and CTF practitioners, Bounty Hunter autonomously maps attack surfaces, verifies discovered assets, spiders dynamic Single Page Applications (SPAs) for hidden APIs and secrets, executes security audits through an unconditional scope gate, and writes submission-ready reports for HackerOne, Bugcrowd, and private engagements.
 
-Traditional tools dump thousands of unverified records, forcing you to waste hours filtering noise. Hellhound operates as an **autonomous reconnaissance co-pilot**: it reasons over target data, escalates between passive lookups and active brute-forcing intelligently, validates findings factually, and persists all intelligence in isolated per-target workspaces.
+It features persistent target memory—assets, open ports, crawl trees, and triage notes are automatically retained in isolated per-target workspaces so hunts seamlessly resume across sessions.
 
----
-
-> [!NOTE]
-> **The Hellhound Advantage:**
-> *"Traditional reconnaissance tools are like generic metal detectors—they dump thousands of unverified records, leaving you to manually filter false positives and noise. **Hellhound operates like an autonomous reconnaissance co-pilot.** It reasons over target data, escalates between passive lookups and active brute-forcing intelligently, and validates findings factually within your scope rules."*
-
----
-
-## What It Does
-
-Hellhound unifies a dual-engine architecture:
-
-1. **High-Performance Binary Pipeline**: High-speed active DNS brute-forcing (`shuffledns` + `massdns`), subdomain permutation (`alterx`), bulk resolving (`dnsx`), port scanning (`naabu`), TLS/SAN inspection (`tlsx`), vhost/content fuzzing (`ffuf`), and service probing (`httpx`).
-2. **Universal Headless SPA Spider**: An integrated crawler powered by asynchronous HTTP workers and headless Chromium (`playwright`/`patchright`) that intercepts live background XHR/fetch calls, forms, query parameters, JS routes, secrets, and CTF flags.
-3. **Neural Reasoning Core**: Seamlessly integrates local offline SLMs (`qwen2.5:3b`, `gemma2:2b` via Ollama) and cloud inference (NVIDIA NIM Nemotron/Llama-3.3, Google Gemini, Anthropic Claude, OpenAI) to plan and execute multi-step recon strategies.
-4. **Hard Code-Level Scope Enforcement**: Pre-execution scope gate (`is_in_scope`) guarantees that no packets leave your machine targeting out-of-scope assets or wildcard-violating domains.
+Works across three flexible interfaces:
+- **Interactive Terminal**: An interactive terminal environment with real-time feedback and inline command autocompletion (`hellhound`).
+- **Headless CLI Runner**: Direct one-line command execution for quick scripts and pipelines (`hellhound -p "prompt"`).
+- **Desktop GUI Application**: A dedicated desktop application with persistent target management and a live findings drawer (`hellhound --gui`).
 
 ---
 
-## The Recon & Triage Arsenal
+## How It Works
 
-Each module is integrated directly into the autonomous execution loop and available for manual dispatch:
-
-| Tool | Category | Engine / Binary | Description |
-| :--- | :--- | :--- | :--- |
-| `subfinder` | Passive Recon | ProjectDiscovery Subfinder + crt.sh | Passive subdomain discovery from certificate transparency & OSINT APIs. |
-| `dns_bruteforce` | Active Recon | Shuffledns + MassDNS | High-speed active DNS brute-forcing with wildcard handling and custom resolvers. |
-| `permute_subdomains` | Speculative Recon | AlterX | Subdomain permutation and mutation generation from discovered assets. |
-| `resolve_candidates` | Bulk Resolution | DNSX | Bulk-resolves candidate wordlists and permutations with CNAME & A tracking. |
-| `port_scan` | Network Recon | Naabu | Active TCP/UDP port scanning across top ports (`top-100`, `top-1000`, `full`) or custom ranges. |
-| `httpx` | Live Probing | ProjectDiscovery HTTPX | Probes live services, status codes, content-lengths, redirects (`location`), page titles, and tech stacks. |
-| `tls_cert_scan` | TLS / SAN Recon | TLSX | Inspects TLS/SSL certificates to extract Subject Alternative Names (SANs) and Common Names (CNs). |
-| `vhost_fuzz` | Active Fuzzing | FFUF | Virtual-host fuzzing against target IPs sharing hosts and internal infrastructure. |
-| `content_discovery` | Content Fuzzing | FFUF + SecLists | Active path and directory discovery fuzzing on live web applications. |
-| `subzy` | Takeover Triage | Subzy / CNAME Engine | Verifies dangling CNAME records against known cloud takeover signatures. |
-| `spider` | Web Crawling | Hellhound Spider (v13.21) | Dual-engine crawler (Async HTTP + Headless Chromium SPA) mapping endpoints, parameters, and secrets. |
-| `wafbuster` | WAF Profiling | Custom Signature Matrix | Detects WAF / CDN signatures (Cloudflare, AWS WAF, Akamai) and security headers. |
-| `surface_auditor` | Surface Audit | Native Engine Auditor | Audits exposed API routes, OpenAPI/Swagger specs, `.well-known` endpoints, and sensitive files. |
-| `cors_checker` | Logic Audit | CORS Engine | Active CORS audit for arbitrary origin reflection and credential exposure. |
-| `graphql_probe` | API Recon | GraphQL Engine | Detects GraphQL endpoints and audits schema introspection status. |
-| `dig` | DNS Resolution | Native DNS | Non-destructive DNS queries for A, CNAME, TXT, MX, and NS records. |
-| `curl` | HTTP Probe | Custom Client | Fetches headers and body previews with researcher identity headers. |
-
----
-
-## What Gets Found
-
-### Discovery Vectors
-- **Subdomain Pipelines**: Passive OSINT & CT logs (`subfinder`, `crt.sh`) → Alteration permutations (`alterx`) → Mass-DNS verification (`dnsx`) → Wildcard filtering (`shuffledns`).
-- **Infrastructure Discovery**: TLS/SSL SAN parsing (`tlsx`), Virtual host fuzzing (`vhost_fuzz`), open port mapping (`naabu`).
-- **Web & API Attack Surface**: Full HTML crawling, live SPA XHR/Fetch interception, robots.txt & sitemap XML index recursion, `.well-known` discovery (OIDC/JWKS), OpenAPI/Swagger endpoints, GraphQL schema introspection.
-- **Parameter & Asset Mining**: Form fields (hidden, file, required), JS fetch/axios body keys, query parameters, dynamic runtime template strings (`/api/${id}`), and orphan parameters.
-- **Vulnerability Indicators**: Dangling CNAME takeovers, CORS reflection misconfigurations, exposed secrets & API keys, WAF/CDN signatures, and CTF flag formats.
-
----
-
-## System Compatibility & Prerequisites
-
-Hellhound is engineered for high performance across all major operating systems:
-
-* **Linux (Native)**: Fully optimized for Kali Linux, Ubuntu, Debian, Arch, and Parrot OS.
-* **macOS (Native)**: Runs natively on Apple Silicon (M1/M2/M3/M4) and Intel-based Macs.
-* **Windows (via WSL2)**: Fully supported through Windows Subsystem for Linux (WSL2).
-
-### Prerequisites
-- **Python 3.10+** (Recommended: Python 3.12 / 3.13)
-- **Git**
-- **Go Binaries / Toolchain** (`shuffledns`, `massdns`, `subfinder`, `alterx`, `dnsx`, `naabu`, `httpx`, `tlsx`, `ffuf`)
-- **Ollama** *(Optional, for 100% offline local SLM execution)*
-
----
-
-## One-Step Automated Install
-
-```bash
-# Clone repository
-git clone https://github.com/project-hellhound-org/bounty-hunter.git
-cd bounty-hunter
-
-# Run installer
-chmod +x install.sh
-./install.sh
+```
+You ──> /recon target.com ──> Orchestrator (Fast SLM) ──> Scope Security Gate
+                                     │                            │ (Blocks out-of-scope)
+                                     ▼                            ▼
+                          Active Reconnaissance        Binary Toolchain Verification
+                          ├─ Shuffledns + AlterX       (Subfinder, DNSX, Naabu, HTTPX)
+                          ├─ MassDNS + TLSX           
+                          └─ Headless SPA Spider      
+                                     │
+                                     ▼
+                          Synthesizer (Reasoning LLM) <── 16 Methodology Skills
+                                     │                     (CTF, Web2, GraphQL, Web3)
+                                     ▼
+                                /report (Submission-ready markdown/JSON/HTML)
 ```
 
-*After installation, reload your shell configuration:*
-```bash
-source ~/.bashrc   # or source ~/.zshrc
-```
+- **Scope Security Gate**: Unscoped targets are unconditionally blocked before any active network traffic leaves your system.
+- **Missing Tool Grace**: External tool dependencies are verified on-demand—missing binaries trigger guided installation prompts rather than crashing.
+- **Persistent Workspace State**: Target assets, history, and extracted findings are stored automatically in isolated target workspaces.
 
-### Manual / Virtual Environment Installation
+---
+
+## Two-Tier Model Routing
+
+Bounty Hunter eliminates LLM latency bottlenecks by decoupling real-time tool selection from deep vulnerability synthesis:
+
+1. **Orchestrator Tier (Fast & Local)**: An ultra-fast local model (e.g. Ollama `qwen2.5:3b-instruct` or Groq) handles rapid, iterative tool-selection decisions with zero reasoning lag.
+2. **Synthesizer Tier (Deep Reasoning LLM)**: A high-parameter reasoning model (NVIDIA NIM `nemotron-3-super`, Anthropic `claude-3-5-sonnet`, Google `gemini-2.0-flash`, or OpenAI `gpt-4o`) executes upon completing recon passes to correlate discoveries, apply methodology checklists, and format the final triage report.
 
 ```bash
-cd bounty-hunter
-python3 -m venv ~/.hellhound-env
-source ~/.hellhound-env/bin/activate
-pip install --upgrade pip
-pip install -e .
-playwright install chromium
-playwright install-deps chromium
+# Inspect active two-tier routing status
+> /model
+
+# Set local orchestrator (tool selection)
+> /model orchestrator ollama qwen2.5:3b-instruct-q4_0
+
+# Set cloud synthesizer (deep analysis & reporting)
+> /model synthesizer nvidia nvidia/nemotron-3-super-120b-a12b
 ```
 
 ---
 
-## AI Neural Core Configuration
+## Quick Start
 
-Hellhound supports completely offline local models via Ollama as well as high-performance cloud providers.
-
-### Option 1: NVIDIA NIM (Recommended Cloud Engine)
-
-NVIDIA NIM provides ultra-fast reasoning with Nemotron and Llama models:
-
+### 1. Interactive Terminal
+Launch the interactive console:
 ```bash
-# Set your API key
-export NVIDIA_API_KEY="nvapi-your-key-here"
-
-# Launch Hellhound and select NIM model
 hellhound
-> /model nvidia/nemotron-3-super-120b-a12b
 ```
 
-Supported NVIDIA models:
-- `nvidia/nemotron-3-super-120b-a12b` *(Default NIM Model)*
-- `meta/llama-3.3-70b-instruct`
-- `meta/llama-3.1-70b-instruct`
-- `deepseek-ai/deepseek-r1`
+### 2. Headless CLI Automation
+Run one-off prompts and pipeline commands directly:
+```bash
+# Scope refusal verification (unscoped target)
+hellhound -p "recon discover.com"
+
+# Automated CTF/lab active brute-force
+hellhound -p "recon topaz.ctfio.com, it is a CTF target"
+
+# Direct slash command execution
+hellhound -p "/hunt target.com --json"
+```
+
+### 3. Native Desktop GUI App
+Launch the desktop application:
+```bash
+hellhound --gui
+```
 
 ---
 
-### Option 2: Ollama (Local SLM — 100% Offline)
+## Zero-Cost Fully Offline Setup
 
-For private, offline operation without API keys or external data transfer:
+Bounty Hunter can operate 100% locally and offline without paid subscriptions or external API keys:
 
 ```bash
-# 1. Install Ollama
+# 1. Install Ollama (local AI engine)
 curl -fsSL https://ollama.com/install.sh | sh
 
-# 2. Pull the recommended local SLM
-ollama pull qwen2.5:3b-instruct-q4_0
-# or
-ollama pull gemma2:2b
+# 2. Pull recommended local models
+ollama pull qwen2.5:3b-instruct-q4_0    # ~2GB — fast orchestrator
+ollama pull mistral:7b                  # ~4GB — local synthesizer
 
-# 3. Launch Hellhound with the local model
+# 3. Clone & Install
+git clone https://github.com/project-hellhound-org/bounty-hunter.git
+cd bounty-hunter
+chmod +x install.sh
+./install.sh
+
+# 4. Launch & Configure
 hellhound
-> /model qwen2.5:3b-instruct-q4_0
+> /model orchestrator ollama qwen2.5:3b-instruct-q4_0
+> /model synthesizer ollama mistral:7b
 ```
 
----
+### Cloud Providers Setup (NVIDIA NIM, Claude, Gemini, OpenAI)
 
-### Option 3: Google Gemini, Anthropic Claude, or OpenAI
-
-Set your API key in your shell environment:
+Configure API keys in your environment or interactively inside the console:
 
 ```bash
-# Google Gemini
-export GEMINI_API_KEY="AIza..."
+# NVIDIA NIM (Ultra-fast cloud inference — Recommended)
+export NVIDIA_API_KEY="nvapi-your-key-here"
 
 # Anthropic Claude
 export ANTHROPIC_API_KEY="sk-ant-..."
+
+# Google Gemini
+export GEMINI_API_KEY="AIza..."
 
 # OpenAI
 export OPENAI_API_KEY="sk-..."
 ```
 
-Switch models dynamically inside the console:
+Inside Bounty Hunter:
 ```bash
-> /model gemini-2.0-flash
-> /model claude-3-5-sonnet-20240620
-> /model gpt-4o
+> /model synthesizer nvidia/nemotron-3-super-120b-a12b
+> /model synthesizer anthropic claude-3-5-sonnet
+> /model synthesizer gemini gemini-2.0-flash
 ```
 
 ---
 
-## Interactive Console & Workflow
+## Commands
 
-### Starting the Console
-```bash
-hellhound
-```
+All actions can be triggered via slash commands or natural language:
 
-### 1. Setting Scope & Target
-Define target domain and authorized boundaries before launching tools:
-```bash
-# Set target domain
-> /target example.com
+### Core Slash Commands
 
-# Define in-scope assets, wildcards, and exclusions
-> /scope in:example.com,*.example.com out:dev.example.com rule:no-dos
-```
-
-### 2. Conversational Recon & Natural Language Execution
-Prompt Hellhound naturally—the agent autonomously decides tool chains and escalations:
-
-- **Active CTF / Lab Escalation**:
-  `"Recon this target topaz.ctfio.com it is a CTF target so skip passive recon and do active brute-force"`
-- **Permutations & Bulk Resolution**:
-  `"Generate subdomain mutations from discovered subdomains and resolve them with dnsx"`
-- **Port Scanning & Service Fingerprinting**:
-  `"Scan top 100 ports on all resolved hosts with naabu, then probe live web services with httpx"`
-- **TLS Certificate Discovery**:
-  `"Inspect TLS certificates on example.com and extract all Subject Alternative Names (SANs)"`
-- **VHost Discovery**:
-  `"Fuzz virtual hosts on 10.10.10.50 with base domain ctf.local"`
-- **Endpoint & SPA Spidering**:
-  `"Spider https://app.example.com to depth 3 with deep SPA mode to capture background API calls"`
-- **Findings Triage & Loot**:
-  `"Summarize all verified findings and export loot for target example.com"`
+| Command | Aliases | Description | Usage |
+| :--- | :--- | :--- | :--- |
+| `/recon` | `/surface`, `/spider` | Run scoped reconnaissance pipeline against target | `/recon <target> [--json]` |
+| `/hunt` | `/auto` | Autonomous, scope-aware multi-stage hunt and triage | `/hunt [target] [--json]` |
+| `/scan` | `/strike` | Execute a specific discovery or audit module | `/scan <module> [target] [key=val...]` |
+| `/howl` | `/correlate`, `/graph` | Correlate discoveries or generate visual attack graph | `/howl [--graph] [target]` |
+| `/scope` | `/rules` | View, clear, or configure program scope rules | `/scope [show \| clear \| <rules_text>]` |
+| `/skills` | `/skill` | Search or list loaded methodology skills & checklists | `/skills [query] [--json]` |
+| `/model` | `/ai` | Inspect/switch active model for orchestrator/synthesizer | `/model [orchestrator\|synthesizer] <model-id>` |
+| `/headers` | `/head` | Manage custom HTTP request & BugBounty identity headers | `/headers [Header: Value \| --clear]` |
+| `/setup` | `/health`, `/doctor` | Check AI connectivity, tool dependencies & auto-install | `/setup [tools [auto-install on\|off]]` |
+| `/report` | `/loot` | Generate structured bug bounty reconnaissance report | `/report [--format html\|json]` |
+| `/ask` | `/chat` | Query co-pilot with session context and tool access | `/ask <question>` |
+| `/help` | `/?` | Show all available slash commands and usage | `/help` |
 
 ---
 
-## Slash Commands Reference
+## The Recon & Triage Arsenal
 
-| Command | Usage | Description |
+Bounty Hunter coordinates specialized security tooling into a unified, scope-governed execution pipeline:
+
+| Module | Category | Binary / Engine | Description |
+| :--- | :--- | :--- | :--- |
+| `subfinder` | Passive OSINT | ProjectDiscovery Subfinder | Passive subdomain harvesting from certificate transparency logs and APIs. |
+| `dns_bruteforce` | Active Recon | Shuffledns + MassDNS | High-speed active DNS brute-forcing with wildcard handling and custom resolvers. |
+| `permute_subdomains`| Speculative Recon | AlterX | Subdomain permutation and mutation generation from discovered assets. |
+| `resolve_candidates`| Bulk DNS | DNSX | Multi-threaded candidate resolution with CNAME, A, AAAA, and wildcard filtering. |
+| `port_scan` | Network Recon | Naabu | High-performance port scanning across top ports (`top-100`, `top-1000`, `full`). |
+| `httpx` | Live Probing | ProjectDiscovery HTTPX | Probes live services, status codes, tech stacks, redirects, and titles. |
+| `tls_cert_scan` | TLS Inspection | TLSX | Extracts Subject Alternative Names (SANs) and certificate chains. |
+| `vhost_fuzz` | Active Fuzzing | FFUF | Virtual-host fuzzing on target IPs with custom host header routing. |
+| `content_discovery` | Path Discovery | FFUF + SecLists | Active path and endpoint discovery on live web applications. |
+| `subzy` | Takeover Triage | Subzy / CNAME Engine | Verifies dangling CNAME records against cloud takeover signatures. |
+| `spider` | SPA Crawling | Headless SPA Engine | Intercepts dynamic background XHR/Fetch calls, forms, query params, and secrets. |
+| `wafbuster` | WAF Profiling | Signature Matrix | Detects WAF / CDN signatures (Cloudflare, AWS WAF, Akamai) and headers. |
+| `surface_auditor` | Surface Audit | Native Engine Auditor | Audits OpenAPI/Swagger specs, `.well-known` endpoints, and sensitive files. |
+| `cors_checker` | Logic Audit | CORS Engine | Active CORS audit for arbitrary origin reflection and credential exposure. |
+| `graphql_probe` | API Recon | GraphQL Engine | Detects GraphQL endpoints and audits schema introspection status. |
+
+---
+
+## What It Finds
+
+### 1. Attack Surface Discovery
+- **Subdomains**: Passive OSINT (`subfinder`) -> Permutations (`alterx`) -> MassDNS brute-forcing (`shuffledns`) -> Candidate resolving (`dnsx`).
+- **Infrastructure**: TLS/SAN extraction (`tlsx`), Virtual host fuzzing (`vhost_fuzz`), and open port mapping (`naabu`).
+- **Web & SPA Attack Surface**: Deep SPA DOM rendering, background XHR/Fetch request interception, dynamic route discovery, OpenAPI/Swagger specifications, and GraphQL endpoints.
+
+### 2. Vulnerability & Exposure Indicators
+- **Dangling CNAME Takeovers**: Detection of orphaned DNS pointers to unclaimed S3 buckets, GitHub Pages, Azure services, and Heroku apps.
+- **Authentication & Logic**: Standalone input fields outside `<form>` tags, jQuery AJAX endpoints, CORS origin reflection misconfigurations.
+- **Sensitive Data & Secrets**: API keys, bearer tokens, PII leaks, internal endpoints, and CTF flag formats in client-side code and API responses.
+
+---
+
+## Hunting Methodology Skills
+
+Bounty Hunter includes **16 specialized methodology skills** loaded dynamically into the agent reasoning context:
+
+| Skill | Category | Description |
 | :--- | :--- | :--- |
-| `/target` | `/target [domain]` | Set active target context or display current target details |
-| `/scope` | `/scope [in:domain out:domain rule:no-dos]` | View or update engagement boundaries and restrictions |
-| `/hunt` | `/hunt [target]` | Execute full autonomous reconnaissance and triage pipeline |
-| `/scan` | `/scan <tool> [target]` | Execute a single tool (`shuffledns`, `subfinder`, `httpx`, `spider`, `naabu`, `dnsx`, etc.) |
-| `/model` | `/model [name]` | List available models or switch active inference model |
-| `/loot` | `/loot [target]` | View discovered assets, live hosts, open ports, and verified findings |
-| `/headers` | `/headers [Key: Value]` | Configure persistent research identity headers (e.g. `X-Bug-Bounty: handle`) |
-| `/clear` | `/clear` | Clear screen and redraw dashboard |
-| `/exit` | `/exit` | Exit the session |
+| `ctf-lab-recon` | CTF & Labs | Active enumeration doctrine for HTB, THM, and isolated training ranges. |
+| `bb-methodology` | Core Mindset | Systematic 5-phase bug bounty workflow and session discipline. |
+| `web2-recon` | Surface Mapping | Comprehensive subdomain enumeration, port scanning, and live service mapping. |
+| `web2-vuln-classes`| Vulnerability Rules | In-depth heuristics for IDOR, SSRF, SQLi, XSS, SSTI, and OAuth flaws. |
+| `security-arsenal` | Payloads & Bypasses | Curated payload lists, filter bypasses, and WAF evasion techniques. |
+| `triage-validation`| Quality Gate | Strict finding validation to eliminate false positives before reporting. |
+| `report-writing` | Submissions | Formatted templates for HackerOne, Bugcrowd, Intigriti, and Immunefi. |
+| `graphql-audit` | API Security | Introspection queries, batching attacks, and field suggestion exploitation. |
+| `web3-audit` | Smart Contracts | EVM / Solidity vulnerability patterns, reentrancy, and flash loan attacks. |
+| `meme-coin-audit` | Token Security | Liquidity pool manipulation, honeypot detection, and bonding curve flaws. |
+| `mobile-pentest` | Mobile Security | Android/iOS static analysis, deep-link routing, and certificate pinning bypasses. |
+| `cicd-security` | Pipeline Security | GitHub Actions / GitLab CI misconfigurations, secret leakage, and runner abuse. |
+| `credential-attack`| Identity Recon | Password spray strategies, username enumeration, and credential auditing. |
+| `client-reverse` | Reverse Eng | Request-signing analysis and anti-bot token de-obfuscation. |
+| `argus` | Threat Intel | Deep intelligence correlation and entity relationship graphing. |
+| `bug-bounty` | Master Playbook | End-to-end bug bounty lifecycle orchestration and triage tracking. |
+
+Search skills anytime inside the console:
+```bash
+> /skills ctf
+> /skills graphql
+```
 
 ---
 
-## Output Formats & Target Storage
+## Desktop GUI App
 
-Target findings, state, and reports are persisted in isolated workspaces under `~/.hellhound/targets/<target_name>/`:
+Bounty Hunter includes a native desktop interface:
 
-- **`task.json`** — Complete target state, in-scope rules, discovered subdomains, open ports, live web hosts, and triage notes.
-- **`spider_report.json`** — Detailed crawl graph with mapped endpoints, query parameters, forms, and detected secrets.
-- **Export Options**: Export loot in `JSON`, `CSV`, `Burp XML`, `JSONL`, `URLs`, and `Nuclei` formats.
+```bash
+hellhound --gui
+```
+
+- **Target-Archive Sidebar**: Switch between targets or spin up new target workspaces instantly.
+- **Live Thinking Drawer**: Real-time inspection of the AI co-pilot's tool-selection rationale.
+- **Instant Slash Palette**: Execute `/recon`, `/hunt`, `/model`, and `/report` directly with UI feedback.
+- **Findings Pane**: Tabbed view of discovered subdomains, live hosts, open ports, and extracted loot.
 
 ---
 
-## Compliance & Scope Policy
+## Installation
 
-Hellhound is developed strictly for **authorized security assessments, bug bounty programs, and educational CTF lab environments**. Users must ensure explicit written authorization exists before testing any target.
+### Prerequisites
+- **Linux (Native)**: Kali Linux, Ubuntu, Debian, Arch, Parrot OS.
+- **macOS (Native)**: Apple Silicon (M1/M2/M3/M4) and Intel Macs.
+- **Windows (WSL2)**: Windows Subsystem for Linux.
+- **Python 3.10+** (Recommended: Python 3.12 / 3.13)
+- **Go 1.20+** (For ProjectDiscovery tools & FFUF)
+
+### One-Step Installation Script
+
+```bash
+# Clone the repository
+git clone https://github.com/project-hellhound-org/bounty-hunter.git
+cd bounty-hunter
+
+# Run automated installer
+chmod +x install.sh
+./install.sh
+
+# Reload shell environment
+source ~/.bashrc   # or source ~/.zshrc
+```
+
+The installer automatically:
+1. Creates an isolated Python virtual environment.
+2. Installs all Python dependencies and browser automation binaries.
+3. Configures tool binary paths and desktop application launchers.
+4. Prompts for your preferred local Ollama model (e.g. `qwen2.5:3b-instruct-q4_0`).
+
+---
+
+## Scope Policy & Legal Compliance
+
+Bounty Hunter is built strictly for **authorized security assessments, bug bounty programs, and educational CTF training environments**.
+- The built-in Scope Security Gate refuses commands targeting assets outside your configured scope rules.
+- Always obtain explicit written authorization before testing any target.
+- Users are solely responsible for ensuring compliance with all applicable laws and program guidelines.
 
 ---
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
+This project is licensed under the [GNU General Public License v3 (GPLv3)](LICENSE).
 
 ---
 
