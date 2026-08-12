@@ -294,13 +294,15 @@ class ThinkingIndicator:
         self.lock = threading.Lock()
         self.thread = None
         self.start_time = time.time()
+        # Rotating braille spinner — bare frames, no brackets, with red color pulse
         self.frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        self.colors = [
-            "\033[38;5;196;1m",
-            "\033[38;5;203;1m",
-            "\033[38;5;208;1m",
-            "\033[38;5;203;1m",
-            "\033[38;5;196;1m",
+        self.pulse_colors = [
+            "\033[38;5;196;1m",  # bright red
+            "\033[38;5;203;1m",  # coral
+            "\033[38;5;210;1m",  # salmon
+            "\033[38;5;217;1m",  # light pink
+            "\033[38;5;210;1m",  # salmon (back)
+            "\033[38;5;203;1m",  # coral (back)
         ]
 
     def start(self):
@@ -317,16 +319,18 @@ class ThinkingIndicator:
                     if not self.stop_event.is_set():
                         dot = self.frames[idx % len(self.frames)]
                         elapsed = int(time.time() - self.start_time)
-                        time_str = f"({elapsed}s • esc to interrupt)"
+                        time_str = f"({elapsed}s · esc to interrupt)"
                         if self.status_callback:
-                            self.status_callback("status", f"[{dot}] {self.label}... {time_str}")
+                            self.status_callback("status", f"{dot} {self.label}... {time_str}")
                         elif sys.stdout and not sys.stdout.closed:
-                            c = self.colors[idx % len(self.colors)]
-                            msg = f"\r \033[38;5;238m[\033[0m{c}{dot}\033[0m\033[38;5;238m]\033[0m \033[38;5;245m{self.label}...\033[0m \033[38;5;240m{time_str}\033[0m\033[K"
+                            c = self.pulse_colors[idx % len(self.pulse_colors)]
+                            msg = f"\r {c}{dot}\033[0m \033[38;5;245m{self.label}...\033[0m \033[38;5;240m{time_str}\033[0m\033[K"
                             sys.stdout.write(msg)
                             sys.stdout.flush()
-                except Exception:
+                except (BrokenPipeError, OSError):
                     break
+                except Exception:
+                    pass
             idx += 1
             time.sleep(0.08)
 
@@ -483,7 +487,7 @@ class ThinkingIndicator:
             try:
                 if sys.stdout and not sys.stdout.closed:
                     sys.stdout.write("\r\033[2K\r")
-                    sys.stdout.write(f"   \033[38;5;240m└\033[0m {color}[{icon}]\033[0m \033[38;5;250m{msg}\033[0m\n")
+                    sys.stdout.write(f"   \033[38;5;240m└\033[0m {color}{icon}\033[0m \033[38;5;250m{msg}\033[0m\n")
                     sys.stdout.flush()
             except Exception:
                 pass
@@ -545,13 +549,22 @@ def classify_intent(user_input: str) -> str:
     """Classifies user input before sending to model."""
     text = user_input.lower().strip()
 
+    # If the user query mentions security, targets, or recon actions, always route to hunt/tool reasoning
+    security_keywords = [
+        "target", "recon", "scan", "subdomain", "port", "vuln", "vulnerability",
+        "triage", "summarize", "scope", "finding", "endpoint", "spider", "probe",
+        "brute", "dns", "waf", "xss", "sqli", "cors", "cname", "report"
+    ]
+    if any(k in text for k in security_keywords):
+        return "hunt"
+
     social_triggers = [
-        "how are you", "what's up", "hey", "hi ", "hello", "good morning",
+        "how are you", "what's up", "hey", "hi", "hello", "good morning",
         "good night", "who are you", "what are you", "introduce yourself",
         "thanks", "thank you", "ok", "okay", "nice", "cool", "got it",
-        "makes sense", "lol", "haha", "bye", "see you", "later"
+        "makes sense", "lol", "haha", "bye", "see you", "later", "say ok", "say "
     ]
-    if any(t in text for t in social_triggers) and len(text.split()) < 15:
+    if (any(t in text for t in social_triggers) or text in ("hi", "hey", "yo", "ok", "test", "ping", "say ok")) and len(text.split()) < 15:
         return "chat"
 
     return "hunt"
@@ -991,6 +1004,7 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
             "model": model,
             "messages": messages,
             "stream": True,
+            "keep_alive": -1,
             "options": {
                 "temperature": 0.7,
                 "top_p": 0.9,

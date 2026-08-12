@@ -290,16 +290,15 @@ def render_banner_card(target_name: Optional[str] = None):
 
 def print_turn_separator():
     width = shutil.get_terminal_size(fallback=(80, 24)).columns
-    print(f"{C_GRAY_BOX}{'─' * width}{RST}")
+    print(f"\n{C_GRAY_BOX}{'─' * width}{RST}\n")
 
 
 def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -> Optional[str]:
     """
-    Renders the input prompt inside a compact, single-line enclosed Frame box
-    matching the exact width of the banner card and eliminating vertical padding.
+    Renders the input prompt inside a full-width Frame box.
+    After submission, the frame collapses to a flat '❯ input' line with Claude Code spacing.
     """
     w = get_terminal_width()
-    card_w = min(w - 4, 96)
 
     if isinstance(session, FileHistory):
         history = session
@@ -311,7 +310,7 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
 
     text_area = TextArea(
         multiline=False,
-        prompt=HTML("<ansicyan><b>&gt; </b></ansicyan>"),
+        prompt=HTML("<ansicyan><b>❯ </b></ansicyan>"),
         completer=HellhoundCompleter(),
         complete_while_typing=True,
         history=history,
@@ -337,7 +336,7 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
     frame = Frame(
         body=text_area,
         height=D.exact(3),
-        width=D.exact(card_w),
+        width=D.exact(w),
         style="class:frame",
     )
 
@@ -361,13 +360,28 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
 
     try:
         raw_result = app.run()
+
+        # Collapse the bordered frame cleanly to a flat Claude Code-style line
+        try:
+            sys.stdout.write("\033[3A\033[J")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
         if raw_result is None:
             return None
         text = raw_result.strip()
         if text:
             history.append_string(text)
+            # Print collapsed input line with breathing room: ❯ user input
+            print(f" {C_CYAN}❯{RST} {text}\n")
         return text
     except (KeyboardInterrupt, EOFError):
+        try:
+            sys.stdout.write("\033[3A\033[J")
+            sys.stdout.flush()
+        except Exception:
+            pass
         return None
 
 
@@ -441,56 +455,76 @@ def render_response_bubble(response_text: str, sender: str = "HELLHOUND"):
 
 from hellhound.core.emit import PlainEmit
 class InteractiveAgentEmit(PlainEmit):
-    def __init__(self):
+    """Emit that wraps a ThinkingIndicator for live Claude Code-style feedback.
+    
+    The spinner starts IMMEDIATELY on construction so the user always sees
+    activity from the very first millisecond. info/warn/success/error print
+    inline alongside the running spinner (just like Claude Code does).
+    Only the final response output (__call__) kills the spinner.
+    """
+    def __init__(self, label="HELLHOUND IS ANALYZING & EXECUTING"):
         super().__init__()
-        self.indicator = None
-
-    def _ensure_indicator(self, label="HELLHOUND IS ANALYZING & EXECUTING"):
-        if not self.indicator:
-            from hellhound.core.ai_utils import ThinkingIndicator
-            self.indicator = ThinkingIndicator(label)
-            self.indicator.start()
+        from hellhound.core.ai_utils import ThinkingIndicator
+        self.indicator = ThinkingIndicator(label)
+        self.indicator.start()
 
     def set_label(self, label: str):
-        self._ensure_indicator(label)
-        self.indicator.set_label(label)
+        if self.indicator:
+            self.indicator.set_label(label)
 
     def tool_start(self, tool_name: str, args: dict):
-        self._ensure_indicator()
-        self.indicator.tool_start(tool_name, args)
+        if self.indicator:
+            self.indicator.tool_start(tool_name, args)
 
     def tool_result(self, tool_name: str, result: any):
         if self.indicator:
             self.indicator.tool_result(tool_name, result)
-            
+
     def stop_indicator(self):
-        if self.indicator and getattr(self.indicator, "thread", None) and self.indicator.thread.is_alive():
-            self.indicator.stop()
+        if self.indicator:
+            try:
+                self.indicator.stop()
+            except Exception:
+                pass
             self.indicator = None
 
     def __call__(self, msg):
         self.stop_indicator()
-        # For simple tool results that don't need a huge panel
-        if "switched to" in msg or "Target set" in msg or "No target" in msg:
+        if not msg or not msg.strip():
+            return
+        # Short status messages stay plain; longer AI responses get a panel
+        if len(msg) < 120 and ("switched to" in msg or "Target set" in msg or "No target" in msg):
             super().__call__(msg)
         else:
             render_response_bubble(msg)
 
+    # ── Inline messages: print alongside the running spinner ──
+    # These clear the current spinner line, print the message, then the
+    # spinner thread immediately redraws on the next tick. This gives the
+    # Claude Code live-feed look.
     def info(self, msg):
-        self.stop_indicator()
-        super().info(msg)
+        if self.indicator:
+            self.indicator.info(msg)
+        else:
+            super().info(msg)
 
     def success(self, msg):
-        self.stop_indicator()
-        super().success(msg)
+        if self.indicator:
+            self.indicator.success(msg)
+        else:
+            super().success(msg)
 
     def warn(self, msg):
-        self.stop_indicator()
-        super().warn(msg)
+        if self.indicator:
+            self.indicator.warn(msg)
+        else:
+            super().warn(msg)
 
     def error(self, msg):
-        self.stop_indicator()
-        super().error(msg)
+        if self.indicator:
+            self.indicator.error(msg)
+        else:
+            super().error(msg)
 
 
 
@@ -504,6 +538,30 @@ def start_chat_session(initial_target: Optional[str] = None):
     # Configure persistent history
     history_file = os.path.expanduser("~/.hellhound_history")
     history = FileHistory(history_file)
+
+    # ── Warmup: pre-load Ollama model in background while banner renders ──
+    # First Ollama call takes ~40s (cold model load). By firing a tiny 1-token
+    # request now with keep_alive=-1, the model is cached in RAM permanently.
+    import threading
+    def _warmup_ollama():
+        try:
+            from hellhound.core.ai_utils import load_config
+            cfg = load_config()
+            orch_prov = (cfg.get("orchestrator_provider") or cfg.get("ai_provider") or "ollama").lower()
+            if orch_prov == "ollama":
+                model = cfg.get("orchestrator_model") or cfg.get("ai_model") or "qwen2.5:3b-instruct-q4_0"
+                import requests
+                requests.post(
+                    "http://localhost:11434/api/generate",
+                    json={"model": model, "prompt": "ok", "stream": False,
+                          "keep_alive": -1,
+                          "options": {"num_predict": 1}},
+                    timeout=180
+                )
+        except Exception:
+            pass  # non-critical, just a warmup
+
+    threading.Thread(target=_warmup_ollama, daemon=True).start()
 
     # Clear terminal cleanly for fresh Claude Code aesthetic
     os.system("clear" if os.name == "posix" else "cls")
@@ -553,13 +611,21 @@ def start_chat_session(initial_target: Optional[str] = None):
                     "scope_rules": agent.target.scope_rules,
                     "options": {}
                 }
-                
-                # Use InteractiveAgentEmit for slash commands so that /recon, /scan etc show the spinner
-                emit = InteractiveAgentEmit()
-                try:
-                    res = dispatch(cmd_line, session_ctx, emit)
-                finally:
-                    emit.stop_indicator()
+
+                # Determine if this is a long-running AI command that needs the live spinner
+                ai_commands = {"/recon", "/scan", "/audit", "/hunt", "/spider", "/surface"}
+                cmd_base = cmd_line.split()[0].lower()
+                if cmd_base in ai_commands:
+                    # Start spinner IMMEDIATELY so user sees activity from the first ms
+                    emit = InteractiveAgentEmit(f"EXECUTING {cmd_base.upper()[1:]}")
+                    try:
+                        res = dispatch(cmd_line, session_ctx, emit)
+                    finally:
+                        emit.stop_indicator()
+                else:
+                    # Simple non-AI commands (/help, /setup, /scope, etc.) don't need a spinner
+                    from hellhound.core.emit import PlainEmit as _PlainEmit
+                    res = dispatch(cmd_line, session_ctx, _PlainEmit())
 
                 if session_ctx.get("target"):
                     agent.set_target(session_ctx["target"])

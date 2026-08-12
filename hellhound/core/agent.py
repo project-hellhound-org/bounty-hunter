@@ -361,6 +361,19 @@ def _execute_subfinder(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     if domain.startswith("http://") or domain.startswith("https://"):
         domain = urlparse(domain).netloc.split(":")[0]
 
+    # Fast skip for CTF / Lab targets (unindexed private environments)
+    from hellhound.core.skills import is_ctf_domain_pattern, is_ctf_auto_scope_eligible
+    if is_ctf_domain_pattern(domain) or is_ctf_auto_scope_eligible(target.name):
+        if emit and hasattr(emit, "info"):
+            emit.info(f"[*] Skipping passive subfinder for CTF/lab target '{domain}' (unindexed). Using active enumeration.")
+        return {
+            "domain": domain,
+            "count": 0,
+            "subdomains": [],
+            "total_discovered": 0,
+            "note": "Skipped passive OSINT (subfinder) on CTF/lab target. Subdomains in private labs are not in public CT logs. Active dns_bruteforce or httpx should be used instead."
+        }
+
     auto_install = bool(load_config().get("auto_install_missing_tools", False))
     check = ensure_tool("subfinder", emit=emit, auto_install=auto_install)
     if not check["available"]:
@@ -1299,7 +1312,7 @@ def _execute_fuzz_hunter(args: Dict[str, Any], target: Target, emit: Any) -> Dic
 TOOL_REGISTRY: Dict[str, ToolSpec] = {
     "subfinder": ToolSpec(
         name="subfinder",
-        description="Enumerate subdomains for a domain using passive sources and certificate transparency logs.",
+        description="Enumerate subdomains for a domain using passive sources and certificate transparency logs. (Do NOT use on CTF/lab/private targets like *.ctfio.com or *.htb — use dns_bruteforce or httpx directly).",
         parameters={
             "type": "object",
             "properties": {
@@ -1667,6 +1680,40 @@ class Agent:
             self.history = []
         return self.target
 
+    def _get_trimmed_history(self, max_turns: int = 4, for_chat: bool = False) -> List[Dict[str, str]]:
+        """
+        Returns a lightweight, sanitized history window for LLM/SLM prompts.
+        Prevents prompt bloat and eliminates massive inference lag.
+        """
+        if not self.history:
+            return []
+
+        if for_chat:
+            chat_turns = []
+            for h in reversed(self.history):
+                content = str(h.get("content", ""))
+                # Skip heavy reports, tool outputs, session summaries, and lengthy blocks
+                if (
+                    "[TOOL RESULT:" in content
+                    or "ALWAYS-ON" in content
+                    or "Session Summary" in content
+                    or len(content) > 350
+                ):
+                    continue
+                chat_turns.insert(0, {"role": h.get("role", "user"), "content": content.strip()})
+                if len(chat_turns) >= max_turns:
+                    break
+            return chat_turns
+
+        trimmed = []
+        recent = self.history[-max_turns:] if len(self.history) > max_turns else self.history
+        for h in recent:
+            content = str(h.get("content", ""))
+            if len(content) > 800:
+                content = content[:700] + "\n...[truncated]..."
+            trimmed.append({"role": h.get("role", "user"), "content": content})
+        return trimmed
+
     def _extract_target_from_args(self, args: Dict[str, Any]) -> str:
         for key in ("domain", "domains", "target", "url", "subdomain", "subdomains", "host", "hosts", "candidates"):
             if key in args and args[key]:
@@ -1860,7 +1907,30 @@ INSTRUCTIONS:
 - Highlight actionable security observations, open attack surfaces, and logical next triage steps.
 """
 
+        original_user_query = user_text
+        from hellhound.core.ai_utils import classify_intent, CHAT_PERSONA_SLM
+
+        # ── 0. Direct Conversational Fast-Path (Instant 1s responses for chat) ──
+        if classify_intent(user_text) == "chat":
+            if emit and hasattr(emit, "set_label"):
+                emit.set_label("HELLHOUND")
+            chat_resp = ask_neural_core(
+                prompt=user_text,
+                system_prompt=CHAT_PERSONA_SLM,
+                role="orchestrator",
+                thinking=False,
+                history=self._get_trimmed_history(max_turns=4, for_chat=True),
+                on_token=on_token
+            )
+            chat_resp = chat_resp or "Ok."
+            self.history.append({"role": "user", "content": user_text})
+            self.history.append({"role": "assistant", "content": chat_resp})
+            self.target.state["history"] = self.history
+            save_target(self.target)
+            return chat_resp
+
         self.history.append({"role": "user", "content": user_text})
+        tools_executed = []
 
         # ── 3. Orchestrator Iteration Loop (Thinking=False, Fast Local/Tool Calls) ──
         for iteration in range(max_iterations):
@@ -1872,7 +1942,7 @@ INSTRUCTIONS:
                 system_prompt=orchestrator_system_prompt,
                 role="orchestrator",
                 thinking=False,
-                history=self.history
+                history=self._get_trimmed_history(max_turns=6, for_chat=False)
             )
 
             if not ai_resp or not ai_resp.strip():
@@ -1899,6 +1969,7 @@ INSTRUCTIONS:
             if tool_call and tool_call.get("tool") in TOOL_REGISTRY:
                 t_name = tool_call["tool"]
                 t_args = tool_call.get("args") or tool_call.get("parameters") or tool_call.get("arguments") or {}
+                tools_executed.append(t_name)
                 
                 if emit and hasattr(emit, "set_label"):
                     emit.set_label(f"EXECUTING {t_name.upper()}")
@@ -1940,24 +2011,31 @@ INSTRUCTIONS:
                 continue
 
             # Non-tool response / "DONE" / conversational output from orchestrator -> exit tool loop
-            if ai_resp.strip().upper() != "DONE":
-                # If the orchestrator provided a direct conversational answer (e.g. greeting or direct question answer)
-                # and no tools were run, we can also let synthesizer refine or synthesize directly
-                pass
             break
 
-        # ── 4. Exactly One Synthesizer Call (Thinking=True, Deep Synthesis) ───────
+        # ── 4. Final Answer Generation (Streaming, Fast & Context-Specific) ───────
         if emit and hasattr(emit, "set_label"):
             emit.set_label("FINALIZING RESPONSE")
 
-        final_answer = ask_neural_core(
-            prompt="Based on all context, evidence, and tool results gathered, provide the researcher's final answer.",
-            system_prompt=synthesizer_system_prompt,
-            role="synthesizer",
-            thinking=True,
-            history=self.history,
-            on_token=on_token
-        )
+        if not tools_executed:
+            # If no tools were run, answer the user's specific question directly
+            final_answer = ask_neural_core(
+                prompt=original_user_query,
+                system_prompt=f"You are HELLHOUND, an expert bug bounty and offensive security assistant. Answer the researcher's query directly, accurately, and concisely.\nTARGET: {self.target.name}\nSCOPE: {scope_summary}",
+                role="synthesizer",
+                thinking=False,
+                history=self._get_trimmed_history(max_turns=6, for_chat=False),
+                on_token=on_token
+            )
+        else:
+            final_answer = ask_neural_core(
+                prompt=f"Based on the tool results gathered ({', '.join(tools_executed)}), synthesize all findings for target '{self.target.name}' and provide concrete next triage steps.",
+                system_prompt=synthesizer_system_prompt,
+                role="synthesizer",
+                thinking=False,
+                history=self._get_trimmed_history(max_turns=6, for_chat=False),
+                on_token=on_token
+            )
 
         final_response = final_answer or ai_resp or "Analysis completed. No further actions required."
         self.history.append({"role": "assistant", "content": final_response})

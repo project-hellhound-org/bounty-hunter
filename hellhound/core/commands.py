@@ -176,6 +176,13 @@ def handle_recon(args: List[str], session_context: Dict[str, Any], emit: Any) ->
             f"using httpx. Do not perform any crawling, spidering, or subdomain enumeration. "
             f"Respect scope throughout."
         )
+    elif is_ctf_domain_pattern(target) or is_ctf_auto_scope_eligible(target):
+        prompt = (
+            f"Perform active CTF/lab reconnaissance on {target}. "
+            f"This is an isolated/unindexed challenge target. Do NOT perform passive subdomain enumeration (no subfinder). "
+            f"Start with active DNS brute-force (dns_bruteforce) and live-host confirmation (httpx), "
+            f"then content/endpoint discovery and vhost fuzzing on live ports. Respect scope throughout."
+        )
     else:
         prompt = (
             f"Perform reconnaissance on {target}. Follow proper methodology: "
