@@ -20,10 +20,9 @@ import click
 @click.option("--print", "-p", "print_cmd", default=None, help="Execute a slash command in headless mode and print output")
 @click.option("--json", "-j", "json_output", is_flag=True, default=False, help="Force structured JSON output for automation")
 @click.option("--gui", is_flag=True, default=False, help="Launch PyWebView graphical user interface")
-@click.option("--classic", is_flag=True, default=False, hidden=True, help="Launch legacy Metasploit-style console instead of chat UI")
 @click.version_option("12.6.0", prog_name="HELLHOUND")
 @click.pass_context
-def cli(ctx, print_cmd, json_output, gui, classic):
+def cli(ctx, print_cmd, json_output, gui):
     """
     HELLHOUND — Autonomous bug bounty recon & triage assistant
 
@@ -43,7 +42,7 @@ def cli(ctx, print_cmd, json_output, gui, classic):
         return
 
     if ctx.invoked_subcommand is None:
-        _launch_console(classic=classic)
+        _launch_console()
 
 
 def _execute_headless(command_str: str, force_json: bool = False):
@@ -132,14 +131,10 @@ def upgrade():
 # -------------------------------------------------
 # Shared launcher
 # -------------------------------------------------
-def _launch_console(classic: bool = False):
+def _launch_console():
     try:
-        if classic:
-            from hellhound.console import HellhoundConsole
-            HellhoundConsole().cmdloop()
-        else:
-            from hellhound.core.chat_ui import start_chat_session
-            start_chat_session()
+        from hellhound.core.chat_ui import start_chat_session
+        start_chat_session()
     except KeyboardInterrupt:
         click.echo("\n[+] Exiting HELLHOUND.")
         sys.exit(0)

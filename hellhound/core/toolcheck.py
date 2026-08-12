@@ -138,3 +138,32 @@ def check_all_tools() -> Dict[str, Any]:
         "missing_count": len(missing_pd) + len(missing_other),
         "combined_pd_install": combined_pd_cmd
     }
+
+
+def check_wordlists() -> Dict[str, Any]:
+    """
+    Checks availability of standard system wordlists (SecLists, Kali wordlists).
+    Returns path, status, and installation recommendations.
+    """
+    seclists_paths = [
+        "/usr/share/wordlists/seclists",
+        "/usr/share/seclists",
+        str(Path.home() / "wordlists" / "seclists"),
+        str(Path.home() / "SecLists"),
+    ]
+    seclists_found = None
+    for p in seclists_paths:
+        if os.path.isdir(p) and os.path.exists(os.path.join(p, "Discovery")):
+            seclists_found = p
+            break
+
+    kali_wordlists = os.path.isdir("/usr/share/wordlists")
+
+    return {
+        "seclists_installed": bool(seclists_found),
+        "seclists_path": seclists_found or "",
+        "kali_wordlists_installed": kali_wordlists,
+        "install_hint_apt": "sudo apt update && sudo apt install -y seclists wordlists",
+        "install_hint_git": "sudo git clone --depth 1 https://github.com/danielmiessler/SecLists.git /usr/share/wordlists/seclists"
+    }
+

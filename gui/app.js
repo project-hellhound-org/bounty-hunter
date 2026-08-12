@@ -531,6 +531,14 @@ function handleIncomingEmit(data) {
     }
 
     if (activeEmitsContainer) {
+        if (data.type === 'status') {
+            let statusCard = activeEmitsContainer.querySelector('.tool-emit-card.status');
+            if (statusCard) {
+                statusCard.innerText = typeof data.payload === 'object' ? JSON.stringify(data.payload) : String(data.payload);
+                scrollToBottom();
+                return;
+            }
+        }
         const item = document.createElement('div');
         item.className = `tool-emit-card ${data.type}`;
         item.innerText = typeof data.payload === 'object' ? JSON.stringify(data.payload) : String(data.payload);

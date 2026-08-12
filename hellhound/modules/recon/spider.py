@@ -3011,17 +3011,30 @@ class Extractor:
         (r'\b(0x[a-fA-F0-9]{40})\b',                                      "Ethereum_Address"),
         (r'(AIza[0-9A-Za-z\-_]{35})',                                     "Google_API_Key"),
         (r'(AKIA[0-9A-Z]{16})',                                            "AWS_Access_Key"),
+        (r'secret_key\s*[:=]\s*["\']([a-zA-Z0-9/+=]{40})["\']',          "AWS_Secret_Key"),
         (r'Bearer\s+([a-zA-Z0-9\-._~+/]{20,}=*)',                         "Bearer_Token"),
+        (r'sk_live_[0-9a-zA-Z]{24}',                                       "Stripe_Live_Secret"),
+        (r'sk_test_[0-9a-zA-Z]{24}',                                       "Stripe_Test_Secret"),
         (r'["\']sk-[a-zA-Z0-9]{20,}["\']',                               "Stripe_Key"),
         (r'gh[pousr]_[A-Za-z0-9_]{36,}',                                  "GitHub_PAT"),
+        (r'glpat-[0-9A-Za-z\-_]{20,}',                                     "GitLab_PAT"),
+        (r'sq0csp-[0-9A-Za-z\-_]{43}',                                     "Square_Secret"),
+        (r'npm_[A-Za-z0-9]{36}',                                           "NPM_Token"),
+        (r'pypi-[A-Za-z0-9]{16,}',                                         "PyPI_Token"),
+        (r'00[a-zA-Z0-9_-]{40}',                                           "Okta_API_Token"),
+        (r'shpat_[a-fA-F0-9]{32}',                                         "Shopify_Private_App_Token"),
+        (r'shpss_[a-fA-F0-9]{32}',                                         "Shopify_Shared_Secret"),
+        (r'[a-f0-9]{32}\.atlasv2',                                         "MongoDB_Atlas_Key"),
+        (r'ya29\.[0-9A-Za-z\-_]+',                                         "Google_OAuth_Token"),
+        (r'key-[0-9a-zA-Z]{32}',                                           "Mailgun_API_Key"),
         (r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',                      "Private_Key_PEM"),
         (r'["\'](?:password|passwd|secret|api_?key|token)\s*["\']?\s*[:=]\s*["\']([^"\']{6,})["\']',
                                                                            "Hardcoded_Credential"),
-                                                                        
-        (r'xox[bpsa]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,}',        "Slack_Token"),
-        (r'\bAC[a-z0-9]{32}\b',                                           "Twilio_AccountSID"),
-        (r'\bSK[a-z0-9]{32}\b',                                           "Twilio_AuthToken"),
-        (r'SG\.[a-zA-Z0-9\-_]{22,}',                                      "SendGrid_Key"),
+        (r'xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,}',       "Slack_Token"),
+        (r'https://hooks\.slack\.com/services/T[a-zA-Z0-9_]+/B[a-zA-Z0-9_]+/[a-zA-Z0-9_]+', "Slack_Webhook"),
+        (r'\bAC[a-f0-9]{32}\b',                                           "Twilio_AccountSID"),
+        (r'\bSK[a-f0-9]{32}\b',                                           "Twilio_AuthToken"),
+        (r'SG\.[a-zA-Z0-9\-_]{22,}\.?[a-zA-Z0-9\-_]*',                    "SendGrid_Key"),
         (r'pk\.eyJ1[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+',                   "Mapbox_Token"),
         (r'https://[a-z0-9\-]+\.firebaseio\.com',                        "Firebase_URL"),
         (r'[a-zA-Z0-9\-_]+\.firebaseapp\.com',                           "Firebase_App"),
@@ -3773,6 +3786,14 @@ class Extractor:
             except Exception:
                 pass
 
+    @staticmethod
+    def _shannon_entropy(data: str) -> float:
+        if not data:
+            return 0.0
+        import math
+        probs = [float(data.count(c)) / len(data) for c in set(data)]
+        return -sum(p * math.log2(p) for p in probs)
+
     @classmethod
     def secrets(cls, text, url, store, emit):
         for pat, stype in cls._SECRET_RE:
@@ -3785,6 +3806,10 @@ class Extractor:
                 val_lo = val.lower()
                 if any(ph in val_lo for ph in cls._SECRET_PLACEHOLDERS):
                     continue
+
+                if stype == "Hardcoded_Credential":
+                    if cls._shannon_entropy(val) < 3.2:
+                        continue
                                               
                 if stype == "Bitcoin_Address":
                                                                                     

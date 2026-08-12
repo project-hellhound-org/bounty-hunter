@@ -1,0 +1,3 @@
+"""
+hellhound/mcp package initialization.
+"""

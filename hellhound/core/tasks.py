@@ -15,8 +15,39 @@ import re
 from typing import Dict, Any, List, Optional, Callable
 from urllib.parse import urlparse
 
+import hashlib
+
 from hellhound.core.scope import ScopeRules, parse_program_rules
 from hellhound.core.rotation import rotate_if_needed
+
+
+def hash_auth_value(value: str) -> str:
+    """One-way hash of secret value so it's not recoverable from disk/logs."""
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def redact_sensitive_dict_keys(d: Any) -> Any:
+    """Recursively walks a dict/list structure and replaces sensitive keys with hashed values."""
+    if isinstance(d, dict):
+        new_d = {}
+        for k, v in d.items():
+            k_lower = str(k).lower()
+            if any(s in k_lower for s in ("cookie", "auth", "token", "key", "secret", "password")):
+                if isinstance(v, str):
+                    new_d[k] = hash_auth_value(v) if v else ""
+                elif isinstance(v, dict):
+                    new_d[k] = redact_sensitive_dict_keys(v)
+                else:
+                    new_d[k] = "********"
+            else:
+                new_d[k] = redact_sensitive_dict_keys(v)
+        return new_d
+    elif isinstance(d, list):
+        return [redact_sensitive_dict_keys(item) for item in d]
+    return d
+
 
 
 def _get_targets_dir() -> str:
@@ -64,7 +95,7 @@ class Target:
             "last_active": self.last_active,
             "notes": self.notes,
             "findings": self.findings,
-            "state": self.state,
+            "state": redact_sensitive_dict_keys(self.state),
         }
 
     @classmethod
@@ -79,16 +110,22 @@ class Target:
         else:
             scope_rules = ScopeRules()
 
+        findings_raw = data.get("findings")
+        findings = list(findings_raw) if isinstance(findings_raw, list) else []
+
+        state_raw = data.get("state")
+        state = dict(state_raw) if isinstance(state_raw, dict) else {}
+
         return cls(
-            name=str(data.get("name", "default")),
+            name=sanitize_target_name(str(data.get("name", "default"))),
             scope_raw=str(data.get("scope_raw", "")),
             scope_rules=scope_rules,
             scope_summary=str(data.get("scope_summary", "")),
             created_at=str(data.get("created_at", datetime.now(timezone.utc).isoformat())),
             last_active=str(data.get("last_active", datetime.now(timezone.utc).isoformat())),
             notes=data.get("notes", ""),
-            findings=list(data.get("findings", [])),
-            state=dict(data.get("state", {})),
+            findings=findings,
+            state=state,
         )
 
 
@@ -119,11 +156,11 @@ def create_or_load_target(name: str) -> Target:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 return Target.from_dict(data)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[!] Warning: Failed to load target {safe_name} from disk (corrupted JSON?): {e}")
 
     # Create new target with clean empty scope
-    target = Target(name=name)
+    target = Target(name=safe_name)
     save_target(target)
     return target
 

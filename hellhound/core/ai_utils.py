@@ -5,8 +5,9 @@ import concurrent.futures
 import os
 import re
 import threading
+import time
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 
 # Path to persistent Hellhound configuration
 CONFIG_DIR = Path.home() / ".hellhound"
@@ -286,11 +287,13 @@ def render_chat_bubble(text: str, sender: str = "HELLHOUND"):
 
 class ThinkingIndicator:
     """Thread-safe floating loader supporting dynamic step emission, tool action trees, and clean shutdown."""
-    def __init__(self, label="HELLHOUND IS ANALYZING & EXECUTING"):
+    def __init__(self, label="HELLHOUND IS ANALYZING & EXECUTING", status_callback=None):
         self.label = label
+        self.status_callback = status_callback
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.thread = None
+        self.start_time = time.time()
         self.frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self.colors = [
             "\033[38;5;196;1m",
@@ -301,6 +304,7 @@ class ThinkingIndicator:
         ]
 
     def start(self):
+        self.start_time = time.time()
         self.thread = threading.Thread(target=self._animate, daemon=True)
         self.thread.start()
         return self
@@ -310,12 +314,17 @@ class ThinkingIndicator:
         while not self.stop_event.is_set():
             with self.lock:
                 try:
-                    if not self.stop_event.is_set() and sys.stdout and not sys.stdout.closed:
+                    if not self.stop_event.is_set():
                         dot = self.frames[idx % len(self.frames)]
-                        c = self.colors[idx % len(self.colors)]
-                        msg = f"\r \033[38;5;238m[\033[0m{c}{dot}\033[0m\033[38;5;238m]\033[0m \033[38;5;245m{self.label}...\033[0m"
-                        sys.stdout.write(msg)
-                        sys.stdout.flush()
+                        elapsed = int(time.time() - self.start_time)
+                        time_str = f"({elapsed}s • esc to interrupt)"
+                        if self.status_callback:
+                            self.status_callback("status", f"[{dot}] {self.label}... {time_str}")
+                        elif sys.stdout and not sys.stdout.closed:
+                            c = self.colors[idx % len(self.colors)]
+                            msg = f"\r \033[38;5;238m[\033[0m{c}{dot}\033[0m\033[38;5;238m]\033[0m \033[38;5;245m{self.label}...\033[0m \033[38;5;240m{time_str}\033[0m\033[K"
+                            sys.stdout.write(msg)
+                            sys.stdout.flush()
                 except Exception:
                     break
             idx += 1
@@ -324,15 +333,21 @@ class ThinkingIndicator:
     def set_label(self, label: str):
         with self.lock:
             self.label = label
-            try:
-                if not self.stop_event.is_set() and sys.stdout and not sys.stdout.closed:
-                    sys.stdout.write("\r\033[2K\r")
-                    sys.stdout.flush()
-            except Exception:
-                pass
+            if self.status_callback:
+                self.status_callback("status", f"{self.label}...")
+            else:
+                try:
+                    if not self.stop_event.is_set() and sys.stdout and not sys.stdout.closed:
+                        sys.stdout.write("\r\033[2K\r")
+                        sys.stdout.flush()
+                except Exception:
+                    pass
 
     def tool_start(self, tool_name: str, args: Dict[str, Any]):
         """Prints a Claude Code-style action bullet for tool execution."""
+        if self.status_callback:
+            self.status_callback("tool_start", {"tool": tool_name, "args": args})
+            return
         formatted_name = tool_name.replace("_", " ").title().replace(" ", "")
         args_items = []
         for k, v in (args or {}).items():
@@ -347,19 +362,30 @@ class ThinkingIndicator:
             try:
                 if sys.stdout and not sys.stdout.closed:
                     sys.stdout.write("\r\033[2K\r")
-                    sys.stdout.write(f" \033[38;5;203;1m●\033[0m \033[1;97m{formatted_name}\033[0m\033[38;5;244m({args_str})\033[0m\n")
+                    sys.stdout.write(f" \033[38;5;46;1m●\033[0m \033[1;97m{formatted_name}\033[0m\033[38;5;244m({args_str})\033[0m\n")
                     sys.stdout.flush()
             except Exception:
                 pass
 
     def tool_result(self, tool_name: str, result: Any):
         """Prints a nested branch summarizing tool results."""
+        if self.status_callback:
+            self.status_callback("tool_result", {"tool": tool_name, "result": result})
+            return
         summary = self._summarize_result(tool_name, result)
+        icon = "✓"
+        color = "\033[38;5;46;1m"
+        if isinstance(result, dict) and result.get("error"):
+            icon = "✗"
+            color = "\033[38;5;196;1m"
+        elif isinstance(result, dict) and result.get("blocked"):
+            icon = "!"
+            color = "\033[38;5;220;1m"
         with self.lock:
             try:
                 if sys.stdout and not sys.stdout.closed:
                     sys.stdout.write("\r\033[2K\r")
-                    sys.stdout.write(f"   \033[38;5;240m└\033[0m \033[38;5;250m{summary}\033[0m\n")
+                    sys.stdout.write(f"   \033[38;5;240m└\033[0m {color}{icon}\033[0m \033[38;5;250m{summary}\033[0m\n")
                     sys.stdout.flush()
             except Exception:
                 pass
@@ -384,6 +410,9 @@ class ThinkingIndicator:
         elif tool_name == "subfinder":
             subs = result.get("subdomains", [])
             return f"Discovered {len(subs)} subdomain(s) via passive CT sources"
+        elif tool_name == "dns_bruteforce":
+            subs = result.get("subdomains", [])
+            return f"Brute-forced {len(subs)} active DNS subdomain(s)"
         elif tool_name == "httpx":
             live = result.get("live_hosts", [])
             return f"Probed {len(live)} live HTTP/HTTPS service(s)"
@@ -393,6 +422,42 @@ class ThinkingIndicator:
         elif tool_name == "tls_cert_scan":
             names = result.get("subject_names", [])
             return f"Extracted {len(names)} SAN/CN record(s) from TLS certificate"
+        elif tool_name == "vhost_fuzz":
+            vhosts = result.get("vhosts", [])
+            return f"Discovered {len(vhosts)} virtual host(s)"
+        elif tool_name == "content_discovery":
+            paths = result.get("paths", [])
+            return f"Discovered {len(paths)} path(s)"
+        elif tool_name in ("subzy", "takeover_scanner"):
+            subs = result.get("takeovers", [])
+            return f"Scanned {len(subs)} service(s) for subdomain takeover"
+        elif tool_name == "hydra":
+            vulns = result.get("vulnerabilities", [])
+            return f"Audited surface — {len(vulns)} high-impact finding(s)"
+        elif tool_name == "cloudscout":
+            assets = result.get("assets", [])
+            return f"Identified {len(assets)} cloud asset(s)"
+        elif tool_name == "transport_auditor":
+            findings = result.get("findings", [])
+            return f"Audited TLS/transport — {len(findings)} security observation(s)"
+        elif tool_name == "fuzz_hunter":
+            endpoints = result.get("discovered_endpoints", [])
+            return f"Discovered {len(endpoints)} endpoint(s) via parameter fuzzing"
+        elif tool_name == "wafbuster":
+            waf = result.get("waf", result.get("detected_waf", "None"))
+            return f"Fingerprinted WAF: {waf}"
+        elif tool_name == "cors_checker":
+            vulns = result.get("cors_issues", [])
+            return f"Audited CORS — {len(vulns)} misconfiguration(s) found"
+        elif tool_name == "graphql_probe":
+            schema = result.get("schema_exposed", False)
+            return f"Probed GraphQL — schema {'exposed' if schema else 'secured'}"
+        elif tool_name == "surface_auditor":
+            surfaces = result.get("surfaces", [])
+            return f"Audited API attack surfaces — {len(surfaces)} surface(s) analyzed"
+        elif tool_name == "run_terminal_command":
+            code = result.get("exit_code", 0)
+            return f"Command executed (exit code {code})"
 
         keys = [k for k in result.keys() if k not in ("target", "state")]
         if keys:
@@ -404,6 +469,16 @@ class ThinkingIndicator:
         return "Operation completed successfully"
 
     def print_step(self, icon: str, msg: str, color: str = "\033[38;5;203;1m"):
+        if self.status_callback:
+            event_type = "info"
+            if icon == "✓":
+                event_type = "success"
+            elif icon == "!":
+                event_type = "warn"
+            elif icon == "✗":
+                event_type = "error"
+            self.status_callback(event_type, msg)
+            return
         with self.lock:
             try:
                 if sys.stdout and not sys.stdout.closed:
@@ -430,13 +505,14 @@ class ThinkingIndicator:
 
     def stop(self):
         self.stop_event.set()
-        with self.lock:
-            try:
-                if sys.stdout and not sys.stdout.closed:
-                    sys.stdout.write("\r\033[2K\r")
-                    sys.stdout.flush()
-            except Exception:
-                pass
+        if not self.status_callback:
+            with self.lock:
+                try:
+                    if sys.stdout and not sys.stdout.closed:
+                        sys.stdout.write("\r\033[2K\r")
+                        sys.stdout.flush()
+                except Exception:
+                    pass
         if self.thread and self.thread.is_alive():
             try:
                 self.thread.join(timeout=0.3)
@@ -600,7 +676,7 @@ def list_available_models() -> List[Dict[str, Any]]:
 
     return models_list
 
-def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
+def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None) -> Optional[str]:
     """Unified dispatcher for all supported AI providers."""
     provider = (provider or "ollama").lower().strip()
     
@@ -611,19 +687,19 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
     active_model = model or get_default_model(provider)
 
     if provider in ("nvidia", "nim"):
-        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens)
+        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token)
     elif provider == "openai":
-        res = call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens)
+        res = call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token)
     elif provider == "anthropic":
-        res = call_anthropic(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens)
+        res = call_anthropic(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token)
     elif provider == "gemini":
-        res = ask_gemini(api_key, active_model, system_prompt, prompt, max_tokens=max_tokens, timeout=timeout, history=history, thinking=thinking)
+        res = ask_gemini(api_key, active_model, system_prompt, prompt, max_tokens=max_tokens, timeout=timeout, history=history, thinking=thinking, on_token=on_token)
     else: # Ollama / Local
-        res = call_ollama(prompt, model=active_model, system_prompt=system_prompt, timeout=timeout, history=history, thinking=thinking, max_tokens=max_tokens)
+        res = call_ollama(prompt, model=active_model, system_prompt=system_prompt, timeout=timeout, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token)
 
     return strip_thinking_tags(res) if res else res
 
-def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, role: str = "orchestrator", thinking: bool = False, max_tokens: int = None, history: list = None) -> Optional[str]:
+def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, role: str = "orchestrator", thinking: bool = False, max_tokens: int = None, history: list = None, on_token: Optional[Callable[[str], None]] = None) -> Optional[str]:
     """Config-aware wrapper to query the configured AI provider/model for a specific role (orchestrator vs synthesizer)."""
     cfg = load_config()
     provider = cfg.get(f"{role}_provider") or cfg.get("ai_provider", "ollama")
@@ -658,10 +734,10 @@ def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, t
             active_model = cfg.get("orchestrator_model") or cfg.get("ai_model") or get_default_model(provider)
             api_key = api_keys.get(provider) or os.environ.get(env_map.get(provider, ""), "") or "ollama"
 
-    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens)
+    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token)
 
-def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
-    """REST call to NVIDIA NIM OpenAI-compatible API."""
+def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """REST call to NVIDIA NIM OpenAI-compatible API with SSE streaming."""
     try:
         url = "https://integrate.api.nvidia.com/v1/chat/completions"
         headers = {
@@ -683,19 +759,45 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             "messages": messages,
             "temperature": 0.5,
             "max_tokens": resolved_max_tokens,
+            "stream": True,
             "chat_template_kwargs": {"thinking": thinking}
         }
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:
             return f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:100]}"
-        data = r.json()
-        raw_content = data["choices"][0]["message"]["content"] if "choices" in data else None
-        return strip_thinking_tags(raw_content) if raw_content else None
+
+        full_response = []
+        for line in r.iter_lines():
+            if not line:
+                continue
+            decoded = line.decode("utf-8").strip()
+            if not decoded:
+                continue
+            if decoded.startswith("data:"):
+                data_str = decoded[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    choices = chunk.get("choices", [])
+                    if choices:
+                        delta = choices[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            full_response.append(token)
+                            if on_token:
+                                on_token(token)
+                except json.JSONDecodeError:
+                    continue
+
+        result = "".join(full_response).strip()
+        cleaned = strip_thinking_tags(result)
+        return cleaned if cleaned else None
     except Exception as e:
         return f"Error: NVIDIA NIM connection failed ({str(e)})"
 
-def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
-    """REST call to OpenAI Chat Completions API."""
+def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """REST call to OpenAI Chat Completions API with SSE streaming."""
     try:
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -710,18 +812,43 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
         cfg = load_config()
         resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
 
-        payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": resolved_max_tokens}
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": resolved_max_tokens, "stream": True}
+        r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:
             return f"Error: OpenAI API returned {r.status_code}"
-        data = r.json()
-        raw_content = data["choices"][0]["message"]["content"] if "choices" in data else None
-        return strip_thinking_tags(raw_content) if raw_content else None
+
+        full_response = []
+        for line in r.iter_lines():
+            if not line:
+                continue
+            decoded = line.decode("utf-8").strip()
+            if not decoded:
+                continue
+            if decoded.startswith("data:"):
+                data_str = decoded[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    choices = chunk.get("choices", [])
+                    if choices:
+                        delta = choices[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            full_response.append(token)
+                            if on_token:
+                                on_token(token)
+                except json.JSONDecodeError:
+                    continue
+
+        result = "".join(full_response).strip()
+        cleaned = strip_thinking_tags(result)
+        return cleaned if cleaned else None
     except Exception as e:
         return f"Error: OpenAI connection failed ({str(e)})"
 
-def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20240620", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
-    """REST call to Anthropic Messages API."""
+def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20240620", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """REST call to Anthropic Messages API with SSE streaming."""
     try:
         url = "https://api.anthropic.com/v1/messages"
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
@@ -738,21 +865,47 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
             "model": model,
             "messages": messages,
             "max_tokens": resolved_max_tokens,
-            "temperature": 0.7
+            "temperature": 0.7,
+            "stream": bool(on_token)
         }
         if system_prompt:
             payload["system"] = system_prompt
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        r = requests.post(url, headers=headers, json=payload, stream=bool(on_token), timeout=timeout)
         if r.status_code != 200:
             return f"Error: Anthropic API returned {r.status_code}"
-        data = r.json()
-        raw_content = data["content"][0]["text"] if "content" in data else None
-        return strip_thinking_tags(raw_content) if raw_content else None
+        
+        if on_token:
+            full_response = []
+            for line in r.iter_lines():
+                if line:
+                    decoded = line.decode("utf-8") if isinstance(line, bytes) else line
+                    if decoded.startswith("data:"):
+                        data_str = decoded[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            if chunk.get("type") == "content_block_delta":
+                                delta = chunk.get("delta", {})
+                                if delta.get("type") == "text_delta":
+                                    token = delta.get("text", "")
+                                    if token:
+                                        full_response.append(token)
+                                        on_token(token)
+                        except json.JSONDecodeError:
+                            continue
+            result = "".join(full_response).strip()
+            cleaned = strip_thinking_tags(result)
+            return cleaned if cleaned else None
+        else:
+            data = r.json()
+            raw_content = data["content"][0]["text"] if "content" in data and data["content"] else None
+            return strip_thinking_tags(raw_content) if raw_content else None
     except Exception as e:
         return f"Error: Anthropic connection failed ({str(e)})"
 
-def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = None, timeout: int = 20, history: list = None, thinking: bool = False) -> Optional[str]:
-    """Gemini API caller."""
+def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = None, timeout: int = 20, history: list = None, thinking: bool = False, on_token: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """Gemini API caller with SSE streaming support."""
     try:
         contents = []
         if history:
@@ -773,20 +926,45 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
                 "topP": 0.9
             }
         }
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-            json=payload,
-            timeout=timeout
-        )
+        endpoint = "streamGenerateContent?alt=sse" if on_token else "generateContent"
+        sep = "&" if "?" in endpoint else "?"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:{endpoint}{sep}key={api_key}"
+
+        r = requests.post(url, json=payload, stream=bool(on_token), timeout=timeout)
         if r.status_code != 200:
             return f"Error: Gemini API returned {r.status_code} - {r.text[:100]}"
-        data = r.json()
-        if "candidates" not in data:
-            return f"Error: No candidates in response"
-        parts = data["candidates"][0]["content"]["parts"]
-        text = "".join(part["text"] for part in parts if "text" in part)
-        cleaned = strip_thinking_tags(text.strip())
-        return cleaned if cleaned else "Error: Empty response text"
+
+        if on_token:
+            full_response = []
+            for line in r.iter_lines():
+                if line:
+                    decoded = line.decode("utf-8") if isinstance(line, bytes) else line
+                    if decoded.startswith("data:"):
+                        data_str = decoded[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            candidates = chunk.get("candidates", [])
+                            if candidates:
+                                parts = candidates[0].get("content", {}).get("parts", [])
+                                token = "".join(part.get("text", "") for part in parts if "text" in part and not part.get("thought", False))
+                                if token:
+                                    full_response.append(token)
+                                    on_token(token)
+                        except json.JSONDecodeError:
+                            continue
+            result = "".join(full_response).strip()
+            cleaned = strip_thinking_tags(result)
+            return cleaned if cleaned else None
+        else:
+            data = r.json()
+            if "candidates" not in data:
+                return f"Error: No candidates in response"
+            parts = data["candidates"][0]["content"]["parts"]
+            text = "".join(part["text"] for part in parts if "text" in part)
+            cleaned = strip_thinking_tags(text.strip())
+            return cleaned if cleaned else "Error: Empty response text"
     except Exception as e:
         return f"Error: Gemini connection failed ({str(e)})"
 
@@ -794,7 +972,7 @@ def call_gemini(prompt: str, api_key: str, model: str = "gemini-2.0-flash", time
     res = ask_gemini(api_key, model, ASK_PERSONA, prompt, timeout=timeout)
     return res if res else "Error: AI analysis failed."
 
-def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None, thinking: bool = False, max_tokens: int = None) -> Optional[str]:
+def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None) -> Optional[str]:
     """REST call to local Ollama API using chat endpoint."""
     try:
         model = model or get_default_model("ollama")
@@ -831,9 +1009,11 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
             if line:
                 try:
                     chunk = json.loads(line.decode("utf-8"))
-                    token = chunk.get("message", {}).get("content", "")
+                    token = chunk.get("message", {}).get("content", "") or chunk.get("response", "")
                     if token:
                         full_response.append(token)
+                        if on_token:
+                            on_token(token)
                     if chunk.get("done", False):
                         break
                 except json.JSONDecodeError:

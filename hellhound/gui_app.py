@@ -28,7 +28,7 @@ from hellhound.core.tasks import (
     sanitize_target_name,
     _get_targets_dir
 )
-from hellhound.core.ai_utils import load_config
+from hellhound.core.ai_utils import load_config, ThinkingIndicator
 from hellhound.core.toolcheck import check_all_tools
 
 
@@ -38,9 +38,16 @@ class GuiEmit:
         self.window = window
         self.target_name = target_name
         self.events: List[Dict[str, Any]] = []
+        self.indicator = ThinkingIndicator(status_callback=self._send_js)
+        self.indicator.start()
 
     def _send_js(self, event_type: str, payload: Any):
-        self.events.append({"type": event_type, "payload": payload, "time": datetime.now(timezone.utc).isoformat()})
+        if event_type == "status" and self.events and self.events[-1]["type"] == "status":
+            self.events[-1]["payload"] = payload
+            self.events[-1]["time"] = datetime.now(timezone.utc).isoformat()
+        else:
+            self.events.append({"type": event_type, "payload": payload, "time": datetime.now(timezone.utc).isoformat()})
+
         if self.window:
             try:
                 js_code = f"if (window.onAgentEmit) {{ window.onAgentEmit({json.dumps({'target': self.target_name, 'type': event_type, 'payload': payload})}); }}"
@@ -49,25 +56,25 @@ class GuiEmit:
                 pass
 
     def info(self, msg: str):
-        self._send_js("info", str(msg))
+        self.indicator.info(msg)
 
     def warn(self, msg: str):
-        self._send_js("warn", str(msg))
+        self.indicator.warn(msg)
 
     def error(self, msg: str):
-        self._send_js("error", str(msg))
+        self.indicator.error(msg)
 
     def success(self, msg: str):
-        self._send_js("success", str(msg))
+        self.indicator.success(msg)
 
     def set_label(self, label: str):
-        self._send_js("status", str(label))
+        self.indicator.set_label(label)
 
     def tool_start(self, tool_name: str, args: Dict[str, Any]):
-        self._send_js("tool_start", {"tool": tool_name, "args": args})
+        self.indicator.tool_start(tool_name, args)
 
     def tool_result(self, tool_name: str, result: Any):
-        self._send_js("tool_result", {"tool": tool_name, "result": result})
+        self.indicator.tool_result(tool_name, result)
 
 
 class HellhoundAPI:
@@ -218,87 +225,90 @@ class HellhoundAPI:
             agent.target = target
 
         gui_emit = GuiEmit(window=self._window, target_name=clean_name)
-        gui_emit.set_label("INITIALIZING RECON ENGINE")
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-
-        # Record user message in target chat history
-        if "chat_history" not in target.state:
-            target.state["chat_history"] = []
-        target.state["chat_history"].append({
-            "role": "user",
-            "content": text,
-            "timestamp": now_iso,
-        })
-        save_target(target)
-
         try:
-            session_ctx = {
-                "target": clean_name,
-                "options": {},
-                "scope_rules": target.scope_rules
-            }
+            gui_emit.set_label("INITIALIZING RECON ENGINE")
 
-            response_text = agent.handle_message(text, session_context=session_ctx, emit=gui_emit)
+            now_iso = datetime.now(timezone.utc).isoformat()
 
-            # Check if cancelled mid-execution
-            if self._cancel_flags.get(clean_name, False):
-                response_text += "\n\n*[Execution stopped by user]*"
-
-            # Reload target to capture updated findings/state from tool executions
-            target = create_or_load_target(clean_name)
-
-            # Extract finding counts to generate interactive chips
-            finding_chips = []
-            if target.state.get("takeover_candidates"):
-                finding_chips.append({"category": "takeover_candidates", "label": "Takeovers", "count": len(target.state["takeover_candidates"])})
-            if target.state.get("subdomains"):
-                finding_chips.append({"category": "subdomains", "label": "Subdomains", "count": len(target.state["subdomains"])})
-            if target.state.get("open_ports"):
-                finding_chips.append({"category": "open_ports", "label": "Open Ports", "count": len(target.state["open_ports"])})
-            if target.state.get("live_hosts"):
-                finding_chips.append({"category": "live_hosts", "label": "Live Hosts", "count": len(target.state["live_hosts"])})
-            if target.state.get("endpoints"):
-                finding_chips.append({"category": "endpoints", "label": "Endpoints", "count": len(target.state["endpoints"])})
-            if target.findings or target.state.get("vulnerabilities"):
-                vuln_count = len(target.findings) or len(target.state.get("vulnerabilities", []))
-                finding_chips.append({"category": "vulnerabilities", "label": "Vulnerabilities", "count": vuln_count})
-
-            # Record assistant response
+            # Record user message in target chat history
+            if "chat_history" not in target.state:
+                target.state["chat_history"] = []
             target.state["chat_history"].append({
-                "role": "assistant",
-                "content": response_text,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "chips": finding_chips,
-                "emits": gui_emit.events,
+                "role": "user",
+                "content": text,
+                "timestamp": now_iso,
             })
             save_target(target)
 
-            return {
-                "status": "ok",
-                "response": response_text,
-                "target": clean_name,
-                "chips": finding_chips,
-                "emits": gui_emit.events,
-            }
+            try:
+                session_ctx = {
+                    "target": clean_name,
+                    "options": {},
+                    "scope_rules": target.scope_rules
+                }
 
-        except Exception as e:
-            err_msg = f"Error processing query: {str(e)}"
-            target.state["chat_history"].append({
-                "role": "assistant",
-                "content": f"❌ {err_msg}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "chips": [],
-                "emits": gui_emit.events,
-            })
-            save_target(target)
-            return {
-                "status": "error",
-                "error": str(e),
-                "response": f"❌ {err_msg}",
-                "target": clean_name,
-                "chips": [],
-            }
+                response_text = agent.handle_message(text, session_context=session_ctx, emit=gui_emit)
+
+                # Check if cancelled mid-execution
+                if self._cancel_flags.get(clean_name, False):
+                    response_text += "\n\n*[Execution stopped by user]*"
+
+                # Reload target to capture updated findings/state from tool executions
+                target = create_or_load_target(clean_name)
+
+                # Extract finding chips
+                finding_chips = []
+                if target.state.get("takeover_candidates"):
+                    finding_chips.append({"category": "takeover_candidates", "label": "Takeovers", "count": len(target.state["takeover_candidates"])})
+                if target.state.get("subdomains"):
+                    finding_chips.append({"category": "subdomains", "label": "Subdomains", "count": len(target.state["subdomains"])})
+                if target.state.get("open_ports"):
+                    finding_chips.append({"category": "open_ports", "label": "Open Ports", "count": len(target.state["open_ports"])})
+                if target.state.get("live_hosts"):
+                    finding_chips.append({"category": "live_hosts", "label": "Live Hosts", "count": len(target.state["live_hosts"])})
+                if target.state.get("endpoints"):
+                    finding_chips.append({"category": "endpoints", "label": "Endpoints", "count": len(target.state["endpoints"])})
+                if target.findings or target.state.get("vulnerabilities"):
+                    vuln_count = len(target.findings) or len(target.state.get("vulnerabilities", []))
+                    finding_chips.append({"category": "vulnerabilities", "label": "Vulnerabilities", "count": vuln_count})
+
+                # Record assistant response
+                target.state["chat_history"].append({
+                    "role": "assistant",
+                    "content": response_text,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "chips": finding_chips,
+                    "emits": gui_emit.events,
+                })
+                save_target(target)
+
+                return {
+                    "status": "ok",
+                    "response": response_text,
+                    "target": clean_name,
+                    "chips": finding_chips,
+                    "emits": gui_emit.events,
+                }
+
+            except Exception as e:
+                err_msg = f"Error processing query: {str(e)}"
+                target.state["chat_history"].append({
+                    "role": "assistant",
+                    "content": f"❌ {err_msg}",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "chips": [],
+                    "emits": gui_emit.events,
+                })
+                save_target(target)
+                return {
+                    "status": "error",
+                    "error": str(e),
+                    "response": f"❌ {err_msg}",
+                    "target": clean_name,
+                    "chips": [],
+                }
+        finally:
+            gui_emit.indicator.stop()
 
     def stop_request(self, target_name: str) -> Dict[str, Any]:
         """Signals cancellation for the active request on the specified target."""

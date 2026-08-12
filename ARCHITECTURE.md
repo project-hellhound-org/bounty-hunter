@@ -1,73 +1,70 @@
-# Hellhound Pentest Framework — Technical Architecture
+# Hellhound Framework — Technical Architecture
 
-This document provides a deep-dive into the core engines and modular architecture that power the Hellhound framework.
-
----
-
-## 1. The Hydra Logic Engine
-
-Hydra is the multi-headed analysis heartbeat of Hellhound. It bridges the gap between reconnaissance and exploitation by understanding the **intent** and **state** of parameters.
-
-### Analysis Heads
-*   **Cerberus Head (Entropy)**: Discovers hidden data roles (IDs, Tokens, Secrets) using passive heuristic analysis and technology profiling.
-*   **Lailaps Head (Differential)**: Actively probes for dynamism. Identifies how the application reacts to parameter shifts, length deltas, and status code variations.
-*   **Geryon Head (Correlation)**: Correlates parameters across distinct endpoints to identify potential cross-context logic flaws.
-
-Hydra acts as the **Intelligence Orchestrator**, automatically recommending and seeding specialized auditors like `IDORdetector` or `CORSbuster` with high-fidelity targets.
+Hellhound is an AI-driven, chat-centric bug bounty and attack surface discovery framework designed for security researchers and penetration testers.
 
 ---
 
-## 2. Universal Schema-Agnostic Rendering
+## 1. Unified Interface Architecture
 
-Hellhound v12.5 utilizes a dynamic rendering engine that decouples module logic from visual representation.
+Hellhound is built around a single, unified execution surface:
 
-*   **Intelligent UI Hooking**: Modules no longer execute their own `print()` commands. The console automatically detects data clusters, parses them, and organizes them into immersive visual blocks.
-*   **Recursive Information Cleaning**: Automated filtering of high-noise data to ensure only high-fidelity signals reach the operator.
-*   **High Value Target (HVT) Synthesis**: The engine autonomously correlates output across modules to build a prioritized attack surface.
-
----
-
-## 3. Apex-King AI Core
-
-The AI Core is an agnostic, multi-tier correlation layer designed for professional offensive speed.
-
-*   **Zero-Config Discovery**: Standardized handshakes establish connectivity with OpenAI, Anthropic, or Google Gemini in seconds.
-*   **Specialized Personas**:
-    *   **The Strategic Correlator**: Maps independent findings into complex multi-step attack chains.
-    *   **The Deep Logic Auditor**: High-fidelity static analysis of reconstructed source code focusing on dangerous sinks.
-*   **Non-Blocking Execution**: AI features are isolated in the execution pipeline. Quota limits or network errors never interrupt the core rule-based detection flow.
+*   **Chat Terminal UI (`hellhound/core/chat_ui.py`)**: The primary interactive surface providing real-time AI reasoning, multi-turn context, live tool execution feedback, and slash commands.
+*   **Desktop App (`hellhound/gui_app.py`)**: A modern desktop interface powered by PyWebView that interacts directly with the same underlying engine, target persistence, and tool registry.
+*   **Decoupled Rendering & Engine (`hellhound/core/engine.py`)**: `HellhoundEngine.run_single` acts as the single execution broker for all modules, handling asynchronous event loops (`nest_asyncio`) and routing real-time telemetry via structured `emit` callbacks.
 
 ---
 
-## 4. Module Matrix & Detection Capabilities
+## 2. Tool Registry & Model Dispatch System
 
-### Sensitive Data Exposure
-| Check | Module | Signal |
-|---|---|---|
-| Hardcoded secrets (API keys, JWTs, credentials) | Spider + SourceAuditor | `[SECRET:*]` |
-| Logs / backup file exposure (`.log`, `.bak`, `.sql`) | Spider passive extraction | `[Leaked-File]` |
-| Weak encryption (MD5, SHA1, RC4, DES) | SourceAuditor SA-013 | Pre-filter → AI verify |
-| Client storage leak (sessionStorage, IndexedDB) | SourceAuditor SA-014 | Pre-filter → AI verify |
-| Session cookie flags (HttpOnly, Secure, SameSite) | TransportAuditor | TA-02x |
+All capabilities are exposed to the AI reasoning loop through the structured `TOOL_REGISTRY` in `hellhound/core/agent.py`.
 
-### Infrastructure & Configuration
-| Check | Module | Signal |
-|---|---|---|
-| SSL cert expiry, weak ciphers, deprecated TLS | TransportAuditor | TA-00x |
-| Default server/framework pages | SurfaceAuditor | SA-101 |
-| CDN misconfiguration + origin IP leak | SurfaceAuditor | SA-102/103 |
-| Open ports & unnecessary services | SurfaceAuditor | SA-110 |
-| Outdated frontend SDKs | SourceAuditor SA-016 | Pre-filter → AI verify |
+### Tool Specification Standard (`ToolSpec`)
+Each tool is defined with:
+- **`name`**: Tool identifier matching engine module handlers or CLI wrappers.
+- **`description`**: Semantic description guiding the model on when and how to invoke the tool.
+- **`parameters`**: Strict JSON Schema defining input constraints, data types, and required fields.
+- **`executor`**: Wrapper function executing the underlying module via `HellhoundEngine.run_single` and returning normalized dictionaries.
+
+### Tool Registry Matrix
+| Tool Name | Module / Backend | Category | Description |
+|---|---|---|---|
+| `spider` | `hellhound.modules.recon.spider` | Active Recon | Deep DOM crawling, form discovery, parameter harvesting, secret detection, and tech profiling. |
+| `httpx` | `projectdiscovery/httpx` | Active Recon | Service probing, HTTP status codes, title scraping, and technology stack fingerprinting. |
+| `subfinder` | `projectdiscovery/subfinder` | Passive Recon | Passive subdomain enumeration via certificate transparency logs and public archives. |
+| `dns_bruteforce` | `projectdiscovery/shuffledns` | Active Recon | MassDNS-backed active DNS brute-forcing for non-public or lab targets. |
+| `vhost_fuzz` | `ffuf/ffuf` | Active Recon | Host header fuzzing to find unindexed virtual hosts on shared IPs. |
+| `port_scan` | `projectdiscovery/naabu` | Active Recon | Fast SYN/Connect port scanning for open TCP/UDP services. |
+| `permute_subdomains` | `projectdiscovery/alterx` | Recon Mutation | Rule-based and permutation subdomain candidate generation. |
+| `resolve_candidates` | `projectdiscovery/dnsx` | Active Recon | High-throughput DNS resolver and wildcard filtering. |
+| `tls_cert_scan` | `projectdiscovery/tlsx` | Recon / Intel | TLS certificate inspection and Subject Alternative Names (SAN) extraction. |
+| `content_discovery` | `ffuf/ffuf` | Active Recon | High-speed directory and file path fuzzing. |
+| `subzy` / `takeover_scanner` | `hellhound.modules.recon` | Takeover | Dangling DNS record and cloud service takeover detection. |
+| `hackerone_*` | `hellhound.modules.intel` | Threat Intel | Hacktivity search, policy scope analysis, and bounty statistics. |
+| `wafbuster` | `hellhound.modules.recon.WAFbuster` | Surface Analysis | WAF/CDN signature identification and bypass heuristic checks. |
+| `surface_auditor` | `hellhound.modules.recon.SurfaceAuditor` | Surface Analysis | API route detection, OpenAPI/Swagger discovery, and sensitive file checks. |
+| `cors_checker` | `hellhound.modules.recon.CORSbuster` | Surface Analysis | CORS origin reflection and credential leakage checks. |
+| `graphql_probe` | `hellhound.modules.recon.GraphQL` | Surface Analysis | GraphQL endpoint detection and schema introspection queries. |
+| `hydra` | `hellhound.modules.analysis.Hydra` | Logic Analysis | Parameter dynamism, differential response analysis, and logic flaw hunting. |
+| `cloudscout` | `hellhound.modules.intel.CloudScout` | Cloud Intel | S3, Azure Blob, GCP, and Firebase asset identification from recon data. |
+| `transport_auditor` | `hellhound.modules.recon.TransportAuditor` | Transport | SSL/TLS certificate audit, HSTS validation, and cookie security flags. |
+| `fuzz_hunter` | `hellhound.modules.recon.FUZZhunter` | Active Recon | Recursive path fuzzing with 404 similarity baseline heuristics. |
+| `run_terminal_command` | `bash` / Host CLI | Custom Execution | Scoped custom command execution for specialized tools. |
 
 ---
 
-## 5. Obsidian Neural Attack Graphing
+## 3. Autopilot & Scope Guardrails
 
-The Attack Graph is the visualization heartbeat of Hellhound, providing a high-fidelity "God's Eye View" of the target's security posture.
+Hellhound enforces defensive rules-of-engagement before executing any tool:
 
-*   **Force-Directed Physics (D3-force)**: Utilizes a dynamic physics simulation where nodes attract/repulse based on their relationship density. Highly connected targets (e.g., API Gateways) naturally cluster in the center.
-*   **3D Neural Mapping (Three.js)**: Transitions from 2D flat-space to 3D spatial awareness. Nodes are rendered as glowing spheres with emissive intensity scaled by vulnerability severity.
-*   **Tactical Interaction**:
-    *   **Node Deep-Dive**: Clicking a node triggers a tactical zoom and opens the Forensic Intelligence panel.
-    *   **Flow Particles**: Real-time directional particles visualize the "Attack Path" between discovery and exploitation.
-    *   **Minimalist HUD**: Tooltips and labels are dynamically hidden to maintain a professional, high-signal interface.
+*   **Target Scope Validation (`hellhound/core/scope.py`)**: Validates domain names, wildcards, and IP boundaries against the active target scope definition before any network call.
+*   **Risk Classification (`MODULE_RISK_MAP`)**: Maps module actions against disallowed testing flags (`no-dos`, `no-brute-force`, `no-fuzzing`, `no-active-exploitation`, `no-automated-scanners`).
+*   **Circuit Breakers & Rate Limiting (`AutopilotGuard`)**: Enforces rate limits (RPS) and trips safety circuit breakers upon encountering consecutive anomalous error rates.
+
+---
+
+## 4. Target State & Intelligence Persistence
+
+State is persistently managed across sessions in `targets/<target_name>/task.json`:
+*   **`target.state["spider_intel"]`**: Central aggregated intelligence (endpoints, forms, parameters, comments, secrets, tech stack) populated by `spider` and consumed by downstream auditors (`hydra`, `cloudscout`, `transport_auditor`, `fuzz_hunter`).
+*   **`target.state["history"]`**: Multi-turn LLM reasoning history ensuring continuous context between queries.
+*   **`target.findings`**: Structured, verified vulnerability disclosures and anomalous attack surfaces.

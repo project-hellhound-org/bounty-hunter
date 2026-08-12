@@ -146,22 +146,28 @@ class ConsoleEmit(PlainEmit):
         self._console = console
 
     def _w(self, method_name, *args, **kwargs):
-        """Clears progress line and prints while holding the terminal lock."""
-        with self._console.term_lock:
-            # 1. Clear the animation line
-            if hasattr(self._console, "clear_progress_unlocked"):
-                self._console.clear_progress_unlocked()
-            
-            # 2. Call the actual console printing method
-            method = getattr(self._console, method_name, None)
-            if method:
-                method(*args, **kwargs)
-            else:
-                # Fallback print if console method is missing
-                print(f"[{method_name}] {' '.join(map(str, args))}")
-            
-            # 3. No manual redraw here. 
-            # The background thread will take the lock and redraw in its next cycle.
+        """Clears progress line and prints while holding the terminal lock if available."""
+        term_lock = getattr(self._console, "term_lock", None)
+        if term_lock is not None:
+            with term_lock:
+                self._print_unlocked(method_name, *args, **kwargs)
+        else:
+            self._print_unlocked(method_name, *args, **kwargs)
+
+    def _print_unlocked(self, method_name, *args, **kwargs):
+        # 1. Clear the animation line
+        if hasattr(self._console, "clear_progress_unlocked"):
+            self._console.clear_progress_unlocked()
+        
+        # 2. Call the actual console printing method
+        method = getattr(self._console, method_name, None)
+        if method:
+            method(*args, **kwargs)
+        elif hasattr(self._console, "print"):
+            self._console.print(*args, **kwargs)
+        else:
+            # Fallback print if console method is missing
+            print(f"[{method_name}] {' '.join(map(str, args))}")
 
     def info(self, msg):
         self._w("info", msg)

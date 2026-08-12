@@ -23,6 +23,22 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style as PTStyle
+from prompt_toolkit.widgets import Frame, TextArea
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import FloatContainer, Float
+from prompt_toolkit.layout.dimension import Dimension as D
+from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.application import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.defaults import load_key_bindings
+from prompt_toolkit.key_binding.key_bindings import merge_key_bindings
+
+from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+
+rich_console = Console()
 
 from hellhound.core.tasks import list_targets, create_or_load_target, Target
 from hellhound.core.ai_utils import load_config
@@ -44,7 +60,9 @@ C_BG_PROMPT  = "\033[48;5;234m"     # Dark Slate Prompt Highlight
 RST          = Style.RESET_ALL
 
 PT_CUSTOM_STYLE = PTStyle.from_dict({
-    'prompt': '#ff2244 bold',
+    'prompt': '#00ffff bold',
+    'frame.border': '#555555',
+    'frame.label': '#888888',
     'completion-menu': 'bg:#1e1e1e #cccccc',
     'completion-menu.completion': 'bg:#1e1e1e #cccccc',
     'completion-menu.completion.current': 'bg:#880000 #ffffff bold',
@@ -156,6 +174,16 @@ class HellhoundCompleter(Completer):
                 if val.lower().startswith(arg_text.lower()):
                     yield Completion(val, start_position=-len(arg_text), display=val, display_meta=meta)
 
+        elif cmd_name in ("/recon", "/surface", "/spider"):
+            sub_suggestions = [
+                ("subdomains", "Asset discovery only (subfinder/dns_bruteforce)"),
+                ("endpoints", "Content and endpoint discovery only (spider)"),
+                ("tech", "Live-host and technology fingerprinting only (httpx)"),
+            ]
+            for val, meta in sub_suggestions:
+                if val.lower().startswith(word_before.lower()):
+                    yield Completion(val, start_position=-len(word_before), display=val, display_meta=meta)
+
 
 def render_banner_card(target_name: Optional[str] = None):
     r"""
@@ -260,43 +288,210 @@ def render_banner_card(target_name: Optional[str] = None):
     print(f"  {C_TEXT_DIM}/model to switch models  •  /scope to configure target scope  •  /hunt for auto triage{RST}\n")
 
 
-def prompt_user_input(agent, session: PromptSession) -> Optional[str]:
-    """
-    Renders clean input prompt using prompt_toolkit PromptSession with inline autocompletion dropdown.
-    """
-    full_w = get_terminal_width()
-    div_w = min(full_w - 4, 96)
+def print_turn_separator():
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    print(f"{C_GRAY_BOX}{'─' * width}{RST}")
 
-    # Top horizontal divider
-    print(f" {C_GRAY_BOX}{'─' * div_w}{RST}")
 
-    prompt_str = HTML("<ansired><b>&gt;</b></ansired> ")
+def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -> Optional[str]:
+    """
+    Renders the input prompt inside a compact, single-line enclosed Frame box
+    matching the exact width of the banner card and eliminating vertical padding.
+    """
+    w = get_terminal_width()
+    card_w = min(w - 4, 96)
+
+    if isinstance(session, FileHistory):
+        history = session
+    else:
+        hist_path = history_file or os.path.expanduser("~/.hellhound_history")
+        history = FileHistory(hist_path)
+
+    kb = KeyBindings()
+
+    text_area = TextArea(
+        multiline=False,
+        prompt=HTML("<ansicyan><b>&gt; </b></ansicyan>"),
+        completer=HellhoundCompleter(),
+        complete_while_typing=True,
+        history=history,
+        dont_extend_height=True,
+        height=D.exact(1),
+        style="class:input-text",
+    )
+
+    @kb.add("enter")
+    def _on_enter(event):
+        event.app.exit(result=text_area.text)
+
+    @kb.add("c-c")
+    def _on_sigint(event):
+        event.app.exit(result=None)
+
+    @kb.add("c-d")
+    def _on_eof(event):
+        event.app.exit(result=None)
+
+    all_kb = merge_key_bindings([load_key_bindings(), kb])
+
+    frame = Frame(
+        body=text_area,
+        height=D.exact(3),
+        width=D.exact(card_w),
+        style="class:frame",
+    )
+
+    root = FloatContainer(
+        content=frame,
+        floats=[
+            Float(
+                xcursor=True,
+                ycursor=True,
+                content=CompletionsMenu(max_height=8),
+            )
+        ],
+    )
+
+    app = Application(
+        layout=Layout(root, text_area.window),
+        key_bindings=all_kb,
+        style=PT_CUSTOM_STYLE,
+        full_screen=False,
+    )
+
     try:
-        user_input = session.prompt(prompt_str).strip()
-        return user_input
+        raw_result = app.run()
+        if raw_result is None:
+            return None
+        text = raw_result.strip()
+        if text:
+            history.append_string(text)
+        return text
     except (KeyboardInterrupt, EOFError):
         return None
 
 
+class StreamRenderer:
+    """
+    Renders streaming tokens incrementally inside a Rich Markdown Panel with Live display.
+    """
+    def __init__(self, title: str = "HELLHOUND", border_style: str = "bold red"):
+        self.title = title
+        self.border_style = border_style
+        self.accumulated_text = ""
+        self.live: Optional[Live] = None
+        self._started = False
+
+    def on_token(self, token: str):
+        if not token:
+            return
+        self.accumulated_text += token
+        if not self._started:
+            self._started = True
+            self.live = Live(
+                self._render_panel(),
+                console=rich_console,
+                refresh_per_second=12,
+                vertical_overflow="visible"
+            )
+            self.live.start()
+        else:
+            if self.live:
+                self.live.update(self._render_panel())
+
+    def _render_panel(self) -> Panel:
+        md = Markdown(self.accumulated_text or " ")
+        return Panel(
+            md,
+            title=f"[bold red] {self.title} [/bold red]",
+            title_align="left",
+            border_style=self.border_style,
+            padding=(0, 1)
+        )
+
+    def finish(self, final_text: Optional[str] = None):
+        if final_text and not self.accumulated_text:
+            self.accumulated_text = final_text
+
+        if self.live and self._started:
+            if final_text:
+                self.accumulated_text = final_text
+            self.live.update(self._render_panel())
+            self.live.stop()
+            self.live = None
+        elif self.accumulated_text:
+            rich_console.print(self._render_panel())
+
+
 def render_response_bubble(response_text: str, sender: str = "HELLHOUND"):
     """
-    Renders AI findings and assistant responses in a visually distinct bordered block
-    with a crimson left-margin indicator.
+    Renders AI findings and assistant responses in a visually distinct Rich Markdown Panel.
     """
     if not response_text or not response_text.strip():
         return
+    clean_sender = re_strip_ansi(sender)
+    md = Markdown(response_text.strip())
+    rich_console.print(Panel(
+        md,
+        title=f"[bold red] {clean_sender} [/bold red]",
+        title_align="left",
+        border_style="bold red",
+        padding=(0, 1)
+    ))
 
-    clean_sender = html.escape(re_strip_ansi(sender))
-    print_formatted_text(HTML(f"<ansired><b>┃</b></ansired> <b><ansired>{clean_sender}</ansired></b>"))
+from hellhound.core.emit import PlainEmit
+class InteractiveAgentEmit(PlainEmit):
+    def __init__(self):
+        super().__init__()
+        self.indicator = None
 
-    for line in response_text.strip().split("\n"):
-        clean_line = re_strip_ansi(line)
-        escaped_line = html.escape(clean_line)
-        if escaped_line:
-            print_formatted_text(HTML(f"<ansired>┃</ansired> {escaped_line}"))
+    def _ensure_indicator(self, label="HELLHOUND IS ANALYZING & EXECUTING"):
+        if not self.indicator:
+            from hellhound.core.ai_utils import ThinkingIndicator
+            self.indicator = ThinkingIndicator(label)
+            self.indicator.start()
+
+    def set_label(self, label: str):
+        self._ensure_indicator(label)
+        self.indicator.set_label(label)
+
+    def tool_start(self, tool_name: str, args: dict):
+        self._ensure_indicator()
+        self.indicator.tool_start(tool_name, args)
+
+    def tool_result(self, tool_name: str, result: any):
+        if self.indicator:
+            self.indicator.tool_result(tool_name, result)
+            
+    def stop_indicator(self):
+        if self.indicator and getattr(self.indicator, "thread", None) and self.indicator.thread.is_alive():
+            self.indicator.stop()
+            self.indicator = None
+
+    def __call__(self, msg):
+        self.stop_indicator()
+        # For simple tool results that don't need a huge panel
+        if "switched to" in msg or "Target set" in msg or "No target" in msg:
+            super().__call__(msg)
         else:
-            print_formatted_text(HTML("<ansired>┃</ansired>"))
-    print()
+            render_response_bubble(msg)
+
+    def info(self, msg):
+        self.stop_indicator()
+        super().info(msg)
+
+    def success(self, msg):
+        self.stop_indicator()
+        super().success(msg)
+
+    def warn(self, msg):
+        self.stop_indicator()
+        super().warn(msg)
+
+    def error(self, msg):
+        self.stop_indicator()
+        super().error(msg)
+
 
 
 def start_chat_session(initial_target: Optional[str] = None):
@@ -306,14 +501,9 @@ def start_chat_session(initial_target: Optional[str] = None):
     target = initial_target or "default"
     agent = get_agent(target)
 
-    # Configure prompt session with persistent history, completer, and custom styling
+    # Configure persistent history
     history_file = os.path.expanduser("~/.hellhound_history")
-    session = PromptSession(
-        completer=HellhoundCompleter(),
-        history=FileHistory(history_file),
-        complete_while_typing=True,
-        style=PT_CUSTOM_STYLE,
-    )
+    history = FileHistory(history_file)
 
     # Clear terminal cleanly for fresh Claude Code aesthetic
     os.system("clear" if os.name == "posix" else "cls")
@@ -323,7 +513,7 @@ def start_chat_session(initial_target: Optional[str] = None):
 
     while True:
         try:
-            user_input = prompt_user_input(agent, session=session)
+            user_input = prompt_user_input(agent, session=history)
             if user_input is None:
                 print(f" {C_RED_MAIN}[+] Exiting Hellhound Bounty Hunter. Happy Hunting!{RST}\n")
                 break
@@ -339,6 +529,7 @@ def start_chat_session(initial_target: Optional[str] = None):
                 from hellhound.core.commands import handle_help
                 from hellhound.core.emit import PlainEmit
                 handle_help([], {}, PlainEmit())
+                print_turn_separator()
                 continue
 
             if user_input.lower() == "clear":
@@ -357,33 +548,53 @@ def start_chat_session(initial_target: Optional[str] = None):
 
             if is_explicit_cmd or is_bare_cmd:
                 cmd_line = user_input if user_input.startswith("/") else "/" + user_input
-                from hellhound.core.emit import PlainEmit
                 session_ctx = {
                     "target": agent.target.name,
                     "scope_rules": agent.target.scope_rules,
                     "options": {}
                 }
-                res = dispatch(cmd_line, session_ctx, PlainEmit())
-                if session_ctx.get("target") and session_ctx["target"] != agent.target.name:
+                
+                # Use InteractiveAgentEmit for slash commands so that /recon, /scan etc show the spinner
+                emit = InteractiveAgentEmit()
+                try:
+                    res = dispatch(cmd_line, session_ctx, emit)
+                finally:
+                    emit.stop_indicator()
+
+                if session_ctx.get("target"):
                     agent.set_target(session_ctx["target"])
+                print_turn_separator()
                 continue
 
-            # Natural Language Query → Route to Agent reasoning loop with live thinking indicator
+            # Natural Language Query → Route to Agent reasoning loop with live thinking indicator and streaming
             from hellhound.core.ai_utils import ThinkingIndicator
             indicator = ThinkingIndicator("HELLHOUND IS ANALYZING & EXECUTING")
             indicator.start()
+
+            streamer = StreamRenderer(title="HELLHOUND")
+
+            def on_token_callback(token: str):
+                if indicator.thread and indicator.thread.is_alive():
+                    indicator.stop()
+                streamer.on_token(token)
 
             session_ctx = {
                 "target": agent.target.name,
                 "scope_rules": agent.target.scope_rules
             }
+            ai_response = None
             try:
-                ai_response = agent.handle_message(user_input, session_context=session_ctx, emit=indicator)
+                ai_response = agent.handle_message(
+                    user_input,
+                    session_context=session_ctx,
+                    emit=indicator,
+                    on_token=on_token_callback
+                )
             finally:
                 indicator.stop()
+                streamer.finish(ai_response)
 
-            # Render response in distinct chat bubble
-            render_response_bubble(ai_response)
+            print_turn_separator()
 
         except (KeyboardInterrupt, EOFError):
             print(f"\n {C_RED_MAIN}[+] Exiting Hellhound Bounty Hunter.{RST}\n")

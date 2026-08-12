@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import requests
 
 from hellhound.core.scope import ScopeRules, is_in_scope, check_module_against_rules
-from hellhound.core.tasks import Target, create_or_load_target, save_target, set_scope
+from hellhound.core.tasks import Target, create_or_load_target, save_target, set_scope, sanitize_target_name
 from hellhound.core.guard import AutopilotGuard
 from hellhound.core.ai_utils import (
     load_config,
@@ -86,15 +86,16 @@ def _find_binary(name: str) -> Optional[str]:
 
 
 def _resolve_resolvers_path() -> str:
-    """Resolve DNS resolvers file, checking repository wordlists, local tool configs, or generating default public resolvers."""
+    """Resolve DNS resolvers file, checking fast local list, tool configs, standard SecLists paths, or generating default public resolvers."""
     repo_root = Path(__file__).resolve().parent.parent
     candidates = [
-        str(repo_root / "wordlists" / "dns" / "resolvers.txt"),
+        str(repo_root / "wordlists" / "dns" / "resolvers-fast.txt"),
+        "/usr/share/wordlists/seclists/Miscellaneous/dns-resolvers.txt",
+        "/usr/share/seclists/Miscellaneous/dns-resolvers.txt",
         str(Path.home() / "HACK-HUB" / "bug-hunting" / "Tools" / "resolvers.txt"),
         str(Path.home() / ".config" / "subfinder" / "resolvers.txt"),
         str(Path.home() / ".config" / "dnsx" / "resolvers.txt"),
-        str(Path.home() / ".hellhound" / "resolvers.txt"),
-        "/usr/share/seclists/Miscellaneous/dns-resolvers.txt"
+        str(Path.home() / ".hellhound" / "resolvers.txt")
     ]
     for c in candidates:
         if os.path.exists(c) and os.path.getsize(c) > 0:
@@ -125,13 +126,15 @@ def _execute_shuffledns(args: Dict[str, Any], target: Target, emit: Any) -> Dict
 
     binary = get_binary_path("shuffledns") or "shuffledns"
 
-    # Resolve wordlist path
+    # Resolve wordlist path (prioritize SecLists / Kali system wordlists, fallback to curated fast list)
     repo_root = Path(__file__).resolve().parent.parent
     wordlist_candidates = [
-        repo_root / "wordlists" / "dns" / "subdomains.txt",
+        Path("/usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-5000.txt"),
         Path("/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt"),
+        Path("/usr/share/wordlists/seclists/Discovery/DNS/namelist.txt"),
         Path("/usr/share/seclists/Discovery/DNS/namelist.txt"),
-        Path("/usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-5000.txt")
+        Path("/usr/share/wordlists/amass/subdomains.lst"),
+        repo_root / "wordlists" / "dns" / "subdomains-fast.txt"
     ]
     wordlist = None
     for wc in wordlist_candidates:
@@ -264,8 +267,11 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
 
     repo_root = Path(__file__).resolve().parent.parent
     wordlist_candidates = [
-        repo_root / "wordlists" / "web" / "directories.txt",
-        Path("/usr/share/seclists/Discovery/Web-Content/common.txt")
+        Path("/usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"),
+        Path("/usr/share/seclists/Discovery/Web-Content/common.txt"),
+        Path("/usr/share/wordlists/dirb/common.txt"),
+        Path("/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt"),
+        repo_root / "wordlists" / "web" / "directories-fast.txt"
     ]
     wordlist = None
     for wc in wordlist_candidates:
@@ -311,6 +317,42 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
         "discovered_endpoints": results[:100],
         "count": len(results)
     }
+
+
+def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Execute a custom terminal command/Kali tool targeting a specified host/IP."""
+    command = args.get("command", "").strip()
+    target_host = args.get("target", "").strip()
+
+    if not command:
+        return {"error": "No command specified."}
+
+    try:
+        import subprocess
+        # 180s timeout to prevent locking execution loops
+        proc = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=180
+        )
+        return {
+            "command": command,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "exit_code": proc.returncode
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "command": command,
+            "error": "Command execution timed out after 180 seconds."
+        }
+    except Exception as e:
+        return {
+            "command": command,
+            "error": f"Failed to execute command: {e}"
+        }
 
 
 def _execute_subfinder(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -819,6 +861,123 @@ def _execute_subzy(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
     return result
 
 
+def _execute_takeover_scanner(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Scan subdomains for takeover vulnerabilities using subjack and signature grep."""
+    subdomains = args.get("subdomains")
+    if not subdomains:
+        subdomains = target.state.get("subdomains", [])
+    
+    if not subdomains:
+        return {"error": "No subdomains found to scan."}
+
+    # Write subdomains to a temp file in target's directory
+    sub_file = Path(target.dir) / "takeover_subs_temp.txt"
+    try:
+        with open(sub_file, "w", encoding="utf-8") as f:
+            for s in subdomains:
+                f.write(f"{s}\n")
+    except Exception as e:
+        return {"error": f"Failed to write temporary subdomains file: {e}"}
+
+    script_path = Path(__file__).resolve().parent.parent / "tools" / "takeover_scanner.sh"
+    if not script_path.exists():
+        return {"error": f"takeover_scanner.sh not found at {script_path}"}
+
+    out_dir = Path(target.dir) / "takeover"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_json = out_dir / "results.json"
+    if results_json.exists():
+        results_json.unlink()
+
+    env = os.environ.copy()
+    env["TAKEOVER_OUT_DIR"] = str(out_dir)
+
+    try:
+        cmd = [str(script_path), str(sub_file)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=180)
+        
+        # Parse JSON output
+        results = []
+        if results_json.exists():
+            with open(results_json, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    results = json.loads(content)
+    except Exception as e:
+        results = []
+        return {"error": f"takeover_scanner execution failed: {e}"}
+    finally:
+        if sub_file.exists():
+            sub_file.unlink()
+
+    # Process and verify candidates
+    takeovers_found = []
+    for entry in results:
+        if isinstance(entry, dict) and entry.get("vulnerable"):
+            takeovers_found.append(entry)
+            finding = {
+                "type": "Subdomain Takeover Candidate",
+                "target": entry["subdomain"],
+                "cname": entry.get("cname", "None"),
+                "service": entry.get("service", "Unknown"),
+                "severity": "HIGH",
+                "verified": True
+            }
+            if finding not in target.findings:
+                target.findings.append(finding)
+    
+    if takeovers_found:
+        save_target(target)
+
+    return {
+        "scanned_count": len(subdomains),
+        "takeovers_found": takeovers_found,
+        "count": len(takeovers_found)
+    }
+
+
+def _execute_hackerone_search(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Search HackerOne Hacktivity for disclosed vulnerability reports."""
+    keyword = args.get("keyword", "")
+    program = args.get("program", "")
+    limit = args.get("limit", 10)
+    
+    try:
+        from hellhound.mcp.hackerone_mcp.server import search_disclosed_reports
+        results = search_disclosed_reports(keyword=keyword, program=program, limit=limit)
+        return {"status": "success", "results": results, "count": len(results)}
+    except Exception as e:
+        return {"error": f"HackerOne search failed: {e}"}
+
+
+def _execute_hackerone_policy(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Get the public policy and scopes for a HackerOne program."""
+    program = args.get("program", "") or target.name.split(".")[0]
+    
+    try:
+        from hellhound.mcp.hackerone_mcp.server import get_program_policy
+        result = get_program_policy(program)
+        if "error" in result:
+            return result
+        return {"status": "success", "policy": result}
+    except Exception as e:
+        return {"error": f"Failed to retrieve HackerOne policy: {e}"}
+
+
+def _execute_hackerone_stats(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Get public statistics (bounties, response times, resolved reports) for a HackerOne program."""
+    program = args.get("program", "") or target.name.split(".")[0]
+    
+    try:
+        from hellhound.mcp.hackerone_mcp.server import get_program_stats
+        result = get_program_stats(program)
+        if "error" in result:
+            return result
+        return {"status": "success", "stats": result}
+    except Exception as e:
+        return {"error": f"Failed to retrieve HackerOne stats: {e}"}
+
+
 def _execute_dig(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     domain = args.get("domain") or target.name
     record_type = args.get("type", "A").upper()
@@ -885,9 +1044,17 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
     engine = HellhoundEngine()
     opts = {"depth": depth, "max_pages": 50, "target": url}
     try:
-        res = engine.run_single("spider", url, options=opts)
+        res = engine.run_single("spider", url, options=opts, emit=emit)
         intel = res.get("intel", {}) if isinstance(res, dict) else {}
+        if intel and hasattr(target, "state"):
+            target.state["spider_intel"] = intel
         endpoints = [ep.get("url") for ep in intel.get("endpoints", []) if isinstance(ep, dict)]
+        if endpoints and hasattr(target, "state"):
+            if "endpoints" not in target.state:
+                target.state["endpoints"] = []
+            for ep in endpoints:
+                if ep not in target.state["endpoints"]:
+                    target.state["endpoints"].append(ep)
         return {
             "url": url,
             "endpoints_found": len(endpoints),
@@ -907,7 +1074,7 @@ def _execute_wafbuster(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
 
     engine = HellhoundEngine()
     try:
-        res = engine.run_single("wafbuster", url)
+        res = engine.run_single("wafbuster", url, emit=emit)
         return {
             "url": url,
             "result": res
@@ -922,9 +1089,11 @@ def _execute_surface_auditor(args: Dict[str, Any], target: Target, emit: Any) ->
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
+    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    opts = {"spider_intel": spider_intel}
     engine = HellhoundEngine()
     try:
-        res = engine.run_single("surface_auditor", url)
+        res = engine.run_single("surface_auditor", url, options=opts, emit=emit)
         return {
             "url": url,
             "result": res
@@ -939,9 +1108,11 @@ def _execute_cors_checker(args: Dict[str, Any], target: Target, emit: Any) -> Di
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
+    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    opts = {"spider_intel": spider_intel}
     engine = HellhoundEngine()
     try:
-        res = engine.run_single("corsbuster", url)
+        res = engine.run_single("corsbuster", url, options=opts, emit=emit)
         return {
             "url": url,
             "result": res
@@ -956,15 +1127,172 @@ def _execute_graphql_probe(args: Dict[str, Any], target: Target, emit: Any) -> D
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
+    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    opts = {"spider_intel": spider_intel}
     engine = HellhoundEngine()
     try:
-        res = engine.run_single("graphql", url)
+        res = engine.run_single("graphql", url, options=opts, emit=emit)
         return {
             "url": url,
             "result": res
         }
     except Exception as e:
         return {"url": url, "error": f"GraphQL check error: {e}"}
+
+
+def _execute_hydra(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Execute Hydra parameter and logic flaw analysis across discovered endpoints."""
+    from hellhound.core.engine import HellhoundEngine
+    url = args.get("url") or target.name
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    if not spider_intel and "endpoints" in target.state:
+        spider_intel = {"endpoints": [{"url": ep} if isinstance(ep, str) else ep for ep in target.state.get("endpoints", [])]}
+
+    concurrency = args.get("concurrency", 10)
+    enable_probing = args.get("enable_probing", False)
+    opts = {
+        "spider_intel": spider_intel,
+        "concurrency": concurrency,
+        "enable_probing": enable_probing,
+    }
+    engine = HellhoundEngine()
+    try:
+        res = engine.run_single("hydra", url, options=opts, emit=emit)
+        intel = res.get("intel", {}) if isinstance(res, dict) else {}
+        surfaces = intel.get("surfaces", [])
+        logic_chains = intel.get("logic_chains", [])
+        vulns = intel.get("vulnerabilities", [])
+
+        for v in vulns:
+            finding = {
+                "type": f"Logic Flaw / Param Anomaly ({v.get('parameter', '')})",
+                "target": v.get("url", url),
+                "severity": "HIGH" if v.get("impact_score", 0) >= 8 else "MEDIUM",
+                "details": v.get("impact_path") or v.get("attack_chains", []),
+                "verified": False
+            }
+            if finding not in target.findings:
+                target.findings.append(finding)
+
+        return {
+            "url": url,
+            "raw": res.get("raw", "") if isinstance(res, dict) else str(res),
+            "surfaces_analyzed": len(surfaces),
+            "logic_chains_found": len(logic_chains),
+            "high_impact_vulnerabilities": len(vulns),
+            "signals": res.get("signals", []) if isinstance(res, dict) else [],
+            "top_findings": surfaces[:10]
+        }
+    except Exception as e:
+        return {"url": url, "error": f"Hydra analysis error: {e}"}
+
+
+def _execute_cloudscout(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Scan application and recon text for cloud infrastructure assets."""
+    from hellhound.core.engine import HellhoundEngine
+    url = args.get("url") or target.name
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    verify_public = args.get("verify_public", False)
+    opts = {
+        "spider_intel": spider_intel,
+        "verify_public": verify_public
+    }
+    engine = HellhoundEngine()
+    try:
+        res = engine.run_single("cloudscout", url, options=opts, emit=emit)
+        intel = res.get("intel", {}) if isinstance(res, dict) else {}
+        assets = intel.get("assets", [])
+        providers = intel.get("providers", [])
+        return {
+            "url": url,
+            "assets_found": len(assets),
+            "providers": providers,
+            "assets": assets[:25],
+            "risk_score": intel.get("risk_score", 0),
+            "signals": intel.get("signals", [])
+        }
+    except Exception as e:
+        return {"url": url, "error": f"CloudScout error: {e}"}
+
+
+def _execute_transport_auditor(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Audit transport security: SSL certs, HTTPS/HSTS, and cookie security flags."""
+    from hellhound.core.engine import HellhoundEngine
+    url = args.get("url") or target.name
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    opts = {
+        "spider_intel": spider_intel,
+        "check_ssl": args.get("check_ssl", True),
+        "check_https": args.get("check_https", True),
+        "check_cookies": args.get("check_cookies", True),
+        "check_payment": args.get("check_payment", True),
+    }
+    engine = HellhoundEngine()
+    try:
+        res = engine.run_single("transport_auditor", url, options=opts, emit=emit)
+        intel = res.get("intel", {}) if isinstance(res, dict) else {}
+        findings = intel.get("findings", [])
+        risk_score = res.get("risk_score", 0) if isinstance(res, dict) else 0
+
+        for f in findings:
+            if f.get("severity", 0) >= 15:
+                finding = {
+                    "type": f"Transport Security: {f.get('name', 'Issue')}",
+                    "target": url,
+                    "severity": "HIGH" if f.get("severity", 0) >= 30 else "MEDIUM",
+                    "description": f.get("description", ""),
+                    "verified": True
+                }
+                if finding not in target.findings:
+                    target.findings.append(finding)
+
+        return {
+            "url": url,
+            "findings_count": len(findings),
+            "findings": findings,
+            "risk_score": risk_score,
+            "signals": res.get("signals", []) if isinstance(res, dict) else []
+        }
+    except Exception as e:
+        return {"url": url, "error": f"Transport auditor error: {e}"}
+
+
+def _execute_fuzz_hunter(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Run recursive path fuzzing with 404 similarity baseline heuristics."""
+    from hellhound.core.engine import HellhoundEngine
+    url = args.get("url") or target.name
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    opts = {
+        "spider_intel": spider_intel,
+        "max_depth": args.get("max_depth", 2),
+        "threads": args.get("threads", 10),
+        "quick": args.get("quick", False),
+    }
+    engine = HellhoundEngine()
+    try:
+        res = engine.run_single("fuzz_hunter", url, options=opts, emit=emit)
+        intel = res.get("intel", {}) if isinstance(res, dict) else {}
+        endpoints = intel.get("endpoints", [])
+        return {
+            "url": url,
+            "endpoints_found": len(endpoints),
+            "endpoints": endpoints[:30],
+            "signals": res.get("signals", []) if isinstance(res, dict) else []
+        }
+    except Exception as e:
+        return {"url": url, "error": f"FUZZhunter error: {e}"}
 
 
 # Tool Registry Map
@@ -1004,6 +1332,58 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["subdomain"]
         },
         executor=_execute_subzy
+    ),
+    "takeover_scanner": ToolSpec(
+        name="takeover_scanner",
+        description="Active CNAME/fingerprint-based subdomain takeover scanner targeting AWS, GitHub Pages, Heroku, Shopify, etc.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "subdomains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of subdomains to scan. Defaults to all active target subdomains."
+                }
+            }
+        },
+        executor=_execute_takeover_scanner
+    ),
+    "hackerone_search": ToolSpec(
+        name="hackerone_search",
+        description="Search HackerOne Hacktivity for disclosed reports to learn about past vulnerability classes on the target or industry.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "Search term (e.g. ssrf, bypass, subdomain takeover)."},
+                "program": {"type": "string", "description": "HackerOne program handle (e.g. shopify)."},
+                "limit": {"type": "integer", "description": "Max results to return (default: 10).", "default": 10}
+            }
+        },
+        executor=_execute_hackerone_search
+    ),
+    "hackerone_policy": ToolSpec(
+        name="hackerone_policy",
+        description="Retrieve public policy, safe harbor terms, and in-scope asset identifiers for a HackerOne program.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "program": {"type": "string", "description": "HackerOne program handle (e.g. shopify)."}
+            },
+            "required": ["program"]
+        },
+        executor=_execute_hackerone_policy
+    ),
+    "hackerone_stats": ToolSpec(
+        name="hackerone_stats",
+        description="Retrieve public program statistics (bounty ranges, response times, resolved report counts) for a HackerOne program.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "program": {"type": "string", "description": "HackerOne program handle (e.g. shopify)."}
+            },
+            "required": ["program"]
+        },
+        executor=_execute_hackerone_stats
     ),
     "dig": ToolSpec(
         name="dig",
@@ -1188,6 +1568,77 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_ffuf_content
     ),
+    "run_terminal_command": ToolSpec(
+        name="run_terminal_command",
+        description="Run an arbitrary terminal command or Kali tool (e.g., custom nmap, gobuster, sqlmap, custom ffuf pipes) targeting a specific host. You MUST specify the target host parameter for scope validation.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The exact shell command line string to execute."},
+                "target": {"type": "string", "description": "The target domain, IP, or URL being tested (used for safety scope verification)."}
+            },
+            "required": ["command", "target"]
+        },
+        executor=_execute_terminal_command
+    ),
+    "hydra": ToolSpec(
+        name="hydra",
+        description="Hydra multi-engine logic & parameter anomaly analyzer — tests endpoints for logic flaws, race conditions, differential parameter handling, and broken access controls.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Base target URL to analyze."},
+                "concurrency": {"type": "integer", "description": "Number of concurrent workers (default: 10).", "default": 10},
+                "enable_probing": {"type": "boolean", "description": "Enable active differential mutation probes (default: false).", "default": False}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_hydra
+    ),
+    "cloudscout": ToolSpec(
+        name="cloudscout",
+        description="CloudScout cloud asset discovery — identifies AWS S3 buckets, Azure Blob storage, Google Cloud Storage buckets, and Firebase databases exposed in application responses, JS files, or endpoints.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target base URL to scan."},
+                "verify_public": {"type": "boolean", "description": "Actively check if discovered cloud storage buckets/resources are publicly accessible (default: false).", "default": False}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_cloudscout
+    ),
+    "transport_auditor": ToolSpec(
+        name="transport_auditor",
+        description="Transport & cookie security auditor — inspects SSL/TLS certificates, cipher suites, HSTS enforcement, and cookie security flags (Secure, HttpOnly, SameSite).",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target URL or hostname to audit."},
+                "check_ssl": {"type": "boolean", "description": "Audit SSL/TLS certificate validity and protocol versions (default: true).", "default": True},
+                "check_https": {"type": "boolean", "description": "Audit HTTPS enforcement and HSTS header presence (default: true).", "default": True},
+                "check_cookies": {"type": "boolean", "description": "Audit cookie security flags on response headers (default: true).", "default": True},
+                "check_payment": {"type": "boolean", "description": "Audit PCI-DSS transport requirements if payment flows detected (default: true).", "default": True}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_transport_auditor
+    ),
+    "fuzz_hunter": ToolSpec(
+        name="fuzz_hunter",
+        description="FUZZhunter intelligent recursive path discovery — performs deep recursive fuzzing with dynamic 404 similarity calibration and custom wordlists.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target base URL to fuzz."},
+                "max_depth": {"type": "integer", "description": "Maximum recursive discovery depth (default: 2).", "default": 2},
+                "threads": {"type": "integer", "description": "Concurrent HTTP workers (default: 10).", "default": 10},
+                "quick": {"type": "boolean", "description": "Quick mode with top-priority wordlist paths only (default: false).", "default": False}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_fuzz_hunter
+    ),
 }
 
 
@@ -1198,7 +1649,9 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
 class Agent:
     def __init__(self, target: Optional[Target] = None):
         self.target = target or create_or_load_target("default")
-        self.history: List[Dict[str, str]] = []
+        self.history: List[Dict[str, str]] = self.target.state.get("history") or []
+        if not isinstance(self.history, list):
+            self.history = []
         self.guard = AutopilotGuard(
             circuit_threshold=5,
             circuit_cooldown=60.0,
@@ -1209,6 +1662,9 @@ class Agent:
 
     def set_target(self, target_name: str) -> Target:
         self.target = create_or_load_target(target_name)
+        self.history = self.target.state.get("history") or []
+        if not isinstance(self.history, list):
+            self.history = []
         return self.target
 
     def _extract_target_from_args(self, args: Dict[str, Any]) -> str:
@@ -1289,14 +1745,16 @@ class Agent:
             self.guard.record_failure(host)
             return {"error": f"Tool execution failed: {str(e)}"}
 
-    def handle_message(self, user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, max_iterations: int = 15) -> str:
+    def handle_message(self, user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, max_iterations: int = 15, on_token: Optional[Callable[[str], None]] = None) -> str:
         """
         Main autonomous reasoning and conversational loop.
         """
         if session_context:
             t_name = session_context.get("target") or session_context.get("target_name")
-            if t_name and (not self.target or self.target.name != t_name):
+            if t_name and t_name != self.target.name:
                 self.set_target(t_name)
+            if session_context.get("scope_rules"):
+                self.target.scope_rules = session_context["scope_rules"]
 
         # Check if the user is asking to recon a target without any scope loaded or defined
         lower_text = user_text.lower()
@@ -1306,9 +1764,10 @@ class Agent:
         # Check if there is a target defined in the prompt or active context
         domain_match = re.search(r'([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.[a-zA-Z]{2,})', user_text)
         if domain_match:
-            detected_domain = domain_match.group(1).lower().lstrip("*.")
-            if self.target.name == "default" or (self.target.name != detected_domain and "." in detected_domain):
-                self.set_target(detected_domain)
+            detected_domain = sanitize_target_name(domain_match.group(1))
+            if self.target.name == "default" or (self.target.name != detected_domain and "." in detected_domain and self.target.name != detected_domain):
+                if self.target.name != detected_domain:
+                    self.set_target(detected_domain)
         elif self.target.name == "default" and self.target.scope_rules.in_scope:
             primary_domain = self.target.scope_rules.in_scope[0].lstrip("*.")
             if primary_domain and "." in primary_domain:
@@ -1362,6 +1821,8 @@ You are HELLHOUND Orchestrator. Your sole job is to evaluate if a tool should be
 
 TARGET: {self.target.name}
 SCOPE: {scope_summary}
+
+{skills_block}
 
 AVAILABLE TOOLS:
 {tools_summary}
@@ -1437,7 +1898,7 @@ INSTRUCTIONS:
 
             if tool_call and tool_call.get("tool") in TOOL_REGISTRY:
                 t_name = tool_call["tool"]
-                t_args = tool_call.get("args", {})
+                t_args = tool_call.get("args") or tool_call.get("parameters") or tool_call.get("arguments") or {}
                 
                 if emit and hasattr(emit, "set_label"):
                     emit.set_label(f"EXECUTING {t_name.upper()}")
@@ -1494,11 +1955,13 @@ INSTRUCTIONS:
             system_prompt=synthesizer_system_prompt,
             role="synthesizer",
             thinking=True,
-            history=self.history
+            history=self.history,
+            on_token=on_token
         )
 
         final_response = final_answer or ai_resp or "Analysis completed. No further actions required."
         self.history.append({"role": "assistant", "content": final_response})
+        self.target.state["history"] = self.history
         save_target(self.target)
         return final_response
 
@@ -1508,14 +1971,15 @@ _global_agent: Optional[Agent] = None
 
 def get_agent(target_name: Optional[str] = None) -> Agent:
     global _global_agent
+    name = target_name or (_global_agent.target.name if _global_agent else "default")
     if _global_agent is None:
-        _global_agent = Agent(create_or_load_target(target_name or "default"))
-    elif target_name and _global_agent.target.name != target_name:
-        _global_agent.set_target(target_name)
+        _global_agent = Agent(create_or_load_target(name))
+    else:
+        _global_agent.set_target(name)
     return _global_agent
 
-def handle_message(user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None) -> str:
+def handle_message(user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, on_token: Optional[Callable[[str], None]] = None) -> str:
     """Entrypoint for conversational chat queries."""
     target_name = (session_context or {}).get("target")
     agent = get_agent(target_name)
-    return agent.handle_message(user_text, session_context=session_context, emit=emit)
+    return agent.handle_message(user_text, session_context=session_context, emit=emit, on_token=on_token)

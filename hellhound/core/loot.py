@@ -322,7 +322,7 @@ def render_loot(target, all_results):
     _kv("Issues Found", f"{total_vulns}")
     _kv("Modules Run", f"{len(all_results)}")
 
-    prio = ["agent", "agent_findings", "spider", "stalk", "fuzzhunter", "techprofiler", "wafbuster", "surfaceauditor", "exmap"]
+    prio = ["agent", "agent_findings", "spider", "fuzz_hunter", "hydra", "cloudscout", "transport_auditor", "wafbuster", "surfaceauditor", "exmap"]
     sorted_mods = sorted(all_results.keys(), key=lambda x: prio.index(x) if x in prio else 99)
 
     for mod in sorted_mods:

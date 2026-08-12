@@ -17,12 +17,21 @@ INTERNAL_WORDLIST = [
 ]
 
 def get_wordlist_path():
-    """Resolves path to wordlists/web/directories.txt"""
+    """Resolves path to web wordlist, prioritizing standard Kali/SecLists paths with fast fallback."""
     try:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
-        wordlist_path = os.path.join(project_root, "wordlists", "web", "directories.txt")
-        return wordlist_path if os.path.exists(wordlist_path) else None
+        candidates = [
+            "/usr/share/wordlists/seclists/Discovery/Web-Content/common.txt",
+            "/usr/share/seclists/Discovery/Web-Content/common.txt",
+            "/usr/share/wordlists/dirb/common.txt",
+            "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt",
+            os.path.join(project_root, "wordlists", "web", "directories-fast.txt")
+        ]
+        for c in candidates:
+            if os.path.exists(c) and os.path.getsize(c) > 0:
+                return c
+        return None
     except Exception:
         return None
 

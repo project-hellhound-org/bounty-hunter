@@ -76,13 +76,13 @@ def _normalize_host(target: str) -> Tuple[str, str]:
 
     try:
         parsed = urlparse(target)
-        hostname = (parsed.hostname or parsed.netloc.split(":")[0] or "").lower()
+        hostname = (parsed.hostname or parsed.netloc.split(":")[0] or "").lower().rstrip(".")
         path = parsed.path or "/"
         return hostname, path
     except Exception:
         # Fallback regex extraction
         clean = re.sub(r"^https?://", "", target, flags=re.IGNORECASE)
-        host = clean.split("/")[0].split(":")[0].lower()
+        host = clean.split("/")[0].split(":")[0].lower().rstrip(".")
         path = "/" + "/".join(clean.split("/")[1:]) if "/" in clean else "/"
         return host, path
 
