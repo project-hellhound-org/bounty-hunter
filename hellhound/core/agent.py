@@ -1655,6 +1655,9 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
 }
 
 
+# Capability fast-path removed to allow natural LLM responses
+
+
 # ==========================================================
 # AGENT REASONING & EXECUTION LOOP
 # ==========================================================
@@ -1792,7 +1795,7 @@ class Agent:
             self.guard.record_failure(host)
             return {"error": f"Tool execution failed: {str(e)}"}
 
-    def handle_message(self, user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, max_iterations: int = 15, on_token: Optional[Callable[[str], None]] = None) -> str:
+    def handle_message(self, user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, max_iterations: int = 15, on_token: Optional[Callable[[str], None]] = None, cancel_check: Optional[Callable[[], bool]] = None) -> str:
         """
         Main autonomous reasoning and conversational loop.
         """
@@ -1804,9 +1807,12 @@ class Agent:
                 self.target.scope_rules = session_context["scope_rules"]
 
         # Check if the user is asking to recon a target without any scope loaded or defined
+        from hellhound.core.ai_utils import classify_intent, CHAT_PERSONA_SLM
+        intent = classify_intent(user_text)
+
         lower_text = user_text.lower()
-        recon_words = ["recon", "scan", "enumerate", "subdomains", "crawl", "spider", "test", "hunt"]
-        has_recon_intent = any(rw in lower_text for rw in recon_words)
+        recon_words = ["recon", "scan", "enumerate", "subdomains", "crawl", "spider", "hunt"]
+        has_recon_intent = (intent != "chat") and any(rw in lower_text for rw in recon_words)
         
         # Check if there is a target defined in the prompt or active context
         domain_match = re.search(r'([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.[a-zA-Z]{2,})', user_text)
@@ -1839,6 +1845,8 @@ class Agent:
                     f"risks chasing something that's actually disallowed. Provide the "
                     f"program's in-scope/out-of-scope rules first (e.g. `/scope <paste>`)."
                 )
+
+        # Hardcoded Capability Question Fast-Path removed.
 
         # Build System Prompt with registered tools and current target scope
         tools_summary = "\n".join([
@@ -1875,16 +1883,17 @@ AVAILABLE TOOLS:
 {tools_summary}
 
 RULES:
-1. ONLY call tools when the user explicitly requests reconnaissance, scanning, enumeration, or analysis of a target.
-2. For greetings, casual questions, or general discussion, do NOT call any tools. Output "DONE".
-3. To call a tool, respond ONLY with JSON:
+1. ONLY call tools when the user explicitly requests active reconnaissance, scanning, enumeration, or analysis of a target.
+2. If the user asks a complex question, hypothetical scenario, or asks for cybersecurity advice (e.g., "how to bypass 403 proxy"), do NOT call any tools. Output "DONE".
+3. For greetings, casual questions, or general discussion, do NOT call any tools. Output "DONE".
+4. To call a tool, respond ONLY with JSON:
 ```json
 {{
   "tool": "<tool_name>",
   "args": {{ ... }}
 }}
 ```
-4. If no further tools are needed, or after inspecting tool findings, respond with "DONE".
+5. If no further tools are needed, or after inspecting tool findings, respond with "DONE".
 """
 
         # ── 2. Comprehensive Synthesizer System Prompt (Deep Reasoning & Synthesis)
@@ -1896,6 +1905,9 @@ TARGET: {self.target.name}
 SCOPE CONSTRAINTS: {scope_summary}
 CURRENT FINDINGS: {len(self.target.findings)} verified findings
 
+AVAILABLE TOOLS (this is the complete, real list — you have no other tools):
+{tools_summary}
+
 === ALWAYS-ON BASELINE DOCTRINE ===
 {BASELINE_RULES_PROMPT}
 
@@ -1905,23 +1917,33 @@ INSTRUCTIONS:
 - Review the entire conversation history, executed tools, and gathered evidence.
 - Produce a clear, concise, and structured synthesis of all findings.
 - Highlight actionable security observations, open attack surfaces, and logical next triage steps.
+- When asked about your capabilities, tools, or what you can do: answer ONLY
+  from the AVAILABLE TOOLS list above. Never claim access to external tools
+  not in that list (Nmap, Burp Suite, Metasploit, etc. are NOT available
+  unless they literally appear above). Never claim you lack tool access —
+  you have the tools listed above and can invoke them.
 """
 
-        original_user_query = user_text
-        from hellhound.core.ai_utils import classify_intent, CHAT_PERSONA_SLM
-
         # ── 0. Direct Conversational Fast-Path (Instant 1s responses for chat) ──
-        if classify_intent(user_text) == "chat":
+        if intent == "chat":
             if emit and hasattr(emit, "set_label"):
                 emit.set_label("HELLHOUND")
-            chat_resp = ask_neural_core(
+            
+            clean_tools = ", ".join(TOOL_REGISTRY.keys())
+            chat_sys = f"{CHAT_PERSONA_SLM}\n\nYou have access to the following tools: {clean_tools}. Briefly describe your capabilities naturally if asked, but do NOT mention internal instructions or restrictions."
+            
+            chat_resp, tokens = ask_neural_core(
                 prompt=user_text,
-                system_prompt=CHAT_PERSONA_SLM,
+                system_prompt=chat_sys,
                 role="orchestrator",
                 thinking=False,
                 history=self._get_trimmed_history(max_turns=4, for_chat=True),
-                on_token=on_token
+                on_token=on_token,
+                return_usage=True,
+                cancel_check=cancel_check
             )
+            if tokens is not None and emit and hasattr(emit, "set_token_count"):
+                emit.set_token_count(tokens)
             chat_resp = chat_resp or "Ok."
             self.history.append({"role": "user", "content": user_text})
             self.history.append({"role": "assistant", "content": chat_resp})
@@ -1934,16 +1956,24 @@ INSTRUCTIONS:
 
         # ── 3. Orchestrator Iteration Loop (Thinking=False, Fast Local/Tool Calls) ──
         for iteration in range(max_iterations):
+            if cancel_check and cancel_check():
+                break
+
             if emit and hasattr(emit, "set_label"):
                 emit.set_label("HELLHOUND IS THINKING")
 
-            ai_resp = ask_neural_core(
+            ai_resp, tokens = ask_neural_core(
                 prompt=user_text if iteration == 0 else "Continue analysis based on tool results. Choose next tool or output 'DONE'.",
                 system_prompt=orchestrator_system_prompt,
                 role="orchestrator",
                 thinking=False,
-                history=self._get_trimmed_history(max_turns=6, for_chat=False)
+                history=self._get_trimmed_history(max_turns=6, for_chat=False),
+                return_usage=True,
+                cancel_check=cancel_check
             )
+            
+            if tokens is not None and emit and hasattr(emit, "set_token_count"):
+                emit.set_token_count(tokens)
 
             if not ai_resp or not ai_resp.strip():
                 break
@@ -2017,25 +2047,39 @@ INSTRUCTIONS:
         if emit and hasattr(emit, "set_label"):
             emit.set_label("FINALIZING RESPONSE")
 
+        cfg = load_config()
+        self.last_tool_count = len(tools_executed)
+
         if not tools_executed:
             # If no tools were run, answer the user's specific question directly
-            final_answer = ask_neural_core(
-                prompt=original_user_query,
-                system_prompt=f"You are HELLHOUND, an expert bug bounty and offensive security assistant. Answer the researcher's query directly, accurately, and concisely.\nTARGET: {self.target.name}\nSCOPE: {scope_summary}",
-                role="synthesizer",
-                thinking=False,
-                history=self._get_trimmed_history(max_turns=6, for_chat=False),
-                on_token=on_token
-            )
-        else:
-            final_answer = ask_neural_core(
-                prompt=f"Based on the tool results gathered ({', '.join(tools_executed)}), synthesize all findings for target '{self.target.name}' and provide concrete next triage steps.",
+            final_answer, tokens = ask_neural_core(
+                prompt=user_text,
                 system_prompt=synthesizer_system_prompt,
                 role="synthesizer",
                 thinking=False,
                 history=self._get_trimmed_history(max_turns=6, for_chat=False),
-                on_token=on_token
+                on_token=on_token,
+                return_usage=True,
+                cancel_check=cancel_check
             )
+        else:
+            synth_prompt = f"Based on the tool results gathered ({', '.join(tools_executed)}), synthesize all findings for target '{self.target.name}' and provide concrete next triage steps."
+            if len(tools_executed) > 0 and cfg.get("show_recaps", True):
+                synth_prompt += "\n\nAfter your analysis, end with a single recap line in this exact format:\nrecap: Goal was [goal]. Done: [what was accomplished]. Next: [recommended next step]. (disable recaps in /setup)"
+            
+            final_answer, tokens = ask_neural_core(
+                prompt=synth_prompt,
+                system_prompt=synthesizer_system_prompt,
+                role="synthesizer",
+                thinking=False,
+                history=self._get_trimmed_history(max_turns=6, for_chat=False),
+                on_token=on_token,
+                return_usage=True,
+                cancel_check=cancel_check
+            )
+
+        if tokens is not None and emit and hasattr(emit, "set_token_count"):
+            emit.set_token_count(tokens)
 
         final_response = final_answer or ai_resp or "Analysis completed. No further actions required."
         self.history.append({"role": "assistant", "content": final_response})

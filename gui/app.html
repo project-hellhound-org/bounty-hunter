@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HELLHOUND // BOUNTY HUNTER</title>
+    <title>HELLHOUND | BOUNTY HUNTER</title>
     <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -87,6 +87,9 @@
                 </div>
 
                 <div class="main-header-actions">
+                    <button id="bgToggleBtn" class="btn-header" title="Toggle Clean Dark Interface">
+                        <span>CLEAN UI</span>
+                    </button>
                     <button id="findingsToggleBtn" class="btn-header btn-findings-toggle" title="View discovered findings for this target">
                         <span>FINDINGS</span>
                         <span id="headerFindingsCount" class="findings-count-badge">0</span>
@@ -109,24 +112,7 @@
                         Select an existing target from the archive sidebar or initialize a new engagement.
                         Execute scope-aware slash commands or chat directly with the AI agent.
                     </p>
-                    <div class="quick-prompts-grid">
-                        <div class="quick-prompt-card" data-cmd="/recon">
-                            <span class="quick-prompt-cmd">/recon [target]</span>
-                            <span class="quick-prompt-desc">Full reconnaissance pipeline & scope triage</span>
-                        </div>
-                        <div class="quick-prompt-card" data-cmd="/hunt">
-                            <span class="quick-prompt-cmd">/hunt</span>
-                            <span class="quick-prompt-desc">Autonomous multi-stage vulnerability triage</span>
-                        </div>
-                        <div class="quick-prompt-card" data-cmd="/scan spider">
-                            <span class="quick-prompt-cmd">/scan spider</span>
-                            <span class="quick-prompt-desc">Deep endpoint & secret spidering</span>
-                        </div>
-                        <div class="quick-prompt-card" data-cmd="/skills">
-                            <span class="quick-prompt-cmd">/skills</span>
-                            <span class="quick-prompt-desc">View loaded methodology skills</span>
-                        </div>
-                    </div>
+
                 </div>
                 <!-- Dynamic Chat Bubbles will be injected here -->
             </div>
@@ -141,11 +127,8 @@
                 <div class="input-wrapper">
                     <textarea id="chatInput" rows="1" placeholder="Type a message or /command (e.g. /recon, /hunt, /scope)..."></textarea>
                     <div class="input-actions">
-                        <button id="stopBtn" class="btn-stop" title="Stop active task">
-                            <span>STOP</span>
-                        </button>
                         <button id="sendBtn" class="btn-send" title="Send message (Enter)">
-                            <span>SEND</span>
+                            <span>➤</span>
                         </button>
                     </div>
                 </div>

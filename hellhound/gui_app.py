@@ -12,10 +12,12 @@ warnings.filterwarnings("ignore", message=".*RequestsDependencyWarning.*")
 
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
 import threading
+import time
 from typing import Dict, Any, List, Optional
 
 from hellhound.core.agent import Agent
@@ -31,6 +33,8 @@ from hellhound.core.tasks import (
 from hellhound.core.ai_utils import load_config, ThinkingIndicator
 from hellhound.core.toolcheck import check_all_tools
 
+logger = logging.getLogger("hellhound.gui")
+
 
 class GuiEmit:
     """Emits agent progress and tool execution events to PyWebView."""
@@ -38,6 +42,7 @@ class GuiEmit:
         self.window = window
         self.target_name = target_name
         self.events: List[Dict[str, Any]] = []
+        self.tokens = 0
         self.indicator = ThinkingIndicator(status_callback=self._send_js)
         self.indicator.start()
 
@@ -52,8 +57,8 @@ class GuiEmit:
             try:
                 js_code = f"if (window.onAgentEmit) {{ window.onAgentEmit({json.dumps({'target': self.target_name, 'type': event_type, 'payload': payload})}); }}"
                 self.window.evaluate_js(js_code)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[GuiEmit] evaluate_js failed: {e}")
 
     def info(self, msg: str):
         self.indicator.info(msg)
@@ -75,6 +80,15 @@ class GuiEmit:
 
     def tool_result(self, tool_name: str, result: Any):
         self.indicator.tool_result(tool_name, result)
+
+    def progress_start(self, desc: str):
+        self.set_label(f"RUNNING: {desc}")
+
+    def progress_stop(self):
+        self.set_label("THINKING...")
+
+    def set_token_count(self, count: int):
+        self.tokens += count
 
 
 class HellhoundAPI:
@@ -225,6 +239,7 @@ class HellhoundAPI:
             agent.target = target
 
         gui_emit = GuiEmit(window=self._window, target_name=clean_name)
+        start_time = time.time()
         try:
             gui_emit.set_label("INITIALIZING RECON ENGINE")
 
@@ -247,7 +262,20 @@ class HellhoundAPI:
                     "scope_rules": target.scope_rules
                 }
 
-                response_text = agent.handle_message(text, session_context=session_ctx, emit=gui_emit)
+                if text.strip().startswith("/"):
+                    from hellhound.core.commands import dispatch
+                    res = dispatch(text, session_ctx, gui_emit)
+                    if isinstance(res, dict):
+                        response_text = res.get("response") or res.get("message") or json.dumps(res, indent=2)
+                    else:
+                        response_text = str(res)
+                else:
+                    response_text = agent.handle_message(
+                        text,
+                        session_context=session_ctx,
+                        emit=gui_emit,
+                        cancel_check=lambda: self._cancel_flags.get(clean_name, False)
+                    )
 
                 # Check if cancelled mid-execution
                 if self._cancel_flags.get(clean_name, False):
@@ -272,6 +300,10 @@ class HellhoundAPI:
                     vuln_count = len(target.findings) or len(target.state.get("vulnerabilities", []))
                     finding_chips.append({"category": "vulnerabilities", "label": "Vulnerabilities", "count": vuln_count})
 
+                end_time = time.time()
+                time_sec = int(end_time - start_time)
+                metrics = {"tokens": gui_emit.tokens, "time_sec": time_sec}
+
                 # Record assistant response
                 target.state["chat_history"].append({
                     "role": "assistant",
@@ -279,6 +311,7 @@ class HellhoundAPI:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "chips": finding_chips,
                     "emits": gui_emit.events,
+                    "metrics": metrics,
                 })
                 save_target(target)
 
@@ -288,6 +321,7 @@ class HellhoundAPI:
                     "target": clean_name,
                     "chips": finding_chips,
                     "emits": gui_emit.events,
+                    "metrics": metrics,
                 }
 
             except Exception as e:
@@ -457,7 +491,7 @@ def launch_gui(target: Optional[str] = None, debug: bool = False):
     api = HellhoundAPI()
 
     window = webview.create_window(
-        title="HELLHOUND // BOUNTY HUNTER",
+        title="HELLHOUND | BOUNTY HUNTER",
         url=str(html_path),
         js_api=api,
         width=1360,

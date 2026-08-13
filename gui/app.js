@@ -392,43 +392,11 @@ function showWelcomeHero() {
                 Engaged target: <strong style="color: #ff5577;">${escapeHtml(currentTarget || 'None')}</strong>.
                 Execute scope-aware slash commands or chat directly with the AI agent.
             </p>
-            <div class="quick-prompts-grid">
-                <div class="quick-prompt-card" data-cmd="/recon ${escapeHtml(currentTarget || '')}">
-                    <span class="quick-prompt-cmd">/recon</span>
-                    <span class="quick-prompt-desc">Full reconnaissance pipeline & scope triage</span>
-                </div>
-                <div class="quick-prompt-card" data-cmd="/hunt ${escapeHtml(currentTarget || '')}">
-                    <span class="quick-prompt-cmd">/hunt</span>
-                    <span class="quick-prompt-desc">Autonomous multi-stage vulnerability triage</span>
-                </div>
-                <div class="quick-prompt-card" data-cmd="/scan spider ${escapeHtml(currentTarget || '')}">
-                    <span class="quick-prompt-cmd">/scan spider</span>
-                    <span class="quick-prompt-desc">Deep endpoint & secret spidering</span>
-                </div>
-                <div class="quick-prompt-card" data-cmd="/skills">
-                    <span class="quick-prompt-cmd">/skills</span>
-                    <span class="quick-prompt-desc">View loaded methodology skills</span>
-                </div>
-            </div>
         </div>
     `;
-
-    // Bind prompt cards
-    threadEl.querySelectorAll('.quick-prompt-card').forEach(card => {
-        card.onclick = () => {
-            const cmd = card.getAttribute('data-cmd');
-            if (cmd) {
-                const input = document.getElementById('chatInput');
-                if (input) {
-                    input.value = cmd;
-                    handleSendMessage();
-                }
-            }
-        };
-    });
 }
 
-function appendMessageBubble(role, content, chips = [], emits = [], scroll = true) {
+function appendMessageBubble(role, content, chips = [], emits = [], scroll = true, metrics = null) {
     const threadEl = document.getElementById('chatThread');
     if (!threadEl) return;
 
@@ -440,15 +408,21 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
     msgEl.className = `chat-msg ${role}`;
 
     const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const formattedHtml = formatMarkdown(content);
 
     if (role === 'user') {
         msgEl.innerHTML = `
-            <div class="user-bubble">${escapeHtml(content)}</div>
-            <div class="msg-meta-user">${timeStr}</div>
+            <div class="user-bubble">
+                <div class="user-header" style="text-align: right; margin-bottom: 4px;">
+                    <button class="btn-msg-copy" title="Copy text" style="background:none; border:none; color:#888; cursor:pointer; font-size:12px;">Copy</button>
+                </div>
+                <div class="user-body">${formattedHtml}</div>
+            </div>
         `;
+        msgEl.querySelector('.btn-msg-copy')?.addEventListener('click', () => {
+            copyToClipboard(content);
+        });
     } else {
-        const formattedHtml = formatMarkdown(content);
-        
         let chipsHtml = '';
         if (chips && chips.length > 0) {
             chipsHtml = `<div class="finding-chips-container">` + chips.map(c => `
@@ -472,7 +446,8 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
                     <div class="assistant-tag">
                         <span>HELLHOUND AGENT</span>
                     </div>
-                    <div class="assistant-actions">
+                    <div class="assistant-actions" style="display: flex; align-items: center; gap: 10px;">
+                        ${metrics ? `<span style="font-size: 10px; color: #888; font-family: monospace;">${metrics.tokens} tokens | ${metrics.time_sec}s</span>` : ''}
                         <button class="btn-msg-copy" title="Copy response">Copy</button>
                     </div>
                 </div>
@@ -482,8 +457,13 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
             </div>
         `;
 
+        let fullOutputToCopy = content;
+        if (emits && emits.length > 0) {
+            fullOutputToCopy = emits.map(e => `[${e.type.toUpperCase()}] ${typeof e.payload === 'object' ? JSON.stringify(e.payload) : String(e.payload)}`).join('\n') + '\n\n' + content;
+        }
+
         msgEl.querySelector('.btn-msg-copy')?.addEventListener('click', () => {
-            copyToClipboard(content);
+            copyToClipboard(fullOutputToCopy);
         });
 
         // Add interactive event listeners on finding chips
@@ -581,7 +561,7 @@ async function handleSendMessage() {
         document.querySelectorAll('.in-flight-emit-msg').forEach(el => el.remove());
 
         if (res) {
-            appendMessageBubble('assistant', res.response, res.chips || [], res.emits || []);
+            appendMessageBubble('assistant', res.response, res.chips || [], res.emits || [], true, res.metrics);
             // Refresh isolated findings drawer data and sidebar counts
             if (findingsComponent) {
                 await findingsComponent.refreshData();
@@ -608,12 +588,22 @@ async function handleStopRequest() {
 function setExecutionState(executing) {
     isExecuting = executing;
     const sendBtn = document.getElementById('sendBtn');
-    const stopBtn = document.getElementById('stopBtn');
     const chatInput = document.getElementById('chatInput');
 
-    if (sendBtn) sendBtn.disabled = executing;
-    if (stopBtn) stopBtn.style.display = executing ? 'flex' : 'none';
-    if (chatInput) chatInput.placeholder = executing ? 'Executing toolchain and reasoning...' : 'Type a message or /command...';
+    if (sendBtn) {
+        if (executing) {
+            sendBtn.innerHTML = '<span>■</span>';
+            sendBtn.title = 'Stop active task';
+            sendBtn.classList.add('btn-stop-mode');
+        } else {
+            sendBtn.innerHTML = '<span>➤</span>';
+            sendBtn.title = 'Send message (Enter)';
+            sendBtn.classList.remove('btn-stop-mode');
+        }
+    }
+    if (chatInput) {
+        chatInput.placeholder = executing ? 'Executing toolchain and reasoning...' : 'Type a message or /command...';
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -752,11 +742,19 @@ async function refreshSystemInfo() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function setupDOMEventHandlers() {
-    // Send Button
-    document.getElementById('sendBtn')?.addEventListener('click', handleSendMessage);
+    // Send / Stop Button Toggle
+    document.getElementById('sendBtn')?.addEventListener('click', () => {
+        if (isExecuting) {
+            handleStopRequest();
+        } else {
+            handleSendMessage();
+        }
+    });
 
-    // Stop Button
-    document.getElementById('stopBtn')?.addEventListener('click', handleStopRequest);
+    // Clean UI Toggle
+    document.getElementById('bgToggleBtn')?.addEventListener('click', () => {
+        document.body.classList.toggle('clean-interface');
+    });
 
     // Slash Palette
     setupSlashPalette();
@@ -1131,11 +1129,19 @@ function scrollToBottom() {
 }
 
 function copyToClipboard(text) {
-    navigator.clipboard.writeText(text).then(() => {
-        console.log("Copied to clipboard.");
-    }).catch(err => {
-        console.error("Clipboard copy failed:", err);
-    });
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    textArea.style.position = "fixed";
+    textArea.style.opacity = 0;
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+        document.execCommand("copy");
+        console.log("Copied via execCommand");
+    } catch (err) {
+        console.error("execCommand copy failed:", err);
+    }
+    document.body.removeChild(textArea);
 }
 
 function escapeHtml(str) {

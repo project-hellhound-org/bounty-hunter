@@ -13,6 +13,7 @@ import shutil
 import textwrap
 import html
 import re
+import time
 from typing import Optional, Dict, Any, List
 
 from colorama import Fore, Back, Style, init
@@ -25,7 +26,8 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.widgets import Frame, TextArea
 from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import FloatContainer, Float
+from prompt_toolkit.layout.containers import FloatContainer, Float, HSplit, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension as D
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.application import Application
@@ -151,6 +153,8 @@ class HellhoundCompleter(Completer):
                 ("tools auto-install on", "Enable automated binary dependency installation"),
                 ("tools auto-install off", "Disable automated binary dependency installation"),
                 ("tools install-all", "Install all missing tool dependencies via pdtm"),
+                ("recaps on", "Enable recap footers after multi-tool analysis"),
+                ("recaps off", "Disable recap footers after multi-tool analysis"),
             ]
             for val, meta in sub_suggestions:
                 if val.lower().startswith(arg_text.lower()):
@@ -289,8 +293,7 @@ def render_banner_card(target_name: Optional[str] = None):
 
 
 def print_turn_separator():
-    width = shutil.get_terminal_size(fallback=(80, 24)).columns
-    print(f"\n{C_GRAY_BOX}{'─' * width}{RST}\n")
+    print("\n")
 
 
 def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -> Optional[str]:
@@ -340,8 +343,26 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
         style="class:frame",
     )
 
+    def _get_toolbar_text():
+        cfg = load_config()
+        auto = "auto-install: on" if cfg.get("auto_install_missing_tools") else "auto-install: off"
+        target_name = agent.target.name if agent else "default"
+        prov = (cfg.get("orchestrator_provider") or cfg.get("ai_provider", "ollama")).upper()
+        model = cfg.get("orchestrator_model") or cfg.get("ai_model", "auto")
+        if len(model) > 20:
+            model = model[:17] + "..."
+        return HTML(f"<ansigray>{auto} · {target_name} · {prov}/{model} · esc to interrupt · /help for commands</ansigray>")
+
+    toolbar = Window(
+        content=FormattedTextControl(_get_toolbar_text),
+        height=D.exact(1),
+        style="class:toolbar"
+    )
+
+    main_split = HSplit([frame, toolbar])
+
     root = FloatContainer(
-        content=frame,
+        content=main_split,
         floats=[
             Float(
                 xcursor=True,
@@ -356,17 +377,11 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
         key_bindings=all_kb,
         style=PT_CUSTOM_STYLE,
         full_screen=False,
+        erase_when_done=True,
     )
 
     try:
         raw_result = app.run()
-
-        # Collapse the bordered frame cleanly to a flat Claude Code-style line
-        try:
-            sys.stdout.write("\033[3A\033[J")
-            sys.stdout.flush()
-        except Exception:
-            pass
 
         if raw_result is None:
             return None
@@ -377,11 +392,6 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
             print(f" {C_CYAN}❯{RST} {text}\n")
         return text
     except (KeyboardInterrupt, EOFError):
-        try:
-            sys.stdout.write("\033[3A\033[J")
-            sys.stdout.flush()
-        except Exception:
-            pass
         return None
 
 
@@ -479,6 +489,10 @@ class InteractiveAgentEmit(PlainEmit):
     def tool_result(self, tool_name: str, result: any):
         if self.indicator:
             self.indicator.tool_result(tool_name, result)
+
+    def set_token_count(self, count: int):
+        if self.indicator:
+            self.indicator.set_token_count(count)
 
     def stop_indicator(self):
         if self.indicator:
@@ -618,10 +632,15 @@ def start_chat_session(initial_target: Optional[str] = None):
                 if cmd_base in ai_commands:
                     # Start spinner IMMEDIATELY so user sees activity from the first ms
                     emit = InteractiveAgentEmit(f"EXECUTING {cmd_base.upper()[1:]}")
+                    t0 = time.monotonic()
                     try:
                         res = dispatch(cmd_line, session_ctx, emit)
                     finally:
                         emit.stop_indicator()
+                        t1 = time.monotonic()
+                        elapsed = t1 - t0
+                        elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
+                        print_formatted_text(HTML(f"<ansigray>✳ Cooked for {elapsed_str}</ansigray>"))
                 else:
                     # Simple non-AI commands (/help, /setup, /scope, etc.) don't need a spinner
                     from hellhound.core.emit import PlainEmit as _PlainEmit
@@ -649,6 +668,7 @@ def start_chat_session(initial_target: Optional[str] = None):
                 "scope_rules": agent.target.scope_rules
             }
             ai_response = None
+            t0 = time.monotonic()
             try:
                 ai_response = agent.handle_message(
                     user_input,
@@ -658,7 +678,27 @@ def start_chat_session(initial_target: Optional[str] = None):
                 )
             finally:
                 indicator.stop()
+                
+                # Check for recap before finishing stream to strip it out
+                recap_line = None
+                if ai_response:
+                    lines = ai_response.splitlines()
+                    for i, line in enumerate(lines):
+                        if line.strip().lower().startswith("recap:"):
+                            recap_line = line.strip()
+                            lines.pop(i)
+                            ai_response = "\n".join(lines)
+                            break
+                            
                 streamer.finish(ai_response)
+                
+                if recap_line:
+                    print_formatted_text(HTML(f"<i><ansigray>{html.escape(recap_line)}</ansigray></i>"))
+                
+                t1 = time.monotonic()
+                elapsed = t1 - t0
+                elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
+                print_formatted_text(HTML(f"<ansigray>✳ Cooked for {elapsed_str}</ansigray>"))
 
             print_turn_separator()
 

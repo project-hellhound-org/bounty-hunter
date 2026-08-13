@@ -740,6 +740,25 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
                     emit.warn("Usage: /setup tools auto-install [on|off]")
                 return {"status": "error", "error": "invalid_option", "message": "Usage: /setup tools auto-install [on|off]"}
 
+        if first in ("recaps", "recap"):
+            action = clean_args[-1].lower()
+            if action in ("on", "true", "1", "enable", "enabled"):
+                cfg["show_recaps"] = True
+                save_config(cfg)
+                if not is_json:
+                    emit.success("Recap footers ENABLED.")
+                return {"status": "success", "show_recaps": True}
+            elif action in ("off", "false", "0", "disable", "disabled"):
+                cfg["show_recaps"] = False
+                save_config(cfg)
+                if not is_json:
+                    emit.success("Recap footers DISABLED.")
+                return {"status": "success", "show_recaps": False}
+            else:
+                if not is_json:
+                    emit.warn("Usage: /setup recaps [on|off]")
+                return {"status": "error", "error": "invalid_option", "message": "Usage: /setup recaps [on|off]"}
+
         if first in ("install-all", "install") or (first == "tools" and len(clean_args) > 1 and clean_args[1].lower() in ("install-all", "install")):
             tool_status = check_all_tools()
             missing_pd = tool_status.get("missing_pd", [])
@@ -821,6 +840,9 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
 
         auto_state = "[bold green]ON[/bold green]" if auto_install_enabled else "[dim]OFF[/dim]"
         emit(f"\n  Auto-Install Missing Tools: {auto_state} (Toggle: `/setup tools auto-install on|off`)")
+        
+        recap_state = "[bold green]ON[/bold green]" if cfg.get("show_recaps", True) else "[dim]OFF[/dim]"
+        emit(f"  Multi-tool Recap Footers:   {recap_state} (Toggle: `/setup recaps on|off`)")
 
         if (tool_status["missing_pd"] or tool_status["missing_other"]) and not is_json and sys.stdin.isatty():
             ans = _interactive_prompt("Some binary tools are missing. Would you like to install them now? (y/n)")

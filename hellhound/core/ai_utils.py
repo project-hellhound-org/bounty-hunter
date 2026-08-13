@@ -568,6 +568,14 @@ def classify_intent(user_input: str) -> str:
     """Classifies user input before sending to model."""
     text = user_input.lower().strip()
 
+    advice_triggers = [
+        "how to", "how do i", "ways to", "what are the ways", "what is",
+        "can you explain", "bypass", "help me understand", "what should i do",
+        "how can i", "tips"
+    ]
+    if any(a in text for a in advice_triggers):
+        return "chat"
+
     # If the user query mentions security, targets, or recon actions, always route to hunt/tool reasoning
     security_keywords = [
         "target", "recon", "scan", "subdomain", "port", "vuln", "vulnerability",
@@ -709,7 +717,7 @@ def list_available_models() -> List[Dict[str, Any]]:
 
     return models_list
 
-def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """Unified dispatcher for all supported AI providers."""
     provider = (provider or "ollama").lower().strip()
     
@@ -720,7 +728,7 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
     active_model = model or get_default_model(provider)
 
     if provider in ("nvidia", "nim"):
-        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage)
+        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check)
     elif provider == "openai":
         res = call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage)
     elif provider == "anthropic":
@@ -728,7 +736,7 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
     elif provider == "gemini":
         res = ask_gemini(api_key, active_model, system_prompt, prompt, max_tokens=max_tokens, timeout=timeout, history=history, thinking=thinking, on_token=on_token, return_usage=return_usage)
     else: # Ollama / Local
-        res = call_ollama(prompt, model=active_model, system_prompt=system_prompt, timeout=timeout, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage)
+        res = call_ollama(prompt, model=active_model, system_prompt=system_prompt, timeout=timeout, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check)
 
     if return_usage:
         text, tokens = res
@@ -737,7 +745,7 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
     
     return strip_thinking_tags(res) if res else res
 
-def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, role: str = "orchestrator", thinking: bool = False, max_tokens: int = None, history: list = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, role: str = "orchestrator", thinking: bool = False, max_tokens: int = None, history: list = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """Config-aware wrapper to query the configured AI provider/model for a specific role (orchestrator vs synthesizer)."""
     cfg = load_config()
     provider = cfg.get(f"{role}_provider") or cfg.get("ai_provider", "ollama")
@@ -772,9 +780,9 @@ def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, t
             active_model = cfg.get("orchestrator_model") or cfg.get("ai_model") or get_default_model(provider)
             api_key = api_keys.get(provider) or os.environ.get(env_map.get(provider, ""), "") or "ollama"
 
-    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage)
+    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check)
 
-def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """REST call to NVIDIA NIM OpenAI-compatible API with SSE streaming."""
     try:
         url = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -809,6 +817,8 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
         token_count = 0
         usage_tokens = None
         for line in r.iter_lines():
+            if cancel_check and cancel_check():
+                break
             if not line:
                 continue
             decoded = line.decode("utf-8").strip()
@@ -1064,7 +1074,7 @@ def call_gemini(prompt: str, api_key: str, model: str = "gemini-2.0-flash", time
     res = ask_gemini(api_key, model, ASK_PERSONA, prompt, timeout=timeout)
     return res if res else "Error: AI analysis failed."
 
-def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """REST call to local Ollama API using chat endpoint."""
     try:
         model = model or get_default_model("ollama")
@@ -1117,6 +1127,8 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
         token_count = 0
         eval_count = None
         for line in r.iter_lines():
+            if cancel_check and cancel_check():
+                break
             if line:
                 try:
                     chunk = json.loads(line.decode("utf-8"))
