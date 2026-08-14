@@ -636,6 +636,134 @@ function showWelcomeHero() {
     `;
 }
 
+// Pulls subdomain/permutation/httpx data out of a message's tool_result
+// emits. Returns null if there's nothing graph-worthy (no subdomains
+// discovered), so the chip only appears when it's actually useful.
+function extractReconGraphData(emits) {
+    if (!emits || emits.length === 0) return null;
+
+    let rootDomain = null;
+    let subdomains = [];
+    let permutationMatches = [];   // [{host, a, cname, status_code}]
+    const httpxByHost = {};        // hostname -> {status_code, title, tech}
+
+    for (const e of emits) {
+        if (e.type !== 'tool_result' || !e.payload) continue;
+        const { tool, result } = e.payload;
+        if (!result || typeof result !== 'object') continue;
+
+        if ((tool === 'dns_bruteforce' || tool === 'subfinder') && Array.isArray(result.subdomains)) {
+            rootDomain = rootDomain || result.domain;
+            subdomains = Array.from(new Set([...subdomains, ...result.subdomains]));
+        } else if (tool === 'resolve_candidates' && Array.isArray(result.resolved)) {
+            permutationMatches = result.resolved;
+        } else if (tool === 'httpx' && Array.isArray(result.live_hosts)) {
+            for (const h of result.live_hosts) {
+                try {
+                    const hostname = new URL(h.url).hostname;
+                    httpxByHost[hostname] = { status_code: h.status_code, title: h.title, tech: h.tech };
+                } catch (_) { /* ignore unparseable url */ }
+            }
+        }
+    }
+
+    if (!rootDomain && subdomains.length === 0) return null;
+    if (subdomains.length === 0 && permutationMatches.length === 0) return null;
+
+    return { rootDomain: rootDomain || 'target', subdomains, permutationMatches, httpxByHost };
+}
+
+function truncateMiddle(s, max) {
+    if (!s) return '';
+    if (s.length <= max) return s;
+    const keep = Math.floor((max - 3) / 2);
+    return s.slice(0, keep) + '...' + s.slice(s.length - keep);
+}
+
+function renderReconGraphSVG(data) {
+    const { rootDomain, subdomains, permutationMatches, httpxByHost } = data;
+
+    const COL_W = 240;
+    const ROW_H = 44;
+    const NODE_W = 210;
+    const NODE_H = 30;
+    const PAD = 20;
+
+    // Build a flat node list with (col, row) grid positions.
+    const nodes = [];
+    const edges = [];
+
+    nodes.push({ id: 'root', label: rootDomain, col: 0, row: 0, kind: 'root' });
+
+    subdomains.forEach((s, i) => {
+        const id = `sub:${s}`;
+        nodes.push({ id, label: s, col: 1, row: i, kind: 'subdomain', httpx: httpxByHost[s] });
+        edges.push(['root', id]);
+    });
+
+    if (permutationMatches.length > 0) {
+        const bucketId = 'bucket:permutation';
+        nodes.push({ id: bucketId, label: 'Permutation matches', col: 1, row: subdomains.length, kind: 'bucket' });
+        edges.push(['root', bucketId]);
+
+        permutationMatches.forEach((m, i) => {
+            const id = `perm:${m.host}`;
+            nodes.push({ id, label: m.host, col: 2, row: subdomains.length + i, kind: 'permutation', httpx: httpxByHost[m.host] });
+            edges.push([bucketId, id]);
+        });
+    }
+
+    const maxRow = Math.max(...nodes.map(n => n.row), 0);
+    const maxCol = Math.max(...nodes.map(n => n.col), 0);
+    const width = PAD * 2 + (maxCol + 1) * COL_W;
+    const height = PAD * 2 + (maxRow + 1) * ROW_H;
+
+    const pos = {};
+    nodes.forEach(n => {
+        pos[n.id] = {
+            x: PAD + n.col * COL_W,
+            y: PAD + n.row * ROW_H + NODE_H / 2
+        };
+    });
+
+    const edgePaths = edges.map(([fromId, toId]) => {
+        const a = pos[fromId], b = pos[toId];
+        const x1 = a.x + NODE_W, y1 = a.y;
+        const x2 = b.x, y2 = b.y;
+        const midX = (x1 + x2) / 2;
+        return `<path d="M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}" class="graph-edge" />`;
+    }).join('');
+
+    const nodeEls = nodes.map(n => {
+        const p = pos[n.id];
+        let statusClass = 'unknown';
+        let statusLabel = '';
+        if (n.httpx) {
+            const code = n.httpx.status_code;
+            statusClass = code && code < 400 ? 'live' : 'dead';
+            statusLabel = code ? String(code) : '';
+        }
+        return `
+            <g class="graph-node graph-node-${n.kind} status-${statusClass}" transform="translate(${p.x}, ${p.y - NODE_H / 2})">
+                <rect width="${NODE_W}" height="${NODE_H}" rx="6"></rect>
+                <circle cx="14" cy="${NODE_H / 2}" r="4" class="graph-status-dot"></circle>
+                <text x="26" y="${NODE_H / 2 + 4}" class="graph-node-label">${escapeHtml(truncateMiddle(n.label, 26))}</text>
+                ${statusLabel ? `<text x="${NODE_W - 10}" y="${NODE_H / 2 + 4}" text-anchor="end" class="graph-status-label">${statusLabel}</text>` : ''}
+                <title>${escapeHtml(n.label)}${n.httpx?.title ? ' \u2014 ' + escapeHtml(n.httpx.title) : ''}</title>
+            </g>
+        `;
+    }).join('');
+
+    return `
+        <div class="graph-scroll">
+            <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+                ${edgePaths}
+                ${nodeEls}
+            </svg>
+        </div>
+    `;
+}
+
 function appendMessageBubble(role, content, chips = [], emits = [], scroll = true, metrics = null) {
     const threadEl = document.getElementById('chatThread');
     if (!threadEl) return;
@@ -643,6 +771,10 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
     // Remove welcome hero if present
     const hero = document.getElementById('welcomeHero');
     if (hero) hero.remove();
+
+    // Remove any streaming caret placeholder message
+    const activeStream = threadEl.querySelector('.streaming-assistant-msg');
+    if (activeStream) activeStream.remove();
 
     const msgEl = document.createElement('div');
     msgEl.className = `chat-msg ${role}`;
@@ -678,20 +810,34 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
             emitsHtml = `<div class="tool-emits-container">` + emits.map(e => renderToolEmitCard(e)).join('') + `</div>`;
         }
 
+        const graphData = extractReconGraphData(emits);
+        let graphChipHtml = '';
+        if (graphData) {
+            graphChipHtml = `
+                <button class="findings-map-toggle">
+                    <span class="findings-map-icon">&#x2318;</span>
+                    <span>Findings Map</span>
+                    <span class="findings-map-count">${graphData.subdomains.length + graphData.permutationMatches.length} host(s)</span>
+                </button>
+                <div class="findings-map-panel" style="display: none;"></div>
+            `;
+        }
+
         msgEl.innerHTML = `
             <div class="assistant-bubble">
                 <div class="assistant-header">
                     <div class="assistant-tag">
                         <span>HELLHOUND AGENT</span>
                     </div>
+                    <div class="assistant-actions" style="display: flex; align-items: center; gap: 10px;">
+                        ${metrics ? `<span style="font-size: 10px; color: #888; font-family: monospace;">${metrics.tokens} tokens | ${metrics.time_sec}s</span>` : ''}
+                        <button class="btn-msg-copy" title="Copy response">Copy</button>
+                    </div>
                 </div>
-                <div class="assistant-body">${formattedHtml}</div>
                 ${emitsHtml}
+                <div class="assistant-body">${formattedHtml}</div>
                 ${chipsHtml}
-                <div class="assistant-footer">
-                    ${metrics ? `<span class="assistant-metrics">${metrics.tokens} tokens | ${metrics.time_sec}s</span>` : ''}
-                    <button class="btn-msg-copy" title="Copy response">📋 Copy Response</button>
-                </div>
+                ${graphChipHtml}
             </div>
         `;
 
@@ -713,6 +859,21 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
                 }
             });
         });
+
+        // Wire Findings Map toggle
+        const mapToggle = msgEl.querySelector('.findings-map-toggle');
+        const mapPanel = msgEl.querySelector('.findings-map-panel');
+        if (mapToggle && mapPanel && graphData) {
+            mapToggle.onclick = () => {
+                const open = mapPanel.style.display !== 'none';
+                mapPanel.style.display = open ? 'none' : 'block';
+                mapToggle.classList.toggle('open', !open);
+                if (!open && !mapPanel.dataset.rendered) {
+                    mapPanel.innerHTML = renderReconGraphSVG(graphData);
+                    mapPanel.dataset.rendered = '1';
+                }
+            };
+        }
     }
 
     threadEl.appendChild(msgEl);
@@ -724,16 +885,41 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
 
 function handleIncomingEmit(data) {
     console.log("[AGENT EMIT]", data);
-    // Dynamic in-flight emit cards can update the last active assistant message
     const thread = document.getElementById('chatThread');
     if (!thread) return;
+
+    if (data.type === 'token') {
+        let streamingMsg = thread.querySelector('.streaming-assistant-msg');
+        if (!streamingMsg) {
+            streamingMsg = document.createElement('div');
+            streamingMsg.className = 'chat-msg assistant streaming-assistant-msg';
+            streamingMsg.innerHTML = `
+                <div class="assistant-bubble">
+                    <div class="assistant-header">
+                        <div class="assistant-tag">
+                            <span>HELLHOUND AGENT</span>
+                        </div>
+                    </div>
+                    <div class="assistant-body"></div>
+                </div>
+            `;
+            thread.appendChild(streamingMsg);
+        }
+        const bodyEl = streamingMsg.querySelector('.assistant-body');
+        if (bodyEl) {
+            streamingMsg.dataset.accumulated = (streamingMsg.dataset.accumulated || '') + (data.payload || '');
+            bodyEl.innerHTML = formatMarkdown(streamingMsg.dataset.accumulated) + '<span class="stream-caret"></span>';
+        }
+        scrollToBottom();
+        return;
+    }
 
     let activeEmitsContainer = thread.querySelector('.active-in-flight-emits');
     if (!activeEmitsContainer) {
         const emitWrapper = document.createElement('div');
         emitWrapper.className = 'chat-msg assistant in-flight-emit-msg';
         emitWrapper.innerHTML = `
-            <div class="assistant-bubble" style="padding: 12px 16px;">
+            <div class="assistant-bubble" style="padding: 4px 4px 4px 0;">
                 <div class="assistant-header" style="margin-bottom: 6px;">
                     <div class="assistant-tag" style="color: #38bdf8;">
                         <span class="status-dot-pulse"></span>
@@ -976,6 +1162,17 @@ function renderSlashPalette(query) {
     palette.innerHTML = '';
     selectedSlashIndex = 0;
 
+    // Breadcrumb: show completed tokens once we're past the base command
+    const trailingSpace = /\s$/.test(query);
+    const tokens = query.split(/\s+/).filter(Boolean);
+    const completed = trailingSpace ? tokens : tokens.slice(0, -1);
+    if (completed.length > 1) {
+        const crumb = document.createElement('div');
+        crumb.className = 'slash-breadcrumb';
+        crumb.textContent = completed.join(' \u203a ');  // "› " separator
+        palette.appendChild(crumb);
+    }
+
     matches.forEach((c, idx) => {
         const item = document.createElement('div');
         item.className = `slash-item ${idx === 0 ? 'selected' : ''}`;
@@ -1008,10 +1205,13 @@ function applySlashMatch(idx) {
     const before = input.value.slice(0, currentReplaceStart);
     input.value = before + match.value + ' ';
     input.focus();
-    hideSlashPalette();
-    // Re-trigger palette for the next token (e.g. after picking "subdomains",
-    // immediately show active/passive/permute)
-    renderSlashPalette(input.value);
+
+    const { matches } = getSlashMatches(input.value);
+    if (matches.length === 0) {
+        hideSlashPalette();
+    } else {
+        renderSlashPalette(input.value);
+    }
 }
 
 function updateSlashSelection(items) {

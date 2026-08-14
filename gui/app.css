@@ -769,29 +769,27 @@ body.clean-interface .ambient-bg {
 .chat-msg.assistant {
     align-self: flex-start;
     width: 100%;
-    max-width: 100%;
+    max-width: 92%;
 }
 
 .assistant-bubble {
-    background: rgba(14, 16, 24, 0.55);
+    background: transparent;
     border: none;
-    border-left: 3px solid var(--primary);
-    backdrop-filter: blur(14px);
-    border-radius: 0 8px 8px 0;
-    padding: 16px 20px;
-    margin: 8px 0 16px 0;
-    width: 100%;
-    user-select: text;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+    border-left: none;
+    backdrop-filter: none;
+    border-radius: 0;
+    padding: 4px 4px 4px 0;
+    box-shadow: none;
 }
 
 .assistant-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 12px;
-    padding-bottom: 6px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    margin-bottom: 8px;
+    padding-bottom: 0;
+    border-bottom: none;
+    opacity: 0.75;
 }
 
 .assistant-tag {
@@ -939,10 +937,12 @@ body.clean-interface .ambient-bg {
 
 /* Tool execution status emits */
 .tool-emits-container {
-    margin-top: 10px;
     display: flex;
     flex-direction: column;
     gap: 4px;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px dashed rgba(255, 255, 255, 0.06);
 }
 
 .tool-emit-card {
@@ -958,6 +958,93 @@ body.clean-interface .ambient-bg {
 
 .tool-emit-card.error { border-left-color: var(--danger); color: #fca5a5; }
 .tool-emit-card.success { border-left-color: var(--success); color: #6ee7b7; }
+
+/* Streaming Caret */
+.stream-caret {
+    display: inline-block;
+    width: 7px;
+    height: 1em;
+    background: var(--primary);
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    animation: caret-blink 1s steps(1) infinite;
+}
+@keyframes caret-blink {
+    50% { opacity: 0; }
+}
+
+/* Slash Autocomplete Breadcrumb */
+.slash-breadcrumb {
+    font-size: 10px;
+    color: var(--text-dim);
+    padding: 6px 12px 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Expandable Recon Findings Map Node Graph */
+.findings-map-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+    padding: 6px 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 20px;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-family: 'Space Grotesk', monospace;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.findings-map-toggle:hover { background: rgba(255, 255, 255, 0.06); }
+.findings-map-toggle.open { border-color: var(--primary); color: var(--text-main); }
+.findings-map-count {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-size: 10px;
+}
+
+.findings-map-panel {
+    margin-top: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.3);
+    padding: 8px;
+}
+
+.graph-scroll { overflow-x: auto; }
+
+.graph-edge {
+    fill: none;
+    stroke: rgba(255, 255, 255, 0.15);
+    stroke-width: 1.5;
+}
+
+.graph-node rect {
+    fill: rgba(255, 255, 255, 0.04);
+    stroke: rgba(255, 255, 255, 0.1);
+    stroke-width: 1;
+}
+.graph-node-root rect { fill: rgba(56, 189, 248, 0.12); stroke: #38bdf8; }
+.graph-node-bucket rect { stroke-dasharray: 3 2; }
+
+.graph-node-label {
+    fill: var(--text-main);
+    font-size: 11px;
+    font-family: 'Space Grotesk', monospace;
+}
+.graph-status-label {
+    fill: var(--text-dim);
+    font-size: 10px;
+    font-family: monospace;
+}
+.graph-status-dot { fill: var(--text-dim); }
+.status-live .graph-status-dot { fill: var(--success); }
+.status-dead .graph-status-dot { fill: var(--danger); }
 
 /* ── CHAT INPUT BAR ──────────────────────────────────────────────── */
 .chat-input-container {
