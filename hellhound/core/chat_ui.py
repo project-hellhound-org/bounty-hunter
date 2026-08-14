@@ -179,11 +179,34 @@ class HellhoundCompleter(Completer):
                     yield Completion(val, start_position=-len(arg_text), display=val, display_meta=meta)
 
         elif cmd_name in ("/recon", "/surface", "/spider"):
-            sub_suggestions = [
-                ("subdomains", "Asset discovery only (subfinder/dns_bruteforce)"),
-                ("endpoints", "Content and endpoint discovery only (spider)"),
-                ("tech", "Live-host and technology fingerprinting only (httpx)"),
-            ]
+            arg_tokens = arg_text.split()
+            in_subdomains_mode = bool(arg_tokens) and arg_tokens[0].lower() in ("subdomains", "subdomain")
+
+            if in_subdomains_mode:
+                # Already-typed active/passive selector — don't re-suggest it
+                already_has_mode = any(
+                    t.lower() in ("active", "passive") for t in arg_tokens[1:]
+                )
+                already_has_permute = any(
+                    t.lower() == "permute" for t in arg_tokens[1:]
+                )
+                sub_suggestions = []
+                if not already_has_mode:
+                    sub_suggestions += [
+                        ("active", "DNS brute-force enumeration (CTF/lab targets, isolated zones)"),
+                        ("passive", "CT-log/passive sources via subfinder (default for public targets)"),
+                    ]
+                if not already_has_permute:
+                    sub_suggestions.append(
+                        ("permute", "Generate + resolve mutated candidate subdomains from found hosts")
+                    )
+            else:
+                sub_suggestions = [
+                    ("subdomains", "Asset discovery only (dns_bruteforce/subfinder)"),
+                    ("endpoints", "Content and endpoint discovery only (spider)"),
+                    ("tech", "Live-host and technology fingerprinting only (httpx)"),
+                ]
+
             for val, meta in sub_suggestions:
                 if val.lower().startswith(word_before.lower()):
                     yield Completion(val, start_position=-len(word_before), display=val, display_meta=meta)
@@ -398,6 +421,14 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
 class StreamRenderer:
     """
     Renders streaming tokens incrementally inside a Rich Markdown Panel with Live display.
+
+    While tokens are arriving, the Live region is cropped to the terminal's
+    viewport height (vertical_overflow="crop") so Rich can always correctly
+    erase and redraw the previous frame in place — this is what prevents the
+    panel from leaving duplicate copies in scrollback once content grows
+    past one screen. The in-progress cropped frame is never committed to
+    scrollback (transient=True); once streaming finishes, the COMPLETE,
+    un-cropped response is printed exactly once as a normal static block.
     """
     def __init__(self, title: str = "HELLHOUND", border_style: str = "bold red"):
         self.title = title
@@ -416,7 +447,8 @@ class StreamRenderer:
                 self._render_panel(),
                 console=rich_console,
                 refresh_per_second=12,
-                vertical_overflow="visible"
+                vertical_overflow="crop",
+                transient=True,
             )
             self.live.start()
         else:
@@ -434,17 +466,22 @@ class StreamRenderer:
         )
 
     def finish(self, final_text: Optional[str] = None):
-        if final_text and not self.accumulated_text:
+        if final_text:
             self.accumulated_text = final_text
+        elif not self.accumulated_text:
+            return
 
         if self.live and self._started:
-            if final_text:
-                self.accumulated_text = final_text
-            self.live.update(self._render_panel())
+            # transient=True erases the cropped in-progress frame from the
+            # terminal on stop — nothing from the live phase is committed
+            # to scrollback.
             self.live.stop()
             self.live = None
-        elif self.accumulated_text:
-            rich_console.print(self._render_panel())
+
+        # Print the complete, un-cropped response exactly once. This is the
+        # only thing that ends up in permanent scrollback.
+        rich_console.print(self._render_panel())
+
 
 
 def render_response_bubble(response_text: str, sender: str = "HELLHOUND"):
@@ -632,11 +669,24 @@ def start_chat_session(initial_target: Optional[str] = None):
                 if cmd_base in ai_commands:
                     # Start spinner IMMEDIATELY so user sees activity from the first ms
                     emit = InteractiveAgentEmit(f"EXECUTING {cmd_base.upper()[1:]}")
+                    streamer = StreamRenderer(title="HELLHOUND")
+
+                    def on_token_callback(token: str):
+                        # Tool-start/tool-result lines (Fix 4) already print via
+                        # the indicator; the first synthesis token replaces the
+                        # spinner with the live response panel.
+                        emit.stop_indicator()
+                        streamer.on_token(token)
+
                     t0 = time.monotonic()
                     try:
-                        res = dispatch(cmd_line, session_ctx, emit)
+                        res = dispatch(cmd_line, session_ctx, emit, on_token=on_token_callback)
                     finally:
                         emit.stop_indicator()
+                        final_text = None
+                        if isinstance(res, dict):
+                            final_text = res.get("advice") or res.get("response")
+                        streamer.finish(final_text)
                         t1 = time.monotonic()
                         elapsed = t1 - t0
                         elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
