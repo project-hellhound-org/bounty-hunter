@@ -43,6 +43,241 @@ async function callApi(method, ...args) {
     }
 }
 
+// ── CUSTOM CONFIRMATION MODAL ───────────────────────────────────────
+function showConfirmModal({ title = "CONFIRM ACTION", message = "Are you sure you want to proceed?", confirmText = "CONFIRM", danger = true } = {}) {
+    return new Promise((resolve) => {
+        const modal = document.getElementById('confirmModal');
+        const titleEl = document.getElementById('confirmModalTitle');
+        const msgEl = document.getElementById('confirmModalMessage');
+        const cancelBtn = document.getElementById('cancelConfirmBtn');
+        const acceptBtn = document.getElementById('acceptConfirmBtn');
+
+        if (!modal) {
+            resolve(confirm(message));
+            return;
+        }
+
+        if (titleEl) titleEl.innerText = title;
+        if (msgEl) msgEl.innerText = message;
+        if (acceptBtn) {
+            acceptBtn.innerText = confirmText;
+            if (danger) {
+                acceptBtn.classList.add('btn-danger');
+            } else {
+                acceptBtn.classList.remove('btn-danger');
+            }
+        }
+
+        modal.classList.add('open');
+
+        const cleanup = () => {
+            modal.classList.remove('open');
+            cancelBtn?.removeEventListener('click', onCancel);
+            acceptBtn?.removeEventListener('click', onAccept);
+        };
+
+        const onCancel = () => {
+            cleanup();
+            resolve(false);
+        };
+
+        const onAccept = () => {
+            cleanup();
+            resolve(true);
+        };
+
+        cancelBtn?.addEventListener('click', onCancel);
+        acceptBtn?.addEventListener('click', onAccept);
+    });
+}
+
+// ── STRUCTURED NODE-BASED CARD RENDERER ─────────────────────────────
+function renderToolEmitCard(emit) {
+    const type = emit.type || 'info';
+    const payload = emit.payload;
+    
+    if (type === 'tool_start') {
+        const tool = payload?.tool || 'Tool';
+        const args = payload?.args || {};
+        const targetStr = args.domain || args.target || args.url || args.subdomain || args.hosts || JSON.stringify(args);
+        return `
+            <div class="node-exec-card active">
+                <div class="node-exec-header">
+                    <span class="node-status-dot pulse"></span>
+                    <span class="node-tool-name">${escapeHtml(tool)}</span>
+                    <span class="node-target-tag">${escapeHtml(String(targetStr))}</span>
+                </div>
+                <div class="node-exec-body">
+                    <span class="node-param-label">Running:</span> <code>${escapeHtml(JSON.stringify(args))}</code>
+                </div>
+            </div>
+        `;
+    }
+
+    if (type === 'tool_result') {
+        const tool = payload?.tool || 'Tool';
+        const result = payload?.result || {};
+
+        if (result.blocked || (typeof result.error === 'string' && (result.error.includes('SCOPE_VIOLATION') || result.error.includes('SCOPE REFUSAL')))) {
+            return `
+                <div class="node-exec-card scope-blocked">
+                    <div class="node-exec-header">
+                        <span class="node-status-icon">⛔</span>
+                        <span class="node-tool-name">SCOPE REFUSAL</span>
+                    </div>
+                    <div class="node-exec-body">
+                        <span class="scope-reason-text">${escapeHtml(result.error || result.reason || "Action blocked by scope rules.")}</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        if (result.error) {
+            return `
+                <div class="node-exec-card error">
+                    <div class="node-exec-header">
+                        <span class="node-status-icon">⚠️</span>
+                        <span class="node-tool-name">${escapeHtml(tool)} Error</span>
+                    </div>
+                    <div class="node-exec-body">
+                        <span>${escapeHtml(result.error)}</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        if (tool === 'dns_bruteforce' || tool === 'subfinder') {
+            const subs = result.subdomains || [];
+            const count = result.total_discovered || result.count || subs.length;
+            const rootDomain = result.domain || 'Target';
+
+            const limit = 12;
+            const branchesHtml = subs.slice(0, limit).map((sub, idx) => {
+                const prefix = (idx === Math.min(subs.length, limit) - 1) ? '└──' : '├──';
+                return `
+                    <div class="node-branch-item">
+                        <span class="tree-line">${prefix}</span>
+                        <span class="node-sub-dot online"></span>
+                        <span class="node-sub-name">${escapeHtml(sub)}</span>
+                    </div>
+                `;
+            }).join('');
+
+            const remaining = subs.length > limit ? `<div class="node-branch-more">+ ${subs.length - limit} more subdomains</div>` : '';
+
+            return `
+                <div class="node-topology-card">
+                    <div class="node-topo-header">
+                        <span class="node-topo-title">🌐 DOMAIN TOPOLOGY MAP (${tool})</span>
+                        <span class="node-topo-badge">${count} DISCOVERED</span>
+                    </div>
+                    <div class="node-topo-tree">
+                        <div class="node-tree-root">
+                            <span class="node-icon root">🎯</span>
+                            <span class="node-root-name">${escapeHtml(rootDomain)}</span>
+                        </div>
+                        <div class="node-tree-branches">
+                            ${branchesHtml}
+                            ${remaining}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        if (tool === 'permute_subdomains' || tool === 'resolve_candidates') {
+            const cands = result.candidates || result.subdomains || [];
+            const count = result.resolved_count || result.count || cands.length;
+
+            const limit = 10;
+            const itemsHtml = cands.slice(0, limit).map((item, idx) => {
+                const prefix = (idx === Math.min(cands.length, limit) - 1) ? '└──' : '├──';
+                return `
+                    <div class="node-branch-item">
+                        <span class="tree-line">${prefix}</span>
+                        <span class="node-sub-dot resolved"></span>
+                        <span class="node-sub-name">${escapeHtml(item)}</span>
+                    </div>
+                `;
+            }).join('');
+
+            return `
+                <div class="node-topology-card">
+                    <div class="node-topo-header">
+                        <span class="node-topo-title">🧬 PERMUTATION & RESOLUTION (${tool})</span>
+                        <span class="node-topo-badge">${count} RESOLVED</span>
+                    </div>
+                    <div class="node-topo-tree">
+                        <div class="node-tree-branches">
+                            ${itemsHtml}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        if (tool === 'httpx') {
+            const liveServices = result.live_hosts || result.services || [];
+            const rowsHtml = Array.isArray(liveServices) ? liveServices.slice(0, 10).map(srv => {
+                const urlStr = typeof srv === 'string' ? srv : (srv.url || srv.host);
+                const status = srv.status_code || 200;
+                const title = srv.title ? ` - ${srv.title}` : '';
+                const statusClass = status >= 200 && status < 300 ? 'status-200' : (status >= 300 && status < 400 ? 'status-300' : 'status-400');
+                return `
+                    <div class="httpx-service-row">
+                        <span class="http-status-code ${statusClass}">${status}</span>
+                        <span class="service-url">${escapeHtml(urlStr)}</span>
+                        <span class="service-title">${escapeHtml(title)}</span>
+                    </div>
+                `;
+            }).join('') : `<div>Probed ${liveServices} live hosts</div>`;
+
+            return `
+                <div class="node-topology-card">
+                    <div class="node-topo-header">
+                        <span class="node-topo-title">📡 HTTP SERVICE PROBES (httpx)</span>
+                        <span class="node-topo-badge">${Array.isArray(liveServices) ? liveServices.length : 'ACTIVE'} SERVICES</span>
+                    </div>
+                    <div class="httpx-services-list">
+                        ${rowsHtml}
+                    </div>
+                </div>
+            `;
+        }
+
+        const keys = Object.keys(result).filter(k => k !== 'status');
+        const keySummary = keys.map(k => {
+            const val = result[k];
+            const valStr = Array.isArray(val) ? `${val.length} items` : (typeof val === 'object' ? 'object' : String(val));
+            return `<div><strong>${escapeHtml(k)}:</strong> ${escapeHtml(valStr)}</div>`;
+        }).join('');
+
+        return `
+            <div class="node-exec-card success">
+                <div class="node-exec-header">
+                    <span class="node-status-icon">✓</span>
+                    <span class="node-tool-name">${escapeHtml(tool)} Completed</span>
+                </div>
+                <div class="node-exec-body">
+                    ${keySummary || 'Completed successfully'}
+                </div>
+            </div>
+        `;
+    }
+
+    if (type === 'status' || type === 'info' || type === 'warn' || type === 'error' || type === 'success') {
+        const msg = typeof payload === 'object' ? JSON.stringify(payload) : String(payload);
+        return `
+            <div class="tool-emit-card ${type}">
+                <span class="emit-badge">${type.toUpperCase()}</span>
+                <span>${escapeHtml(msg)}</span>
+            </div>
+        `;
+    }
+
+    return `<div class="tool-emit-card info">${escapeHtml(String(payload))}</div>`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. INITIALIZATION & LIFECYCLE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,7 +361,12 @@ function renderTargetList(targets) {
         if (delBtn) {
             delBtn.onclick = async (e) => {
                 e.stopPropagation();
-                if (confirm(`Delete target "${t.name}" and all associated task data?`)) {
+                const confirmed = await showConfirmModal({
+                    title: "DELETE TARGET",
+                    message: `Are you sure you want to delete target "${t.name}" and all associated task data?`,
+                    confirmText: "DELETE TARGET"
+                });
+                if (confirmed) {
                     await deleteTarget(t.name);
                 }
             };
@@ -435,9 +675,7 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
 
         let emitsHtml = '';
         if (emits && emits.length > 0) {
-            emitsHtml = `<div class="tool-emits-container">` + emits.map(e => `
-                <div class="tool-emit-card ${e.type}">${escapeHtml(typeof e.payload === 'object' ? JSON.stringify(e.payload) : String(e.payload))}</div>
-            `).join('') + `</div>`;
+            emitsHtml = `<div class="tool-emits-container">` + emits.map(e => renderToolEmitCard(e)).join('') + `</div>`;
         }
 
         msgEl.innerHTML = `
@@ -446,14 +684,14 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
                     <div class="assistant-tag">
                         <span>HELLHOUND AGENT</span>
                     </div>
-                    <div class="assistant-actions" style="display: flex; align-items: center; gap: 10px;">
-                        ${metrics ? `<span style="font-size: 10px; color: #888; font-family: monospace;">${metrics.tokens} tokens | ${metrics.time_sec}s</span>` : ''}
-                        <button class="btn-msg-copy" title="Copy response">Copy</button>
-                    </div>
                 </div>
                 <div class="assistant-body">${formattedHtml}</div>
                 ${emitsHtml}
                 ${chipsHtml}
+                <div class="assistant-footer">
+                    ${metrics ? `<span class="assistant-metrics">${metrics.tokens} tokens | ${metrics.time_sec}s</span>` : ''}
+                    <button class="btn-msg-copy" title="Copy response">📋 Copy Response</button>
+                </div>
             </div>
         `;
 
@@ -514,15 +752,16 @@ function handleIncomingEmit(data) {
         if (data.type === 'status') {
             let statusCard = activeEmitsContainer.querySelector('.tool-emit-card.status');
             if (statusCard) {
-                statusCard.innerText = typeof data.payload === 'object' ? JSON.stringify(data.payload) : String(data.payload);
+                const msg = typeof data.payload === 'object' ? JSON.stringify(data.payload) : String(data.payload);
+                statusCard.innerHTML = `<span class="emit-badge">STATUS</span> <span>${escapeHtml(msg)}</span>`;
                 scrollToBottom();
                 return;
             }
         }
-        const item = document.createElement('div');
-        item.className = `tool-emit-card ${data.type}`;
-        item.innerText = typeof data.payload === 'object' ? JSON.stringify(data.payload) : String(data.payload);
-        activeEmitsContainer.appendChild(item);
+        const cardHtml = renderToolEmitCard(data);
+        const tempDiv = document.createElement('div');
+        tempDiv.innerHTML = cardHtml;
+        activeEmitsContainer.appendChild(tempDiv.firstElementChild || tempDiv);
         scrollToBottom();
     }
 }
@@ -580,6 +819,9 @@ async function handleStopRequest() {
     if (!currentTarget) return;
     try {
         await callApi('stop_request', currentTarget);
+        setExecutionState(false);
+        document.querySelectorAll('.in-flight-emit-msg').forEach(el => el.remove());
+        appendMessageBubble('assistant', '*[Execution stopped by user]*');
     } catch (e) {
         console.error("Error stopping request:", e);
     }
@@ -606,11 +848,34 @@ function setExecutionState(executing) {
     }
 }
 
+// Nested subcommand suggestions, keyed by base command.
+// Structure: { <cmd>: { <parent-token-path>: [ {value, desc}, ... ] } }
+// "" (empty string key) = suggestions shown right after the base command itself.
+const SLASH_SUBCOMMANDS = {
+    "/recon": {
+        "": [
+            { value: "subdomains", desc: "Asset discovery only (subfinder/dns_bruteforce)" },
+            { value: "endpoints", desc: "Content and endpoint discovery only (spider)" },
+            { value: "tech", desc: "Live-host and technology fingerprinting only (httpx)" },
+        ],
+        "subdomains": [
+            { value: "active", desc: "DNS brute-force enumeration (CTF/lab targets, isolated zones)" },
+            { value: "passive", desc: "CT-log/passive sources via subfinder (default for public targets)" },
+            { value: "permute", desc: "Generate + resolve mutated candidate subdomains from found hosts" },
+        ],
+    },
+};
+// /surface and /spider are aliases of /recon — reuse the same tree.
+SLASH_SUBCOMMANDS["/surface"] = SLASH_SUBCOMMANDS["/recon"];
+SLASH_SUBCOMMANDS["/spider"] = SLASH_SUBCOMMANDS["/recon"];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 6. SLASH COMMAND PALETTE & AUTOCOMPLETE
 // ─────────────────────────────────────────────────────────────────────────────
 
 let selectedSlashIndex = 0;
+let currentSlashMatches = [];   // [{ value, desc, usage }]
+let currentReplaceStart = 0;    // index in input.value where the match gets spliced in
 
 function setupSlashPalette() {
     const input = document.getElementById('chatInput');
@@ -640,11 +905,7 @@ function setupSlashPalette() {
             } else if (e.key === 'Enter' || e.key === 'Tab') {
                 if (items.length > 0 && selectedSlashIndex < items.length) {
                     e.preventDefault();
-                    const chosenCmd = items[selectedSlashIndex].getAttribute('data-cmd');
-                    if (chosenCmd) {
-                        input.value = chosenCmd + ' ';
-                        hideSlashPalette();
-                    }
+                    applySlashMatch(selectedSlashIndex);
                 }
             } else if (e.key === 'Escape') {
                 hideSlashPalette();
@@ -656,12 +917,56 @@ function setupSlashPalette() {
     });
 }
 
+// Computes { matches, replaceStart } for the current input value.
+// replaceStart is the character index in `value` where the currently-typed
+// word begins — the part that gets replaced when a suggestion is chosen.
+function getSlashMatches(value) {
+    const trailingSpace = /\s$/.test(value);
+    const tokens = value.split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return { matches: [], replaceStart: 0 };
+
+    const currentWord = trailingSpace ? '' : tokens[tokens.length - 1];
+    const replaceStart = value.length - currentWord.length;
+
+    // Still typing/filtering the base command itself
+    if (tokens.length === 1 && !trailingSpace) {
+        const filter = currentWord.slice(1).toLowerCase();
+        const matches = SLASH_COMMANDS
+            .filter(c => c.cmd.slice(1).startsWith(filter))
+            .map(c => ({ value: c.cmd, desc: c.desc, usage: c.usage }));
+        return { matches, replaceStart: 0 }; // base command always replaces the whole input
+    }
+
+    // Subcommand level(s)
+    const cmdName = tokens[0].toLowerCase();
+    const tree = SLASH_SUBCOMMANDS[cmdName];
+    if (!tree) return { matches: [], replaceStart };
+
+    const completedArgTokens = (trailingSpace ? tokens.slice(1) : tokens.slice(1, -1))
+        .map(t => t.toLowerCase());
+
+    // Path key: "" for right after the base command, else the first arg token
+    const pathKey = completedArgTokens.length === 0 ? "" : completedArgTokens[0];
+    const candidates = tree[pathKey] || [];
+
+    // Don't re-suggest a value that's already been typed for this command
+    const already = new Set(completedArgTokens.slice(pathKey === "" ? 0 : 1));
+    const filtered = candidates.filter(c => !already.has(c.value.toLowerCase()));
+
+    const matches = filtered
+        .filter(c => c.value.toLowerCase().startsWith(currentWord.toLowerCase()))
+        .map(c => ({ value: c.value, desc: c.desc, usage: '' }));
+
+    return { matches, replaceStart };
+}
+
 function renderSlashPalette(query) {
     const palette = document.getElementById('slashPalette');
     if (!palette) return;
 
-    const filter = query.toLowerCase().slice(1);
-    const matches = SLASH_COMMANDS.filter(c => c.cmd.slice(1).startsWith(filter));
+    const { matches, replaceStart } = getSlashMatches(query);
+    currentSlashMatches = matches;
+    currentReplaceStart = replaceStart;
 
     if (matches.length === 0) {
         hideSlashPalette();
@@ -674,29 +979,39 @@ function renderSlashPalette(query) {
     matches.forEach((c, idx) => {
         const item = document.createElement('div');
         item.className = `slash-item ${idx === 0 ? 'selected' : ''}`;
-        item.setAttribute('data-cmd', c.cmd);
+        item.setAttribute('data-cmd', c.value);
 
         item.innerHTML = `
             <div class="slash-item-left">
-                <span class="slash-item-cmd">${c.cmd}</span>
+                <span class="slash-item-cmd">${c.value}</span>
                 <span class="slash-item-desc">${c.desc}</span>
             </div>
-            <span class="slash-item-usage">${c.usage}</span>
+            <span class="slash-item-usage">${c.usage || ''}</span>
         `;
 
-        item.onclick = () => {
-            const input = document.getElementById('chatInput');
-            if (input) {
-                input.value = c.cmd + ' ';
-                input.focus();
-            }
-            hideSlashPalette();
-        };
+        item.onclick = () => applySlashMatch(idx);
 
         palette.appendChild(item);
     });
 
     palette.style.display = 'flex';
+}
+
+// Splices the chosen suggestion into the input at currentReplaceStart,
+// replacing only the word currently being typed — preserves everything
+// typed before it (target, prior subcommand tokens, etc).
+function applySlashMatch(idx) {
+    const input = document.getElementById('chatInput');
+    const match = currentSlashMatches[idx];
+    if (!input || !match) return;
+
+    const before = input.value.slice(0, currentReplaceStart);
+    input.value = before + match.value + ' ';
+    input.focus();
+    hideSlashPalette();
+    // Re-trigger palette for the next token (e.g. after picking "subdomains",
+    // immediately show active/passive/permute)
+    renderSlashPalette(input.value);
 }
 
 function updateSlashSelection(items) {
@@ -807,8 +1122,7 @@ function setupDOMEventHandlers() {
 
     // Scope Modal
     const scopeModal = document.getElementById('scopeModal');
-    const scopeModalBtn = document.getElementById('scopeModalBtn');
-    const scopeBadge = document.getElementById('scopeSummaryBadge');
+    const scopeInlineBtn = document.getElementById('scopeInlineBtn');
     const scopeTextInput = document.getElementById('scopeTextInput');
     const saveScopeBtn = document.getElementById('saveScopeBtn');
     const cancelScopeBtn = document.getElementById('cancelScopeBtn');
@@ -827,8 +1141,7 @@ function setupDOMEventHandlers() {
         }
     };
 
-    scopeModalBtn?.addEventListener('click', openScopeModal);
-    scopeBadge?.addEventListener('click', openScopeModal);
+    scopeInlineBtn?.addEventListener('click', openScopeModal);
 
     cancelScopeBtn?.addEventListener('click', () => {
         scopeModal?.classList.remove('open');
@@ -849,7 +1162,12 @@ function setupDOMEventHandlers() {
     // Clear Chat Button
     document.getElementById('clearChatBtn')?.addEventListener('click', async () => {
         if (!currentTarget) return;
-        if (confirm(`Clear conversation history for "${currentTarget}"?`)) {
+        const confirmed = await showConfirmModal({
+            title: "CLEAR CONVERSATION",
+            message: `Clear all message history for target "${currentTarget}"?`,
+            confirmText: "CLEAR CHAT"
+        });
+        if (confirmed) {
             await callApi('clear_chat_history', currentTarget);
             await loadTargetChatHistory(currentTarget);
         }
@@ -966,6 +1284,24 @@ function setupDOMEventHandlers() {
             installMissingToolsBtn.textContent = originalText;
         }
     });
+
+    // API Key Eye Toggle (Show/Hide)
+    document.querySelectorAll('.btn-toggle-key').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const targetId = btn.getAttribute('data-target');
+            const input = document.getElementById(targetId);
+            if (!input) return;
+            if (input.type === 'password') {
+                input.type = 'text';
+                btn.textContent = '🙈';
+                btn.title = 'Hide key';
+            } else {
+                input.type = 'password';
+                btn.textContent = '👁';
+                btn.title = 'Show key';
+            }
+        });
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -998,12 +1334,14 @@ async function openSettingsModal() {
             const keyOai = document.getElementById('cfgKeyOpenai');
             const keyOr = document.getElementById('cfgKeyOpenrouter');
             const keyGroq = document.getElementById('cfgKeyGroq');
+            const keyGemini = document.getElementById('cfgKeyGemini');
 
             if (keyNv) keyNv.value = keys.nvidia || '';
             if (keyAnt) keyAnt.value = keys.anthropic || '';
             if (keyOai) keyOai.value = keys.openai || '';
             if (keyOr) keyOr.value = keys.openrouter || '';
             if (keyGroq) keyGroq.value = keys.groq || '';
+            if (keyGemini) keyGemini.value = keys.gemini || '';
 
             // Tools & Auto-Install
             const autoInstall = document.getElementById('cfgAutoInstallTools');
@@ -1088,6 +1426,7 @@ async function saveSettings() {
         api_keys: {
             nvidia: document.getElementById('cfgKeyNvidia')?.value || '',
             anthropic: document.getElementById('cfgKeyAnthropic')?.value || '',
+            gemini: document.getElementById('cfgKeyGemini')?.value || '',
             openai: document.getElementById('cfgKeyOpenai')?.value || '',
             openrouter: document.getElementById('cfgKeyOpenrouter')?.value || '',
             groq: document.getElementById('cfgKeyGroq')?.value || '',
@@ -1121,9 +1460,11 @@ async function saveSettings() {
 // 9. UTILITY HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
-function scrollToBottom() {
+function scrollToBottom(force = false) {
     const thread = document.getElementById('chatThread');
-    if (thread) {
+    if (!thread) return;
+    const isAtBottom = (thread.scrollHeight - thread.scrollTop - thread.clientHeight) < 150;
+    if (force || isAtBottom) {
         thread.scrollTop = thread.scrollHeight;
     }
 }
@@ -1172,43 +1513,102 @@ function formatRelativeTime(isoString) {
 }
 
 /**
- * Lightweight Markdown Parser for chat responses
+ * Robust Markdown Parser for chat responses supporting tables, headers, lists, code blocks, hr, and inline styling
  */
 function formatMarkdown(text) {
     if (!text) return '';
 
-    // Code blocks
-    let html = text.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (match, lang, code) => {
-        return `<pre><code class="language-${escapeHtml(lang)}">${escapeHtml(code.trim())}</code></pre>`;
+    let html = text;
+
+    // Helper for inline markdown replacements
+    const inlineMarkdown = (str) => {
+        if (!str) return '';
+        return str
+            .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+            .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+            .replace(/`([^`]+)`/g, '<code>$1</code>')
+            .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    };
+
+    // 1. Code blocks (fenced ```...```)
+    const codeBlocks = [];
+    html = html.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (match, lang, code) => {
+        const id = `___CODE_BLOCK_${codeBlocks.length}___`;
+        codeBlocks.push(`<pre><code class="language-${escapeHtml(lang || 'text')}">${escapeHtml(code.trim())}</code></pre>`);
+        return id;
     });
 
-    // Inline code
-    html = html.replace(/`([^`]+)`/g, (match, code) => {
-        return `<code>${escapeHtml(code)}</code>`;
+    // 2. Markdown Tables
+    const tableRegex = /((?:^[ \t]*\|[^\n]+\|[ \t]*\n)+)/gm;
+    html = html.replace(tableRegex, (match) => {
+        const lines = match.trim().split('\n').map(l => l.trim());
+        if (lines.length < 2) return match;
+
+        const headerRow = lines[0];
+        const delimiterRow = lines[1];
+
+        if (!/^[ \t]*\|[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)+\|[ \t]*$/.test(delimiterRow)) {
+            return match;
+        }
+
+        const parseRow = (rowStr) => rowStr.replace(/^\||\|$/g, '').split('|').map(cell => cell.trim());
+
+        const headers = parseRow(headerRow);
+        const bodyLines = lines.slice(2);
+
+        let tableHtml = '<div class="table-container"><table class="markdown-table"><thead><tr>';
+        headers.forEach(h => {
+            tableHtml += `<th>${inlineMarkdown(escapeHtml(h))}</th>`;
+        });
+        tableHtml += '</tr></thead><tbody>';
+
+        bodyLines.forEach(bLine => {
+            if (!bLine.startsWith('|')) return;
+            const cells = parseRow(bLine);
+            tableHtml += '<tr>';
+            cells.forEach(c => {
+                tableHtml += `<td>${inlineMarkdown(escapeHtml(c))}</td>`;
+            });
+            tableHtml += '</tr>';
+        });
+
+        tableHtml += '</tbody></table></div>';
+        return tableHtml;
     });
 
-    // Headers
+    // 3. Headers
+    html = html.replace(/^#### (.*$)/gim, '<h4>$1</h4>');
     html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>');
     html = html.replace(/^## (.*$)/gim, '<h2>$1</h2>');
     html = html.replace(/^# (.*$)/gim, '<h1>$1</h1>');
 
-    // Bold & Italics
+    // 4. Horizontal Rules
+    html = html.replace(/^[ \t]*[-*_]{3,}[ \t]*$/gim, '<hr>');
+
+    // 5. Bold & Italics & Inline Code
     html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
 
-    // Bullet lists
+    // 6. Bullet lists & Numbered lists
     html = html.replace(/^\s*[-*]\s+(.*$)/gim, '<li>$1</li>');
-    html = html.replace(/(<li>.*<\/li>)/gims, '<ul>$1</ul>');
+    html = html.replace(/((?:<li>.*<\/li>\s*)+)/gims, '<ul>$1</ul>');
 
-    // Paragraphs
+    // 7. Paragraphs
     const blocks = html.split(/\n\n+/);
     html = blocks.map(b => {
         b = b.trim();
-        if (b.startsWith('<h') || b.startsWith('<pre') || b.startsWith('<ul') || b.startsWith('<div')) {
+        if (!b) return '';
+        if (b.startsWith('<h') || b.startsWith('<pre') || b.startsWith('<ul') || b.startsWith('<div') || b.startsWith('<hr') || b.startsWith('<table') || b.startsWith('___CODE_BLOCK_')) {
             return b;
         }
         return `<p>${b.replace(/\n/g, '<br>')}</p>`;
     }).join('');
+
+    // Restore Code Blocks
+    codeBlocks.forEach((cb, idx) => {
+        html = html.replace(`___CODE_BLOCK_${idx}___`, cb);
+    });
 
     return html;
 }
