@@ -90,6 +90,12 @@ class GuiEmit:
     def set_token_count(self, count: int):
         self.tokens += count
 
+    def __call__(self, msg: Any):
+        if isinstance(msg, str):
+            self.info(msg)
+        else:
+            self._send_js("info", msg)
+
 
 class HellhoundAPI:
     """Python API bridge exposed directly to window.pywebview.api in JavaScript."""
@@ -264,9 +270,14 @@ class HellhoundAPI:
 
                 if text.strip().startswith("/"):
                     from hellhound.core.commands import dispatch
-                    res = dispatch(text, session_ctx, gui_emit)
+                    res = dispatch(
+                        text,
+                        session_ctx,
+                        gui_emit,
+                        cancel_check=lambda: self._cancel_flags.get(clean_name, False)
+                    )
                     if isinstance(res, dict):
-                        response_text = res.get("response") or res.get("message") or json.dumps(res, indent=2)
+                        response_text = res.get("advice") or res.get("response") or res.get("message") or json.dumps(res, indent=2)
                     else:
                         response_text = str(res)
                 else:

@@ -75,9 +75,6 @@
                         <div id="currentTargetTitle" class="current-target-title">
                             <span id="activeTargetNameDisplay">No Target Selected</span>
                         </div>
-                        <div id="scopeSummaryBadge" class="scope-pill" title="Click to view/edit target scope">
-                            <span id="scopeRuleCount">0 in-scope</span>
-                        </div>
                     </div>
                 </div>
 
@@ -93,9 +90,6 @@
                     <button id="findingsToggleBtn" class="btn-header btn-findings-toggle" title="View discovered findings for this target">
                         <span>FINDINGS</span>
                         <span id="headerFindingsCount" class="findings-count-badge">0</span>
-                    </button>
-                    <button id="scopeModalBtn" class="btn-header" title="Edit target scope rules">
-                        <span>SCOPE</span>
                     </button>
                     <button id="clearChatBtn" class="btn-header" title="Clear chat history for this target">
                         <span>CLEAR</span>
@@ -127,6 +121,10 @@
                 <div class="input-wrapper">
                     <textarea id="chatInput" rows="1" placeholder="Type a message or /command (e.g. /recon, /hunt, /scope)..."></textarea>
                     <div class="input-actions">
+                        <button id="scopeInlineBtn" class="btn-scope-inline" title="View/edit scope for this target">
+                            <span class="scope-inline-icon">⊕</span>
+                            <span id="scopeRuleCount" class="scope-inline-count">0 in-scope</span>
+                        </button>
                         <button id="sendBtn" class="btn-send" title="Send message (Enter)">
                             <span>➤</span>
                         </button>
@@ -294,26 +292,48 @@
 
             <!-- Tab 2: API Keys -->
             <div id="settings-tab-apikeys" class="settings-tab-pane">
-                <p class="settings-help">API keys are securely stored in ~/.hellhound/config.json.</p>
+                <p class="settings-help">API keys are securely stored in ~/.hellhound/config.json. Click the eye icon to reveal a key.</p>
                 <div class="settings-field">
                     <label>NVIDIA NIM API Key</label>
-                    <input type="password" id="cfgKeyNvidia" class="settings-input" placeholder="nvapi-...">
+                    <div class="api-key-input-wrap">
+                        <input type="password" id="cfgKeyNvidia" class="settings-input api-key-input" placeholder="nvapi-...">
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyNvidia" title="Show/hide key">👁</button>
+                    </div>
                 </div>
                 <div class="settings-field">
                     <label>Anthropic API Key</label>
-                    <input type="password" id="cfgKeyAnthropic" class="settings-input" placeholder="sk-ant-...">
+                    <div class="api-key-input-wrap">
+                        <input type="password" id="cfgKeyAnthropic" class="settings-input api-key-input" placeholder="sk-ant-...">
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyAnthropic" title="Show/hide key">👁</button>
+                    </div>
+                </div>
+                <div class="settings-field">
+                    <label>Google Gemini API Key</label>
+                    <div class="api-key-input-wrap">
+                        <input type="password" id="cfgKeyGemini" class="settings-input api-key-input" placeholder="AIza...">
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyGemini" title="Show/hide key">👁</button>
+                    </div>
                 </div>
                 <div class="settings-field">
                     <label>OpenAI API Key</label>
-                    <input type="password" id="cfgKeyOpenai" class="settings-input" placeholder="sk-...">
+                    <div class="api-key-input-wrap">
+                        <input type="password" id="cfgKeyOpenai" class="settings-input api-key-input" placeholder="sk-...">
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyOpenai" title="Show/hide key">👁</button>
+                    </div>
                 </div>
                 <div class="settings-field">
                     <label>OpenRouter API Key</label>
-                    <input type="password" id="cfgKeyOpenrouter" class="settings-input" placeholder="sk-or-...">
+                    <div class="api-key-input-wrap">
+                        <input type="password" id="cfgKeyOpenrouter" class="settings-input api-key-input" placeholder="sk-or-...">
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyOpenrouter" title="Show/hide key">👁</button>
+                    </div>
                 </div>
                 <div class="settings-field">
                     <label>Groq API Key</label>
-                    <input type="password" id="cfgKeyGroq" class="settings-input" placeholder="gsk_...">
+                    <div class="api-key-input-wrap">
+                        <input type="password" id="cfgKeyGroq" class="settings-input api-key-input" placeholder="gsk_...">
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyGroq" title="Show/hide key">👁</button>
+                    </div>
                 </div>
             </div>
 
@@ -352,6 +372,18 @@
                     <button id="cancelSettingsBtn" class="btn-modal-cancel">CANCEL</button>
                     <button id="saveSettingsBtn" class="btn-modal-primary">SAVE CONFIGURATION</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── CONFIRMATION MODAL ────────────────────────────────────── -->
+    <div id="confirmModal" class="modal-overlay">
+        <div class="modal-box" style="max-width: 480px;">
+            <div id="confirmModalTitle" class="modal-title">CONFIRM ACTION</div>
+            <p id="confirmModalMessage" class="modal-desc">Are you sure you want to proceed?</p>
+            <div class="modal-actions">
+                <button id="cancelConfirmBtn" class="btn-modal-cancel">CANCEL</button>
+                <button id="acceptConfirmBtn" class="btn-modal-primary btn-danger">CONFIRM</button>
             </div>
         </div>
     </div>

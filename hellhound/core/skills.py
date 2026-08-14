@@ -234,7 +234,7 @@ def is_ctf_auto_scope_eligible(target_name: str, user_text: str = "") -> bool:
       2. User text contains explicit high-confidence multi-word authorization phrases
          ('training range', 'isolated target', 'private target', 'non-indexed target', 'non-indexed lab').
 
-    A bare token like 'lab' or 'test' alone against a regular public domain (e.g. 'discover.com')
+    A bare token like 'lab' or 'test' alone against a regular public domain (e.g. 'targetcorp.example')
     will NEVER qualify for auto-scoping.
     """
     if not target_name:

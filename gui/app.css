@@ -765,22 +765,24 @@ body.clean-interface .ambient-bg {
     margin-right: 4px;
 }
 
-/* Assistant Message */
+/* Assistant Message (Full Width AI Response Flow like ChatGPT/Claude) */
 .chat-msg.assistant {
     align-self: flex-start;
     width: 100%;
-    max-width: 92%;
+    max-width: 100%;
 }
 
 .assistant-bubble {
-    background: rgba(14, 14, 20, 0.85);
-    border: 1px solid var(--surface-border);
-    border-left: 4px solid var(--primary);
-    backdrop-filter: blur(16px);
-    border-radius: 4px 12px 12px 12px;
-    padding: 18px 22px;
-    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+    background: rgba(14, 16, 24, 0.55);
+    border: none;
+    border-left: 3px solid var(--primary);
+    backdrop-filter: blur(14px);
+    border-radius: 0 8px 8px 0;
+    padding: 16px 20px;
+    margin: 8px 0 16px 0;
+    width: 100%;
     user-select: text;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
 }
 
 .assistant-header {
@@ -788,8 +790,8 @@ body.clean-interface .ambient-bg {
     align-items: center;
     justify-content: space-between;
     margin-bottom: 12px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 .assistant-tag {
@@ -803,26 +805,40 @@ body.clean-interface .ambient-bg {
     color: var(--primary);
 }
 
-.assistant-actions {
+.assistant-footer {
     display: flex;
     align-items: center;
-    gap: 8px;
+    justify-content: flex-end;
+    gap: 12px;
+    margin-top: 14px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.assistant-metrics {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-family: 'Space Grotesk', monospace;
 }
 
 .btn-msg-copy {
-    background: none;
-    border: none;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
     color: var(--text-dim);
     cursor: pointer;
-    font-size: 12px;
-    padding: 2px 6px;
+    font-size: 11px;
+    padding: 4px 10px;
     border-radius: 4px;
-    transition: all 0.2s;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: all 0.2s ease;
 }
 
 .btn-msg-copy:hover {
     color: #ffffff;
-    background: rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.2);
 }
 
 .assistant-body {
@@ -1105,6 +1121,81 @@ body.clean-interface .ambient-bg {
 .btn-send.btn-stop-mode:hover {
     background: #dc2626;
     transform: scale(1.05);
+}
+
+/* Inline Scope Button (inside chat input bar) */
+.btn-scope-inline {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--surface-border);
+    color: var(--text-muted);
+    padding: 6px 10px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    font-family: 'Space Grotesk', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+    white-space: nowrap;
+    height: 36px;
+}
+
+.btn-scope-inline:hover {
+    border-color: var(--primary);
+    color: #ffffff;
+    background: rgba(255, 34, 68, 0.06);
+    box-shadow: 0 0 12px var(--primary-glow);
+}
+
+.scope-inline-icon {
+    font-size: 14px;
+    color: var(--primary);
+    line-height: 1;
+}
+
+.scope-inline-count {
+    font-size: 10px;
+    color: inherit;
+}
+
+/* API Key Eye Toggle Button */
+.api-key-input-wrap {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    position: relative;
+}
+
+.api-key-input-wrap .api-key-input {
+    flex: 1;
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    margin-bottom: 0;
+}
+
+.btn-toggle-key {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--surface-border);
+    border-left: none;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+    color: var(--text-dim);
+    padding: 0 12px;
+    cursor: pointer;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+    min-width: 40px;
+}
+
+.btn-toggle-key:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #ffffff;
+    border-color: var(--primary);
 }
 
 /* ── RIGHT SLIDE-OUT FINDINGS DRAWER ──────────────────────────────── */
@@ -1765,4 +1856,269 @@ body.clean-interface .ambient-bg {
 ::-webkit-scrollbar-thumb:hover {
     background: var(--primary);
     box-shadow: 0 0 8px var(--primary-glow);
+}
+
+/* ── NODE VISUALIZATION & EXECUTION CARDS ──────────────────────── */
+.btn-danger {
+    background: var(--primary) !important;
+    border-color: #ff3355 !important;
+    color: #ffffff !important;
+}
+
+.btn-danger:hover {
+    box-shadow: 0 0 16px var(--primary-glow) !important;
+}
+
+.node-exec-card {
+    background: rgba(15, 17, 23, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-left: 3px solid #38bdf8;
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-top: 6px;
+    font-family: 'Space Grotesk', monospace;
+    font-size: 11px;
+}
+
+.node-exec-card.active {
+    border-left-color: #38bdf8;
+    background: rgba(56, 189, 248, 0.04);
+}
+
+.node-exec-card.scope-blocked {
+    border-left-color: var(--primary);
+    background: rgba(255, 34, 68, 0.08);
+}
+
+.node-exec-card.error {
+    border-left-color: var(--danger);
+    background: rgba(239, 68, 68, 0.08);
+}
+
+.node-exec-card.success {
+    border-left-color: var(--success);
+    background: rgba(34, 197, 94, 0.04);
+}
+
+.node-exec-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.node-status-dot.pulse {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #38bdf8;
+    box-shadow: 0 0 8px #38bdf8;
+    animation: pulse 1.5s infinite;
+}
+
+.node-tool-name {
+    font-weight: 700;
+    color: #e2e8f0;
+    letter-spacing: 0.03em;
+}
+
+.node-target-tag {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    color: #94a3b8;
+}
+
+.node-exec-body {
+    color: #94a3b8;
+    line-height: 1.4;
+}
+
+.scope-reason-text {
+    color: #ff6b81;
+    font-weight: 600;
+}
+
+/* Domain Topology Map & Trees */
+.node-topology-card {
+    background: rgba(11, 13, 19, 0.85);
+    border: 1px solid var(--surface-border-accent);
+    border-radius: 6px;
+    padding: 12px;
+    margin-top: 8px;
+}
+
+.node-topo-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    margin-bottom: 8px;
+}
+
+.node-topo-title {
+    font-family: 'Space Grotesk', monospace;
+    font-weight: 700;
+    font-size: 11px;
+    color: #38bdf8;
+    letter-spacing: 0.05em;
+}
+
+.node-topo-badge {
+    background: rgba(56, 189, 248, 0.15);
+    border: 1px solid rgba(56, 189, 248, 0.3);
+    color: #38bdf8;
+    font-size: 9px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+
+.node-topo-tree {
+    font-family: 'Space Grotesk', monospace;
+    font-size: 11px;
+}
+
+.node-tree-root {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 700;
+    color: #ffffff;
+    margin-bottom: 6px;
+}
+
+.node-tree-branches {
+    padding-left: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.node-branch-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #cbd5e1;
+}
+
+.tree-line {
+    color: #475569;
+}
+
+.node-sub-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+
+}
+
+.node-sub-dot.online {
+    background: #4ade80;
+    box-shadow: 0 0 6px rgba(74, 222, 128, 0.5);
+}
+
+.node-sub-dot.resolved {
+    background: #38bdf8;
+    box-shadow: 0 0 6px rgba(56, 189, 248, 0.5);
+}
+
+.node-branch-more {
+    color: #64748b;
+    font-style: italic;
+    padding-left: 24px;
+    margin-top: 2px;
+}
+
+/* HTTP Probes List */
+.httpx-services-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-family: 'Space Grotesk', monospace;
+    font-size: 11px;
+}
+
+.httpx-service-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255, 255, 255, 0.02);
+    padding: 4px 8px;
+    border-radius: 4px;
+}
+
+.http-status-code {
+    font-weight: 700;
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 3px;
+}
+
+.status-200 { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
+.status-300 { background: rgba(234, 179, 8, 0.2); color: #facc15; }
+.status-400 { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+
+.service-url {
+    color: #ffffff;
+    font-weight: 500;
+}
+
+.service-title {
+    color: #94a3b8;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * MARKDOWN TABLE STYLING FOR GUI CHATBOX
+ * ───────────────────────────────────────────────────────────────────────────── */
+.table-container {
+    width: 100%;
+    overflow-x: auto;
+    margin: 14px 0;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(10, 12, 18, 0.6);
+}
+
+.markdown-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    text-align: left;
+    font-family: 'Space Grotesk', system-ui, sans-serif;
+}
+
+.markdown-table th {
+    background: rgba(239, 68, 68, 0.12);
+    color: #f87171;
+    font-family: 'Michroma', sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(239, 68, 68, 0.25);
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+}
+
+.markdown-table td {
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    color: #e2e8f0;
+    line-height: 1.5;
+}
+
+.markdown-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.markdown-table tbody tr:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.assistant-body hr {
+    border: none;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    margin: 16px 0;
 }

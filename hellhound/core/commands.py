@@ -8,6 +8,7 @@ and GUI IPC command execution.
 
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Any, Tuple
+import inspect
 import os
 import sys
 import json
@@ -26,6 +27,7 @@ from hellhound.core.emit import PlainEmit, ConsoleEmit
 from hellhound.core.http_utils import merge_global_context
 from hellhound.core.nodes import build_graph
 from hellhound.core.toolcheck import check_all_tools, try_install, ensure_tool, install_hint, check_wordlists
+from hellhound.core.skills import is_ctf_domain_pattern, is_ctf_auto_scope_eligible
 
 
 def _interactive_prompt(prompt_text: str) -> str:
@@ -129,21 +131,48 @@ def _extract_target_from_args(args: List[str], session_context: Dict[str, Any]) 
     return ""
 
 
-def handle_recon(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+def _call_tool_traced(agent, tool_name: str, args: Dict[str, Any], emit: Any,
+                      cancel_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
     """
-    /recon [subdomains|endpoints|tech] <target> [--json]
-    Delegates to the agent's own reasoning — asset discovery, live-host
-    confirmation, and content discovery in proper order, chosen dynamically
-    rather than a fixed script.
+    Executes a tool via agent.execute_tool_call() while emitting live
+    tool_start/tool_result events — the same events agent.py's agentic
+    handle_message() loop already emits around its own tool calls.
     """
+    if cancel_check and cancel_check():
+        return {"error": "cancelled", "message": "Execution stopped by user", "blocked": True}
+
+    if emit and hasattr(emit, "tool_start"):
+        emit.tool_start(tool_name, args)
+    result = agent.execute_tool_call(tool_name, args, emit=emit)
+    if emit and hasattr(emit, "tool_result"):
+        emit.tool_result(tool_name, result)
+    return result
+
+
+def handle_recon(args: List[str], session_context: Dict[str, Any], emit: Any,
+                 on_token: Optional[Callable[[str], None]] = None,
+                 cancel_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+    """
+    /recon [subdomains [active|passive] [permute] | endpoints | tech] <target> [--json]
+    Deterministic reconnaissance pipelines — known tool sequences are called
+    directly via execute_tool_call() with zero LLM round-trips for tool
+    selection.
+    """
+    if cancel_check and cancel_check():
+        return {"status": "cancelled", "message": "Execution stopped by user"}
+
     is_json = "--json" in args or getattr(emit, "json_mode", False)
     clean_args = [a for a in args if a not in ("--json", "-j")]
 
-    known_modes = {"subdomains", "endpoints", "tech"}
+    known_modes = {
+        "subdomains": "subdomains", "subdomain": "subdomains", "subs": "subdomains", "sub": "subdomains",
+        "endpoints": "endpoints", "endpoint": "endpoints",
+        "tech": "tech"
+    }
     mode = "full"
 
     if clean_args and clean_args[0].lower() in known_modes:
-        mode = clean_args[0].lower()
+        mode = known_modes[clean_args[0].lower()]
         clean_args = clean_args[1:]
 
     target = _extract_target_from_args(clean_args, session_context)
@@ -158,51 +187,170 @@ def handle_recon(args: List[str], session_context: Dict[str, Any], emit: Any) ->
     session_context["target"] = target
     agent = get_agent(target)
 
+    # ── Deterministic pipelines for narrow modes ─────────────────────
+    results = {}
+    answer = ""
+
     if mode == "subdomains":
-        prompt = (
-            f"Enumerate subdomains for {target} using passive discovery, "
-            f"escalating to active brute-force only if passive results are thin. "
-            f"Don't proceed to content discovery or deeper analysis. Respect scope throughout."
-        )
+        # Parse optional active/passive submode and permute flag-word
+        sub_mode = None
+        if clean_args and clean_args[0].lower() in ("active", "passive"):
+            sub_mode = clean_args[0].lower()
+            clean_args = clean_args[1:]
+            re_target = _extract_target_from_args(clean_args, session_context)
+            if re_target:
+                target = sanitize_target_name(re_target)
+                session_context["target"] = target
+                agent = get_agent(target)
+
+        has_permute = False
+        permute_idx = None
+        for idx, a in enumerate(clean_args):
+            if a.lower() == "permute":
+                has_permute = True
+                permute_idx = idx
+                break
+        if permute_idx is not None:
+            clean_args = clean_args[:permute_idx] + clean_args[permute_idx + 1:]
+            re_target = _extract_target_from_args(clean_args, session_context)
+            if re_target:
+                target = sanitize_target_name(re_target)
+                session_context["target"] = target
+                agent = get_agent(target)
+
+        # Auto-detect active/passive when not explicitly specified
+        if sub_mode is None:
+            if is_ctf_domain_pattern(target) or is_ctf_auto_scope_eligible(target):
+                sub_mode = "active"
+            else:
+                sub_mode = "passive"
+
+        if cancel_check and cancel_check():
+            return {"status": "cancelled", "message": "Execution stopped by user"}
+
+        if sub_mode == "active":
+            results["dns_bruteforce"] = _call_tool_traced(
+                agent, "dns_bruteforce", {"domain": target}, emit, cancel_check=cancel_check
+            )
+            found = results["dns_bruteforce"].get("subdomains", [])
+            if len(found) < 3:
+                results["subfinder"] = _call_tool_traced(
+                    agent, "subfinder", {"domain": target}, emit, cancel_check=cancel_check
+                )
+                supplement = results["subfinder"].get("subdomains", [])
+                found = list(dict.fromkeys(found + supplement))
+        else:
+            results["subfinder"] = _call_tool_traced(
+                agent, "subfinder", {"domain": target}, emit, cancel_check=cancel_check
+            )
+            found = results["subfinder"].get("subdomains", [])
+            if len(found) < 3:
+                results["dns_bruteforce"] = _call_tool_traced(
+                    agent, "dns_bruteforce", {"domain": target}, emit, cancel_check=cancel_check
+                )
+                supplement = results["dns_bruteforce"].get("subdomains", [])
+                found = list(dict.fromkeys(found + supplement))
+
+        if cancel_check and cancel_check():
+            return {"status": "cancelled", "message": "Execution stopped by user"}
+
+        # Perform permutation and fast resolution sequence (always resolve discovered subdomains)
+        if found:
+            perm = _call_tool_traced(
+                agent, "permute_subdomains", {"subdomains": found}, emit, cancel_check=cancel_check
+            )
+            results["permute_subdomains"] = perm
+            candidates = perm.get("candidates", [])
+            if candidates:
+                res_cands = _call_tool_traced(
+                    agent, "resolve_candidates",
+                    {"candidates": candidates},
+                    emit,
+                    cancel_check=cancel_check
+                )
+                results["resolve_candidates"] = res_cands
+                resolved = res_cands.get("subdomains", [])
+                found = list(dict.fromkeys(found + resolved))
+
+        if cancel_check and cancel_check():
+            return {"status": "cancelled", "message": "Execution stopped by user"}
+
+        # HTTP Service Discovery via httpx across all discovered subdomains
+        if found:
+            results["httpx"] = _call_tool_traced(
+                agent, "httpx", {"target": found}, emit, cancel_check=cancel_check
+            )
+
     elif mode == "endpoints":
-        prompt = (
-            f"Perform content and endpoint discovery on {target} using spider. "
-            f"Assume live hosts are already known or do a quick httpx check first. "
-            f"Do not perform subdomain enumeration. Respect scope throughout."
+        if cancel_check and cancel_check():
+            return {"status": "cancelled", "message": "Execution stopped by user"}
+        results["httpx"] = _call_tool_traced(
+            agent, "httpx", {"target": [target]}, emit, cancel_check=cancel_check
         )
+        if cancel_check and cancel_check():
+            return {"status": "cancelled", "message": "Execution stopped by user"}
+        results["spider"] = _call_tool_traced(
+            agent, "spider", {"url": target}, emit, cancel_check=cancel_check
+        )
+
     elif mode == "tech":
-        prompt = (
-            f"Perform live-host confirmation and technology fingerprinting on {target} "
-            f"using httpx. Do not perform any crawling, spidering, or subdomain enumeration. "
-            f"Respect scope throughout."
+        if cancel_check and cancel_check():
+            return {"status": "cancelled", "message": "Execution stopped by user"}
+        results["httpx"] = _call_tool_traced(
+            agent, "httpx", {"target": [target]}, emit, cancel_check=cancel_check
         )
-    elif is_ctf_domain_pattern(target) or is_ctf_auto_scope_eligible(target):
-        prompt = (
-            f"Perform active CTF/lab reconnaissance on {target}. "
-            f"This is an isolated/unindexed challenge target. Do NOT perform passive subdomain enumeration (no subfinder). "
-            f"Start with active DNS brute-force (dns_bruteforce) and live-host confirmation (httpx), "
-            f"then content/endpoint discovery and vhost fuzzing on live ports. Respect scope throughout."
+
+    if cancel_check and cancel_check():
+        return {"status": "cancelled", "message": "Execution stopped by user"}
+
+    # ── Advisory synthesis or agentic fallback ───────────────────────
+    if mode in ("subdomains", "endpoints", "tech"):
+        advice = ask_neural_core(
+            prompt=(
+                f"Reconnaissance on {target} (mode: {mode}) completed.\n"
+                f"Raw Tool Results: {json.dumps(results, default=str)[:5000]}.\n\n"
+                f"REQUIREMENTS FOR YOUR RESPONSE:\n"
+                f"1. Mention the underlying tools used: active DNS brute-forcing using shuffledns (via dns_bruteforce), permutation candidate generation, and candidate resolution using dnsx (via resolve_candidates).\n"
+                f"2. Explicitly explain what kind of targets were discovered by HTTPX (e.g. list each live host, its resolved IP, HTTP status code, title/headers, and identified service type like API endpoint, web app, or database service).\n"
+                f"3. Provide a prioritized Next-step reconnaissance action table (Columns: #, Action, Target/Reasoning, Expected Outcome).\n"
+                f"4. Be specific and actionable based on the actual HTTPX results."
+            ),
+            role="synthesizer",
+            thinking=True,
+            on_token=on_token,
         )
+        answer = advice
     else:
-        prompt = (
-            f"Perform reconnaissance on {target}. Follow proper methodology: "
-            f"asset discovery and live-host confirmation first (subfinder, escalate "
-            f"to dns_bruteforce if passive results are thin), then content/endpoint "
-            f"discovery (spider) only against confirmed live hosts, then deeper "
-            f"analysis (wafbuster, tech fingerprinting) as warranted. Respect scope "
-            f"thoughtout."
-        )
+        if is_ctf_domain_pattern(target) or is_ctf_auto_scope_eligible(target):
+            prompt = (
+                f"Perform active CTF/lab reconnaissance on {target}. "
+                f"This is an isolated/unindexed challenge target. Do NOT perform passive subdomain enumeration (no subfinder). "
+                f"Start with active DNS brute-force (dns_bruteforce) and live-host confirmation (httpx), "
+                f"then content/endpoint discovery and vhost fuzzing on live ports. Respect scope throughout."
+            )
+        else:
+            prompt = (
+                f"Perform reconnaissance on {target}. Follow proper methodology: "
+                f"asset discovery and live-host confirmation first (subfinder, escalate "
+                f"to dns_bruteforce if passive results are thin), then content/endpoint "
+                f"discovery (spider) only against confirmed live hosts, then deeper "
+                f"analysis (wafbuster, tech fingerprinting) as warranted. Respect scope "
+                f"throughout."
+            )
+        answer = agent.handle_message(prompt, session_context=session_context, emit=emit, on_token=on_token, cancel_check=cancel_check)
 
-    answer = agent.handle_message(prompt, session_context=session_context, emit=emit)
-    if not is_json:
+    if not is_json and not on_token:
         emit(answer)
-    return {"status": "success", "target": target, "mode": mode, "response": answer}
+    return {"status": "success", "target": target, "mode": mode, "results": results, "advice": answer}
 
 
-def handle_scan(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+def handle_scan(args: List[str], session_context: Dict[str, Any], emit: Any,
+                on_token: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """
     /scan <module> [target] [--json] [key=val ...]
-    Executes a specific discovery/analysis module against the target.
+    Deterministic single-module execution — calls the named tool directly via
+    execute_tool_call() with zero LLM round-trips, then a single
+    ask_neural_core() advisory call reviews the real result.
     """
     is_json = "--json" in args or getattr(emit, "json_mode", False)
     clean_args = [a for a in args if a not in ("--json", "-j")]
@@ -225,14 +373,14 @@ def handle_scan(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
 
     scope_rules = _ensure_scope(session_context)
 
-    # 1. Target Scope Check
+    # 1. Target Scope Check (unchanged — already correctly deterministic)
     allowed_target, t_reason = is_in_scope(target, scope_rules)
     if not allowed_target:
         if not is_json:
             emit.error(f"[SECURITY] Target out of scope: {t_reason}")
         return {"status": "error", "error": "out_of_scope", "target": target, "reason": t_reason}
 
-    # 2. Module Restriction Check
+    # 2. Module Restriction Check (unchanged — already correctly deterministic)
     allowed_mod, m_reason = check_module_against_rules(module_name, scope_rules)
     if not allowed_mod:
         if not is_json:
@@ -249,27 +397,48 @@ def handle_scan(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
     merged_opts.update(custom_opts)
     merge_global_context(merged_opts, session_context.get("options", {}))
 
+    # Inject the target into tool args under the most common parameter names
+    # so execute_tool_call() scope gate can extract and validate it
+    if "domain" not in merged_opts and "url" not in merged_opts and "target" not in merged_opts:
+        merged_opts["domain"] = target
+        merged_opts["target"] = target
+        merged_opts["url"] = target if target.startswith(("http://", "https://")) else f"https://{target}"
+
     session_context["target"] = target
     session_context["module"] = module_name
 
     agent = get_agent(target)
-    # Reconstruct options string
-    opt_str = " ".join(f"{k}={v}" for k, v in custom_opts.items())
-    prompt = f"Run the '{module_name}' tool/module against target {target} with parameters/arguments: {opt_str}."
-    answer = agent.handle_message(prompt, session_context=session_context, emit=emit)
 
-    if not is_json:
-        emit(answer)
+    # ── Direct tool execution — no LLM round-trip for tool selection ──
+    result = _call_tool_traced(agent, module_name, merged_opts, emit)
+
+    # ── Single advisory call — reviews real result ────────────────────
+    advice = ask_neural_core(
+        prompt=(
+            f"Ran '{module_name}' against {target}. "
+            f"Result: {json.dumps(result, default=str)[:4000]}. "
+            f"Review this and advise on next steps, or state clearly if "
+            f"nothing actionable was found."
+        ),
+        role="synthesizer",
+        thinking=True,
+        on_token=on_token,
+    )
+
+    if not is_json and not on_token:
+        emit(advice)
 
     return {
         "status": "success",
         "module": module_name,
         "target": target,
-        "response": answer
+        "result": result,
+        "advice": advice
     }
 
 
-def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any,
+                on_token: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """
     /hunt [target] [--json]
     Delegates to the agent's own reasoning for an autonomous, scope-aware multi-stage hunt and triage.
@@ -291,10 +460,10 @@ def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
         f"Discover the surface area (subdomains, ports, live hosts), run passive and active analysis "
         f"modules (spider, surface_auditor, corsbuster, graphql, exmap, wafbuster), and triage all findings."
     )
-    answer = agent.handle_message(prompt, session_context=session_context, emit=emit)
-    if not is_json:
+    answer = agent.handle_message(prompt, session_context=session_context, emit=emit, on_token=on_token)
+    if not is_json and not on_token:
         emit(answer)
-    return {"status": "success", "target": target, "response": answer}
+    return {"status": "success", "target": target, "advice": answer}
 
 
 def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
@@ -1000,7 +1169,7 @@ register_command(Command(
     name="/recon",
     aliases=["/surface", "/spider"],
     description="Run target reconnaissance pipeline with scope verification",
-    usage="/recon [subdomains|endpoints|tech] <target> [--json]",
+    usage="/recon [subdomains [active|passive] [permute] | endpoints | tech] <target> [--json]",
     category="hunting",
     handler=handle_recon
 ))
@@ -1180,7 +1349,9 @@ register_command(Command(
 # CENTRAL DISPATCHER
 # ─────────────────────────────────────────────────────────────
 
-def dispatch(raw_input: str, session_context: Dict[str, Any], emit: Any = None) -> Optional[Dict[str, Any]]:
+def dispatch(raw_input: str, session_context: Dict[str, Any], emit: Any = None,
+             on_token: Optional[Callable[[str], None]] = None,
+             cancel_check: Optional[Callable[[], bool]] = None) -> Optional[Dict[str, Any]]:
     """
     Main dispatch entry point for all command execution paths.
     Routes slash commands to specific handlers, and routes plain natural language
@@ -1208,7 +1379,13 @@ def dispatch(raw_input: str, session_context: Dict[str, Any], emit: Any = None) 
     if cmd_token.startswith("/"):
         command = get_command(cmd_token)
         if command and command.handler:
-            result = command.handler(args, session_context, emit)
+            handler_params = inspect.signature(command.handler).parameters
+            kwargs = {}
+            if "on_token" in handler_params:
+                kwargs["on_token"] = on_token
+            if "cancel_check" in handler_params:
+                kwargs["cancel_check"] = cancel_check
+            result = command.handler(args, session_context, emit, **kwargs)
             if "--json" in tokens or getattr(emit, "json_mode", False):
                 print(json.dumps(result, indent=2))
             return result
@@ -1225,11 +1402,12 @@ def dispatch(raw_input: str, session_context: Dict[str, Any], emit: Any = None) 
             return result
 
     # Plain natural language input -> Route directly to Agent Reasoning Loop
-    response = agent_handle_message(raw_clean, session_context=session_context, emit=emit)
+    response = agent_handle_message(raw_clean, session_context=session_context, emit=emit, on_token=on_token, cancel_check=cancel_check)
     if "--json" in tokens or getattr(emit, "json_mode", False):
         res_dict = {"status": "success", "response": response}
         print(json.dumps(res_dict, indent=2))
         return res_dict
     else:
-        emit(response)
+        if not on_token:
+            emit(response)
         return {"status": "success", "response": response}

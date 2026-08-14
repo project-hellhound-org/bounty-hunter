@@ -101,7 +101,7 @@ hellhound
 Run one-off prompts and pipeline commands directly:
 ```bash
 # Scope refusal verification (unscoped target)
-hellhound -p "recon discover.com"
+hellhound -p "recon targetcorp.example"
 
 # Automated CTF/lab active brute-force
 hellhound -p "recon topaz.ctfio.com, it is a CTF target"

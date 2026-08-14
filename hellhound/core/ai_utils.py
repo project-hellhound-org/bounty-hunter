@@ -429,16 +429,32 @@ class ThinkingIndicator:
             return f"Generated {count} candidate permutation(s)"
         elif tool_name == "resolve_candidates":
             resolved = result.get("resolved", [])
-            return f"Resolved {len(resolved)} live host(s) across DNS"
+            res_items = []
+            for r in resolved[:10]:
+                if isinstance(r, dict):
+                    res_items.append(r.get("host") or r.get("domain") or str(r))
+                else:
+                    res_items.append(str(r))
+            res_str = f": {', '.join(res_items)}{'...' if len(resolved) > 10 else ''}" if resolved else ""
+            return f"Resolved {len(resolved)} live host(s) across DNS{res_str}"
         elif tool_name == "subfinder":
             subs = result.get("subdomains", [])
-            return f"Discovered {len(subs)} subdomain(s) via passive CT sources"
+            subs_str = f": {', '.join(subs[:10])}{'...' if len(subs) > 10 else ''}" if subs else ""
+            return f"Discovered {len(subs)} subdomain(s) via passive CT sources{subs_str}"
         elif tool_name == "dns_bruteforce":
             subs = result.get("subdomains", [])
-            return f"Brute-forced {len(subs)} active DNS subdomain(s)"
+            subs_str = f": {', '.join(subs[:10])}{'...' if len(subs) > 10 else ''}" if subs else ""
+            return f"Brute-forced {len(subs)} active DNS subdomain(s){subs_str}"
         elif tool_name == "httpx":
             live = result.get("live_hosts", [])
-            return f"Probed {len(live)} live HTTP/HTTPS service(s)"
+            live_items = []
+            for h in live[:10]:
+                if isinstance(h, dict):
+                    live_items.append(h.get("url") or h.get("host") or str(h))
+                else:
+                    live_items.append(str(h))
+            live_str = f": {', '.join(live_items)}{'...' if len(live) > 10 else ''}" if live else ""
+            return f"Probed {len(live)} live HTTP/HTTPS service(s){live_str}"
         elif tool_name == "spider":
             eps = result.get("endpoints_found", 0)
             return f"Crawled application — found {eps} endpoint(s)"
