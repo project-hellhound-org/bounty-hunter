@@ -225,3 +225,4 @@ package-lock.json
 target_history.json
 *.local
 .env
+.env

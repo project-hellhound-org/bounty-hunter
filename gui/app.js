@@ -107,9 +107,6 @@ function renderToolEmitCard(emit) {
                     <span class="node-tool-name">${escapeHtml(tool)}</span>
                     <span class="node-target-tag">${escapeHtml(String(targetStr))}</span>
                 </div>
-                <div class="node-exec-body">
-                    <span class="node-param-label">Running:</span> <code>${escapeHtml(JSON.stringify(args))}</code>
-                </div>
             </div>
         `;
     }
@@ -122,7 +119,7 @@ function renderToolEmitCard(emit) {
             return `
                 <div class="node-exec-card scope-blocked">
                     <div class="node-exec-header">
-                        <span class="node-status-icon">⛔</span>
+                        <span class="node-status-icon">BLOCKED</span>
                         <span class="node-tool-name">SCOPE REFUSAL</span>
                     </div>
                     <div class="node-exec-body">
@@ -136,7 +133,7 @@ function renderToolEmitCard(emit) {
             return `
                 <div class="node-exec-card error">
                     <div class="node-exec-header">
-                        <span class="node-status-icon">⚠️</span>
+                        <span class="node-status-icon">ERROR</span>
                         <span class="node-tool-name">${escapeHtml(tool)} Error</span>
                     </div>
                     <div class="node-exec-body">
@@ -168,12 +165,12 @@ function renderToolEmitCard(emit) {
             return `
                 <div class="node-topology-card">
                     <div class="node-topo-header">
-                        <span class="node-topo-title">🌐 DOMAIN TOPOLOGY MAP (${tool})</span>
+                        <span class="node-topo-title">DOMAIN TOPOLOGY MAP (${tool})</span>
                         <span class="node-topo-badge">${count} DISCOVERED</span>
                     </div>
                     <div class="node-topo-tree">
                         <div class="node-tree-root">
-                            <span class="node-icon root">🎯</span>
+                            <span class="node-icon root">◆</span>
                             <span class="node-root-name">${escapeHtml(rootDomain)}</span>
                         </div>
                         <div class="node-tree-branches">
@@ -204,7 +201,7 @@ function renderToolEmitCard(emit) {
             return `
                 <div class="node-topology-card">
                     <div class="node-topo-header">
-                        <span class="node-topo-title">🧬 PERMUTATION & RESOLUTION (${tool})</span>
+                        <span class="node-topo-title">PERMUTATION & RESOLUTION (${tool})</span>
                         <span class="node-topo-badge">${count} RESOLVED</span>
                     </div>
                     <div class="node-topo-tree">
@@ -235,7 +232,7 @@ function renderToolEmitCard(emit) {
             return `
                 <div class="node-topology-card">
                     <div class="node-topo-header">
-                        <span class="node-topo-title">📡 HTTP SERVICE PROBES (httpx)</span>
+                        <span class="node-topo-title">HTTP SERVICE PROBES (httpx)</span>
                         <span class="node-topo-badge">${Array.isArray(liveServices) ? liveServices.length : 'ACTIVE'} SERVICES</span>
                     </div>
                     <div class="httpx-services-list">
@@ -290,6 +287,7 @@ window.addEventListener('pywebviewready', async () => {
     console.log("[HELLHOUND] PyWebView API bridge initialized.");
     await refreshSystemInfo();
     await loadTargetsList();
+    await initVoiceState();
 });
 
 // Setup agent emit handler called from Python
@@ -424,6 +422,9 @@ async function switchTarget(targetName) {
     // 5. Instantiate fresh Findings Component for this target
     findingsComponent = new IsolatedFindingsComponent(targetName);
     await findingsComponent.refreshData();
+
+    // 5b. Speak the mission briefing — built from the findings data just fetched above
+    speakBriefing(buildBriefingText(targetName, findingsComponent.data));
 
     // 6. Reload Chat History for this target
     await loadTargetChatHistory(targetName);
@@ -619,6 +620,165 @@ async function loadTargetChatHistory(targetName) {
     } catch (e) {
         console.error("Error loading chat history:", e);
     }
+}
+
+// ══════════════════════════════════════════════════════
+// MISSION BRIEFING VOICE
+// Backend-driven TTS via Fish Audio (see VoiceService in
+// hellhound/core/voice_service.py, exposed through HellhoundAPI in
+// gui_app.py) — NOT the browser's speechSynthesis, NOT pyttsx3/edge-tts.
+// Each user configures their own Fish Audio API key + reference voice
+// in Settings > Voice; nothing is hardcoded and nothing lives in .env.
+//
+// window.onVoiceEvent(...) is pushed by VoiceService's event callback via
+// evaluate_js — real start/end/unavailable/error callbacks, not a timer.
+// ══════════════════════════════════════════════════════
+let voiceEnabled = true;
+let voiceConfigured = false; // set from get_voice_settings() on load
+let lastBriefingText = '';
+
+async function initVoiceState() {
+    try {
+        const settings = await callApi('get_voice_settings');
+        voiceEnabled = settings?.enabled !== false;
+        voiceConfigured = !!settings?.configured;
+        setVoiceUI(!voiceConfigured ? 'unavailable' : (voiceEnabled ? 'idle' : 'off'));
+    } catch (err) {
+        console.warn('[Voice] could not load voice settings:', err);
+    }
+}
+
+function setVoiceUI(state) {
+    // state: 'idle' | 'speaking' | 'off' | 'unavailable'
+    const btn = document.getElementById('voiceToggleBtn');
+    const label = document.getElementById('voiceToggleLabel');
+    const logo = document.querySelector('.header-logo-img, .brand-logo');
+    if (btn && label) {
+        btn.classList.toggle('voice-off', state === 'off' || state === 'unavailable');
+        btn.classList.toggle('speaking', state === 'speaking');
+        label.innerText = state === 'unavailable' ? 'VOICE UNAVAILABLE' : (state === 'off' ? 'MUTE VOICE' : (state === 'speaking' ? 'SPEAKING' : 'SPEAK BRIEFING'));
+    }
+    // Wolf-eye glow: intensify the existing logo glow while actually speaking
+    logo?.classList.toggle('eyes-glowing', state === 'speaking');
+}
+
+function pushWaveformTick() {
+    const wave = document.getElementById('voiceWaveform');
+    if (!wave) return;
+    wave.querySelectorAll('.wave-bar').forEach(bar => {
+        bar.style.height = `${30 + Math.random() * 70}%`;
+    });
+}
+
+window.onVoiceEvent = function (evt) {
+    if (evt.type === 'start') {
+        setVoiceUI('speaking');
+    } else if (evt.type === 'word') {
+        pushWaveformTick(); // real per-word callback from the engine, not a fake interval
+    } else if (evt.type === 'end') {
+        setVoiceUI(voiceEnabled ? 'idle' : 'off');
+        document.getElementById('voiceWaveform')?.querySelectorAll('.wave-bar').forEach(bar => {
+            bar.style.height = '8%';
+        });
+    } else if (evt.type === 'unavailable') {
+        setVoiceUI('unavailable');
+        console.warn('[Voice] Fish Audio not configured or unreachable — voice disabled.', evt.payload?.reason);
+    } else if (evt.type === 'error') {
+        console.error('[Voice] engine error:', evt.payload?.error);
+        setVoiceUI(voiceEnabled ? 'idle' : 'off');
+    }
+};
+
+// Opens Settings straight to the Voice tab — the "Open Voice Settings"
+// escape hatch shown whenever voice is unavailable, per spec.
+async function openVoiceSettingsTab() {
+    await openSettingsModal();
+    document.querySelector('.settings-tab[data-settings-tab="voice"]')?.click();
+}
+
+function buildBriefingText(targetName, findingsData) {
+    const total = findingsData?.total_count || 0;
+    if (total === 0) {
+        return `Welcome back, hunter. Target ${targetName} is engaged with no findings on record yet. Ready for your first command.`;
+    }
+    const cats = findingsData?.categories || {};
+    const parts = [];
+    const label = (key) => ({
+        takeover_candidates: 'takeover candidate',
+        subdomains: 'subdomain',
+        open_ports: 'open port',
+        live_hosts: 'live host',
+        endpoints: 'endpoint',
+        vulnerabilities: 'vulnerability',
+        tls_info: 'T L S finding',
+    }[key] || key.replace(/_/g, ' '));
+    for (const [cat, items] of Object.entries(cats)) {
+        const n = Array.isArray(items) ? items.length : 0;
+        if (n > 0) parts.push(`${n} ${label(cat)}${n === 1 ? '' : 's'}`);
+    }
+    const highPriority = (cats.takeover_candidates?.length || 0) + (cats.vulnerabilities?.length || 0);
+    let text = `Welcome back, hunter. Target ${targetName} has ${total} total findings on record: ${parts.join(', ')}.`;
+    if (highPriority > 0) {
+        text += ` ${highPriority} of those require verification before they're report-ready.`;
+    }
+    return text;
+}
+
+async function speakBriefing(text) {
+    if (!voiceEnabled || !text) return;
+    if (!voiceConfigured) {
+        setVoiceUI('unavailable');
+        return;
+    }
+    lastBriefingText = text;
+    try {
+        const res = await callApi('speak_briefing', text);
+        if (res?.status === 'unavailable' || res?.status === 'error') {
+            setVoiceUI('unavailable');
+        }
+    } catch (err) {
+        console.error('[Voice] speak_briefing call failed:', err);
+        setVoiceUI('unavailable');
+    }
+}
+
+async function stopSpeaking() {
+    try { await callApi('stop_speaking'); } catch (err) { /* engine may already be idle */ }
+    setVoiceUI(voiceEnabled ? 'idle' : 'off');
+}
+
+async function replayBriefing() {
+    // Replays the cached audio from the last generation instead of
+    // re-hitting the Fish Audio API.
+    if (!voiceConfigured) {
+        setVoiceUI('unavailable');
+        return;
+    }
+    try {
+        const res = await callApi('replay_voice');
+        if (res?.status === 'unavailable') setVoiceUI('unavailable');
+    } catch (err) {
+        console.error('[Voice] replay_voice call failed:', err);
+    }
+}
+
+// Single header button, three behaviors depending on state:
+//   unavailable      -> jump to Settings > Voice
+//   currently speaking -> Mute (stop playback)
+//   idle             -> toggle voice on/off for future briefings
+function toggleVoice() {
+    if (!voiceConfigured) {
+        openVoiceSettingsTab();
+        return;
+    }
+    const btn = document.getElementById('voiceToggleBtn');
+    if (btn?.classList.contains('speaking')) {
+        stopSpeaking();
+        return;
+    }
+    voiceEnabled = !voiceEnabled;
+    if (!voiceEnabled) stopSpeaking();
+    setVoiceUI(voiceEnabled ? 'idle' : 'off');
 }
 
 function showWelcomeHero() {
@@ -920,13 +1080,8 @@ function handleIncomingEmit(data) {
         emitWrapper.className = 'chat-msg assistant in-flight-emit-msg';
         emitWrapper.innerHTML = `
             <div class="assistant-bubble" style="padding: 4px 4px 4px 0;">
-                <div class="assistant-header" style="margin-bottom: 6px;">
-                    <div class="assistant-tag" style="color: #38bdf8;">
-                        <span class="status-dot-pulse"></span>
-                        <span>EXECUTING PIPELINE...</span>
-                    </div>
-                </div>
                 <div class="tool-emits-container active-in-flight-emits"></div>
+                <div class="thinking-dots"><span></span><span></span><span></span></div>
             </div>
         `;
         thread.appendChild(emitWrapper);
@@ -1271,6 +1426,9 @@ function setupDOMEventHandlers() {
         document.body.classList.toggle('clean-interface');
     });
 
+    // Voice Toggle
+    document.getElementById('voiceToggleBtn')?.addEventListener('click', toggleVoice);
+
     // Slash Palette
     setupSlashPalette();
 
@@ -1410,8 +1568,8 @@ function setupDOMEventHandlers() {
         renderTargetList(targetsList);
     });
 
-    // Sliding Sidebar (Slide out when hovering top-left logo / brand)
-    const logoTrigger = document.getElementById('logoTrigger');
+    // Sliding Sidebar (hover the rail itself, from the logo down — no
+    // separate header logo trigger anymore, just the one rail).
     const sidebar = document.getElementById('sidebar');
 
     let sidebarHoverTimer = null;
@@ -1431,17 +1589,22 @@ function setupDOMEventHandlers() {
         }, 280);
     };
 
-    if (logoTrigger && sidebar) {
-        logoTrigger.addEventListener('mouseenter', openSlidingSidebar);
-        logoTrigger.addEventListener('mouseleave', closeSlidingSidebar);
+    if (sidebar) {
         sidebar.addEventListener('mouseenter', openSlidingSidebar);
         sidebar.addEventListener('mouseleave', closeSlidingSidebar);
-        
-        logoTrigger.addEventListener('click', (e) => {
-            e.stopPropagation();
-            sidebar.classList.toggle('open');
-        });
     }
+
+    // Ctrl+B — pin/unpin the nav rail open, independent of hover
+    document.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+            e.preventDefault();
+            if (sidebarHoverTimer) {
+                clearTimeout(sidebarHoverTimer);
+                sidebarHoverTimer = null;
+            }
+            sidebar?.classList.toggle('open');
+        }
+    });
 
     // ── Floating Settings Button & Modal Setup ──
     const settingsBtn = document.getElementById('settingsBtn');
@@ -1485,6 +1648,42 @@ function setupDOMEventHandlers() {
         }
     });
 
+    // Voice: Test / Replay Last Test
+    const testVoiceBtn = document.getElementById('testVoiceBtn');
+    const replayTestVoiceBtn = document.getElementById('replayTestVoiceBtn');
+
+    testVoiceBtn?.addEventListener('click', async () => {
+        testVoiceBtn.disabled = true;
+        const original = testVoiceBtn.textContent;
+        testVoiceBtn.textContent = 'TESTING...';
+        // Test against whatever is currently typed, saving first so the
+        // backend has the latest key/reference id to test with.
+        try {
+            await callApi('save_voice_settings', {
+                enabled: document.getElementById('cfgVoiceEnabled')?.checked ?? true,
+                api_key: document.getElementById('cfgVoiceApiKey')?.value || '',
+                reference_id: document.getElementById('cfgVoiceReferenceId')?.value || '',
+                model: document.getElementById('cfgVoiceModel')?.value || 's2.1-pro-free',
+                speed: parseFloat(document.getElementById('cfgVoiceSpeed')?.value) || 1.08,
+            });
+            const res = await callApi('test_voice');
+            updateVoiceStatusIndicator(res?.status === 'ok');
+            if (res?.status !== 'ok') {
+                console.warn('[Voice] test failed:', res?.reason);
+            }
+        } catch (e) {
+            console.error('[Voice] test_voice failed:', e);
+            updateVoiceStatusIndicator(false);
+        } finally {
+            testVoiceBtn.disabled = false;
+            testVoiceBtn.textContent = original;
+        }
+    });
+
+    replayTestVoiceBtn?.addEventListener('click', async () => {
+        try { await callApi('replay_voice'); } catch (e) { console.error('[Voice] replay failed:', e); }
+    });
+
     // API Key Eye Toggle (Show/Hide)
     document.querySelectorAll('.btn-toggle-key').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -1493,11 +1692,11 @@ function setupDOMEventHandlers() {
             if (!input) return;
             if (input.type === 'password') {
                 input.type = 'text';
-                btn.textContent = '🙈';
+                btn.textContent = 'HIDE';
                 btn.title = 'Hide key';
             } else {
                 input.type = 'password';
-                btn.textContent = '👁';
+                btn.textContent = 'SHOW';
                 btn.title = 'Show key';
             }
         });
@@ -1567,7 +1766,38 @@ async function openSettingsModal() {
         console.warn('Could not load settings from backend:', e);
     }
 
+    try {
+        const voice = await callApi('get_voice_settings');
+        if (voice) {
+            const enabled = document.getElementById('cfgVoiceEnabled');
+            const apiKey = document.getElementById('cfgVoiceApiKey');
+            const refId = document.getElementById('cfgVoiceReferenceId');
+            const model = document.getElementById('cfgVoiceModel');
+            const speed = document.getElementById('cfgVoiceSpeed');
+            if (enabled) enabled.checked = voice.enabled !== false;
+            // Never populate the real key back into the field — only show a
+            // masked placeholder so the user knows one is already saved.
+            if (apiKey) {
+                apiKey.value = '';
+                apiKey.placeholder = voice.api_key_set ? voice.api_key_masked : 'Paste your Fish Audio API key';
+            }
+            if (refId) refId.value = voice.reference_id || '';
+            if (model) model.value = voice.model || 's2.1-pro-free';
+            if (speed) speed.value = voice.speed || 1.08;
+            updateVoiceStatusIndicator(voice.configured);
+        }
+    } catch (e) {
+        console.warn('Could not load voice settings from backend:', e);
+    }
+
     modal?.classList.add('open');
+}
+
+function updateVoiceStatusIndicator(connected) {
+    const dot = document.getElementById('voiceStatusDot');
+    const text = document.getElementById('voiceStatusText');
+    if (dot) dot.classList.toggle('connected', !!connected);
+    if (text) text.textContent = connected ? '✓ Connected' : 'Not configured';
 }
 
 function closeSettingsModal() {
@@ -1636,8 +1866,21 @@ async function saveSettings() {
         auto_install_missing_tools: document.getElementById('cfgAutoInstallTools')?.checked || false,
     };
 
+    const voicePayload = {
+        enabled: document.getElementById('cfgVoiceEnabled')?.checked ?? true,
+        api_key: document.getElementById('cfgVoiceApiKey')?.value || '',
+        reference_id: document.getElementById('cfgVoiceReferenceId')?.value || '',
+        model: document.getElementById('cfgVoiceModel')?.value || 's2.1-pro-free',
+        speed: parseFloat(document.getElementById('cfgVoiceSpeed')?.value) || 1.08,
+    };
+
     try {
         const res = await callApi('save_settings', payload);
+        const voiceRes = await callApi('save_voice_settings', voicePayload);
+        voiceEnabled = voiceRes?.settings?.enabled !== false;
+        voiceConfigured = !!voiceRes?.settings?.configured;
+        updateVoiceStatusIndicator(voiceConfigured);
+        setVoiceUI(!voiceConfigured ? 'unavailable' : (voiceEnabled ? 'idle' : 'off'));
         if (statusSpan) {
             statusSpan.textContent = '✓ Configuration saved successfully';
             statusSpan.style.color = '#4ade80';

@@ -5,6 +5,7 @@ aiohttp
 rich
 prompt_toolkit
 pywebview
+fish-audio-sdk  # GUI voice only — requires system ffmpeg (ffplay) for playback
 qtpy
 PyQt6
 PyQt6-WebEngine

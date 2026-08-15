@@ -50,7 +50,6 @@
 
             <div class="sidebar-footer">
                 <button id="settingsBtn" class="btn-sidebar-settings" title="System Configuration (Models, Tools, API Keys)">
-                    <span class="settings-gear-icon">⚙</span>
                     <span class="settings-btn-label">SETTINGS</span>
                 </button>
                 <div id="systemModelTag" class="system-model-tag">
@@ -65,12 +64,6 @@
             <!-- Header Bar -->
             <header class="main-header">
                 <div class="header-left-cluster">
-                    <div id="logoTrigger" class="header-logo-trigger" title="Hover to view target archive">
-                        <img src="../Images/logo.png" alt="Hellhound Logo" class="header-logo-img" onerror="this.style.display='none'">
-                    </div>
-
-                    <div class="header-divider"></div>
-
                     <div class="current-target-info">
                         <div id="currentTargetTitle" class="current-target-title">
                             <span id="activeTargetNameDisplay">No Target Selected</span>
@@ -84,6 +77,10 @@
                 </div>
 
                 <div class="main-header-actions">
+                    <button id="voiceToggleBtn" class="btn-header btn-voice-toggle" title="Toggle mission briefing voice">
+                        <span id="voiceIndicatorDot" class="voice-indicator-dot"></span>
+                        <span id="voiceToggleLabel">VOICE ON</span>
+                    </button>
                     <button id="bgToggleBtn" class="btn-header" title="Toggle Clean Dark Interface">
                         <span>CLEAN UI</span>
                     </button>
@@ -222,7 +219,6 @@
         <div class="modal-box settings-modal-box">
             <div class="settings-modal-header">
                 <div class="settings-modal-title">
-                    <span class="settings-modal-icon">⚙</span>
                     <span>HELLHOUND // SYSTEM CONFIGURATION</span>
                 </div>
                 <button id="closeSettingsModalBtn" class="btn-modal-close" title="Close">✕</button>
@@ -234,6 +230,7 @@
                 <button class="settings-tab" data-settings-tab="apikeys">API KEYS</button>
                 <button class="settings-tab" data-settings-tab="tools">TOOL SUITE</button>
                 <button class="settings-tab" data-settings-tab="bounty">BUG BOUNTY & HEADERS</button>
+                <button class="settings-tab" data-settings-tab="voice">VOICE</button>
             </div>
 
             <!-- Tab 1: AI Models & Two-Tier Routing -->
@@ -297,42 +294,42 @@
                     <label>NVIDIA NIM API Key</label>
                     <div class="api-key-input-wrap">
                         <input type="password" id="cfgKeyNvidia" class="settings-input api-key-input" placeholder="nvapi-...">
-                        <button type="button" class="btn-toggle-key" data-target="cfgKeyNvidia" title="Show/hide key">👁</button>
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyNvidia" title="Show/hide key">SHOW</button>
                     </div>
                 </div>
                 <div class="settings-field">
                     <label>Anthropic API Key</label>
                     <div class="api-key-input-wrap">
                         <input type="password" id="cfgKeyAnthropic" class="settings-input api-key-input" placeholder="sk-ant-...">
-                        <button type="button" class="btn-toggle-key" data-target="cfgKeyAnthropic" title="Show/hide key">👁</button>
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyAnthropic" title="Show/hide key">SHOW</button>
                     </div>
                 </div>
                 <div class="settings-field">
                     <label>Google Gemini API Key</label>
                     <div class="api-key-input-wrap">
                         <input type="password" id="cfgKeyGemini" class="settings-input api-key-input" placeholder="AIza...">
-                        <button type="button" class="btn-toggle-key" data-target="cfgKeyGemini" title="Show/hide key">👁</button>
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyGemini" title="Show/hide key">SHOW</button>
                     </div>
                 </div>
                 <div class="settings-field">
                     <label>OpenAI API Key</label>
                     <div class="api-key-input-wrap">
                         <input type="password" id="cfgKeyOpenai" class="settings-input api-key-input" placeholder="sk-...">
-                        <button type="button" class="btn-toggle-key" data-target="cfgKeyOpenai" title="Show/hide key">👁</button>
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyOpenai" title="Show/hide key">SHOW</button>
                     </div>
                 </div>
                 <div class="settings-field">
                     <label>OpenRouter API Key</label>
                     <div class="api-key-input-wrap">
                         <input type="password" id="cfgKeyOpenrouter" class="settings-input api-key-input" placeholder="sk-or-...">
-                        <button type="button" class="btn-toggle-key" data-target="cfgKeyOpenrouter" title="Show/hide key">👁</button>
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyOpenrouter" title="Show/hide key">SHOW</button>
                     </div>
                 </div>
                 <div class="settings-field">
                     <label>Groq API Key</label>
                     <div class="api-key-input-wrap">
                         <input type="password" id="cfgKeyGroq" class="settings-input api-key-input" placeholder="gsk_...">
-                        <button type="button" class="btn-toggle-key" data-target="cfgKeyGroq" title="Show/hide key">👁</button>
+                        <button type="button" class="btn-toggle-key" data-target="cfgKeyGroq" title="Show/hide key">SHOW</button>
                     </div>
                 </div>
             </div>
@@ -363,6 +360,61 @@
                 <div class="settings-field">
                     <label>Global Custom HTTP Headers (One per line: Header: Value)</label>
                     <textarea id="cfgGlobalHeaders" class="settings-input" rows="4" placeholder="X-HackerOne-Handle: L4ZZ3RJ0D&#10;User-Agent: Hellhound-BountyHunter/12.6"></textarea>
+                </div>
+            </div>
+
+            <!-- Tab 5: Voice (Fish Audio, GUI-only) -->
+            <div id="settings-tab-voice" class="settings-tab-pane">
+                <div class="settings-section">
+                    <div class="settings-section-header">
+                        <span class="settings-badge">FISH AUDIO</span>
+                        <span class="settings-section-title">Mission Briefing Voice</span>
+                    </div>
+                    <p class="settings-help">Each hunter uses their own Fish Audio API key and voice reference ID. Stored locally in ~/.hellhound/config.json — never in .env, never logged.</p>
+
+                    <div class="settings-field">
+                        <div class="auto-install-toggle-wrap">
+                            <label class="switch-label">
+                                <input type="checkbox" id="cfgVoiceEnabled">
+                                <span class="switch-slider"></span>
+                            </label>
+                            <span class="switch-text">Voice enabled</span>
+                        </div>
+                    </div>
+
+                    <div class="settings-field">
+                        <label>API Key</label>
+                        <div class="api-key-input-wrap">
+                            <input type="password" id="cfgVoiceApiKey" class="settings-input api-key-input" placeholder="Paste your Fish Audio API key">
+                            <button type="button" class="btn-toggle-key" data-target="cfgVoiceApiKey" title="Show/hide key">SHOW</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-field">
+                        <label>Voice Reference ID</label>
+                        <input type="text" id="cfgVoiceReferenceId" class="settings-input" placeholder="e.g. eaa7a3417355491788fc3fc8d6b29d1a">
+                    </div>
+
+                    <div class="settings-grid">
+                        <div class="settings-field">
+                            <label>Model</label>
+                            <input type="text" id="cfgVoiceModel" class="settings-input" placeholder="s2.1-pro-free">
+                        </div>
+                        <div class="settings-field">
+                            <label>Playback Speed</label>
+                            <input type="number" id="cfgVoiceSpeed" class="settings-input" step="0.01" min="0.5" max="2.0" placeholder="1.08">
+                        </div>
+                    </div>
+
+                    <div class="modal-actions" style="justify-content:flex-start;gap:10px;margin-top:6px;">
+                        <button type="button" id="testVoiceBtn" class="btn-modal-primary">TEST VOICE</button>
+                        <button type="button" id="replayTestVoiceBtn" class="btn-modal-cancel">REPLAY LAST TEST</button>
+                    </div>
+
+                    <div id="voiceStatusIndicator" class="voice-status-indicator">
+                        <span id="voiceStatusDot" class="voice-status-dot"></span>
+                        <span id="voiceStatusText">Not configured</span>
+                    </div>
                 </div>
             </div>
 

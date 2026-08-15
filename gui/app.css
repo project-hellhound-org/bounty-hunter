@@ -3,23 +3,27 @@
  */
 
 :root {
-    --primary: #ff2244;
-    --primary-hover: #ff3b5c;
-    --primary-glow: rgba(255, 34, 68, 0.4);
-    --primary-subtle: rgba(255, 34, 68, 0.08);
-    --background: #020204;
-    --surface-dark: #07070b;
-    --surface: #0e0e14;
-    --surface-card: #13131c;
+    /* Hellhound v2 plan palette — swapped from the old #ff2244 pink-red set.
+       Every rule below already references these variables, not raw hex,
+       so this is the only edit needed to reskin the whole app. */
+    --primary: #C1121F;
+    --primary-hover: #E01A2B;
+    --primary-glow: rgba(193, 18, 31, 0.4);
+    --primary-subtle: rgba(193, 18, 31, 0.08);
+    --background: #050505;
+    --surface-dark: #050505;
+    --surface: #0B0B0B;
+    --surface-card: #0B0B0B;
     --surface-border: rgba(255, 255, 255, 0.08);
-    --surface-border-accent: rgba(255, 34, 68, 0.3);
-    --text-main: #f1f5f9;
+    --surface-border-accent: rgba(193, 18, 31, 0.3);
+    --text-main: #FFFFFF;
     --text-muted: #94a3b8;
     --text-dim: #64748b;
-    --success: #10b981;
-    --warning: #f59e0b;
-    --danger: #ef4444;
+    --success: #16C784;
+    --warning: #FFB020;
+    --danger: #FF3B30;
     --info: #06b6d4;
+    --dark-red: #8B0000;
 }
 
 * {
@@ -30,16 +34,9 @@
 
 body {
     background-color: var(--background);
-    background-image: 
-        radial-gradient(circle at 0% 0%, rgba(255, 34, 68, 0.15) 0%, transparent 30%),
-        radial-gradient(circle at 100% 0%, rgba(255, 34, 68, 0.15) 0%, transparent 30%),
-        radial-gradient(circle at 0% 100%, rgba(255, 34, 68, 0.15) 0%, transparent 30%),
-        radial-gradient(circle at 100% 100%, rgba(255, 34, 68, 0.15) 0%, transparent 30%),
-        linear-gradient(180deg, rgba(2, 2, 4, 0.2) 0%, rgba(2, 2, 4, 0.5) 100%),
-        url('../Images/gui_back.png');
-    background-size: cover;
-    background-position: center;
-    background-repeat: no-repeat;
+    background-image:
+        radial-gradient(circle at 0% 0%, var(--primary-subtle) 0%, transparent 35%),
+        radial-gradient(circle at 100% 100%, rgba(139, 0, 0, 0.10) 0%, transparent 35%);
     background-attachment: fixed;
     color: var(--text-main);
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -50,29 +47,26 @@ body {
     -webkit-font-smoothing: antialiased;
 }
 
+/* Flat #050505 field with a faint crimson glow in two corners — per the
+   Hellhound v2 plan spec ("soft crimson glows", no imagery). No photo,
+   no fixed background-image asset; this is the only background now. */
 .ambient-bg {
     position: fixed;
     top: 0;
     left: 0;
     width: 100%;
     height: 100%;
-    background-image: 
-        radial-gradient(circle at 0% 0%, rgba(255, 34, 68, 0.15) 0%, transparent 30%),
-        radial-gradient(circle at 100% 0%, rgba(255, 34, 68, 0.15) 0%, transparent 30%),
-        radial-gradient(circle at 0% 100%, rgba(255, 34, 68, 0.15) 0%, transparent 30%),
-        radial-gradient(circle at 100% 100%, rgba(255, 34, 68, 0.15) 0%, transparent 30%),
-        linear-gradient(180deg, rgba(2, 2, 4, 0.2) 0%, rgba(2, 2, 4, 0.5) 100%),
-        url('../Images/gui_back.png');
-    background-size: cover;
-    background-position: center;
-    background-repeat: no-repeat;
+    background-image:
+        radial-gradient(circle at 15% 10%, var(--primary-subtle) 0%, transparent 30%),
+        radial-gradient(circle at 85% 90%, rgba(139, 0, 0, 0.08) 0%, transparent 30%);
     pointer-events: none;
     z-index: 0;
 }
 
+/* CLEAN UI toggle now goes even flatter — kills the corner glows too. */
 body.clean-interface {
     background-image: none !important;
-    background-color: #050505 !important;
+    background-color: var(--background) !important;
 }
 
 body.clean-interface .ambient-bg {
@@ -106,13 +100,13 @@ body.clean-interface .ambient-bg {
     overflow: hidden;
 }
 
-/* ── LEFT SIDEBAR (SLIDING TARGET PANEL) ─────────────────────────── */
+/* ── LEFT SIDEBAR (HOVER-EXPANDING NAV RAIL) ─────────────────────── */
 #sidebar {
     position: fixed;
     top: 0;
     left: 0;
-    width: 320px;
-    min-width: 320px;
+    width: 68px;
+    min-width: 68px;
     height: 100vh;
     background: rgba(7, 7, 12, 0.94);
     backdrop-filter: blur(28px);
@@ -120,15 +114,60 @@ body.clean-interface .ambient-bg {
     display: flex;
     flex-direction: column;
     z-index: 100;
-    transform: translateX(-100%);
-    transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.28s ease;
+    overflow: hidden;
+    transition: width 0.22s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.22s ease;
     box-shadow: none;
 }
 
 #sidebar.open,
 #sidebar:hover {
-    transform: translateX(0);
-    box-shadow: 15px 0 45px rgba(0, 0, 0, 0.9), 0 0 25px rgba(255, 34, 68, 0.25);
+    width: 320px;
+    box-shadow: 15px 0 45px rgba(0, 0, 0, 0.9), 0 0 25px var(--primary-glow);
+}
+
+/* Collapsed-rail state: fade + collapse labels down to icon-only.
+   Everything below reappears via the normal (unmodified) rules the
+   moment #sidebar gets :hover or .open. */
+#sidebar:not(:hover):not(.open) .brand-title,
+#sidebar:not(:hover):not(.open) .status-indicator,
+#sidebar:not(:hover):not(.open) #newTargetBtn span:last-child,
+#sidebar:not(:hover):not(.open) .target-search-box,
+#sidebar:not(:hover):not(.open) .target-list-section,
+#sidebar:not(:hover):not(.open) .settings-btn-label,
+#sidebar:not(:hover):not(.open) .system-model-tag {
+    opacity: 0;
+    max-width: 0;
+    overflow: hidden;
+    pointer-events: none;
+    transition: opacity 0.12s ease, max-width 0.18s ease;
+}
+
+#sidebar:not(:hover):not(.open) .sidebar-header {
+    justify-content: center;
+    padding: 18px 0;
+}
+
+#sidebar:not(:hover):not(.open) .brand-wrapper {
+    gap: 0;
+}
+
+#sidebar:not(:hover):not(.open) .sidebar-action-bar {
+    padding: 16px 8px 12px;
+    align-items: center;
+}
+
+#sidebar:not(:hover):not(.open) .btn-new-target {
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border-radius: 50%;
+    gap: 0;
+}
+
+#sidebar:not(:hover):not(.open) .sidebar-footer {
+    justify-content: center;
+    padding: 12px 0;
+    gap: 0;
 }
 
 .sidebar-header {
@@ -187,6 +226,29 @@ body.clean-interface .ambient-bg {
     padding: 4px 8px;
     border-radius: 9999px;
     border: 1px solid rgba(16, 185, 129, 0.2);
+}
+
+.thinking-dots {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 2px 2px;
+}
+
+.thinking-dots span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-dim, #9ca3af);
+    animation: thinking-bounce 1.1s ease-in-out infinite;
+}
+
+.thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes thinking-bounce {
+    0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+    30% { opacity: 1; transform: translateY(-3px); }
 }
 
 .status-dot-pulse {
@@ -457,6 +519,7 @@ body.clean-interface .ambient-bg {
     flex-direction: column;
     position: relative;
     overflow: hidden;
+    margin-left: 68px; /* space for the collapsed rail; rail overlays on top when expanded (position:fixed) */
 }
 
 /* Top Header Bar */
@@ -659,33 +722,79 @@ body.clean-interface .ambient-bg {
     scroll-behavior: smooth;
 }
 
-/* Welcome Hero Container */
+/* Welcome Hero — Mission Briefing style status card, not a photo backdrop */
+.voice-indicator-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    margin-right: 6px;
+    transition: background 0.2s, box-shadow 0.2s;
+}
+
+.btn-voice-toggle.voice-off .voice-indicator-dot {
+    background: var(--text-dim);
+    box-shadow: none;
+}
+
+.btn-voice-toggle:not(.voice-off) .voice-indicator-dot {
+    background: var(--primary);
+    box-shadow: 0 0 6px var(--primary-glow);
+}
+
+.btn-voice-toggle.speaking .voice-indicator-dot {
+    animation: voice-pulse 0.9s ease-in-out infinite;
+}
+
+@keyframes voice-pulse {
+    0%, 100% { box-shadow: 0 0 4px var(--primary-glow); transform: scale(1); }
+    50% { box-shadow: 0 0 14px var(--primary); transform: scale(1.35); }
+}
+
 .welcome-hero {
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: 40px 20px;
+    padding: 48px 40px;
     text-align: center;
     margin: auto;
-    max-width: 680px;
+    max-width: 560px;
+    width: 100%;
+    background: var(--surface-card);
+    border: 1px solid var(--surface-border);
+    border-top: 2px solid var(--primary);
+    border-radius: 4px;
+    box-shadow: 0 0 40px rgba(193, 18, 31, 0.08);
     animation: fade-in 0.4s ease-out;
+}
+
+.welcome-hero::before {
+    content: "● MISSION BRIEFING";
+    display: block;
+    font-family: 'Space Grotesk', monospace;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    color: var(--primary);
+    margin-bottom: 20px;
 }
 
 .welcome-title {
     font-family: 'Michroma', sans-serif;
-    font-size: 20px;
+    font-size: 18px;
     font-weight: 700;
     letter-spacing: 0.1em;
     color: #ffffff;
-    margin-bottom: 8px;
+    margin-bottom: 12px;
 }
 
 .welcome-desc {
     font-size: 13px;
     color: var(--text-muted);
     line-height: 1.6;
-    margin-bottom: 24px;
+    margin-bottom: 0;
 }
 
 .quick-prompts-grid {
@@ -1271,12 +1380,14 @@ body.clean-interface .ambient-bg {
     color: var(--text-dim);
     padding: 0 12px;
     cursor: pointer;
-    font-size: 14px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
     display: flex;
     align-items: center;
     justify-content: center;
     transition: all 0.2s ease;
-    min-width: 40px;
+    min-width: 48px;
 }
 
 .btn-toggle-key:hover {
@@ -1908,6 +2019,28 @@ body.clean-interface .ambient-bg {
     background: rgba(239, 68, 68, 0.15);
     color: #f87171;
     border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.voice-status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 14px;
+    font-size: 12px;
+    color: var(--text-dim, #9ca3af);
+}
+
+.voice-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #f87171;
+    box-shadow: 0 0 6px rgba(239, 68, 68, 0.6);
+}
+
+.voice-status-dot.connected {
+    background: #4ade80;
+    box-shadow: 0 0 6px rgba(34, 197, 94, 0.6);
 }
 
 .settings-modal-footer {

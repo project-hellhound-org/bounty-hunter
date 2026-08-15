@@ -104,9 +104,102 @@ class HellhoundAPI:
         self._agents: Dict[str, Agent] = {}
         self._cancel_flags: Dict[str, bool] = {}
         self._window = None
+        self._voice = None  # lazily created VoiceService, GUI-only
 
     def set_window(self, window):
         self._window = window
+
+    # ── VOICE (Fish Audio, GUI-only) ─────────────────────────────────────
+
+    def _voice_service(self):
+        """Lazily creates the VoiceService and wires its events back to JS."""
+        if self._voice is None:
+            from hellhound.core.voice_service import get_voice_service
+
+            def _on_voice_event(event_type: str, payload: Dict[str, Any]):
+                if not self._window:
+                    return
+                try:
+                    self._window.evaluate_js(
+                        f"if (window.onVoiceEvent) {{ window.onVoiceEvent({json.dumps({'type': event_type, 'payload': payload})}); }}"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("voice JS bridge failed: %s", e)
+
+            self._voice = get_voice_service(event_callback=_on_voice_event)
+        return self._voice
+
+    def _voice_config(self) -> Dict[str, Any]:
+        from hellhound.core.voice_service import DEFAULT_MODEL, DEFAULT_SPEED
+
+        cfg = load_config()
+        voice = cfg.get("voice", {})
+        return {
+            "enabled": voice.get("enabled", True),
+            "api_key": voice.get("api_key", ""),
+            "reference_id": voice.get("reference_id", ""),
+            "model": voice.get("model") or DEFAULT_MODEL,
+            "speed": voice.get("speed") or DEFAULT_SPEED,
+        }
+
+    def get_voice_settings(self) -> Dict[str, Any]:
+        """Returns voice settings for the Settings > Voice panel. api_key is masked."""
+        voice = self._voice_config()
+        has_key = bool(voice.get("api_key"))
+        return {
+            "enabled": voice.get("enabled", True),
+            "api_key_set": has_key,
+            "api_key_masked": ("•" * 12) if has_key else "",
+            "reference_id": voice.get("reference_id", ""),
+            "model": voice.get("model"),
+            "speed": voice.get("speed"),
+            "configured": has_key and bool(voice.get("reference_id")),
+        }
+
+    def save_voice_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
+        """Persists Fish Audio config to ~/.hellhound/config.json (no .env required)."""
+        from hellhound.core.ai_utils import save_config
+        from hellhound.core.voice_service import DEFAULT_MODEL, DEFAULT_SPEED
+
+        cfg = load_config()
+        voice = cfg.get("voice", {})
+
+        if "enabled" in settings:
+            voice["enabled"] = bool(settings["enabled"])
+        # Only overwrite the stored key if the user actually typed a new one;
+        # the masked placeholder from get_voice_settings is never sent back.
+        new_key = settings.get("api_key")
+        if new_key and new_key.strip() and not set(new_key.strip()) == {"\u2022"}:
+            voice["api_key"] = new_key.strip()
+        if "reference_id" in settings and str(settings["reference_id"]).strip():
+            voice["reference_id"] = str(settings["reference_id"]).strip()
+        voice["model"] = str(settings.get("model") or voice.get("model") or DEFAULT_MODEL).strip()
+        try:
+            voice["speed"] = float(settings.get("speed") or voice.get("speed") or DEFAULT_SPEED)
+        except (TypeError, ValueError):
+            voice["speed"] = voice.get("speed", DEFAULT_SPEED)
+
+        cfg["voice"] = voice
+        success = save_config(cfg)
+        logger.info("voice settings saved (key redacted)")
+        return {"status": "ok" if success else "error", "settings": self.get_voice_settings()}
+
+    def test_voice(self, sample_text: Optional[str] = None) -> Dict[str, Any]:
+        """Blocking connectivity check used by the 'Test Voice' button."""
+        return self._voice_service().test_voice(self._voice_config(), sample_text=sample_text)
+
+    def speak_briefing(self, text: str) -> Dict[str, Any]:
+        """Speaks `text` using the saved Fish Audio config. Non-blocking."""
+        voice = self._voice_config()
+        if not voice.get("enabled", True):
+            return {"status": "off"}
+        return self._voice_service().speak(text, voice)
+
+    def stop_speaking(self) -> Dict[str, Any]:
+        return self._voice_service().stop()
+
+    def replay_voice(self) -> Dict[str, Any]:
+        return self._voice_service().replay()
 
     # ── TARGET MANAGEMENT ──────────────────────────────────────────────
 
