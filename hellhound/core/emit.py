@@ -29,6 +29,37 @@ except Exception:
     _rich_console = None
 
 
+class _AnimatorShim:
+    """
+    Some modules (spider.py) were written against a local `Emit` class that
+    exposes `self.emit.animator.{start_anim,update,stop_anim,active}` for a
+    background progress spinner. The GUI-facing PlainEmit/ConsoleEmit never
+    implemented that surface, so any such module crashed the moment it ran
+    outside its original standalone script with an AttributeError.
+
+    This shim gives every Emit backend that same interface, routed onto
+    whatever progress_start/progress_update/progress_stop this backend
+    already supports (a no-op if it supports none of them) — so callers
+    never crash, they just silently get no visible spinner in modes that
+    don't render one.
+    """
+
+    def __init__(self, owner):
+        self._owner = owner
+        self.active = False
+
+    def start_anim(self, label, total=0):
+        self.active = True
+        self._owner.progress_start(label, total)
+
+    def update(self, current, label=None):
+        self._owner.progress_update(current, label)
+
+    def stop_anim(self):
+        self.active = False
+        self._owner.progress_stop()
+
+
 class PlainEmit:
     """
     Standard emit backed by Rich Console for vibrant terminal formatting,
@@ -37,6 +68,7 @@ class PlainEmit:
 
     def __init__(self, socketio=None):
         self.socketio = socketio
+        self.animator = _AnimatorShim(self)
 
     def __call__(self, msg):
         self._send(msg)
@@ -81,8 +113,9 @@ class PlainEmit:
     def banner(self, title):
         self._send(f"\n[bold red]═══ {title} ═══[/bold red]")
 
-    def section(self, title):
-        self._send(f"\n[bold red]── {title} ──[/bold red]")
+    def section(self, title, orbital: bool = False):
+        icon = "◓ " if orbital else ""
+        self._send(f"\n[bold red]── {icon}{title} ──[/bold red]")
 
     def row(self, key, value, **kwargs):
         self._send(f"[bold white]{key}:[/bold white] {value}")
@@ -162,7 +195,13 @@ class ConsoleEmit(PlainEmit):
         # 2. Call the actual console printing method
         method = getattr(self._console, method_name, None)
         if method:
-            method(*args, **kwargs)
+            try:
+                method(*args, **kwargs)
+            except TypeError:
+                # Underlying console method doesn't know this kwarg (e.g. an
+                # older console build without `orbital=`) — degrade instead
+                # of crashing the whole module.
+                method(*args)
         elif hasattr(self._console, "print"):
             self._console.print(*args, **kwargs)
         else:
@@ -193,8 +232,8 @@ class ConsoleEmit(PlainEmit):
         else:
             self.success(msg)
 
-    def section(self, title):
-        self._w("section", title)
+    def section(self, title, orbital: bool = False):
+        self._w("section", title, orbital=orbital)
 
     def row(self, key, value, **kwargs):
         self._w("row", key, value, **kwargs)

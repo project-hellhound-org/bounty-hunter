@@ -91,188 +91,187 @@ function showConfirmModal({ title = "CONFIRM ACTION", message = "Are you sure yo
     });
 }
 
-// ── STRUCTURED NODE-BASED CARD RENDERER ─────────────────────────────
-function renderToolEmitCard(emit) {
-    const type = emit.type || 'info';
-    const payload = emit.payload;
-    
-    if (type === 'tool_start') {
+// ══════════════════════════════════════════════════════
+// ChatRenderer — single source of truth mapping backend events to UI.
+// The backend (emit.py / agent.py / tool modules) only ever sends
+// structured data (type + payload) via tool_start/tool_result/status/etc;
+// it never builds HTML. This is the only place that decides how a given
+// event type is presented.
+//
+//   STATUS/INFO/WARN/SUCCESS -> inline activity line
+//   TOOL_START               -> small running chip
+//   TOOL_RESULT (rich)       -> evidence card (subdomain tree, httpx table)
+//   TOOL_RESULT (thin)       -> inline completion line
+//   ERROR / SCOPE_BLOCKED    -> friendly inline AI message, never a raw
+//                                Python traceback
+// ══════════════════════════════════════════════════════
+const ChatRenderer = {
+    render(emit) {
+        const type = emit.type || 'info';
+        const payload = emit.payload;
+
+        if (type === 'tool_start') return this._toolStart(payload);
+        if (type === 'tool_result') return this._toolResult(payload);
+        if (type === 'status' || type === 'info' || type === 'warn' || type === 'error' || type === 'success') {
+            return this._statusLine(payload);
+        }
+        return this._inline(String(payload));
+    },
+
+    // Strips raw Python tracebacks / exception noise down to one plain
+    // sentence — the doc's "never expose Python traceback" rule, applied
+    // everywhere an error string might originate from a backend module.
+    friendlyError(raw, context) {
+        if (!raw) return `I hit an internal issue${context ? ' during ' + context : ''} and skipped that step.`;
+        const text = String(raw);
+        if (/Traceback \(most recent call last\)|File "[^"]+", line \d+|^\s+at .+:\d+/m.test(text)) {
+            return `I couldn't complete ${context || 'that step'} because an internal module error occurred. I've skipped it and continued with the rest of the investigation.`;
+        }
+        return text.length > 220 ? text.slice(0, 220) + '…' : text;
+    },
+
+    _inline(text, opts = {}) {
+        const icon = opts.icon ? `<span class="node-status-icon ${opts.iconClass || ''}">${opts.icon}</span>` : (opts.pulse ? '<span class="node-status-dot pulse"></span>' : '');
+        return `<div class="inline-activity-line">${icon}<span class="inline-activity-text">${escapeHtml(text)}</span></div>`;
+    },
+
+    _toolStart(payload) {
         const tool = payload?.tool || 'Tool';
         const args = payload?.args || {};
-        const targetStr = args.domain || args.target || args.url || args.subdomain || args.hosts || JSON.stringify(args);
+        const targetStr = args.domain || args.target || args.url || args.subdomain || args.hosts || '';
         return `
-            <div class="node-exec-card active">
-                <div class="node-exec-header">
-                    <span class="node-status-dot pulse"></span>
-                    <span class="node-tool-name">${escapeHtml(tool)}</span>
-                    <span class="node-target-tag">${escapeHtml(String(targetStr))}</span>
-                </div>
+            <div class="inline-activity-line">
+                <span class="node-status-dot pulse"></span>
+                <span class="inline-activity-text">Running <code class="inline-tool-badge">${escapeHtml(tool)}</code>${targetStr ? ` · ${escapeHtml(String(targetStr))}` : ''}</span>
             </div>
         `;
-    }
+    },
 
-    if (type === 'tool_result') {
+    _statusLine(payload) {
+        let msg;
+        if (typeof payload === 'object' && payload !== null) {
+            msg = payload.message || payload.text || payload.detail || payload.status || 'Update received';
+        } else {
+            msg = String(payload);
+        }
+        return this._inline(this.friendlyError(msg));
+    },
+
+    _toolResult(payload) {
         const tool = payload?.tool || 'Tool';
         const result = payload?.result || {};
 
         if (result.blocked || (typeof result.error === 'string' && (result.error.includes('SCOPE_VIOLATION') || result.error.includes('SCOPE REFUSAL')))) {
-            return `
-                <div class="node-exec-card scope-blocked">
-                    <div class="node-exec-header">
-                        <span class="node-status-icon">BLOCKED</span>
-                        <span class="node-tool-name">SCOPE REFUSAL</span>
-                    </div>
-                    <div class="node-exec-body">
-                        <span class="scope-reason-text">${escapeHtml(result.error || result.reason || "Action blocked by scope rules.")}</span>
-                    </div>
-                </div>
-            `;
+            return this._inline(
+                `Skipped — ${result.error || result.reason || 'out of the authorized scope'}.`,
+                { icon: '⦸', iconClass: 'blocked-icon' }
+            );
         }
 
         if (result.error) {
-            return `
-                <div class="node-exec-card error">
-                    <div class="node-exec-header">
-                        <span class="node-status-icon">ERROR</span>
-                        <span class="node-tool-name">${escapeHtml(tool)} Error</span>
-                    </div>
-                    <div class="node-exec-body">
-                        <span>${escapeHtml(result.error)}</span>
-                    </div>
-                </div>
-            `;
+            return this._inline(this.friendlyError(result.error, `the ${tool} step`), { icon: '!', iconClass: 'error-icon' });
         }
 
         if (tool === 'dns_bruteforce' || tool === 'subfinder') {
-            const subs = result.subdomains || [];
-            const count = result.total_discovered || result.count || subs.length;
-            const rootDomain = result.domain || 'Target';
-
-            const limit = 12;
-            const branchesHtml = subs.slice(0, limit).map((sub, idx) => {
-                const prefix = (idx === Math.min(subs.length, limit) - 1) ? '└──' : '├──';
-                return `
-                    <div class="node-branch-item">
-                        <span class="tree-line">${prefix}</span>
-                        <span class="node-sub-dot online"></span>
-                        <span class="node-sub-name">${escapeHtml(sub)}</span>
-                    </div>
-                `;
-            }).join('');
-
-            const remaining = subs.length > limit ? `<div class="node-branch-more">+ ${subs.length - limit} more subdomains</div>` : '';
-
-            return `
-                <div class="node-topology-card">
-                    <div class="node-topo-header">
-                        <span class="node-topo-title">DOMAIN TOPOLOGY MAP (${tool})</span>
-                        <span class="node-topo-badge">${count} DISCOVERED</span>
-                    </div>
-                    <div class="node-topo-tree">
-                        <div class="node-tree-root">
-                            <span class="node-icon root">◆</span>
-                            <span class="node-root-name">${escapeHtml(rootDomain)}</span>
-                        </div>
-                        <div class="node-tree-branches">
-                            ${branchesHtml}
-                            ${remaining}
-                        </div>
-                    </div>
-                </div>
-            `;
+            return this._subdomainCard(tool, result);
         }
-
         if (tool === 'permute_subdomains' || tool === 'resolve_candidates') {
-            const cands = result.candidates || result.subdomains || [];
-            const count = result.resolved_count || result.count || cands.length;
-
-            const limit = 10;
-            const itemsHtml = cands.slice(0, limit).map((item, idx) => {
-                const prefix = (idx === Math.min(cands.length, limit) - 1) ? '└──' : '├──';
-                return `
-                    <div class="node-branch-item">
-                        <span class="tree-line">${prefix}</span>
-                        <span class="node-sub-dot resolved"></span>
-                        <span class="node-sub-name">${escapeHtml(item)}</span>
-                    </div>
-                `;
-            }).join('');
-
-            return `
-                <div class="node-topology-card">
-                    <div class="node-topo-header">
-                        <span class="node-topo-title">PERMUTATION & RESOLUTION (${tool})</span>
-                        <span class="node-topo-badge">${count} RESOLVED</span>
-                    </div>
-                    <div class="node-topo-tree">
-                        <div class="node-tree-branches">
-                            ${itemsHtml}
-                        </div>
-                    </div>
-                </div>
-            `;
+            return this._permutationCard(tool, result);
         }
-
         if (tool === 'httpx') {
-            const liveServices = result.live_hosts || result.services || [];
-            const rowsHtml = Array.isArray(liveServices) ? liveServices.slice(0, 10).map(srv => {
-                const urlStr = typeof srv === 'string' ? srv : (srv.url || srv.host);
-                const status = srv.status_code || 200;
-                const title = srv.title ? ` - ${srv.title}` : '';
-                const statusClass = status >= 200 && status < 300 ? 'status-200' : (status >= 300 && status < 400 ? 'status-300' : 'status-400');
-                return `
-                    <div class="httpx-service-row">
-                        <span class="http-status-code ${statusClass}">${status}</span>
-                        <span class="service-url">${escapeHtml(urlStr)}</span>
-                        <span class="service-title">${escapeHtml(title)}</span>
-                    </div>
-                `;
-            }).join('') : `<div>Probed ${liveServices} live hosts</div>`;
-
-            return `
-                <div class="node-topology-card">
-                    <div class="node-topo-header">
-                        <span class="node-topo-title">HTTP SERVICE PROBES (httpx)</span>
-                        <span class="node-topo-badge">${Array.isArray(liveServices) ? liveServices.length : 'ACTIVE'} SERVICES</span>
-                    </div>
-                    <div class="httpx-services-list">
-                        ${rowsHtml}
-                    </div>
-                </div>
-            `;
+            return this._httpxCard(result);
         }
 
         const keys = Object.keys(result).filter(k => k !== 'status');
+        const isLightweight = keys.length <= 3 && keys.every(k => typeof result[k] !== 'object' || result[k] === null);
+        if (isLightweight) {
+            const summary = keys.map(k => `${k}: ${result[k]}`).join(' · ');
+            return this._inline(`${tool} completed${summary ? ' — ' + summary : ''}`, { icon: '✓', iconClass: 'success-icon' });
+        }
+
         const keySummary = keys.map(k => {
             const val = result[k];
             const valStr = Array.isArray(val) ? `${val.length} items` : (typeof val === 'object' ? 'object' : String(val));
             return `<div><strong>${escapeHtml(k)}:</strong> ${escapeHtml(valStr)}</div>`;
         }).join('');
-
         return `
             <div class="node-exec-card success">
                 <div class="node-exec-header">
                     <span class="node-status-icon">✓</span>
                     <span class="node-tool-name">${escapeHtml(tool)} Completed</span>
                 </div>
-                <div class="node-exec-body">
-                    ${keySummary || 'Completed successfully'}
+                <div class="node-exec-body">${keySummary || 'Completed successfully'}</div>
+            </div>
+        `;
+    },
+
+    _subdomainCard(tool, result) {
+        const subs = result.subdomains || [];
+        const count = result.total_discovered || result.count || subs.length;
+        const rootDomain = result.domain || 'Target';
+        const limit = 12;
+        const branchesHtml = subs.slice(0, limit).map((sub, idx) => {
+            const prefix = (idx === Math.min(subs.length, limit) - 1) ? '└──' : '├──';
+            return `<div class="node-branch-item"><span class="tree-line">${prefix}</span><span class="node-sub-dot online"></span><span class="node-sub-name">${escapeHtml(sub)}</span></div>`;
+        }).join('');
+        const remaining = subs.length > limit ? `<div class="node-branch-more">+ ${subs.length - limit} more subdomains</div>` : '';
+        return `
+            <div class="node-topology-card">
+                <div class="node-topo-header">
+                    <span class="node-topo-title">DOMAIN TOPOLOGY MAP (${tool})</span>
+                    <span class="node-topo-badge">${count} DISCOVERED</span>
+                </div>
+                <div class="node-topo-tree">
+                    <div class="node-tree-root"><span class="node-icon root">◆</span><span class="node-root-name">${escapeHtml(rootDomain)}</span></div>
+                    <div class="node-tree-branches">${branchesHtml}${remaining}</div>
                 </div>
             </div>
         `;
-    }
+    },
 
-    if (type === 'status' || type === 'info' || type === 'warn' || type === 'error' || type === 'success') {
-        const msg = typeof payload === 'object' ? JSON.stringify(payload) : String(payload);
+    _permutationCard(tool, result) {
+        const cands = result.candidates || result.subdomains || [];
+        const count = result.resolved_count || result.count || cands.length;
+        const limit = 10;
+        const itemsHtml = cands.slice(0, limit).map((item, idx) => {
+            const prefix = (idx === Math.min(cands.length, limit) - 1) ? '└──' : '├──';
+            return `<div class="node-branch-item"><span class="tree-line">${prefix}</span><span class="node-sub-dot resolved"></span><span class="node-sub-name">${escapeHtml(item)}</span></div>`;
+        }).join('');
         return `
-            <div class="tool-emit-card ${type}">
-                <span class="emit-badge">${type.toUpperCase()}</span>
-                <span>${escapeHtml(msg)}</span>
+            <div class="node-topology-card">
+                <div class="node-topo-header">
+                    <span class="node-topo-title">PERMUTATION & RESOLUTION (${tool})</span>
+                    <span class="node-topo-badge">${count} RESOLVED</span>
+                </div>
+                <div class="node-topo-tree"><div class="node-tree-branches">${itemsHtml}</div></div>
             </div>
         `;
-    }
+    },
 
-    return `<div class="tool-emit-card info">${escapeHtml(String(payload))}</div>`;
+    _httpxCard(result) {
+        const liveServices = result.live_hosts || result.services || [];
+        const rowsHtml = Array.isArray(liveServices) ? liveServices.slice(0, 10).map(srv => {
+            const urlStr = typeof srv === 'string' ? srv : (srv.url || srv.host);
+            const status = srv.status_code || 200;
+            const title = srv.title ? ` - ${srv.title}` : '';
+            const statusClass = status >= 200 && status < 300 ? 'status-200' : (status >= 300 && status < 400 ? 'status-300' : 'status-400');
+            return `<div class="httpx-service-row"><span class="http-status-code ${statusClass}">${status}</span><span class="service-url">${escapeHtml(urlStr)}</span><span class="service-title">${escapeHtml(title)}</span></div>`;
+        }).join('') : `<div>Probed ${liveServices} live hosts</div>`;
+        return `
+            <div class="node-topology-card">
+                <div class="node-topo-header">
+                    <span class="node-topo-title">HTTP SERVICE PROBES (httpx)</span>
+                    <span class="node-topo-badge">${Array.isArray(liveServices) ? liveServices.length : 'ACTIVE'} SERVICES</span>
+                </div>
+                <div class="httpx-services-list">${rowsHtml}</div>
+            </div>
+        `;
+    },
+};
+
+// Back-compat wrapper — existing call sites use this name.
+function renderToolEmitCard(emit) {
+    return ChatRenderer.render(emit);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -648,7 +647,7 @@ async function initVoiceState() {
     }
 }
 
-function setVoiceUI(state) {
+function setVoiceUI(state, reason) {
     // state: 'idle' | 'speaking' | 'off' | 'unavailable'
     const btn = document.getElementById('voiceToggleBtn');
     const label = document.getElementById('voiceToggleLabel');
@@ -657,6 +656,7 @@ function setVoiceUI(state) {
         btn.classList.toggle('voice-off', state === 'off' || state === 'unavailable');
         btn.classList.toggle('speaking', state === 'speaking');
         label.innerText = state === 'unavailable' ? 'VOICE UNAVAILABLE' : (state === 'off' ? 'MUTE VOICE' : (state === 'speaking' ? 'SPEAKING' : 'SPEAK BRIEFING'));
+        btn.title = (state === 'unavailable' && reason) ? reason : 'Click to open Voice Settings';
     }
     // Wolf-eye glow: intensify the existing logo glow while actually speaking
     logo?.classList.toggle('eyes-glowing', state === 'speaking');
@@ -681,11 +681,11 @@ window.onVoiceEvent = function (evt) {
             bar.style.height = '8%';
         });
     } else if (evt.type === 'unavailable') {
-        setVoiceUI('unavailable');
-        console.warn('[Voice] Fish Audio not configured or unreachable — voice disabled.', evt.payload?.reason);
+        setVoiceUI('unavailable', evt.payload?.reason);
+        console.warn('[Voice] unavailable:', evt.payload?.reason);
     } else if (evt.type === 'error') {
         console.error('[Voice] engine error:', evt.payload?.error);
-        setVoiceUI(voiceEnabled ? 'idle' : 'off');
+        setVoiceUI('unavailable', evt.payload?.error);
     }
 };
 
@@ -734,11 +734,12 @@ async function speakBriefing(text) {
     try {
         const res = await callApi('speak_briefing', text);
         if (res?.status === 'unavailable' || res?.status === 'error') {
-            setVoiceUI('unavailable');
+            console.error('[Voice] speak_briefing failed:', res.reason || res);
+            setVoiceUI('unavailable', res.reason);
         }
     } catch (err) {
         console.error('[Voice] speak_briefing call failed:', err);
-        setVoiceUI('unavailable');
+        setVoiceUI('unavailable', err?.message);
     }
 }
 
@@ -987,7 +988,9 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
             <div class="assistant-bubble">
                 <div class="assistant-header">
                     <div class="assistant-tag">
-                        <span>HELLHOUND AGENT</span>
+                        <img src="../Images/logo.png" alt="" class="assistant-avatar-icon" onerror="this.style.display='none'">
+                        <span>HELLHOUND AI</span>
+                        <span class="assistant-timestamp">${timeStr}</span>
                     </div>
                     <div class="assistant-actions" style="display: flex; align-items: center; gap: 10px;">
                         ${metrics ? `<span style="font-size: 10px; color: #888; font-family: monospace;">${metrics.tokens} tokens | ${metrics.time_sec}s</span>` : ''}
@@ -1009,6 +1012,8 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
         msgEl.querySelector('.btn-msg-copy')?.addEventListener('click', () => {
             copyToClipboard(fullOutputToCopy);
         });
+
+        wireCodeBlockCopyButtons(msgEl.querySelector('.assistant-body'));
 
         // Add interactive event listeners on finding chips
         msgEl.querySelectorAll('.finding-chip').forEach(chip => {
@@ -1043,12 +1048,36 @@ function appendMessageBubble(role, content, chips = [], emits = [], scroll = tru
     }
 }
 
+// Per-turn state for the live status widget. Reset in handleSendMessage
+// right before each request starts.
+let _turnHasToolRun = false;
+let _turnHasStreamedToken = false;
+
 function handleIncomingEmit(data) {
     console.log("[AGENT EMIT]", data);
+
+    // Hard guard: once a turn is no longer executing (response returned,
+    // stopped, or errored), drop anything that still arrives. Without this,
+    // a straggling backend tick (the thinking-indicator thread ticks every
+    // ~80ms and isn't guaranteed to stop instantly) can land *after* we've
+    // already cleaned up the DOM and recreate a status node that then never
+    // gets removed — that's the "stale HELLHOUND... (Ns · esc to interrupt)"
+    // bug. Ignoring all post-completion emits fixes it at the source.
+    if (!isExecuting) return;
+
     const thread = document.getElementById('chatThread');
     if (!thread) return;
 
     if (data.type === 'token') {
+        _turnHasStreamedToken = true;
+        // Actual text is now flowing — that IS the live feedback, so drop
+        // any pre-content "Thinking" spinner immediately (Fix 3: no
+        // execution status once real output has started, unless a tool
+        // is genuinely running).
+        if (!_turnHasToolRun) {
+            thread.querySelector('.in-flight-emit-msg')?.remove();
+        }
+
         let streamingMsg = thread.querySelector('.streaming-assistant-msg');
         if (!streamingMsg) {
             streamingMsg = document.createElement('div');
@@ -1057,7 +1086,9 @@ function handleIncomingEmit(data) {
                 <div class="assistant-bubble">
                     <div class="assistant-header">
                         <div class="assistant-tag">
-                            <span>HELLHOUND AGENT</span>
+                            <img src="../Images/logo.png" alt="" class="assistant-avatar-icon" onerror="this.style.display='none'">
+                            <span>HELLHOUND AI</span>
+                            <span class="assistant-timestamp">${formatRelativeTime(new Date().toISOString())}</span>
                         </div>
                     </div>
                     <div class="assistant-body"></div>
@@ -1069,42 +1100,129 @@ function handleIncomingEmit(data) {
         if (bodyEl) {
             streamingMsg.dataset.accumulated = (streamingMsg.dataset.accumulated || '') + (data.payload || '');
             bodyEl.innerHTML = formatMarkdown(streamingMsg.dataset.accumulated) + '<span class="stream-caret"></span>';
+            wireCodeBlockCopyButtons(bodyEl);
         }
         scrollToBottom();
         return;
     }
 
-    let activeEmitsContainer = thread.querySelector('.active-in-flight-emits');
-    if (!activeEmitsContainer) {
-        const emitWrapper = document.createElement('div');
-        emitWrapper.className = 'chat-msg assistant in-flight-emit-msg';
-        emitWrapper.innerHTML = `
+    // Everything below this line concerns the live execution-status widget.
+    // Rule (Fix 3): a generic "status"/"info" tick with no tool involved and
+    // no content yet is the pre-first-token "thinking" phase and IS shown;
+    // once a tool has actually started, or once tokens are flowing, generic
+    // ticks just update the existing widget rather than resurrecting it.
+    const wrapperExists = !!thread.querySelector('.in-flight-emit-msg');
+    // tool_start/tool_result are always meaningful (Fix 3's "tool execution
+    // shows live status"). warn/error/success are discrete, actionable
+    // events (e.g. a scope violation) and are always shown too — only the
+    // routine "status"/"info" chatter is gated to the pre-content phase.
+    const isAlwaysShow = data.type === 'tool_start' || data.type === 'tool_result'
+        || data.type === 'warn' || data.type === 'error' || data.type === 'success';
+    const isPreContentThinkingTick = (data.type === 'status' || data.type === 'info') && !_turnHasToolRun && !_turnHasStreamedToken;
+
+    if (!isAlwaysShow && !isPreContentThinkingTick && !wrapperExists) {
+        // Pure conversation, no tool ever ran, content already streaming —
+        // nothing to show. Drop it.
+        return;
+    }
+
+    // Single in-flight wrapper for the whole turn: a spinner-based live
+    // status line ("⟳ Thinking · 1s" / "⟳ Running subfinder · 4s") + a row
+    // of small chips for tools currently executing + a results area for
+    // evidence cards/lines once a tool actually returns something. No
+    // bordered terminal strip.
+    let liveWrapper = thread.querySelector('.in-flight-emit-msg');
+    if (!liveWrapper) {
+        liveWrapper = document.createElement('div');
+        liveWrapper.className = 'chat-msg assistant in-flight-emit-msg';
+        liveWrapper.innerHTML = `
             <div class="assistant-bubble" style="padding: 4px 4px 4px 0;">
+                <div class="live-status-line">
+                    <span class="live-status-spinner"></span>
+                    <span class="live-status-text">Thinking</span>
+                    <span class="live-status-timer">0s</span>
+                </div>
+                <div class="tool-chip-row"></div>
                 <div class="tool-emits-container active-in-flight-emits"></div>
-                <div class="thinking-dots"><span></span><span></span><span></span></div>
             </div>
         `;
-        thread.appendChild(emitWrapper);
-        activeEmitsContainer = emitWrapper.querySelector('.active-in-flight-emits');
+        thread.appendChild(liveWrapper);
         scrollToBottom();
     }
 
-    if (activeEmitsContainer) {
-        if (data.type === 'status') {
-            let statusCard = activeEmitsContainer.querySelector('.tool-emit-card.status');
-            if (statusCard) {
-                const msg = typeof data.payload === 'object' ? JSON.stringify(data.payload) : String(data.payload);
-                statusCard.innerHTML = `<span class="emit-badge">STATUS</span> <span>${escapeHtml(msg)}</span>`;
-                scrollToBottom();
-                return;
+    const statusTextEl = liveWrapper.querySelector('.live-status-text');
+    const chipRow = liveWrapper.querySelector('.tool-chip-row');
+    const resultsContainer = liveWrapper.querySelector('.active-in-flight-emits');
+
+    if (data.type === 'tool_start') {
+        _turnHasToolRun = true;
+        const tool = data.payload?.tool || 'tool';
+        if (statusTextEl) statusTextEl.textContent = `Running ${tool}`;
+        if (chipRow) {
+            const existing = chipRow.querySelector(`[data-chip-tool="${cssEscape(tool)}"]`);
+            if (!existing) {
+                const chip = document.createElement('span');
+                chip.className = 'tool-chip';
+                chip.setAttribute('data-chip-tool', tool);
+                chip.innerHTML = `<span class="tool-chip-dot"></span><span>${escapeHtml(tool)}</span>`;
+                chipRow.appendChild(chip);
             }
         }
+        scrollToBottom();
+        return;
+    }
+
+    if (data.type === 'status' || data.type === 'info') {
+        const msg = typeof data.payload === 'object' ? (data.payload?.message || data.payload?.text || '') : String(data.payload || '');
+        if (statusTextEl && msg) statusTextEl.textContent = ChatRenderer.friendlyError(msg);
+        scrollToBottom();
+        return;
+    }
+
+    if (data.type === 'tool_result') {
+        const tool = data.payload?.tool;
+        if (chipRow && tool) {
+            const chip = chipRow.querySelector(`[data-chip-tool="${cssEscape(tool)}"]`);
+            if (chip) chip.remove();
+        }
+        if (resultsContainer) {
+            const cardHtml = renderToolEmitCard(data);
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = cardHtml;
+            resultsContainer.appendChild(tempDiv.firstElementChild || tempDiv);
+        }
+        scrollToBottom();
+        // Live findings drawer sync: a tool_result almost always means new
+        // state was written to the target's task.json, so refresh the
+        // drawer as it happens rather than waiting for the whole turn.
+        scheduleLiveFindingsRefresh();
+        return;
+    }
+
+    // Fallback for any other emit type (warn/error/success/etc.)
+    if (resultsContainer) {
         const cardHtml = renderToolEmitCard(data);
         const tempDiv = document.createElement('div');
         tempDiv.innerHTML = cardHtml;
-        activeEmitsContainer.appendChild(tempDiv.firstElementChild || tempDiv);
+        resultsContainer.appendChild(tempDiv.firstElementChild || tempDiv);
         scrollToBottom();
     }
+}
+
+// data-chip-tool values are tool names (alnum/underscore in practice) but
+// escape defensively since they come from the backend.
+function cssEscape(s) {
+    return String(s).replace(/["\\]/g, '\\$&');
+}
+
+let _liveFindingsRefreshTimer = null;
+function scheduleLiveFindingsRefresh() {
+    if (!findingsComponent) return;
+    if (_liveFindingsRefreshTimer) return; // already queued, coalesce bursts
+    _liveFindingsRefreshTimer = setTimeout(() => {
+        _liveFindingsRefreshTimer = null;
+        findingsComponent.refreshData();
+    }, 400);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1131,14 +1249,22 @@ async function handleSendMessage() {
     // Render User Message immediately
     appendMessageBubble('user', text);
 
+    // Reset per-turn live-status state and sweep any stale in-flight nodes
+    // from a previous turn before starting fresh.
+    _turnHasToolRun = false;
+    _turnHasStreamedToken = false;
+    document.querySelectorAll('.in-flight-emit-msg, .streaming-assistant-msg').forEach(el => el.remove());
+
     // Update execution UI state
     setExecutionState(true);
 
     try {
         const res = await callApi('send_message', currentTarget, text);
         
-        // Remove in-flight emit bubble if present
-        document.querySelectorAll('.in-flight-emit-msg').forEach(el => el.remove());
+        // Remove in-flight emit bubble and any leftover streaming
+        // placeholder — the finished bubble below is the sole source of
+        // truth for this turn's content.
+        document.querySelectorAll('.in-flight-emit-msg, .streaming-assistant-msg').forEach(el => el.remove());
 
         if (res) {
             appendMessageBubble('assistant', res.response, res.chips || [], res.emits || [], true, res.metrics);
@@ -1150,6 +1276,7 @@ async function handleSendMessage() {
         }
     } catch (err) {
         console.error("Error executing query:", err);
+        document.querySelectorAll('.in-flight-emit-msg, .streaming-assistant-msg').forEach(el => el.remove());
         appendMessageBubble('assistant', `Error: ${err.message || err}`);
     } finally {
         setExecutionState(false);
@@ -1161,12 +1288,15 @@ async function handleStopRequest() {
     try {
         await callApi('stop_request', currentTarget);
         setExecutionState(false);
-        document.querySelectorAll('.in-flight-emit-msg').forEach(el => el.remove());
+        document.querySelectorAll('.in-flight-emit-msg, .streaming-assistant-msg').forEach(el => el.remove());
         appendMessageBubble('assistant', '*[Execution stopped by user]*');
     } catch (e) {
         console.error("Error stopping request:", e);
     }
 }
+
+let _executionTimerInterval = null;
+let _executionStartedAt = 0;
 
 function setExecutionState(executing) {
     isExecuting = executing;
@@ -1186,6 +1316,21 @@ function setExecutionState(executing) {
     }
     if (chatInput) {
         chatInput.placeholder = executing ? 'Executing toolchain and reasoning...' : 'Type a message or /command...';
+    }
+
+    if (executing) {
+        _executionStartedAt = Date.now();
+        if (_executionTimerInterval) clearInterval(_executionTimerInterval);
+        _executionTimerInterval = setInterval(() => {
+            const timerEl = document.querySelector('.in-flight-emit-msg .live-status-timer');
+            if (timerEl) {
+                const secs = Math.max(0, Math.round((Date.now() - _executionStartedAt) / 1000));
+                timerEl.textContent = `${secs}s`;
+            }
+        }, 1000);
+    } else if (_executionTimerInterval) {
+        clearInterval(_executionTimerInterval);
+        _executionTimerInterval = null;
     }
 }
 
@@ -1656,8 +1801,7 @@ function setupDOMEventHandlers() {
         testVoiceBtn.disabled = true;
         const original = testVoiceBtn.textContent;
         testVoiceBtn.textContent = 'TESTING...';
-        // Test against whatever is currently typed, saving first so the
-        // backend has the latest key/reference id to test with.
+        updateVoiceStatusIndicator(null, 'Testing...');
         try {
             await callApi('save_voice_settings', {
                 enabled: document.getElementById('cfgVoiceEnabled')?.checked ?? true,
@@ -1667,13 +1811,15 @@ function setupDOMEventHandlers() {
                 speed: parseFloat(document.getElementById('cfgVoiceSpeed')?.value) || 1.08,
             });
             const res = await callApi('test_voice');
-            updateVoiceStatusIndicator(res?.status === 'ok');
-            if (res?.status !== 'ok') {
-                console.warn('[Voice] test failed:', res?.reason);
+            if (res?.status === 'ok') {
+                updateVoiceStatusIndicator(true, '✓ Connected');
+            } else {
+                console.warn('[Voice] test failed:', res);
+                updateVoiceStatusIndicator(false, res?.reason || 'Voice unavailable.');
             }
         } catch (e) {
             console.error('[Voice] test_voice failed:', e);
-            updateVoiceStatusIndicator(false);
+            updateVoiceStatusIndicator(false, 'Call failed: ' + (e?.message || e));
         } finally {
             testVoiceBtn.disabled = false;
             testVoiceBtn.textContent = original;
@@ -1682,6 +1828,24 @@ function setupDOMEventHandlers() {
 
     replayTestVoiceBtn?.addEventListener('click', async () => {
         try { await callApi('replay_voice'); } catch (e) { console.error('[Voice] replay failed:', e); }
+    });
+
+    document.getElementById('installFishAudioBtn')?.addEventListener('click', async (e) => {
+        const btn = e.target;
+        btn.disabled = true;
+        btn.textContent = 'INSTALLING...';
+        try {
+            const res = await callApi('install_fish_audio_sdk');
+            await refreshVoiceDiagnostics();
+            if (res?.status !== 'ok') {
+                updateVoiceStatusIndicator(false, 'Install failed — see diagnostics below.');
+            }
+        } catch (err) {
+            updateVoiceStatusIndicator(false, 'Install call failed: ' + (err?.message || err));
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'INSTALL AUTOMATICALLY';
+        }
     });
 
     // API Key Eye Toggle (Show/Hide)
@@ -1785,6 +1949,7 @@ async function openSettingsModal() {
             if (model) model.value = voice.model || 's2.1-pro-free';
             if (speed) speed.value = voice.speed || 1.08;
             updateVoiceStatusIndicator(voice.configured);
+            await refreshVoiceDiagnostics();
         }
     } catch (e) {
         console.warn('Could not load voice settings from backend:', e);
@@ -1793,11 +1958,35 @@ async function openSettingsModal() {
     modal?.classList.add('open');
 }
 
-function updateVoiceStatusIndicator(connected) {
+function updateVoiceStatusIndicator(connected, message) {
     const dot = document.getElementById('voiceStatusDot');
     const text = document.getElementById('voiceStatusText');
-    if (dot) dot.classList.toggle('connected', !!connected);
-    if (text) text.textContent = connected ? '✓ Connected' : 'Not configured';
+    if (dot) {
+        dot.classList.toggle('connected', connected === true);
+        dot.classList.toggle('testing', connected === null);
+    }
+    if (text) {
+        text.textContent = message || (connected ? '✓ Connected' : 'Not configured');
+        text.style.color = connected === false ? '#f87171' : '';
+    }
+}
+
+async function refreshVoiceDiagnostics() {
+    // Always reads sys.executable live from the running process — never a
+    // cached or hardcoded interpreter path.
+    const block = document.getElementById('voiceDiagBlock');
+    const installBtn = document.getElementById('installFishAudioBtn');
+    if (!block) return;
+    try {
+        const d = await callApi('get_voice_diagnostics');
+        block.textContent =
+            `Python           ${d.python_executable}\n` +
+            `Fish Audio       ${d.fishaudio_importable ? '✓ Installed' : '✗ Not installed for this interpreter'}\n` +
+            `Voice (ffplay)   ${d.ffplay_path ? '✓ Ready — ' + d.ffplay_path : '✗ Not found on PATH'}`;
+        if (installBtn) installBtn.style.display = d.fishaudio_importable ? 'none' : 'inline-block';
+    } catch (e) {
+        block.textContent = 'Could not read diagnostics: ' + (e?.message || e);
+    }
 }
 
 function closeSettingsModal() {
@@ -1912,6 +2101,25 @@ function scrollToBottom(force = false) {
     }
 }
 
+function wireCodeBlockCopyButtons(containerEl) {
+    if (!containerEl) return;
+    containerEl.querySelectorAll('.code-block-copy-btn').forEach(btn => {
+        if (btn.dataset.wired) return; // avoid double-binding on re-renders (streaming re-sets innerHTML)
+        btn.dataset.wired = '1';
+        btn.addEventListener('click', () => {
+            const codeEl = btn.closest('.code-block')?.querySelector('pre code');
+            if (!codeEl) return;
+            copyToClipboard(codeEl.textContent);
+            btn.textContent = 'Copied';
+            btn.classList.add('copied');
+            setTimeout(() => {
+                btn.textContent = 'Copy';
+                btn.classList.remove('copied');
+            }, 1500);
+        });
+    });
+}
+
 function copyToClipboard(text) {
     const textArea = document.createElement("textarea");
     textArea.value = text;
@@ -1977,7 +2185,17 @@ function formatMarkdown(text) {
     const codeBlocks = [];
     html = html.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (match, lang, code) => {
         const id = `___CODE_BLOCK_${codeBlocks.length}___`;
-        codeBlocks.push(`<pre><code class="language-${escapeHtml(lang || 'text')}">${escapeHtml(code.trim())}</code></pre>`);
+        const label = (lang || 'text').toLowerCase();
+        const codeText = code.trim();
+        codeBlocks.push(
+            `<div class="code-block">` +
+                `<div class="code-block-header">` +
+                    `<span class="code-block-lang">${escapeHtml(label)}</span>` +
+                    `<button type="button" class="code-block-copy-btn" title="Copy code">Copy</button>` +
+                `</div>` +
+                `<pre><code class="language-${escapeHtml(label)}">${escapeHtml(codeText)}</code></pre>` +
+            `</div>`
+        );
         return id;
     });
 

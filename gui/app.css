@@ -228,6 +228,46 @@ body.clean-interface .ambient-bg {
     border: 1px solid rgba(16, 185, 129, 0.2);
 }
 
+.inline-activity-line {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 13.5px;
+    color: var(--text-muted);
+    line-height: 1.6;
+}
+
+.inline-activity-text {
+    flex: 1;
+    min-width: 0;
+    word-break: break-word;
+}
+
+.inline-tool-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-main);
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 4px;
+    padding: 1px 6px;
+}
+
+.node-status-icon.success-icon {
+    color: var(--success);
+    font-size: 12px;
+}
+
+.node-status-icon.error-icon {
+    color: var(--danger);
+    font-size: 12px;
+}
+
+.node-status-icon.blocked-icon {
+    color: var(--warning);
+    font-size: 12px;
+}
+
 .thinking-dots {
     display: flex;
     align-items: center;
@@ -249,6 +289,77 @@ body.clean-interface .ambient-bg {
 @keyframes thinking-bounce {
     0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
     30% { opacity: 1; transform: translateY(-3px); }
+}
+
+/* Claude-style live status line while the agent is executing — replaces
+   any bordered terminal-strip status readout. One evolving line, no box. */
+.live-status-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 13.5px;
+    color: var(--text-muted);
+}
+
+.live-status-spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid rgba(255, 34, 68, 0.18);
+    border-top-color: var(--primary);
+    border-radius: 50%;
+    flex-shrink: 0;
+    animation: status-spin 0.7s linear infinite;
+}
+
+@keyframes status-spin {
+    to { transform: rotate(360deg); }
+}
+
+.live-status-text {
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.live-status-timer {
+    font-family: 'Space Grotesk', monospace;
+    font-size: 11px;
+    color: var(--text-dim, #9ca3af);
+}
+
+/* Small pill chips for tools currently executing — replace full-row log
+   lines. Removed the moment a tool_result arrives for that tool. */
+.tool-chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 6px 0 0;
+}
+
+.tool-chip-row:empty {
+    margin: 0;
+}
+
+.tool-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: 'Space Grotesk', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 9999px;
+    padding: 3px 10px 3px 8px;
+}
+
+.tool-chip-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #38bdf8;
+    box-shadow: 0 0 5px #38bdf8;
+    animation: pulse 1.4s ease-in-out infinite;
 }
 
 .status-dot-pulse {
@@ -859,8 +970,8 @@ body.clean-interface .ambient-bg {
     border-radius: 12px 12px 2px 12px;
     padding: 14px 18px;
     color: #ffffff;
-    font-size: 14px;
-    line-height: 1.5;
+    font-size: 16px;
+    line-height: 1.6;
     word-break: break-word;
     user-select: text;
 }
@@ -895,21 +1006,40 @@ body.clean-interface .ambient-bg {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 8px;
+    margin-bottom: 10px;
     padding-bottom: 0;
     border-bottom: none;
-    opacity: 0.75;
+    opacity: 0.9;
 }
 
 .assistant-tag {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 10px;
     font-family: 'Michroma', sans-serif;
     font-size: 11px;
     font-weight: 700;
     letter-spacing: 0.05em;
     color: var(--primary);
+}
+
+.assistant-avatar-icon {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    object-fit: cover;
+    flex-shrink: 0;
+    background: #0a0a0d;
+    box-shadow: 0 0 0 1px rgba(255, 34, 68, 0.25), 0 0 10px rgba(255, 34, 68, 0.35);
+}
+
+.assistant-timestamp {
+    font-family: 'Space Grotesk', monospace;
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: normal;
+    text-transform: none;
+    color: var(--text-dim, #9ca3af);
 }
 
 .assistant-footer {
@@ -949,13 +1079,13 @@ body.clean-interface .ambient-bg {
 }
 
 .assistant-body {
-    font-size: 13.5px;
-    line-height: 1.65;
+    font-size: 16px;
+    line-height: 1.7;
     color: rgba(255, 255, 255, 0.9);
 }
 
 /* Markdown formatting inside assistant bubble */
-.assistant-body p { margin-bottom: 10px; }
+.assistant-body p { margin-bottom: 14px; }
 .assistant-body p:last-child { margin-bottom: 0; }
 .assistant-body strong { color: #ffffff; font-weight: 600; }
 .assistant-body em { color: #fca5a5; font-style: italic; }
@@ -983,11 +1113,11 @@ body.clean-interface .ambient-bg {
 
 .assistant-body pre {
     background: #050508 !important;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 6px;
+    border: none;
+    border-radius: 0 0 6px 6px;
     padding: 12px 16px;
     overflow-x: auto;
-    margin: 12px 0;
+    margin: 0;
 }
 
 .assistant-body pre code {
@@ -997,6 +1127,51 @@ body.clean-interface .ambient-bg {
     color: #e2e8f0;
     font-size: 12px;
     line-height: 1.5;
+}
+
+.code-block {
+    background: #050508;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    overflow: hidden;
+    margin: 12px 0;
+}
+
+.code-block-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: rgba(255, 255, 255, 0.03);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.code-block-lang {
+    font-family: 'Space Grotesk', monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-dim, #9ca3af);
+}
+
+.code-block-copy-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-dim, #9ca3af);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    transition: all 0.15s ease;
+}
+
+.code-block-copy-btn:hover {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.code-block-copy-btn.copied {
+    color: var(--success, #10b981);
 }
 
 /* Interactive Finding Chips inside assistant responses */
@@ -2041,6 +2216,40 @@ body.clean-interface .ambient-bg {
 .voice-status-dot.connected {
     background: #4ade80;
     box-shadow: 0 0 6px rgba(34, 197, 94, 0.6);
+}
+
+.voice-status-dot.testing {
+    background: #fbbf24;
+    box-shadow: 0 0 6px rgba(251, 191, 36, 0.6);
+    animation: thinking-bounce 1s ease-in-out infinite;
+}
+
+.voice-diagnose-link {
+    background: none;
+    border: none;
+    color: var(--text-dim, #9ca3af);
+    text-decoration: underline;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0;
+    margin-left: 4px;
+}
+
+.voice-diagnose-link:hover {
+    color: #ffffff;
+}
+
+.voice-diagnostics-output {
+    margin-top: 8px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--surface-border);
+    border-radius: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim, #9ca3af);
+    white-space: pre-wrap;
+    word-break: break-all;
 }
 
 .settings-modal-footer {

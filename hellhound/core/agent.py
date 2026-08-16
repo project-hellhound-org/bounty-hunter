@@ -1953,6 +1953,8 @@ INSTRUCTIONS:
 
         self.history.append({"role": "user", "content": user_text})
         tools_executed = []
+        _prev_ai_resp = None
+        _prev_tool_signature = None
 
         # ── 3. Orchestrator Iteration Loop (Thinking=False, Fast Local/Tool Calls) ──
         for iteration in range(max_iterations):
@@ -1978,6 +1980,14 @@ INSTRUCTIONS:
             if not ai_resp or not ai_resp.strip():
                 break
 
+            # Guard against the orchestrator re-entering with the exact same
+            # output it just produced (identical plan/tool-call regenerated
+            # instead of progressing) — treat that as "done planning" and
+            # fall through to synthesis rather than burning iterations.
+            if ai_resp.strip() == (_prev_ai_resp or "").strip():
+                break
+            _prev_ai_resp = ai_resp
+
             # Check for JSON tool invocation in the response
             tool_call = None
             json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', ai_resp)
@@ -1999,6 +2009,15 @@ INSTRUCTIONS:
             if tool_call and tool_call.get("tool") in TOOL_REGISTRY:
                 t_name = tool_call["tool"]
                 t_args = tool_call.get("args") or tool_call.get("parameters") or tool_call.get("arguments") or {}
+
+                # Same tool + same args as last iteration -> the orchestrator
+                # is stuck, not progressing. Stop calling and move to
+                # synthesis with whatever's already been gathered.
+                _sig = (t_name, json.dumps(t_args, sort_keys=True, default=str))
+                if _sig == _prev_tool_signature:
+                    break
+                _prev_tool_signature = _sig
+
                 tools_executed.append(t_name)
                 
                 if emit and hasattr(emit, "set_label"):

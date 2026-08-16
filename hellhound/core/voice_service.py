@@ -124,10 +124,11 @@ class VoiceService:
                 self._emit("unavailable", {"reason": str(e)})
             except Exception as e:  # noqa: BLE001 - never crash the GUI
                 logger.exception("Voice generation/playback failed")
+                reason = _describe_exception(e)
                 result_box["status"] = "error"
-                result_box["reason"] = "Voice unavailable."
+                result_box["reason"] = reason
                 started.set()
-                self._emit("error", {"error": str(e)})
+                self._emit("error", {"error": reason})
             finally:
                 self._speaking = False
                 if not self._stop_flag.is_set():
@@ -208,13 +209,15 @@ class VoiceService:
             audio_path = self._generate(sample_text, api_key, reference_id, model, speed)
             self._last_audio_path = audio_path
             self._last_text = sample_text
+            if not shutil_which("ffplay"):
+                return {"status": "error", "reason": "ffplay not found on PATH — install ffmpeg (audio generated fine, playback can't start)."}
             self._play(audio_path, block=True)
             return {"status": "ok"}
         except VoiceUnavailable as e:
             return {"status": "unavailable", "reason": str(e)}
         except Exception as e:  # noqa: BLE001
             logger.exception("Voice test failed")
-            return {"status": "error", "reason": "Voice unavailable."}
+            return {"status": "error", "reason": _describe_exception(e)}
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -224,7 +227,11 @@ class VoiceService:
         try:
             from fishaudio import FishAudio
         except ImportError as e:
-            raise VoiceUnavailable("fish-audio-sdk not installed") from e
+            import sys
+            raise VoiceUnavailable(
+                f"fish-audio-sdk not importable under {sys.executable}. "
+                f"Install it into THIS interpreter: {sys.executable} -m pip install fish-audio-sdk"
+            ) from e
 
         try:
             client = FishAudio(api_key=api_key)
@@ -238,11 +245,15 @@ class VoiceService:
         except VoiceUnavailable:
             raise
         except Exception as e:  # noqa: BLE001
-            # Covers auth failures, unknown reference_id, network errors, etc.
-            raise VoiceUnavailable("Voice unavailable.") from e
+            # Surface the REAL error (auth failure, bad reference_id, network
+            # down, etc.) instead of a generic message -- this is what shows
+            # up in the Voice Status line so it's actually debuggable.
+            logger.exception("Fish Audio generation failed")
+            detail = _describe_exception(e)
+            raise VoiceUnavailable(f"Voice unavailable: {detail}") from e
 
         if not audio_bytes:
-            raise VoiceUnavailable("Voice unavailable.")
+            raise VoiceUnavailable("Voice unavailable: Fish Audio returned no audio data")
 
         out_path = CACHE_DIR / f"briefing_{int(time.time() * 1000)}.mp3"
         with open(out_path, "wb") as f:
@@ -290,6 +301,59 @@ class VoiceService:
 def shutil_which(cmd: str) -> Optional[str]:
     import shutil
     return shutil.which(cmd)
+
+
+def _describe_exception(e: Exception) -> str:
+    """
+    Turns SDK/httpx exceptions into a short, actually-useful message instead
+    of a bare repr. Fish Audio's SDK is built on httpx, so most failures are
+    httpx.HTTPStatusError (auth/bad reference id) or httpx.RequestError
+    (DNS/network/timeout).
+    """
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        status = getattr(resp, "status_code", None)
+        body = ""
+        try:
+            body = resp.text[:200]
+        except Exception:  # noqa: BLE001
+            pass
+        if status == 401 or status == 403:
+            return f"HTTP {status} — API key rejected. Double-check the key in Settings."
+        if status == 404:
+            return f"HTTP {status} — voice reference ID not found."
+        if status:
+            return f"HTTP {status}{': ' + body if body else ''}"
+    msg = str(e).strip()
+    if not msg:
+        msg = type(e).__name__
+    return msg[:200]
+
+
+def diagnostics() -> Dict[str, Any]:
+    """
+    Environment diagnostic for the Voice tab. Answers the single most common
+    support question: "pip says it's installed, why doesn't the app see it?"
+    -- almost always the GUI process is a different interpreter/venv than
+    whatever shell `pip install` was run in.
+    """
+    import sys
+
+    fishaudio_ok = False
+    fishaudio_path = None
+    try:
+        import fishaudio
+        fishaudio_ok = True
+        fishaudio_path = getattr(fishaudio, "__file__", None)
+    except ImportError:
+        pass
+
+    return {
+        "python_executable": sys.executable,
+        "fishaudio_importable": fishaudio_ok,
+        "fishaudio_path": fishaudio_path,
+        "ffplay_path": shutil_which("ffplay"),
+    }
 
 
 # Module-level singleton — one voice session for the whole desktop app.

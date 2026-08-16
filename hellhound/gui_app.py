@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import sys
 import threading
 import time
 from typing import Dict, Any, List, Optional
@@ -43,6 +44,7 @@ class GuiEmit:
         self.target_name = target_name
         self.events: List[Dict[str, Any]] = []
         self.tokens = 0
+        self._last_status_push = 0.0
         self.indicator = ThinkingIndicator(status_callback=self._send_js)
         self.indicator.start()
 
@@ -52,6 +54,18 @@ class GuiEmit:
             self.events[-1]["time"] = datetime.now(timezone.utc).isoformat()
         else:
             self.events.append({"type": event_type, "payload": payload, "time": datetime.now(timezone.utc).isoformat()})
+
+        if event_type == "status":
+            # The underlying ThinkingIndicator ticks ~12x/second for a smooth
+            # CLI terminal spinner. That's fine for a direct stdout rewrite,
+            # but pushed through evaluate_js it means 12 new IPC calls a
+            # second driving a single "what's happening now" line — throttle
+            # this specific event type; every other event type (tool_start,
+            # tool_result, token, etc.) still dispatches immediately.
+            now = time.time()
+            if now - self._last_status_push < 0.35:
+                return
+            self._last_status_push = now
 
         if self.window:
             try:
@@ -187,6 +201,28 @@ class HellhoundAPI:
     def test_voice(self, sample_text: Optional[str] = None) -> Dict[str, Any]:
         """Blocking connectivity check used by the 'Test Voice' button."""
         return self._voice_service().test_voice(self._voice_config(), sample_text=sample_text)
+
+    def get_voice_diagnostics(self) -> Dict[str, Any]:
+        """Powers the Voice tab's status block — always the live sys.executable, never a fixed path."""
+        from hellhound.core.voice_service import diagnostics
+        return diagnostics()
+
+    def install_fish_audio_sdk(self) -> Dict[str, Any]:
+        """Installs fish-audio-sdk into the CURRENT interpreter (sys.executable), never a hardcoded path."""
+        import subprocess
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "fish-audio-sdk"],
+                capture_output=True, text=True, timeout=120,
+            )
+            from hellhound.core.voice_service import diagnostics
+            return {
+                "status": "ok" if proc.returncode == 0 else "error",
+                "output": (proc.stdout + proc.stderr)[-2000:],
+                "diagnostics": diagnostics(),
+            }
+        except Exception as e:  # noqa: BLE001
+            return {"status": "error", "reason": str(e)}
 
     def speak_briefing(self, text: str) -> Dict[str, Any]:
         """Speaks `text` using the saved Fish Audio config. Non-blocking."""

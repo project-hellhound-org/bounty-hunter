@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Callable, Union
 
+logger = logging.getLogger("hellhound.ai_utils")
+
 # Path to persistent Hellhound configuration
 CONFIG_DIR = Path.home() / ".hellhound"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -1090,6 +1092,41 @@ def call_gemini(prompt: str, api_key: str, model: str = "gemini-2.0-flash", time
     res = ask_gemini(api_key, model, ASK_PERSONA, prompt, timeout=timeout)
     return res if res else "Error: AI analysis failed."
 
+class _RepetitionGuard:
+    """
+    Detects the classic small-local-model failure mode: the model gets
+    stuck regenerating the same sentence over and over instead of
+    progressing (e.g. "Let me check the baseline response..." x40).
+
+    This is NOT a planner/state-machine issue -- it's a token-generation
+    degeneracy in the underlying model, most visible on low-temperature
+    passes with small quantized models. The fix belongs at the streaming
+    layer: watch the accumulating text for an exact phrase repeating past
+    a small threshold, and cut generation off there instead of riding it
+    out to max_tokens.
+    """
+
+    def __init__(self, min_phrase_len: int = 40, max_repeats: int = 2):
+        self.min_phrase_len = min_phrase_len
+        self.max_repeats = max_repeats
+        self._buffer = ""
+
+    def feed(self, chunk: str) -> bool:
+        """Returns True the moment a loop is detected -- caller should stop."""
+        self._buffer += chunk
+        # Only worth checking once we have enough text for a real phrase,
+        # and only re-check periodically (on sentence-ish boundaries) so
+        # this stays cheap on a hot streaming loop.
+        if len(self._buffer) < self.min_phrase_len * (self.max_repeats + 1):
+            return False
+        if chunk and chunk[-1] not in ".!?\n" and len(self._buffer) % 24 != 0:
+            return False
+
+        tail = self._buffer[-self.min_phrase_len:]
+        occurrences = self._buffer.count(tail)
+        return occurrences > self.max_repeats
+
+
 def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """REST call to local Ollama API using chat endpoint."""
     try:
@@ -1128,7 +1165,12 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
                 "temperature": temp,
                 "top_p": 0.9,
                 "num_predict": n_predict,
-                "num_ctx": n_ctx
+                "num_ctx": n_ctx,
+                # Small quantized models degenerate into exact-sentence
+                # loops without this — was previously unset, i.e. running
+                # on whatever the model's Modelfile happened to default to.
+                "repeat_penalty": 1.3,
+                "repeat_last_n": 256,
             }
         }
         if not thinking:
@@ -1142,6 +1184,8 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
         full_response = []
         token_count = 0
         eval_count = None
+        repeat_guard = _RepetitionGuard()
+        looped = False
         for line in r.iter_lines():
             if cancel_check and cancel_check():
                 break
@@ -1154,6 +1198,9 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
                         token_count += 1
                         if on_token:
                             on_token(token)
+                        if repeat_guard.feed(token):
+                            looped = True
+                            break
                     if chunk.get("done", False):
                         eval_count = chunk.get("eval_count")
                         break
@@ -1161,6 +1208,13 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
                     continue
 
         result = "".join(full_response).strip()
+        if looped:
+            # Trim the trailing repeated tail rather than handing back a
+            # response that visibly loops, then close out on whatever
+            # substantive content came before the loop started.
+            trimmed = re.sub(r'(.{40,}?)(\1){1,}\s*$', r'\1', result, flags=re.DOTALL)
+            result = trimmed.strip() or result
+            logger.warning("Ollama generation loop detected and truncated (model=%s)", model)
         cleaned = strip_thinking_tags(result)
         text = cleaned if cleaned else "Error: Ollama returned an empty response."
         if return_usage:
