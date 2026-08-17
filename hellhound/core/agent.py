@@ -18,6 +18,8 @@ from typing import Dict, Any, List, Optional, Callable, Tuple
 from urllib.parse import urlparse
 
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from hellhound.core.scope import ScopeRules, is_in_scope, check_module_against_rules
 from hellhound.core.tasks import Target, create_or_load_target, save_target, set_scope, sanitize_target_name
@@ -1038,7 +1040,7 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
             "url": url,
             "status_code": r.status_code,
             "headers": dict(r.headers),
-            "body_preview": r.text[:1000]
+            "body_preview": r.text[:6000]
         }
     except Exception as e:
         return {
@@ -1073,7 +1075,9 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
             "endpoints_found": len(endpoints),
             "sample_endpoints": endpoints[:30],
             "forms_found": len(intel.get("forms", [])),
-            "parameters": intel.get("parameters", [])[:20]
+            "parameters": intel.get("parameters", [])[:20],
+            "crashed": bool(isinstance(res, dict) and res.get("crashed")),
+            "tool_error": res.get("error") if isinstance(res, dict) else None
         }
     except Exception as e:
         return {"url": url, "error": f"Spider error: {e}"}

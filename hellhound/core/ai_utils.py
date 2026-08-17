@@ -368,6 +368,27 @@ class ThinkingIndicator:
                 except Exception:
                     pass
 
+    def progress_start(self, desc: str, total: int = 0):
+        """engine.run_single()/run_external() call emit.progress_start(name)
+        before running a module and emit.progress_stop() in a `finally`
+        afterward. On the CLI path a raw ThinkingIndicator is passed as
+        `emit` (the GUI path wraps it in GuiEmit, which already defines
+        these) — without this alias every module run raised
+        AttributeError immediately. Just relabels the already-running
+        spinner; does not touch the thread.
+        """
+        self.set_label(desc)
+
+    def progress_stop(self):
+        """Counterpart to progress_start(). Deliberately a no-op rather
+        than stopping the indicator thread: one ThinkingIndicator is
+        shared across every tool call in a turn (started once in
+        chat_ui.py, stopped once in that turn's `finally`), so killing
+        the thread here would end the spinner after the first tool call
+        in any multi-tool turn.
+        """
+        pass
+
     def tool_start(self, tool_name: str, args: Dict[str, Any]):
         """Prints a Claude Code-style action bullet for tool execution."""
         if self.status_callback:
@@ -583,8 +604,28 @@ def detect_ai_config(api_key: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 def classify_intent(user_input: str) -> str:
-    """Classifies user input before sending to model."""
+    """Classifies user input before sending to model.
+
+    Security keywords are checked FIRST. Previously "advice_triggers"
+    (how to / what is / can you explain / etc.) were checked before
+    security_keywords, so almost any naturally-phrased recon question —
+    "what is the scope for X", "can you explain these findings", "how do
+    I scan this subdomain" — matched an advice trigger on its phrasing
+    alone and got shunted into the single-shot "chat" fast-path, which
+    never runs the tool-use loop at all. That's why every query, recon
+    or not, was coming back in ~2 seconds: the agent wasn't doing any
+    work, just answering conversationally. A real security/recon term
+    anywhere in the text now always wins and routes to "hunt".
+    """
     text = user_input.lower().strip()
+
+    security_keywords = [
+        "target", "recon", "scan", "subdomain", "port", "vuln", "vulnerability",
+        "triage", "summarize", "scope", "finding", "endpoint", "spider", "probe",
+        "brute", "dns", "waf", "xss", "sqli", "cors", "cname", "report"
+    ]
+    if any(k in text for k in security_keywords):
+        return "hunt"
 
     advice_triggers = [
         "how to", "how do i", "ways to", "what are the ways", "what is",
@@ -593,15 +634,6 @@ def classify_intent(user_input: str) -> str:
     ]
     if any(a in text for a in advice_triggers):
         return "chat"
-
-    # If the user query mentions security, targets, or recon actions, always route to hunt/tool reasoning
-    security_keywords = [
-        "target", "recon", "scan", "subdomain", "port", "vuln", "vulnerability",
-        "triage", "summarize", "scope", "finding", "endpoint", "spider", "probe",
-        "brute", "dns", "waf", "xss", "sqli", "cors", "cname", "report"
-    ]
-    if any(k in text for k in security_keywords):
-        return "hunt"
 
     social_triggers = [
         "how are you", "what's up", "hey", "hi", "hello", "good morning",

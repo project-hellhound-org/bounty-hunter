@@ -9000,11 +9000,29 @@ def diff_crawls(old_json: str, new_json: str) -> dict:
 
 def _auto_save(store: Store, target: str, out_path: Optional[str],
                fmt: str, emit: Emit) -> str:
-                                                              
-    domain    = re.sub(r'[^a-zA-Z0-9_\-]', '_', urlparse(target).netloc)
-    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_path = out_path if (out_path and out_path.endswith(".json"))\
-                else f"spider_{domain}_{ts}.json"
+    # Snapshots always land in the same per-target directory everything
+    # else (task.json, findings, chat history) already lives in —
+    # ~/.hellhound/targets/<target>/recon/ — instead of a loose
+    # spider_<domain>_<timestamp>.json dropped in whatever directory the
+    # process happened to be launched from. An explicit out_path (e.g.
+    # CLI `--output somefile.json`) is a deliberate user request and is
+    # still honored exactly as given, in addition to the target-dir copy.
+    domain = re.sub(r'[^a-zA-Z0-9_\-]', '_', urlparse(target).netloc)
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if out_path and out_path.endswith(".json"):
+        json_path = out_path
+    else:
+        try:
+            from hellhound.core.tasks import _get_targets_dir, sanitize_target_name
+            target_dir = Path(_get_targets_dir()) / sanitize_target_name(target) / "recon"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            json_path = str(target_dir / f"spider_{domain}_{ts}.json")
+        except Exception:
+            # Fall back to CWD only if the per-target directory can't be
+            # resolved/created for some reason — never silently drop the
+            # snapshot.
+            json_path = f"spider_{domain}_{ts}.json"
 
     try:
         Path(json_path).write_text(store.export(target, fmt="json"))
@@ -9047,14 +9065,22 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
         def success(self, m):
             if self._v: self._b.success(m)
         def warn(self, m):            self._b.warn(m)
+        def warn_sev(self, m, severity="HIGH"):
+            self._b.warn(f"[{severity.upper()}] {m}")
         def always_info(self, m):     self._b.info(m)
         def always_success(self, m):  self._b.success(m)
-        def section(self, t):         self._b.info(f"── {t} ──")
+        def section(self, t, **kw):   self._b.info(f"── {t} ──")
         def row(self, k, v, **kw):    self._b.info(f"{k}: {_strip(str(v))}")
-        def finding(self, *a):        self._b.warn(str(a))
+        def finding(self, *a, **kw):  self._b.warn(str(a))
         def endpoint_row(self, ep):   self._b.info(ep.get("url",""))
         def live_crawl(self, url):    pass
         def print_always(self, m):    print(m)
+        def _w(self, m):              self._b.info(_strip(str(m)))
+        def crawl_feed(self, *a, **kw):          pass
+        def leader_row(self, k, v="", **kw):     self._b.info(f"{k}: {_strip(str(v))}" if v != "" else str(k))
+        def robots_comment_leak(self, m, **kw):  self._b.warn(str(m))
+        def robots_entry(self, *a, **kw):        self._b.info(" ".join(str(x) for x in a))
+        def security_txt_field(self, k, v="", **kw): self._b.info(f"{k}: {_strip(str(v))}")
         @property
         def _nc(self): return True
                                              
@@ -9062,10 +9088,14 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
         def animator(self):
             class _S:
                 active = False
+                _last_line = ""
                 def start(self, *a, **k): pass
                 def stop(self, *a, **k): pass
                 def update(self, *a, **k): pass
                 def _clear(self): pass
+                # aliases — crawl loop calls these names directly
+                def start_anim(self, *a, **k): pass
+                def stop_anim(self, *a, **k): pass
             return _S()
 
     emit = _W(emit_obj, cfg.verbose)

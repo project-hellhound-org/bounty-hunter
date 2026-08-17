@@ -91,7 +91,7 @@ class HellhoundEngine:
             return res
         except Exception as e:
             active_emit.warn(f"Module '{module_name}' crashed:\n{traceback.format_exc()}")
-            return ""
+            return {"raw": "", "intel": {}, "error": str(e), "crashed": True}
         finally:
             # AUTO-ANIMATION STOP
             active_emit.progress_stop()

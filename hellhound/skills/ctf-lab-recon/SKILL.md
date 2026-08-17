@@ -11,6 +11,17 @@ Unlike public bug bounty programs where targets are indexed globally and subject
 
 ---
 
+## 0. OBJECTIVE MATCH — READ THIS BEFORE ANY OTHER SECTION
+
+The user's stated task always outranks this doctrine's default workflow. Before running anything, classify the task:
+
+- **"Bypass auth", "reach the console/admin/dashboard", "log in", "take over an account"** → this is an **auth-bypass / credential-discovery** task. The path is: read the page(s) already fetched → check for leaked creds (HTML comments, JS, exposed config/backup files, IDOR on session/role) → attempt login/bypass directly. Do **not** run `dns_bruteforce`, `vhost_fuzz`, or port scanning for this task type unless the app itself is unreachable — a hidden subdomain is not what "auth bypass" means, and running that workflow anyway wastes the whole run on the wrong problem.
+- **"Find the app", "there's a hidden service", "enumerate the attack surface"** → this is a **discovery** task. Phases 1–4 below apply.
+
+If the task type is auth-bypass/credential-discovery, skip straight to Phase 0 in Section 2 and stop there once you have a working login — do not continue into Phase 1.
+
+---
+
 ## 1. THE PASSIVE RECON FAILURE MODE
 
 ### Why Passive Recon Guarantees Zero Results in Labs
@@ -29,7 +40,17 @@ Public bug bounty recon relies on passive aggregation:
 
 ## 2. ACTIVE ENUMERATION WORKFLOW
 
-CTF and lab reconnaissance proceeds through four tightly coupled active phases:
+### Phase 0: Read What You Already Fetched (do this FIRST, always)
+
+Before escalating to DNS brute force or vhost fuzzing, fully analyze every response you already have in hand:
+- Read the **entire** `body_preview`/HTML of every page already curled or spidered — not just status code and title.
+- Check HTML comments (`<!-- -->`), inline `<script>` blocks, and linked `.js`/`.css` files for leaked credentials, internal paths, API keys, or staging hostnames.
+- Check for backup/source-leak files adjacent to known paths (`.bak`, `~`, `.git`, `.env`, `.old`, `_old`, source maps).
+- If the objective describes a **single application** (e.g. "sign in to reach the console", "no account needed, recon the public site") rather than "find the hidden host/subdomain", treat this as a content-discovery / credential-leak problem, NOT a subdomain-enumeration problem. Do not jump to `dns_bruteforce` or `vhost_fuzz` just because the domain is `*.ctfhub.io` — those phases are for when the objective or evidence actually points to a hidden host, not by default.
+- If a recon tool (spider, content discovery) crashes or errors, do not treat that as "0 endpoints found" — treat it as inconclusive, note the error, and fall back to reading the raw responses you already have before concluding there's no attack surface.
+- Only proceed to Phase 1 (DNS brute force) if Phase 0 genuinely surfaces nothing exploitable AND the objective implies a hidden host exists.
+
+CTF and lab reconnaissance then proceeds through four tightly coupled active phases:
 
 ```
 +--------------------------------------------------------------------+
@@ -92,8 +113,10 @@ In CTF & Lab Targets:
 ## 5. SUMMARY CHECKLIST FOR LAB SESSIONS
 
 - [ ] Recognize lab/CTF context (HTB, THM, VulnHub, CTFio, private target).
+- [ ] Phase 0: fully read every response already fetched (comments, JS, backup files) before escalating.
+- [ ] Confirm the objective actually implies a hidden host before doing subdomain/vhost work.
 - [ ] Confirm auto-scoping applied (`*.target`, `target`).
-- [ ] Skip passive aggregators; execute `dns_bruteforce`.
+- [ ] Skip passive aggregators; execute `dns_bruteforce` — only if Phase 0 found nothing and a hidden host is implied.
 - [ ] Probe all discovered names with `httpx`.
 - [ ] Execute `vhost_fuzz` against target IP to catch unindexed challenge hosts.
 - [ ] Map high-value endpoints and proceed to challenge exploitation.
