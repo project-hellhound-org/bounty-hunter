@@ -8011,8 +8011,23 @@ class Spider:
             if changed:
                 self.emit.info("[Body-Hints] %s <- %s" % (found, url))
 
+    _SOUP_PARSER = None
+
     def _process_html(self, url, text, depth, source):
-        soup = BeautifulSoup(text, "lxml")
+        if Spider._SOUP_PARSER is None:
+            for parser in ("lxml", "html.parser"):
+                try:
+                    BeautifulSoup("<html></html>", parser)
+                    Spider._SOUP_PARSER = parser
+                    break
+                except Exception:
+                    continue
+            else:
+                Spider._SOUP_PARSER = "html.parser"
+        try:
+            soup = BeautifulSoup(text, Spider._SOUP_PARSER)
+        except Exception:
+            soup = BeautifulSoup(text, "html.parser")
         ctf_patterns = getattr(self.cfg, "ctf_flag_patterns", [])
         Extractor.html_comments(soup, url, self.store, self.emit,
                                 base_url=url, discover_url=self._discover_url, depth=depth)

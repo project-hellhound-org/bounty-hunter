@@ -276,7 +276,7 @@ def is_ctf_lab_context(user_text: str) -> bool:
         if " " in kw:
             if kw in q_lower:
                 return True
-        elif kw in q_tokens or kw in q_lower:
+        elif kw in q_tokens:
             return True
 
     # 2. Check against description tokens of ctf-lab-recon dynamically from registry
@@ -435,6 +435,31 @@ def load_skill_reference(skill_name: str, filename: str) -> Optional[str]:
         return None
 
 
+def is_directed_task(user_text: str) -> bool:
+    """
+    Detects an explicit, concrete task: a specific target (URL/host) paired
+    with an action verb describing what to do to it — e.g. "bypass auth on
+    https://x/pulse", "log in and reach the admin console at x.com".
+    When True, the user has already told the agent exactly what to do, so
+    broad session-start methodology (bb-methodology / ctf-lab-recon) should
+    NOT be injected — it would compete with, rather than inform, an
+    instruction the user already made explicit. Technology-specific skills
+    (Rule 3, e.g. graphql-audit) can still fire independently.
+    """
+    if not user_text:
+        return False
+    q_lower = user_text.lower()
+    has_target = bool(re.search(r"https?://\S+", q_lower)) or bool(re.search(r"\b[a-z0-9.-]+\.[a-z]{2,}(/\S*)?\b", q_lower))
+    action_verbs = [
+        "bypass", "log in", "login", "sign in", "take over", "takeover",
+        "exploit", "reach the", "get us to", "get access", "access the",
+        "retrieve", "extract", "escalate", "dump", "exfiltrate",
+        "find a way to", "break into", "compromise"
+    ]
+    has_action = any(v in q_lower for v in action_verbs)
+    return has_target and has_action
+
+
 def get_relevant_skills_prompt(
     user_text: str,
     history_len: int = 0,
@@ -449,14 +474,20 @@ def get_relevant_skills_prompt(
       2. Triage / Validation / Report Intent: load `triage-validation` first.
       3. General message queries: search and inject top 1-2 relevant skills.
       4. Caps total skill injection and adapts for small context models.
+    An explicit, directed task (see is_directed_task) skips Rule 1 entirely —
+    the user's literal instruction should not compete with injected doctrine.
     """
     q_lower = user_text.lower().strip()
     selected_skills: List[str] = []
+    directed = is_directed_task(user_text)
 
     # Rule 1: First target work / session start / 'what should I do next'
+    # Skipped for directed tasks — the user already said exactly what to do.
     is_start_intent = (
-        history_len <= 1 or
-        any(p in q_lower for p in ["what should i do next", "what next", "where do i start", "where am i", "how to start"])
+        not directed and (
+            history_len <= 1 or
+            any(p in q_lower for p in ["what should i do next", "what next", "where do i start", "where am i", "how to start"])
+        )
     )
     if is_start_intent and not any(p in q_lower for p in ["report", "validate", "finding", "triage"]):
         if is_ctf_lab_context(user_text):

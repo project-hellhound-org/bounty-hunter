@@ -993,6 +993,44 @@ def _execute_hackerone_stats(args: Dict[str, Any], target: Target, emit: Any) ->
         return {"error": f"Failed to retrieve HackerOne stats: {e}"}
 
 
+def _clean_synthesizer_output(text: str) -> str:
+    """
+    Defensive net: if the synthesizer model ignored its plain-prose
+    instruction and emitted a raw orchestrator-style JSON tool-call object
+    instead (seen with small local models echoing prior tool-call turns),
+    convert it into a readable sentence instead of dumping raw JSON to the
+    user's terminal.
+    """
+    if not text:
+        return text
+    stripped = text.strip()
+    candidate = stripped
+    m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', stripped)
+    if m:
+        candidate = m.group(1)
+    elif not (stripped.startswith("{") and stripped.endswith("}")):
+        return text
+
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        return text
+
+    if not isinstance(parsed, dict) or not ({"tool", "next_steps"} & set(parsed.keys())):
+        return text
+
+    parts = []
+    if parsed.get("analysis"):
+        parts.append(str(parsed["analysis"]))
+    if parsed.get("next_steps"):
+        parts.append(f"Next: {parsed['next_steps']}")
+    if parsed.get("tool"):
+        args_str = json.dumps(parsed.get("args", {}))
+        parts.append(f"(Suggested next tool: {parsed['tool']} {args_str})")
+
+    return "\n\n".join(parts) if parts else text
+
+
 def _execute_dig(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     domain = args.get("domain") or target.name
     record_type = args.get("type", "A").upper()
@@ -1926,6 +1964,14 @@ INSTRUCTIONS:
   not in that list (Nmap, Burp Suite, Metasploit, etc. are NOT available
   unless they literally appear above). Never claim you lack tool access —
   you have the tools listed above and can invoke them.
+- OUTPUT FORMAT: Respond in plain natural-language prose only — headings,
+  short paragraphs, and bullet points are fine. NEVER output JSON, a code
+  fence, or a {{"tool": ..., "args": ...}} object. That structured tool-call
+  format belongs to the orchestrator step, which has already finished by the
+  time you are called — you are writing the human-readable answer, not
+  selecting a tool. If you're tempted to propose a next tool to run, say so
+  in a sentence (e.g. "Next, brute-forcing subdomains would help because...")
+  rather than emitting a tool-call object.
 """
 
         # ── 0. Direct Conversational Fast-Path (Instant 1s responses for chat) ──
@@ -2105,6 +2151,7 @@ INSTRUCTIONS:
             emit.set_token_count(tokens)
 
         final_response = final_answer or ai_resp or "Analysis completed. No further actions required."
+        final_response = _clean_synthesizer_output(final_response)
         self.history.append({"role": "assistant", "content": final_response})
         self.target.state["history"] = self.history
         save_target(self.target)

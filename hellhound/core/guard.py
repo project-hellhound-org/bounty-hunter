@@ -4,8 +4,10 @@ hellhound/core/guard.py
 Defensive Guardrails & Pre-Request Verification:
 - RateLimiter: Per-host request pacing separating recon vs. test RPS.
 - CircuitBreaker: Auto-tripping threshold on dead/failing hosts with cooldown.
-- SafeMethodPolicy: Strict gate allowing safe read-only methods (GET/HEAD/OPTIONS)
-  and requiring explicit human approval for mutating methods (POST/PUT/DELETE/PATCH).
+- SafeMethodPolicy: Strict gate allowing safe read-only and standard mutating
+  methods (GET/HEAD/OPTIONS/POST/PUT/PATCH), requiring explicit human
+  approval only for destructive actions (DELETE, or paths that indicate
+  deletion/wipe/purge intent).
 - AutopilotGuard: Unified pre-request guard.
 """
 
@@ -101,13 +103,26 @@ class CircuitBreaker:
 
 
 class SafeMethodPolicy:
-    """Enforce safe HTTP methods in reconnaissance/triage mode.
+    """Enforce a guard against destructive actions during autonomous operation.
 
-    Default safe methods: GET, HEAD, OPTIONS.
-    All mutating methods (POST, PUT, DELETE, PATCH) require explicit approval.
+    Read AND standard mutating methods (GET/HEAD/OPTIONS/POST/PUT/PATCH) are
+    allowed without approval — POST/PUT/PATCH are core to bug hunting (login,
+    form submission, API/IDOR testing) and gating them defeats the point of
+    autonomous testing.
+
+    Only genuinely destructive actions require human approval:
+      - DELETE, always.
+      - Any method whose URL path contains a destructive-intent keyword
+        (delete, destroy, remove, purge, wipe, drop, truncate, format,
+        deprovision, terminate, reset-all).
     """
 
-    DEFAULT_SAFE: Set[str] = {"GET", "HEAD", "OPTIONS"}
+    DEFAULT_SAFE: Set[str] = {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"}
+    DESTRUCTIVE_METHODS: Set[str] = {"DELETE"}
+    DESTRUCTIVE_PATH_KEYWORDS = (
+        "delete", "destroy", "remove", "purge", "wipe", "drop",
+        "truncate", "format", "deprovision", "terminate", "reset-all",
+    )
 
     def __init__(
         self,
@@ -117,22 +132,35 @@ class SafeMethodPolicy:
         self._safe = {m.upper() for m in (safe_methods if safe_methods is not None else self.DEFAULT_SAFE)}
         self._enabled = enabled
 
-    def is_safe(self, method: str) -> bool:
-        """Return True if the method is safe to send without approval."""
+    def _is_destructive_path(self, url: str) -> bool:
+        u = (url or "").lower()
+        return any(kw in u for kw in self.DESTRUCTIVE_PATH_KEYWORDS)
+
+    def is_safe(self, method: str, url: str = "") -> bool:
+        """Return True if the request is safe to send without approval."""
         if not self._enabled:
             return True
-        return method.upper() in self._safe
+        method_upper = method.upper()
+        if method_upper in self.DESTRUCTIVE_METHODS:
+            return False
+        if self._is_destructive_path(url):
+            return False
+        return method_upper in self._safe
 
     def check(self, method: str, url: str) -> Dict[str, Any]:
         """Return a structured decision for the given method + URL."""
         method_upper = method.upper()
-        if self.is_safe(method_upper):
+        if self.is_safe(method_upper, url):
             return {"decision": "allow", "method": method_upper, "url": url}
+        if method_upper in self.DESTRUCTIVE_METHODS:
+            reason = f"Destructive method {method_upper} requires human approval"
+        else:
+            reason = "URL path indicates a destructive action — requires human approval"
         return {
             "decision": "require_approval",
             "method": method_upper,
             "url": url,
-            "reason": f"Unsafe method {method_upper} requires human approval in recon/triage mode",
+            "reason": reason,
         }
 
 
