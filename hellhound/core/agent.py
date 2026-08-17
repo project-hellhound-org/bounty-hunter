@@ -1811,10 +1811,12 @@ class Agent:
             self.history = []
         return self.target
 
-    def _get_trimmed_history(self, max_turns: int = 4, for_chat: bool = False) -> List[Dict[str, str]]:
+    def _get_trimmed_history(self, max_turns: int = 6, for_chat: bool = False, turn_start_idx: Optional[int] = None) -> List[Dict[str, str]]:
         """
-        Returns a lightweight, sanitized history window for LLM/SLM prompts.
-        Prevents prompt bloat and eliminates massive inference lag.
+        Returns a sanitized history window for LLM/SLM prompts.
+        If turn_start_idx is provided, ALL tool results and assistant turns executed in the
+        current turn are preserved intact so the orchestrator and synthesizer have complete
+        visibility of what tools produced during this run.
         """
         if not self.history:
             return []
@@ -1836,25 +1838,30 @@ class Agent:
                     break
             return chat_turns
 
+        if turn_start_idx is not None and 0 <= turn_start_idx <= len(self.history):
+            # Split into prior conversation history and current-turn activity
+            prior_history = self.history[:turn_start_idx]
+            current_turn_history = self.history[turn_start_idx:]
+            # Keep up to max_turns of prior conversational context
+            recent_prior = prior_history[-max_turns:] if len(prior_history) > max_turns else prior_history
+            combined = recent_prior + current_turn_history
+        else:
+            combined = self.history[-max_turns:] if len(self.history) > max_turns else self.history
+
         trimmed = []
-        recent = self.history[-max_turns:] if len(self.history) > max_turns else self.history
-        for h in recent:
+        for h in combined:
             content = str(h.get("content", ""))
             is_tool_result = content.startswith("[TOOL RESULT:")
             if is_tool_result:
-                # Tool results (curl bodies, spider intel, etc.) are the
-                # highest-value content in history — a harvested email,
-                # token, or credential can sit anywhere in the JSON. A blind
-                # 700-char clip here silently truncates mid-field and the
-                # model never sees the data it needs. Give these a much
-                # larger budget, and pull out any emails up front so they
-                # survive even if the body still gets cut.
-                if len(content) > 3500:
+                # Tool results (curl bodies, spider intel, JSON feeds) are the
+                # highest-value content — provide full results up to 25,000 characters
+                # so the LLM can extract tokens, IDs, endpoints, and credentials without loss.
+                if len(content) > 25000:
                     emails = sorted(set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", content)))
                     prefix = f"[EMAILS FOUND IN THIS RESULT: {', '.join(emails)}]\n" if emails else ""
-                    content = prefix + content[:3200] + "\n...[truncated]..."
-            elif len(content) > 800:
-                content = content[:700] + "\n...[truncated]..."
+                    content = prefix + content[:24000] + "\n...[truncated remainder of large output]..."
+            elif len(content) > 4000:
+                content = content[:3800] + "\n...[truncated]..."
             trimmed.append({"role": h.get("role", "user"), "content": content})
         return trimmed
 
@@ -2041,8 +2048,17 @@ class Agent:
             max_skills=2
         )
 
-        # ── 1. Minimal Orchestrator System Prompt (Fast Tool Selection) ─────────
-        orchestrator_system_prompt = f"""\
+        def _get_orchestrator_system_prompt() -> str:
+            known_eps = (self.target.state.get("endpoints") or [])[:35]
+            known_params = (self.target.state.get("spider_intel") or {}).get("parameters", [])[:15]
+            if known_eps:
+                intel_block = "Endpoints already discovered:\n" + "\n".join(f"  - {e}" for e in known_eps)
+                if known_params:
+                    intel_block += "\nParameters already mapped:\n" + "\n".join(f"  - {p}" for p in known_params)
+            else:
+                intel_block = "(nothing gathered yet this session)"
+
+            return f"""\
 You are HELLHOUND Orchestrator. Your sole job is to evaluate if a tool should be executed next or if tool execution is complete.
 
 TARGET: {self.target.name}
@@ -2054,7 +2070,7 @@ AVAILABLE TOOLS:
 {tools_summary}
 
 ALREADY GATHERED THIS SESSION (do not re-run a tool to re-discover this):
-{known_intel_block}
+{intel_block}
 
 RULES:
 1. ONLY call tools when the user explicitly requests active reconnaissance, scanning, enumeration, or analysis of a target.
@@ -2069,6 +2085,7 @@ RULES:
 }}
 ```
 6. If no further tools are needed, or after inspecting tool findings, respond with "DONE".
+7. When testing authentication or password recovery workflows, do NOT invent dummy emails (e.g., test@example.com, admin@local). If crawler results show data/content endpoints (posts, news, users, profiles), fetch them first with curl GET to harvest real user/staff identities.
 """
 
         # ── 2. Comprehensive Synthesizer System Prompt (Deep Reasoning & Synthesis)
@@ -2090,21 +2107,17 @@ AVAILABLE TOOLS (this is the complete, real list — you have no other tools):
 
 INSTRUCTIONS:
 - Review the entire conversation history, executed tools, and gathered evidence.
-- Produce a clear, concise, and structured synthesis of all findings.
-- Highlight actionable security observations, open attack surfaces, and logical next triage steps.
+- When security vulnerabilities, authentication bypasses, or data exposures are discovered:
+  1. Concrete Proof of Concept & Evidence: Detail the exact endpoints, parameters, harvested identities, leaked tokens/passwords, and specific sensitive assets accessed (e.g., exposed API keys, environment secrets, PHI/PII records, bucket URLs) discovered in tool outputs.
+  2. Attack Chain & Reproduction: Provide a clean, step-by-step reproduction sequence.
+  3. Severity & Bounty Impact Escalation: Provide the vulnerability classification (e.g., Critical / High under VRT / CVSS), explain the full business and security impact (e.g., unauthorized access to protected records, privilege escalation), and highlight key evidence researchers can emphasize to maximize bounty rewards.
+  4. Next Triage & Reporting Action: Outline immediate reporting recommendations and safe remediation guidance.
 - When asked about your capabilities, tools, or what you can do: answer ONLY
   from the AVAILABLE TOOLS list above. Never claim access to external tools
   not in that list (Nmap, Burp Suite, Metasploit, etc. are NOT available
   unless they literally appear above). Never claim you lack tool access —
   you have the tools listed above and can invoke them.
-- OUTPUT FORMAT: Respond in plain natural-language prose only — headings,
-  short paragraphs, and bullet points are fine. NEVER output JSON, a code
-  fence, or a {{"tool": ..., "args": ...}} object. That structured tool-call
-  format belongs to the orchestrator step, which has already finished by the
-  time you are called — you are writing the human-readable answer, not
-  selecting a tool. If you're tempted to propose a next tool to run, say so
-  in a sentence (e.g. "Next, brute-forcing subdomains would help because...")
-  rather than emitting a tool-call object.
+- OUTPUT FORMAT: Respond in plain natural-language prose with clean markdown structure (headings, bullet points, and code blocks for evidence/PoC). NEVER output a raw tool-call object.
 """
 
         # ── 0. Direct Conversational Fast-Path (Instant 1s responses for chat) ──
@@ -2134,6 +2147,7 @@ INSTRUCTIONS:
             save_target(self.target)
             return chat_resp
 
+        turn_start_idx = len(self.history)
         self.history.append({"role": "user", "content": user_text})
         tools_executed = []
         _prev_ai_resp = None
@@ -2159,10 +2173,10 @@ INSTRUCTIONS:
 
             ai_resp, tokens = ask_neural_core(
                 prompt=user_text if iteration == 0 else "Continue analysis based on tool results. Choose next tool or output 'DONE'.",
-                system_prompt=orchestrator_system_prompt,
+                system_prompt=_get_orchestrator_system_prompt(),
                 role="orchestrator",
                 thinking=False,
-                history=self._get_trimmed_history(max_turns=6, for_chat=False),
+                history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
                 return_usage=True,
                 cancel_check=cancel_check
             )
@@ -2280,7 +2294,7 @@ INSTRUCTIONS:
                 system_prompt=synthesizer_system_prompt,
                 role="synthesizer",
                 thinking=False,
-                history=self._get_trimmed_history(max_turns=6, for_chat=False),
+                history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
                 on_token=on_token,
                 return_usage=True,
                 cancel_check=cancel_check
@@ -2295,7 +2309,7 @@ INSTRUCTIONS:
                 system_prompt=synthesizer_system_prompt,
                 role="synthesizer",
                 thinking=False,
-                history=self._get_trimmed_history(max_turns=6, for_chat=False),
+                history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
                 on_token=on_token,
                 return_usage=True,
                 cancel_check=cancel_check
