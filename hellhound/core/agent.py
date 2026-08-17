@@ -1078,7 +1078,7 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
             "url": url,
             "status_code": r.status_code,
             "headers": dict(r.headers),
-            "body_preview": r.text[:6000]
+            "body_preview": r.text[:20000]
         }
     except Exception as e:
         return {
