@@ -30,6 +30,7 @@ MODULE_RISK_MAP = {
     "subbrute": ["no-brute-force", "no-dos", "no-automated-scanners"],
     "fuzzhunter": ["no-fuzzing", "no-dos", "no-automated-scanners"],
     "exmap": ["no-active-exploitation"],
+    "bypass403": ["no-automated-scanners"],
 }
 
 

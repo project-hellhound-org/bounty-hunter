@@ -168,7 +168,9 @@ SPECIFICITY_KEYWORDS: Dict[str, List[str]] = {
     "web2-recon": ["subdomain", "recon", "dns", "asn", "ffuf", "httpx", "crawler", "jsluice", "endpoints"],
     "triage-validation": ["validate", "validation", "triage", "gate", "7-question", "validity", "false positive", "kill signal", "cvss"],
     "report-writing": ["report", "write report", "summary", "submission", "remediation", "hackerone", "bugcrowd"],
-    "bb-methodology": ["methodology", "where am i", "what should i do next", "what next", "workflow", "mindset", "phase", "strategy"]
+    "bb-methodology": ["methodology", "where am i", "what should i do next", "what next", "workflow", "mindset", "phase", "strategy"],
+    "auth-bypass": ["auth", "bypass", "forgot password", "reset link", "email leak", "host header"],
+    "authentication": ["auth", "login", "jwt", "oauth", "password", "2fa", "mfa", "captcha", "bot detection", "saml"]
 }
 
 
@@ -439,7 +441,7 @@ def is_directed_task(user_text: str) -> bool:
     """
     Detects an explicit, concrete task: a specific target (URL/host) paired
     with an action verb describing what to do to it — e.g. "bypass auth on
-    https://x/pulse", "log in and reach the admin console at x.com".
+    https://example.com/login", "log in and reach the admin console at x.com".
     When True, the user has already told the agent exactly what to do, so
     broad session-start methodology (bb-methodology / ctf-lab-recon) should
     NOT be injected — it would compete with, rather than inform, an

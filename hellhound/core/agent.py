@@ -357,6 +357,55 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
         }
 
 
+def _execute_bypass403(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Runs the bundled 403-bypass.sh recon script (header/protocol/port/method/
+    encoding probes). Read-only GET/HEAD requests only. The 'SQLi' mode sends an
+    injection-style payload string and requires explicit confirmation before it runs."""
+    url = args.get("url", "").strip()
+    mode = args.get("mode", "header").strip()
+    confirmed = bool(args.get("confirmed", False))
+
+    valid_modes = {"header", "protocol", "port", "HTTPmethod", "encode", "SQLi", "exploit"}
+    if mode not in valid_modes:
+        return {"error": f"Invalid mode '{mode}'. Must be one of {sorted(valid_modes)}"}
+    if not url:
+        return {"error": "No URL specified."}
+
+    # SQLi mode sends an injection-style payload, not a passive probe — require
+    # explicit human confirmation the same way mutating requests do, rather than
+    # letting the orchestrator loop fire it unattended.
+    if mode in ("SQLi", "exploit") and not confirmed:
+        return {
+            "requires_approval": True,
+            "message": (
+                f"Mode '{mode}' includes an injection-style payload probe, not just header/"
+                f"protocol checks. Re-run with confirmed=true after a human reviews it."
+            ),
+            "url": url,
+            "mode": mode,
+        }
+
+    script = str(Path(__file__).resolve().parent.parent / "tools" / "403-bypass.sh")
+    if not os.path.exists(script):
+        return {"error": f"403-bypass.sh not found at {script}"}
+
+    cmd = ["bash", script, "-u", url, f"--{mode}"]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        clean_stdout = re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout)
+        return {
+            "url": url,
+            "mode": mode,
+            "output": clean_stdout[:8000],
+            "exit_code": proc.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "bypass403 execution timed out after 120 seconds.", "url": url, "mode": mode}
+    except Exception as e:
+        return {"error": f"bypass403 execution failed: {e}"}
+
+
 def _execute_subfinder(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     domain = args.get("domain") or target.name
     domain = domain.strip().lower()
@@ -1636,6 +1685,24 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_terminal_command
     ),
+    "bypass403": ToolSpec(
+        name="bypass403",
+        description="Runs read-only 403/401 bypass probes (headers, protocol, port, HTTP method, URL encoding) against an in-scope URL to check if access control is enforced only at a proxy/edge layer. GET/HEAD only; the 'SQLi' and 'exploit' modes require human confirmation before running.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Full in-scope target URL to test, including the endpoint path."},
+                "mode": {
+                    "type": "string",
+                    "enum": ["header", "protocol", "port", "HTTPmethod", "encode", "SQLi", "exploit"],
+                    "description": "Which bypass technique family to run. 'exploit' runs all of them. Default: header."
+                },
+                "confirmed": {"type": "boolean", "description": "Set true only after a human has approved the SQLi/exploit modes.", "default": False}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_bypass403
+    ),
     "hydra": ToolSpec(
         name="hydra",
         description="Hydra multi-engine logic & parameter anomaly analyzer — tests endpoints for logic flaws, race conditions, differential parameter handling, and broken access controls.",
@@ -1904,8 +1971,16 @@ class Agent:
         cfg = load_config()
         ai_prov = (cfg.get("synthesizer_provider") or cfg.get("ai_provider") or "ollama").lower()
         is_small = (ai_prov == "ollama")
+        # Collect recent user messages for skill matching so skills stick around
+        recent_user_text = user_text
+        for h in reversed(self.history[-6:]):
+            if h.get("role") == "user":
+                # Only include actual user prompts, not tool results
+                if not h.get("content", "").startswith("[TOOL"):
+                    recent_user_text = h.get("content", "") + " " + recent_user_text
+
         skills_block = get_relevant_skills_prompt(
-            user_text=user_text,
+            user_text=recent_user_text,
             history_len=len(self.history),
             has_target=(self.target.name != "default"),
             is_small_model=is_small,
