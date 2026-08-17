@@ -1060,6 +1060,11 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
     url = args.get("url") or target.name
     method = args.get("method", "GET").upper()
     custom_headers = args.get("headers", {})
+    body = args.get("body") or args.get("data")
+    
+    if isinstance(body, dict):
+        import json
+        body = json.dumps(body)
 
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
@@ -1070,6 +1075,7 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
             method=method,
             url=url,
             headers=headers,
+            data=body,
             timeout=10,
             verify=False,
             allow_redirects=False
