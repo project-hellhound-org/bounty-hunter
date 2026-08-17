@@ -1765,12 +1765,13 @@ def extract_path_scope(user_text: str) -> Optional[str]:
     m = re.search(r'https?://[^\s"\']+', user_text)
     if not m:
         return None
+    raw_url = m.group(0).rstrip(".,;:!?)>\"'")
     try:
-        parsed = urlparse(m.group(0))
+        parsed = urlparse(raw_url)
     except Exception:
         return None
     path = parsed.path or ""
-    segments = [s for s in path.split("/") if s]
+    segments = [s.strip(".,;:!?)>\"'") for s in path.split("/") if s.strip(".,;:!?)>\"'")]
     if not segments:
         return None
     return "/" + segments[0]
@@ -1781,10 +1782,11 @@ def _url_in_path_scope(url: str, path_scope: str) -> bool:
     bare host root (needed for e.g. robots.txt/global recon of the same
     lab's own path prefix — still checked, root '/' itself is NOT exempt)."""
     try:
-        p = urlparse(url).path or ""
+        p = (urlparse(url).path or "").rstrip("/")
+        scope = path_scope.rstrip(".,;:!?)>\"'").rstrip("/")
     except Exception:
         return True
-    return p == path_scope or p.startswith(path_scope.rstrip("/") + "/")
+    return p == scope or p.startswith(scope + "/")
 
 
 class Agent:
