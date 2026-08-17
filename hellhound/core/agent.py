@@ -1059,31 +1059,66 @@ def _execute_dig(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, A
 def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     url = args.get("url") or target.name
     method = args.get("method", "GET").upper()
-    custom_headers = args.get("headers", {})
-    body = args.get("body") or args.get("data")
+    custom_headers = args.get("headers") or {}
     
-    if isinstance(body, dict):
-        import json
-        body = json.dumps(body)
-
+    body = args.get("json") or args.get("body") or args.get("data")
+    
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
-    headers = merge_global_context({"global_headers": custom_headers})
+    headers = merge_global_context({"global_headers": dict(custom_headers)})
+    
+    json_payload = None
+    data_payload = None
+    
+    if args.get("json") is not None:
+        json_payload = args.get("json")
+    elif isinstance(body, dict):
+        json_payload = body
+    elif isinstance(body, str):
+        body_str = body.strip()
+        if (body_str.startswith("{") and body_str.endswith("}")) or (body_str.startswith("[") and body_str.endswith("]")):
+            try:
+                import json
+                json_payload = json.loads(body_str)
+            except Exception:
+                data_payload = body
+        else:
+            data_payload = body
+
+    has_content_type = any(k.lower() == "content-type" for k in headers.keys())
+    if json_payload is not None and not has_content_type:
+        headers["Content-Type"] = "application/json"
+    elif data_payload is not None and not has_content_type:
+        if "=" in str(data_payload) and "&" in str(data_payload) or ("=" in str(data_payload) and not "{" in str(data_payload)):
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+
     try:
-        r = requests.request(
-            method=method,
-            url=url,
-            headers=headers,
-            data=body,
-            timeout=10,
-            verify=False,
-            allow_redirects=False
-        )
+        if json_payload is not None:
+            r = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=json_payload,
+                timeout=10,
+                verify=False,
+                allow_redirects=False
+            )
+        else:
+            r = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                data=data_payload,
+                timeout=10,
+                verify=False,
+                allow_redirects=False
+            )
         return {
             "url": url,
             "status_code": r.status_code,
             "headers": dict(r.headers),
+            "cookies": r.cookies.get_dict(),
             "body_preview": r.text[:20000]
         }
     except Exception as e:
@@ -1461,12 +1496,15 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "curl": ToolSpec(
         name="curl",
-        description="Fetch HTTP response headers and body preview for an endpoint with standard BugBounty identity headers.",
+        description="Fetch HTTP response headers and body preview for an endpoint with standard BugBounty identity headers. Supports GET, POST, PUT, DELETE with custom headers, JSON objects, and string payloads.",
         parameters={
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "Full URL to request."},
-                "method": {"type": "string", "description": "HTTP Method: GET, HEAD, POST", "default": "GET"}
+                "method": {"type": "string", "description": "HTTP Method: GET, HEAD, POST, PUT, DELETE", "default": "GET"},
+                "headers": {"type": "object", "description": "Optional custom HTTP headers dictionary (e.g. {'Content-Type': 'application/json', 'Host': 'evil.com'})."},
+                "json": {"type": "object", "description": "JSON payload object to send in the request body (automatically sets Content-Type: application/json)."},
+                "data": {"type": "string", "description": "Raw string payload or URL-encoded form data to send in request body."}
             },
             "required": ["url"]
         },

