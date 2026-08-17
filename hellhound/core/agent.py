@@ -1391,8 +1391,192 @@ def _execute_fuzz_hunter(args: Dict[str, Any], target: Target, emit: Any) -> Dic
         return {"url": url, "error": f"FUZZhunter error: {e}"}
 
 
+def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Capture web screenshots via gowitness and store them directly in the target workspace."""
+    from datetime import datetime, timezone
+    from hellhound.memory import update_from_gowitness
+
+    url = args.get("url") or args.get("target") or ""
+    urls = args.get("urls") or []
+
+    if isinstance(urls, str):
+        urls = [u.strip() for u in urls.split(",") if u.strip()]
+
+    target_urls: List[str] = []
+    if url:
+        u = str(url).strip()
+        if not u.startswith(("http://", "https://")):
+            u = f"https://{u}"
+        target_urls.append(u)
+    for u in urls:
+        u = str(u).strip()
+        if u:
+            if not u.startswith(("http://", "https://")):
+                u = f"https://{u}"
+            if u not in target_urls:
+                target_urls.append(u)
+
+    if not target_urls:
+        t_name = target.name.strip()
+        if t_name and t_name != "default":
+            if not t_name.startswith(("http://", "https://")):
+                target_urls.append(f"https://{t_name}")
+            else:
+                target_urls.append(t_name)
+
+    if not target_urls:
+        return {"error": "No URL or target specified for gowitness screenshot capture."}
+
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("gowitness", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
+        return {
+            "error": "gowitness not installed",
+            "message": check["message"],
+            "hint": "go install github.com/sensepost/gowitness@latest"
+        }
+
+    binary = get_binary_path("gowitness") or "gowitness"
+
+    # Setup screenshot output directory
+    target_safe_name = sanitize_target_name(target.name)
+    custom_dir = args.get("output_dir") or args.get("screenshot_path")
+    if custom_dir:
+        screenshots_dir = Path(os.path.expanduser(custom_dir)).resolve()
+    else:
+        screenshots_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_safe_name}/screenshots")).resolve()
+
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+    delay = int(args.get("delay", 2))
+    fullpage = bool(args.get("fullpage", False))
+
+    chrome_bin = _find_binary("chromium") or _find_binary("google-chrome") or _find_binary("chrome")
+
+    captured_items: List[Dict[str, Any]] = []
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        jsonl_path = Path(tmp_dir) / "gowitness_results.jsonl"
+
+        if len(target_urls) == 1:
+            target_url = target_urls[0]
+            cmd = [
+                binary, "scan", "single",
+                "-u", target_url,
+                "-s", str(screenshots_dir),
+                "--screenshot-format", "png",
+                "--delay", str(delay),
+                "--write-jsonl",
+                "--write-jsonl-file", str(jsonl_path),
+            ]
+            if fullpage:
+                cmd.append("--screenshot-fullpage")
+            if chrome_bin:
+                cmd.extend(["--chrome-path", chrome_bin])
+
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except Exception as e:
+                return {"error": f"gowitness execution failed: {e}", "url": target_url}
+        else:
+            targets_file = Path(tmp_dir) / "targets.txt"
+            targets_file.write_text("\n".join(target_urls) + "\n")
+            cmd = [
+                binary, "scan", "file",
+                "-f", str(targets_file),
+                "-s", str(screenshots_dir),
+                "--screenshot-format", "png",
+                "--delay", str(delay),
+                "--write-jsonl",
+                "--write-jsonl-file", str(jsonl_path),
+            ]
+            if fullpage:
+                cmd.append("--screenshot-fullpage")
+            if chrome_bin:
+                cmd.extend(["--chrome-path", chrome_bin])
+
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            except Exception as e:
+                return {"error": f"gowitness batch execution failed: {e}", "urls": target_urls}
+
+        if jsonl_path.exists():
+            for line in jsonl_path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    fname = data.get("file_name", "")
+                    screenshot_file = str(screenshots_dir / fname) if fname else ""
+                    if not (screenshot_file and os.path.exists(screenshot_file)):
+                        for f in screenshots_dir.glob("*.png"):
+                            if fname and str(f).endswith(fname):
+                                screenshot_file = str(f)
+                                break
+
+                    item_info = {
+                        "url": data.get("url", ""),
+                        "final_url": data.get("final_url", ""),
+                        "title": data.get("title", ""),
+                        "response_code": data.get("response_code", 0),
+                        "file_path": screenshot_file,
+                        "file_name": fname,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "technologies": [t.get("value") for t in data.get("technologies", []) if isinstance(t, dict) and t.get("value")],
+                    }
+                    if screenshot_file and os.path.exists(screenshot_file):
+                        item_info["file_size"] = os.path.getsize(screenshot_file)
+                    captured_items.append(item_info)
+                except Exception:
+                    continue
+
+    # Fallback to directory scan if jsonl parsing was empty
+    if not captured_items:
+        for f in screenshots_dir.glob("*.png"):
+            captured_items.append({
+                "url": target_urls[0] if target_urls else target.name,
+                "file_path": str(f),
+                "file_name": f.name,
+                "file_size": f.stat().st_size,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+    if captured_items:
+        update_from_gowitness(target, captured_items)
+        save_target(target)
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[✓] Gowitness captured {len(captured_items)} screenshot(s) in {screenshots_dir}")
+
+    return {
+        "status": "success",
+        "screenshots_count": len(captured_items),
+        "screenshots_dir": str(screenshots_dir),
+        "screenshots": captured_items
+    }
+
+
 # Tool Registry Map
 TOOL_REGISTRY: Dict[str, ToolSpec] = {
+    "gowitness": ToolSpec(
+        name="gowitness",
+        description="Capture high-fidelity visual web screenshots of URLs or endpoints using gowitness. Automatically saves screenshots to target workspace (~/.hellhound/targets/<target>/screenshots/) and indexes them into target investigation memory & visual evidence cards.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target URL to capture screenshot for (e.g. https://example.com/admin or https://target.com/pulse)."},
+                "urls": {"type": "array", "items": {"type": "string"}, "description": "Optional list of multiple target URLs to screenshot in batch."},
+                "fullpage": {"type": "boolean", "description": "Capture full scrollable page instead of standard viewport (default: false).", "default": False},
+                "delay": {"type": "integer", "description": "Delay in seconds before capturing to allow JavaScript rendering (default: 2).", "default": 2},
+                "output_dir": {"type": "string", "description": "Optional custom directory path to save screenshots (defaults to target workspace)."}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_gowitness
+    ),
     "subfinder": ToolSpec(
         name="subfinder",
         description="Enumerate subdomains for a domain using passive sources and certificate transparency logs. (Do NOT use on CTF/lab/private targets like *.ctfio.com or *.htb — use dns_bruteforce or httpx directly).",
@@ -1945,7 +2129,7 @@ class Agent:
             return {"error": f"requires human approval: {reason}", "requires_approval": True}
 
         # 4. Rate Limiter (Pacing)
-        is_recon = tool_name in ("subfinder", "dns_bruteforce", "httpx", "dig", "subzy", "vhost_fuzz")
+        is_recon = tool_name in ("subfinder", "dns_bruteforce", "httpx", "dig", "subzy", "vhost_fuzz", "gowitness")
         host = self.guard._extract_host(url)
         self.guard._limiter.wait(host, is_recon=is_recon)
 

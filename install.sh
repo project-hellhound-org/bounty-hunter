@@ -76,10 +76,18 @@ trap "stop_animation" EXIT INT TERM
 
 echo -e "\n${RED}${BLD}  HELLHOUND — Install${RST}\n"
 
-# ── 1. Preparation ────────────────────────────────────
+# ── 1. Preparation & Remote Bootstrap ─────────────────
 if [ ! -f "setup.py" ]; then
-    echo -e "${RED}[✗] Run this script from the HELLHOUND project root (where setup.py is).${RST}"
-    exit 1
+    info "setup.py not found in current directory. Bootstrapping Bounty Hunter repository..."
+    INSTALL_TARGET="$HOME/.hellhound-src"
+    if [ -d "$INSTALL_TARGET/.git" ]; then
+        info "Updating existing repository at $INSTALL_TARGET..."
+        git -C "$INSTALL_TARGET" pull --quiet origin main || true
+    else
+        info "Cloning Bounty Hunter into $INSTALL_TARGET..."
+        git clone --depth 1 https://github.com/project-hellhound-org/bounty-hunter.git "$INSTALL_TARGET" || error "Failed to clone repository. Ensure git is installed and network connectivity is active."
+    fi
+    cd "$INSTALL_TARGET" || error "Could not enter $INSTALL_TARGET"
 fi
 
 PROJECT_ROOT="$(pwd)"
@@ -178,6 +186,38 @@ else
     "$VENV_DIR/bin/python" -m playwright install-deps chromium 2>&1 | grep --line-buffered -vE "BEWARE|fallback" || true
 fi
 success "SPA Engine mounted successfully"
+
+# ── 4b. Offensive Visual Recon Engine (Gowitness) ──────
+if command -v gowitness &>/dev/null || [ -x "$HOME/go/bin/gowitness" ] || [ -x "/usr/bin/gowitness" ] || [ -x "/usr/local/bin/gowitness" ]; then
+    success "Gowitness screenshot engine verified"
+else
+    info "Installing Gowitness screenshot utility..."
+    if command -v go &>/dev/null; then
+        go install github.com/sensepost/gowitness@latest &>/dev/null && success "Gowitness installed via Go" || warn "Could not install gowitness via Go. Run: go install github.com/sensepost/gowitness@latest"
+    else
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+            x86_64) GW_ARCH="amd64" ;;
+            aarch64|arm64) GW_ARCH="arm64" ;;
+            *) GW_ARCH="" ;;
+        esac
+        if [ -n "$GW_ARCH" ] && [ "$(uname -s)" = "Linux" ]; then
+            TMP_GW="$(mktemp -d)"
+            if curl -fsSL "https://github.com/sensepost/gowitness/releases/latest/download/gowitness-linux-${GW_ARCH}" -o "$TMP_GW/gowitness" 2>/dev/null; then
+                chmod +x "$TMP_GW/gowitness"
+                mkdir -p "$HOME/.local/bin"
+                mv "$TMP_GW/gowitness" "$HOME/.local/bin/gowitness"
+                rm -rf "$TMP_GW"
+                success "Gowitness installed to ~/.local/bin/gowitness"
+            else
+                rm -rf "$TMP_GW"
+                warn "Gowitness not installed. Install via: go install github.com/sensepost/gowitness@latest"
+            fi
+        else
+            warn "Gowitness not installed. Install via: go install github.com/sensepost/gowitness@latest"
+        fi
+    fi
+fi
 
 # ── 5. System Integration ──────────────────────────────
 start_animation "FINALIZING INTEGRATION"

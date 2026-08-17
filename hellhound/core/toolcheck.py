@@ -22,6 +22,7 @@ PD_TOOLS: Set[str] = {
 OTHER_TOOLS: Dict[str, str] = {
     "ffuf": "go install github.com/ffuf/ffuf/v2@latest",
     "subzy": "go install -v github.com/PentestPad/subzy@latest",
+    "gowitness": "go install github.com/sensepost/gowitness@latest",
 }
 
 

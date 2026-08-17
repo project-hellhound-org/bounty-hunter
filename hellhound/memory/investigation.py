@@ -362,6 +362,28 @@ def update_from_bac(target, findings: List[Any], parameter_sensitive: Optional[L
         record_timeline(target, f"{added_sensitive} parameter-sensitive endpoint(s) flagged for follow-up.")
 
 
+def update_from_gowitness(target, screenshots: List[Any]) -> None:
+    added = merge_state_list(target, "screenshots", screenshots)
+    if added:
+        record_timeline(target, f"Gowitness captured {added} visual screenshot(s).")
+        for item in (screenshots or []):
+            if not isinstance(item, dict):
+                continue
+            item_url = item.get("url") or item.get("final_url") or target.name
+            title = item.get("title") or f"Web Screenshot: {item_url}"
+            file_path = item.get("file_path", "")
+            record_evidence_card(
+                target,
+                title=f"Screenshot: {title}",
+                kind="screenshot",
+                severity="low",
+                confidence=0.9,
+                request_ref=str(item_url),
+                screenshot_ref=str(file_path),
+            )
+
+
+
 # ── Read-side: memory-first answers ─────────────────────────────────────────
 
 def _confidence_score(target) -> Optional[float]:
