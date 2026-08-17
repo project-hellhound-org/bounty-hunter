@@ -422,14 +422,20 @@ class StreamRenderer:
     """
     Renders streaming tokens incrementally inside a Rich Markdown Panel with Live display.
 
-    While tokens are arriving, the Live region is cropped to the terminal's
-    viewport height (vertical_overflow="crop") so Rich can always correctly
-    erase and redraw the previous frame in place — this is what prevents the
-    panel from leaving duplicate copies in scrollback once content grows
-    past one screen. The in-progress cropped frame is never committed to
-    scrollback (transient=True); once streaming finishes, the COMPLETE,
-    un-cropped response is printed exactly once as a normal static block.
+    The in-progress Live frame is held at a FIXED height (last N lines of the
+    accumulated text, always exactly N lines regardless of total length) —
+    never the full, growing content. Rich's Live erases the previous frame by
+    moving the cursor up by however many terminal lines that frame occupied;
+    if that height changes between updates (as it does when you naively
+    render the entire, ever-growing response every frame), the erase can
+    desync from what's actually on screen and leave a stale copy behind in
+    scrollback — which is what caused the duplicate-panel glitch. A constant-
+    height frame makes that desync impossible by construction, not just less
+    likely. Once streaming finishes, the COMPLETE, untruncated response is
+    printed exactly once as a normal static block (never during Live).
     """
+    _LIVE_TAIL_LINES = 12
+
     def __init__(self, title: str = "HELLHOUND", border_style: str = "bold red"):
         self.title = title
         self.border_style = border_style
@@ -444,7 +450,7 @@ class StreamRenderer:
         if not self._started:
             self._started = True
             self.live = Live(
-                self._render_panel(),
+                self._render_live_panel(),
                 console=rich_console,
                 refresh_per_second=12,
                 vertical_overflow="crop",
@@ -453,7 +459,23 @@ class StreamRenderer:
             self.live.start()
         else:
             if self.live:
-                self.live.update(self._render_panel())
+                self.live.update(self._render_live_panel())
+
+    def _render_live_panel(self) -> Panel:
+        # Fixed-height tail view only — see class docstring for why.
+        lines = (self.accumulated_text or " ").splitlines() or [" "]
+        tail = lines[-self._LIVE_TAIL_LINES:]
+        preview = "\n".join(tail)
+        if len(lines) > self._LIVE_TAIL_LINES:
+            preview = f"...({len(lines) - self._LIVE_TAIL_LINES} lines above)\n" + preview
+        md = Markdown(preview)
+        return Panel(
+            md,
+            title=f"[bold red] {self.title} [/bold red]",
+            title_align="left",
+            border_style=self.border_style,
+            padding=(0, 1)
+        )
 
     def _render_panel(self) -> Panel:
         md = Markdown(self.accumulated_text or " ")

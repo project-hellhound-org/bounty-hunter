@@ -357,55 +357,6 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
         }
 
 
-def _execute_bypass403(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
-    """Runs the bundled 403-bypass.sh recon script (header/protocol/port/method/
-    encoding probes). Read-only GET/HEAD requests only. The 'SQLi' mode sends an
-    injection-style payload string and requires explicit confirmation before it runs."""
-    url = args.get("url", "").strip()
-    mode = args.get("mode", "header").strip()
-    confirmed = bool(args.get("confirmed", False))
-
-    valid_modes = {"header", "protocol", "port", "HTTPmethod", "encode", "SQLi", "exploit"}
-    if mode not in valid_modes:
-        return {"error": f"Invalid mode '{mode}'. Must be one of {sorted(valid_modes)}"}
-    if not url:
-        return {"error": "No URL specified."}
-
-    # SQLi mode sends an injection-style payload, not a passive probe — require
-    # explicit human confirmation the same way mutating requests do, rather than
-    # letting the orchestrator loop fire it unattended.
-    if mode in ("SQLi", "exploit") and not confirmed:
-        return {
-            "requires_approval": True,
-            "message": (
-                f"Mode '{mode}' includes an injection-style payload probe, not just header/"
-                f"protocol checks. Re-run with confirmed=true after a human reviews it."
-            ),
-            "url": url,
-            "mode": mode,
-        }
-
-    script = str(Path(__file__).resolve().parent.parent / "tools" / "403-bypass.sh")
-    if not os.path.exists(script):
-        return {"error": f"403-bypass.sh not found at {script}"}
-
-    cmd = ["bash", script, "-u", url, f"--{mode}"]
-
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        clean_stdout = re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout)
-        return {
-            "url": url,
-            "mode": mode,
-            "output": clean_stdout[:8000],
-            "exit_code": proc.returncode,
-        }
-    except subprocess.TimeoutExpired:
-        return {"error": "bypass403 execution timed out after 120 seconds.", "url": url, "mode": mode}
-    except Exception as e:
-        return {"error": f"bypass403 execution failed: {e}"}
-
-
 def _execute_subfinder(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     domain = args.get("domain") or target.name
     domain = domain.strip().lower()
@@ -1685,24 +1636,6 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_terminal_command
     ),
-    "bypass403": ToolSpec(
-        name="bypass403",
-        description="Runs read-only 403/401 bypass probes (headers, protocol, port, HTTP method, URL encoding) against an in-scope URL to check if access control is enforced only at a proxy/edge layer. GET/HEAD only; the 'SQLi' and 'exploit' modes require human confirmation before running.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "Full in-scope target URL to test, including the endpoint path."},
-                "mode": {
-                    "type": "string",
-                    "enum": ["header", "protocol", "port", "HTTPmethod", "encode", "SQLi", "exploit"],
-                    "description": "Which bypass technique family to run. 'exploit' runs all of them. Default: header."
-                },
-                "confirmed": {"type": "boolean", "description": "Set true only after a human has approved the SQLi/exploit modes.", "default": False}
-            },
-            "required": ["url"]
-        },
-        executor=_execute_bypass403
-    ),
     "hydra": ToolSpec(
         name="hydra",
         description="Hydra multi-engine logic & parameter anomaly analyzer — tests endpoints for logic flaws, race conditions, differential parameter handling, and broken access controls.",
@@ -1771,6 +1704,45 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
 # AGENT REASONING & EXECUTION LOOP
 # ==========================================================
 
+def extract_path_scope(user_text: str) -> Optional[str]:
+    """
+    If the user's task text names a specific URL with a non-root path
+    (e.g. "...from this endpoint https://host/pulse"), return that first
+    path segment (e.g. "/pulse") as the task's path scope.
+
+    Multi-lab hosts (several independent challenge apps living under
+    different top-level paths on the same domain, e.g. /meridian,
+    /cargoflow, /lumen, /pulse) are common in CTF/lab environments — a task
+    scoped to one endpoint should not wander into the others. Returns None
+    if no path is present (task is domain-wide) so nothing is restricted.
+    """
+    if not user_text:
+        return None
+    m = re.search(r'https?://[^\s"\']+', user_text)
+    if not m:
+        return None
+    try:
+        parsed = urlparse(m.group(0))
+    except Exception:
+        return None
+    path = parsed.path or ""
+    segments = [s for s in path.split("/") if s]
+    if not segments:
+        return None
+    return "/" + segments[0]
+
+
+def _url_in_path_scope(url: str, path_scope: str) -> bool:
+    """True if url's path falls under path_scope (e.g. '/pulse') or is the
+    bare host root (needed for e.g. robots.txt/global recon of the same
+    lab's own path prefix — still checked, root '/' itself is NOT exempt)."""
+    try:
+        p = urlparse(url).path or ""
+    except Exception:
+        return True
+    return p == path_scope or p.startswith(path_scope.rstrip("/") + "/")
+
+
 class Agent:
     def __init__(self, target: Optional[Target] = None):
         self.target = target or create_or_load_target("default")
@@ -1784,6 +1756,7 @@ class Agent:
             test_rps=1.0,
             safe_methods_only=True
         )
+        self._turn_path_scope: Optional[str] = None  # e.g. "/pulse" — set per-turn in handle_message
 
     def set_target(self, target_name: str) -> Target:
         self.target = create_or_load_target(target_name)
@@ -1821,7 +1794,20 @@ class Agent:
         recent = self.history[-max_turns:] if len(self.history) > max_turns else self.history
         for h in recent:
             content = str(h.get("content", ""))
-            if len(content) > 800:
+            is_tool_result = content.startswith("[TOOL RESULT:")
+            if is_tool_result:
+                # Tool results (curl bodies, spider intel, etc.) are the
+                # highest-value content in history — a harvested email,
+                # token, or credential can sit anywhere in the JSON. A blind
+                # 700-char clip here silently truncates mid-field and the
+                # model never sees the data it needs. Give these a much
+                # larger budget, and pull out any emails up front so they
+                # survive even if the body still gets cut.
+                if len(content) > 3500:
+                    emails = sorted(set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", content)))
+                    prefix = f"[EMAILS FOUND IN THIS RESULT: {', '.join(emails)}]\n" if emails else ""
+                    content = prefix + content[:3200] + "\n...[truncated]..."
+            elif len(content) > 800:
                 content = content[:700] + "\n...[truncated]..."
             trimmed.append({"role": h.get("role", "user"), "content": content})
         return trimmed
@@ -1858,6 +1844,24 @@ class Agent:
                 return {
                     "error": f"SCOPE_VIOLATION: {reason}",
                     "target": target_candidate,
+                    "blocked": True
+                }
+
+        # 1b. Enforce per-turn path scope (multi-lab hosts: a task scoped to
+        # one endpoint, e.g. /pulse, must not wander into sibling apps like
+        # /meridian, /cargoflow, /lumen living on the same domain).
+        if self._turn_path_scope:
+            check_url = args.get("url") or (target_candidate if target_candidate.startswith(("http://", "https://")) else f"https://{target_candidate}")
+            if not _url_in_path_scope(check_url, self._turn_path_scope):
+                reason = (
+                    f"URL path is outside this task's scope ('{self._turn_path_scope}'). "
+                    f"Other paths on this host are separate labs/applications and are out of scope for this task."
+                )
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(f"[!] PATH SCOPE REFUSAL: {check_url} — {reason}")
+                return {
+                    "error": f"PATH_SCOPE_VIOLATION: {reason}",
+                    "target": check_url,
                     "blocked": True
                 }
 
@@ -1967,20 +1971,24 @@ class Agent:
         if self.target.scope_rules.in_scope:
             scope_summary = f"IN-SCOPE: {self.target.scope_rules.in_scope} | OUT-OF-SCOPE: {self.target.scope_rules.out_scope}"
 
+        # Summarize what's already been discovered this session so the
+        # orchestrator doesn't re-run spider/content_discovery on a URL it
+        # has already crawled just because it has no memory of the result.
+        known_eps = (self.target.state.get("endpoints") or [])[:25]
+        known_params = (self.target.state.get("spider_intel") or {}).get("parameters", [])[:10]
+        if known_eps:
+            known_intel_block = "Endpoints already discovered:\n" + "\n".join(f"  - {e}" for e in known_eps)
+            if known_params:
+                known_intel_block += "\nParameters already mapped:\n" + "\n".join(f"  - {p}" for p in known_params)
+        else:
+            known_intel_block = "(nothing gathered yet this session)"
+
         # Dynamic Skill-Aware Reasoning Injection (for Synthesizer)
         cfg = load_config()
         ai_prov = (cfg.get("synthesizer_provider") or cfg.get("ai_provider") or "ollama").lower()
         is_small = (ai_prov == "ollama")
-        # Collect recent user messages for skill matching so skills stick around
-        recent_user_text = user_text
-        for h in reversed(self.history[-6:]):
-            if h.get("role") == "user":
-                # Only include actual user prompts, not tool results
-                if not h.get("content", "").startswith("[TOOL"):
-                    recent_user_text = h.get("content", "") + " " + recent_user_text
-
         skills_block = get_relevant_skills_prompt(
-            user_text=recent_user_text,
+            user_text=user_text,
             history_len=len(self.history),
             has_target=(self.target.name != "default"),
             is_small_model=is_small,
@@ -1999,18 +2007,22 @@ SCOPE: {scope_summary}
 AVAILABLE TOOLS:
 {tools_summary}
 
+ALREADY GATHERED THIS SESSION (do not re-run a tool to re-discover this):
+{known_intel_block}
+
 RULES:
 1. ONLY call tools when the user explicitly requests active reconnaissance, scanning, enumeration, or analysis of a target.
 2. If the user asks a complex question, hypothetical scenario, or asks for cybersecurity advice (e.g., "how to bypass 403 proxy"), do NOT call any tools. Output "DONE".
 3. For greetings, casual questions, or general discussion, do NOT call any tools. Output "DONE".
-4. To call a tool, respond ONLY with JSON:
+4. Before calling a recon tool (spider, content_discovery, etc.), check the "ALREADY GATHERED" section above — if it already answers what you need (endpoints, params, forms), use that data directly instead of re-crawling. Only re-run a recon tool if the target URL is genuinely new or the existing data is insufficient for the specific next step.
+5. To call a tool, respond ONLY with JSON:
 ```json
 {{
   "tool": "<tool_name>",
   "args": {{ ... }}
 }}
 ```
-5. If no further tools are needed, or after inspecting tool findings, respond with "DONE".
+6. If no further tools are needed, or after inspecting tool findings, respond with "DONE".
 """
 
         # ── 2. Comprehensive Synthesizer System Prompt (Deep Reasoning & Synthesis)
@@ -2079,7 +2091,17 @@ INSTRUCTIONS:
         self.history.append({"role": "user", "content": user_text})
         tools_executed = []
         _prev_ai_resp = None
-        _prev_tool_signature = None
+        _executed_signatures = set()  # every (tool, args) run this turn — not just the last one
+        _dup_skip_count = 0
+
+        # A path scope set in an earlier turn (e.g. "...from this endpoint
+        # https://host/pulse") persists across the session — most follow-up
+        # messages ("go for it", "try exploiting that flaw") won't repeat the
+        # URL, but the restriction to that lab's path should still hold.
+        # Only overwrite it when this message names a new path explicitly.
+        _new_scope = extract_path_scope(user_text)
+        if _new_scope:
+            self._turn_path_scope = _new_scope
 
         # ── 3. Orchestrator Iteration Loop (Thinking=False, Fast Local/Tool Calls) ──
         for iteration in range(max_iterations):
@@ -2135,13 +2157,24 @@ INSTRUCTIONS:
                 t_name = tool_call["tool"]
                 t_args = tool_call.get("args") or tool_call.get("parameters") or tool_call.get("arguments") or {}
 
-                # Same tool + same args as last iteration -> the orchestrator
-                # is stuck, not progressing. Stop calling and move to
-                # synthesis with whatever's already been gathered.
+                # Already ran this exact tool+args earlier THIS turn (not just
+                # last iteration) -> the orchestrator is repeating itself, not
+                # progressing. Stop calling and move to synthesis with what's
+                # already gathered, instead of re-crawling and re-saving.
                 _sig = (t_name, json.dumps(t_args, sort_keys=True, default=str))
-                if _sig == _prev_tool_signature:
-                    break
-                _prev_tool_signature = _sig
+                if _sig in _executed_signatures:
+                    _dup_skip_count += 1
+                    if _dup_skip_count >= 2:
+                        # Repeating itself even after being told not to — stop
+                        # burning iterations and move straight to synthesis.
+                        break
+                    self.history.append({
+                        "role": "user",
+                        "content": f"[TOOL SKIPPED] '{t_name}' with these exact args already ran earlier this turn — reuse those results instead of repeating it."
+                    })
+                    user_text = f"You already ran '{t_name}' with identical args. Do not repeat it — synthesize from the results you already have, or choose a different tool/target."
+                    continue
+                _executed_signatures.add(_sig)
 
                 tools_executed.append(t_name)
                 

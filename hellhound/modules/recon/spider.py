@@ -8160,7 +8160,7 @@ class Spider:
                     for m in re.finditer(r'"(/[a-zA-Z0-9_\-\/]+)"', text):
                         path = m.group(1)
                         if len(path) > 3:
-                            self.store.add_endpoint(urljoin(url, path), source="SourceMap", score=Conf.HIGH)
+                            self.store.add_endpoint(_resolve_app_path(url, path, self.app_root), source="SourceMap", score=Conf.HIGH)
             except Exception:
                 pass
 
@@ -8361,7 +8361,7 @@ class Spider:
                 for m in re.finditer(r'"([/][a-zA-Z0-9_\-\/]+)"', body):
                     path = m.group(1)
                     if len(path) > 3:
-                        full = urljoin(url, path)
+                        full = _resolve_app_path(url, path, self.app_root)
                         if self.is_valid(full):
                             self.store.add_endpoint(full, source='JSON_Path', score=Conf.LOW)
                             if not self._over_budget(depth + 1):
@@ -8379,7 +8379,7 @@ class Spider:
                                                    "next","prev","previous","first","last"):
                                     _t = str(_v) if _v else ""
                                     if _t.startswith(("/","http")):
-                                        _f = urljoin(url, _t)
+                                        _f = _resolve_app_path(url, _t, self.app_root)
                                         if self.is_valid(_f):
                                             if self.store.add_endpoint(_f, source="JSON_HATEOAS", score=Conf.MEDIUM):
                                                 self.emit.info(f"[HATEOAS] {_k}: {_f}")
