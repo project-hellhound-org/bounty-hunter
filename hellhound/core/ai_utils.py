@@ -517,8 +517,38 @@ class ThinkingIndicator:
         elif tool_name == "surface_auditor":
             surfaces = result.get("surfaces", [])
             return f"Audited API attack surfaces — {len(surfaces)} surface(s) analyzed"
+        elif tool_name == "jwt_forge":
+            role = result.get("forged_payload", {}).get("role", "admin")
+            tokens = result.get("forged_tokens", [])
+            return f"Forged JWT ({len(tokens)} variant(s), role={role}) — target session updated"
+        elif tool_name == "content_discovery":
+            paths = result.get("paths") or [r.get("path") for r in result.get("discovered_endpoints", [])]
+            count = result.get("count", len(paths))
+            if paths:
+                sample = ", ".join(f"/{p}" for p in paths[:3])
+                if len(paths) > 3:
+                    sample += f" (+{len(paths)-3} more)"
+                return f"Discovered {count} path(s): {sample}"
+            return "Discovered 0 paths"
+        elif tool_name == "curl":
+            status = result.get("status_code", 0)
+            url_val = result.get("url", "")
+            routes = result.get("detected_routes", [])
+            jwt_info = result.get("jwt_info", {})
+            parts = [f"HTTP {status}"]
+            if jwt_info:
+                parts.append(f"JWT role={jwt_info.get('role', '?')} ({jwt_info.get('alg', '?')})")
+            if routes:
+                parts.append(f"{len(routes)} route(s) extracted")
+            return f"{' · '.join(parts)} — {url_val}"
         elif tool_name == "run_terminal_command":
             code = result.get("exit_code", 0)
+            out = (result.get("stdout") or result.get("stderr") or "").strip()
+            if out:
+                clean_out = " ".join(out.split())
+                if len(clean_out) > 85:
+                    clean_out = clean_out[:82] + "..."
+                return f"Exit code {code} — {clean_out}"
             return f"Command executed (exit code {code})"
 
         keys = [k for k in result.keys() if k not in ("target", "state")]

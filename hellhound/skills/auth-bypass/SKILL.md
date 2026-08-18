@@ -77,13 +77,13 @@ Before testing out-of-band vectors or complex chains, check if the application l
      }
      ```
    - Verify access to privileged or authenticated areas (e.g., user profiles, admin consoles, internal records) using the resulting session.
-   - **MANDATORY VISUAL PROOF (gowitness):** Immediately capture visual Proof of Concept using `gowitness` on the authenticated web UI (e.g. `/pulse/portal`, `/pulse/dashboard`, `/pulse/admin`, `/pulse/profile`) using the acquired session cookie:
+   - **MANDATORY VISUAL PROOF (gowitness):** Immediately capture visual Proof of Concept using `gowitness` on the authenticated web UI (e.g. the discovered user dashboard, settings, or administrative console) using the acquired session cookie/token:
      ```json
      {
        "tool": "gowitness",
        "args": {
          "url": "<discovered_authenticated_portal_url>",
-         "headers": {"Cookie": "<session_cookie_e.g._p_sid=...>"}
+         "headers": {"Cookie": "<session_cookie_e.g._session=...>"}
        }
      }
      ```
@@ -103,13 +103,18 @@ Before testing out-of-band vectors or complex chains, check if the application l
 
 ## 4. JWT Authentication Bypass & Algorithm Confusion
 
-When the application uses JSON Web Tokens (JWT) for authentication (stored in cookies like `p_sid`, `token`, `session`, `auth_token`, or passed in the `Authorization: Bearer <jwt>` header):
+When the application uses JSON Web Tokens (JWT) for authentication (stored in session cookies or passed in the `Authorization: Bearer <jwt>` header):
+
+> [!IMPORTANT]
+> **Token Type Distinction:** Always verify the token structure before applying JWT attacks.
+> - A valid JWT always starts with `eyJ` and consists of 3 dot-separated base64url segments (`<header>.<payload>.<signature>`).
+> - If the token/cookie is an opaque session ID (`sess_...`, `connect.sid`, `PHPSESSID`, or a hex string without dots), the application uses server-side session management. **DO NOT attempt JWT attacks or run `jwt_forge` on opaque cookies.** Instead, pivot to the `access-control` skill to test Mass Assignment, client JS analysis, and nested property injection (e.g. `{"metadata": {"entitlements": {"admin": true}}}`).
 
 ### A. Decode and Analyze Existing Tokens
 1. Split the token into Header, Payload, and Signature (`<header>.<payload>.<signature>`).
 2. Base64url-decode both Header and Payload to inspect:
    - Header: `alg` (e.g. `HS256`, `RS256`, `none`), `typ`, `kid`, `jwk`, `jku`.
-   - Payload: Subject (`sub`), email, username, role (`role`, `roles`, `isAdmin`, `is_admin`), permissions, and expiration (`exp`).
+   - Payload: Subject (`sub`), email, username, role flags (`role`, `roles`, `isAdmin`, `is_admin`, `group`, `user_type`), permissions, and expiration (`exp`).
 
 ### B. Attack Vector 1: Algorithm Confusion (`alg: "none"`)
 Many insecure JWT verification implementations accept tokens signed with the `none` algorithm or fail to enforce cryptographic signature verification when `alg` is set to `none` (case-insensitive variants).
@@ -118,7 +123,7 @@ Many insecure JWT verification implementations accept tokens signed with the `no
    - Standard: `{"alg": "none", "typ": "JWT"}`
    - Filter-bypass variants: `{"alg": "None"}`, `{"alg": "NONE"}`, `{"alg": "nOnE"}`
 2. **Forge Privileged Payload:**
-   - Set identity to harvested staff/administrator identity (e.g. `{"sub": "admin", "email": "<harvested_admin_email>", "role": "admin", "admin": true, "exp": 9999999999}`).
+   - Set identity to harvested staff/administrator identity or elevate role parameters (e.g. `{"sub": "<harvested_admin_username>", "email": "<harvested_admin_email>", "role": "admin", "admin": true, "isAdmin": true, "exp": 9999999999}`).
 3. **Assemble Unsigned JWT:**
    - Base64url-encode Header and Payload (replacing `+` with `-`, `/` with `_`, and stripping all `=` padding).
    - Concatenate Header and Payload with a trailing dot and **NO** signature:
@@ -126,21 +131,21 @@ Many insecure JWT verification implementations accept tokens signed with the `no
      <base64url_header>.<base64url_payload>.
      ```
 4. **Submit and Verify:**
-   - Send `curl` request to protected endpoint (e.g. `/portal`, `/api/admin`, `/api/user/profile`) with the forged token in the `Cookie` or `Authorization` header.
+   - Send `curl` request to discovered protected/administrative endpoints (e.g. discovered dashboard, profile, or management routes) with the forged token in the `Cookie` or `Authorization` header.
    - If accepted (200 OK / privileged data returned), proceed to visual capture and finding recording.
 
 ### C. Attack Vector 2: RSA Public Key Misuse (RS256 → HS256 Algorithm Confusion)
 When an application uses RS256 (asymmetric signing where the server signs with a private key and verifies with a public key), vulnerable JWT libraries allow switching the algorithm to HS256 (symmetric HMAC). If the server passes its RSA public key to the generic verification function, the HMAC algorithm uses the **public key as the HMAC secret**:
 
 1. **Obtain the Server's RSA Public Key:**
-   - Check standard public key endpoints: `/.well-known/jwks.json`, `/api/auth/jwks`, `/public.pem`, `/cert.pem`, or TLS certificates.
+   - Check standard public key endpoints: `/.well-known/jwks.json`, `/api/auth/jwks`, `/public.pem`, `/cert.pem`, TLS certificates, or frontend bundles.
    - Convert JWK format to PEM string if necessary (`-----BEGIN PUBLIC KEY-----...-----END PUBLIC KEY-----`).
 2. **Forge Header with Symmetric Algorithm:**
    - `{"alg": "HS256", "typ": "JWT"}`
 3. **Sign Payload with Public Key as Secret:**
    - Sign the Base64url `<header>.<payload>` using HMAC-SHA256 with the server's public key text (or raw public key bytes) as the HMAC key.
 4. **Submit and Test:**
-   - Send the forged token to authenticated API routes or web dashboards.
+   - Send the forged token to discovered authenticated API routes or web dashboards.
 
 ### D. Mandatory Verification & Evidence for JWT Flaws
 1. **Capture Visual Proof (gowitness):**
