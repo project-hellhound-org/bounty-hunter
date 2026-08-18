@@ -2484,6 +2484,7 @@ RULES:
 ```
 7. If no further tools are needed, or after inspecting tool findings, respond with "DONE".
 8. When testing authentication or password recovery workflows, do NOT invent dummy emails (e.g., test@example.com, admin@local). If crawler results show data/content endpoints (posts, news, users, profiles), fetch them first with curl GET to harvest real user/staff identities.{path_rule}
+9. JWT Testing & Algorithm Confusion: If the target application utilizes JSON Web Tokens (JWTs in cookies like `p_sid`, `token`, `session` or `Authorization: Bearer` headers), test for `alg: none` unsigned token bypass (base64url header `{"alg":"none","typ":"JWT"}` with forged admin payload and trailing dot with empty signature) and RSA public key confusion (signing HS256 with public key / JWKS as secret) before reporting authentication failure.
 """
 
         # Build live investigation context summary
@@ -2510,28 +2511,26 @@ RULES:
         if report_requested or has_critical_findings:
             report_directive = f"""
 CRITICAL INSTRUCTION - VULNERABILITY REPORT & PROOF OF CONCEPT DIRECTIVE:
-When a vulnerability (such as Account Takeover, Auth Bypass, Token Leakage, or IDOR) is confirmed or the researcher requests a report, format your response as a complete, professional, ready-to-submit HackerOne markdown vulnerability report:
+When a vulnerability (such as Account Takeover, Auth Bypass, JWT Algorithm Confusion, Token Leakage, or IDOR) is confirmed or the researcher requests a report, format your response as a complete, professional, ready-to-submit HackerOne markdown vulnerability report:
 
-# [Vulnerability Title: e.g. Critical Authentication Bypass via Password Reset Token Leakage leading to Account Takeover]
+# [Vulnerability Title: e.g. Critical Authentication Bypass via Password Reset Token Leakage leading to Account Takeover OR JWT Algorithm Confusion leading to Full Account Takeover]
 
 ## Summary
 [Concise executive summary of the vulnerability, root cause, and how it was discovered.]
 
 ## Vulnerability Classification
-- **Vulnerability Type**: Authentication Bypass / Token Leakage / Account Takeover
-- **Weakness**: CWE-640 (Weak Password Recovery Mechanism for Forgotten Password) / CWE-200 (Exposure of Sensitive Information)
+- **Vulnerability Type**: Authentication Bypass / Token Leakage / Account Takeover / Improper Cryptographic Signature Verification
+- **Weakness**: CWE-640 (Weak Password Recovery Mechanism) / CWE-287 (Improper Authentication) / CWE-347 (Improper Verification of Cryptographic Signature) / CWE-200 (Exposure of Sensitive Information)
 - **Severity**: Critical (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H - 9.8)
 
 ## Affected Asset & Endpoints
 - **Target Host**: `{self.target.name}`
-- **Vulnerable Endpoints**:
-  - Request Token: `POST https://{self.target.name}{self._turn_path_scope or ''}/api/auth/forgot`
-  - Reset Password: `POST https://{self.target.name}{self._turn_path_scope or ''}/api/auth/reset`
-  - Authenticated Login: `POST https://{self.target.name}{self._turn_path_scope or ''}/api/auth/login`
+- **Vulnerable Endpoints / Parameters**:
+  - Discovered Endpoint / Parameter: `POST/GET https://{self.target.name}{self._turn_path_scope or ''}/...`
   - Authenticated Member Portal / Dashboard: `GET https://{self.target.name}{self._turn_path_scope or ''}/portal`
 
 ## Step-by-Step Proof of Concept (PoC)
-[Provide exact, reproducible curl commands with real request bodies and response snippets harvested during testing.]
+[Provide exact, reproducible curl commands with real request bodies, forged JWT tokens or reset codes, and response snippets harvested during testing.]
 
 ## Evidence & Screenshots
 [Detail the captured gowitness visual screenshots in ~/.hellhound/targets/{self.target.name}/screenshots/ and authenticated session tokens (e.g. p_sid) demonstrating privileged access to confidential records or administrator settings.]
@@ -2540,7 +2539,7 @@ When a vulnerability (such as Account Takeover, Auth Bypass, Token Leakage, or I
 [Explain the impact of full account takeover: access to PHI/PII, unauthorized actions, takeover of administrator/staff accounts, and confidential data exfiltration.]
 
 ## Remediation & Mitigation
-[Exact developer remediation recommendations, e.g. deliver tokens strictly via out-of-band email, invalidate tokens on use, enforce rate limits, and sanitize debug previews in production API responses.]
+[Exact developer remediation recommendations, e.g. enforce strict algorithm allowlists rejecting 'none' and symmetric HMAC when expecting asymmetric RSA, deliver tokens strictly via out-of-band email, invalidate tokens on use, enforce rate limits, and sanitize debug previews in production API responses.]
 """
 
         # ── 2. Comprehensive Synthesizer System Prompt (Deep Reasoning & Synthesis)

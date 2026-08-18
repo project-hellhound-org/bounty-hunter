@@ -169,7 +169,7 @@ SPECIFICITY_KEYWORDS: Dict[str, List[str]] = {
     "triage-validation": ["validate", "validation", "triage", "gate", "7-question", "validity", "false positive", "kill signal", "cvss"],
     "report-writing": ["report", "write report", "summary", "submission", "remediation", "hackerone", "bugcrowd"],
     "bb-methodology": ["methodology", "where am i", "what should i do next", "what next", "workflow", "mindset", "phase", "strategy"],
-    "auth-bypass": ["auth", "bypass", "forgot password", "reset link", "email leak", "host header"],
+    "auth-bypass": ["auth", "bypass", "forgot password", "reset link", "email leak", "host header", "jwt", "token", "algorithm confusion", "alg:none", "public key", "takeover", "account takeover"],
     "authentication": ["auth", "login", "jwt", "oauth", "password", "2fa", "mfa", "captcha", "bot detection", "saml"]
 }
 
