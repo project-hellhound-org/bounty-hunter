@@ -622,7 +622,9 @@ def classify_intent(user_input: str) -> str:
     security_keywords = [
         "target", "recon", "scan", "subdomain", "port", "vuln", "vulnerability",
         "triage", "summarize", "scope", "finding", "endpoint", "spider", "probe",
-        "brute", "dns", "waf", "xss", "sqli", "cors", "cname", "report"
+        "brute", "dns", "waf", "xss", "sqli", "cors", "cname", "report",
+        "screenshot", "gowitness", "proof", "takeover", "account", "login",
+        "session", "auth", "curl", "cookie", "portal", "admin"
     ]
     if any(k in text for k in security_keywords):
         return "hunt"

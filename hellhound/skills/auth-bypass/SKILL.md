@@ -77,6 +77,29 @@ Before testing out-of-band vectors or complex chains, check if the application l
      }
      ```
    - Verify access to privileged or authenticated areas (e.g., user profiles, admin consoles, internal records) using the resulting session.
+   - **MANDATORY VISUAL PROOF (gowitness):** Immediately capture visual Proof of Concept using `gowitness` on the authenticated web UI (e.g. `/pulse/portal`, `/pulse/dashboard`, `/pulse/admin`, `/pulse/profile`) using the acquired session cookie:
+     ```json
+     {
+       "tool": "gowitness",
+       "args": {
+         "url": "<discovered_authenticated_portal_url>",
+         "headers": {"Cookie": "<session_cookie_e.g._p_sid=...>"}
+       }
+     }
+     ```
+   - **Record Verified Finding:** Log the confirmed vulnerability in structured memory via `record_finding`:
+     ```json
+     {
+       "tool": "record_finding",
+       "args": {
+         "title": "Account Takeover via Password Reset Token Leakage",
+         "kind": "auth_bypass",
+         "severity": "critical",
+         "request_ref": "<discovered_recovery_endpoint>",
+         "note": "Password reset token disclosed directly in HTTP response body; allowed full account takeover of staff/admin account."
+       }
+     }
+     ```
 
 ## 4. Host Header Injection (Password Reset Poisoning)
 If the response body does not directly leak the token:
@@ -95,6 +118,7 @@ When reporting an authentication bypass or account takeover:
 1. **Concrete Evidence / PoC:**
    - Document the full reproduction chain with exact requests, response snippets, leaked tokens, and resulting authenticated session cookies.
    - Highlight any exposed high-value assets (e.g., admin controls, EHR/PHI records, internal API keys, database connection strings, S3/storage bucket links).
+   - Reference the visual PoC screenshot captured via `gowitness` demonstrating authenticated access to the confidential member/admin portal.
 2. **Impact Escalation for Maximum Bounty:**
    - **Severity Rating:** Classify under VRT/CVSS (typically **Critical / High** for ATO).
    - **Business Impact:** Clearly explain how taking over a privileged identity allows unauthorized data exfiltration, compliance violations (e.g., HIPAA/GDPR), and complete administrative compromise.
