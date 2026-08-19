@@ -18,6 +18,10 @@ Before testing access control, establish your session foundation:
 2. **Session Architecture Identification (Opaque Cookie vs. JWT):**
    - **Opaque Session Cookie:** e.g., `m_sid=sess_df11d034...`, `connect.sid=...`, `PHPSESSID=...`, or 32-character hex/random strings. These are server-side session pointers. **NEVER attempt JWT forgery (`jwt_forge`, `alg: none`) on opaque session IDs.**
    - **JSON Web Token (JWT):** e.g., `eyJhbGciOi...` with 3 dot-separated base64url segments. Only use `jwt_forge` when an actual valid JWT is issued.
+3. **Authenticated Deep Reconnaissance & Surface Expansion:**
+   - Once logged in, run `spider` with the acquired session cookie to map the entire authenticated application surface.
+   - Use `curl` to fetch and read internal directory, member, user list, profile, and settings pages mapped during recon.
+   - Harvest identifiers, roles, contextual profile information, security recovery indicators, and secondary routes before attempting privilege escalation.
 
 ---
 
@@ -81,6 +85,71 @@ Always distinguish between cosmetic UI unlocks and genuine backend privilege esc
    - When testing horizontal access (Tenant A accessing Tenant B's records), always verify with a second registered test account to confirm cross-tenant data leakage.
 4. **Test All HTTP Verbs on Sibling Endpoints:**
    - If `GET /api/documents/123` is blocked, test `POST /api/documents/123/export`, `PUT /api/documents/123`, or `DELETE /api/documents/123`.
+
+## 5.1 Target Profile IDOR Mining & Token Delegation Chaining (CRITICAL)
+1. **Target-Specific Profile & State Extraction (IDOR on Profiles/Data)**:
+   - When hunting for a specific target user/role (e.g. user ID 1, Chief of Medicine, Admin):
+     * Do NOT only check your own profile or a generic `/users` list.
+     * Actively probe object/profile endpoints for the target ID with `curl` (e.g. `GET /profile/1`, `GET /portal/profile/1`, `GET /api/user/1`, `GET /users/1`).
+     * Read the response body carefully for embedded secrets, `auth_token`, API keys, MFA seeds, password hashes, or `window.INIT_PROFILE` state objects.
+2. **Probe Accessible/Allowed Objects When Target Action is Blocked**:
+   - When an action or mutation targeting a privileged entity (e.g. `<endpoint>/<victim_id>/impersonate`) returns `403 Forbidden` or `404 Not Found`, do NOT stop.
+   - Test the same action on accessible or normal entities (e.g. `<endpoint>/<allowed_id>/impersonate` or your own account ID) with both `GET` and `POST`.
+   - Reverse-engineer the mechanism: Does it reveal a redemption URL or one-time token handler (e.g. `{"hint": "Use at /login/impersonate?token=..."}`)?
+3. **Artifact Inventory Cross-Check (Mechanical Field-Name Matching)**:
+   - **CRITICAL RULE**: Before searching for a new token or firing new recon, check whether a matching token was already harvested earlier in this session from any staff/user/profile endpoint in the **Harvested Artifact Inventory**.
+   - Before constructing a request to any endpoint accepting a parameter matching `token|key|secret|auth|session|sid|delegation`, cross-check every entry in the Harvested Artifact Inventory for a plausible match, regardless of exact field-name spelling. A field named `auth_token`, `access_token`, `delegation_key`, or `cmo_secret` are all candidates for a parameter named `token`. Do not conclude a new token must be found until the existing inventory has been checked.
+4. **Autonomous Artifact Chaining (Token Parameter Injection)**:
+   - Combine the two primitives: Take the victim's leaked `auth_token` (harvested from the profile IDOR or JS state) and pass it directly to the discovered handler:
+     ```json
+     {
+       "tool": "curl",
+       "args": {
+         "url": "https://<target>/login/impersonate?token=<victim_harvested_token>",
+         "method": "GET"
+       }
+     }
+     ```
+   - Capture the newly issued session cookie from `Set-Cookie: session=...` or the returned privileged JWT.
+   - Use the newly elevated session to access protected endpoints (`/portal/records`, `/portal/admin`, `/portal/profile`), extract all target flags/proof, capture `gowitness` visual evidence, and record the finding.
+
+## 5.2 403 Forbidden / 401 Unauthorized Perimeter & Reverse-Proxy Bypass Probing
+When an administrative endpoint, internal API, or sensitive route (e.g. `/portal/admin`, `/admin`, `/api/v1/management`, `/internal`) returns `403 Forbidden` or `401 Unauthorized`:
+Reverse proxies, load balancers, and API gateways (Nginx, HAProxy, Cloudflare, Envoy, IIS) often enforce access control at the perimeter while delegating routing or trust to headers parsed by the upstream application framework (Spring, Flask/Werkzeug, Express, Rails, ASP.NET). Systematically probe:
+
+1. **URL Rewrite & Path Override Headers:**
+   - Request the allowed landing page or root `/` while instructing the upstream framework to route to the restricted endpoint:
+     ```json
+     {
+       "tool": "curl",
+       "args": {
+         "url": "https://<target>/",
+         "method": "GET",
+         "headers": {
+           "X-Original-URL": "/portal/admin",
+           "X-Rewrite-URL": "/portal/admin",
+           "X-Custom-IP-Authorization": "127.0.0.1"
+         }
+       }
+     }
+     ```
+2. **IP Spoofing & Trust Headers (Localhost / Internal Bypass):**
+   - Probe the restricted route directly with internal origin headers:
+     - `X-Forwarded-For: 127.0.0.1` / `X-Forwarded-For: localhost`
+     - `X-Real-IP: 127.0.0.1`
+     - `X-Client-IP: 127.0.0.1`
+     - `X-Remote-IP: 127.0.0.1`
+     - `X-Originating-IP: 127.0.0.1`
+     - `X-Forwarded-Host: localhost`
+     - `X-Host: localhost`
+3. **URL Normalization & Path Obfuscation:**
+   - Web servers and backend routing engines often differ in how they parse URL delimiters and directory traversals:
+     - Semicolon delimiters (Tomcat/Spring): `/portal/admin;`, `/portal/admin;/`, `/portal/;/admin`
+     - Path traversal & dots: `/portal/./admin`, `/portal//admin`, `/portal/users/../admin`, `/portal/%2e%2e/admin`, `/portal/admin/.`
+     - URL encoded characters: `/%61%64%6d%69%6e`, `/portal/%2fadmin`
+4. **HTTP Verb & Method Tampering:**
+   - If `GET /portal/admin` is 403, test with `POST`, `HEAD`, `OPTIONS`, `PUT`, or custom verbs (`TRACK`, `DEBUG`, `TRACE`).
+   - Add method override headers: `X-HTTP-Method-Override: GET`, `X-Method-Override: GET`.
 
 ---
 

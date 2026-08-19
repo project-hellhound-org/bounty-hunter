@@ -83,30 +83,79 @@ def get_urllib_opener(proxy_url: str = None):
         
     return urllib.request.build_opener(*handlers)
 
-def merge_global_context(options: dict, runtime_headers: dict = None) -> dict:
+from typing import Any, Dict, Optional
+
+
+def normalize_headers(raw: Any) -> Dict[str, str]:
+    """Safely converts dicts, string blobs, or header lists into a standardized {str: str} dict."""
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    if isinstance(raw, (list, tuple)):
+        out = {}
+        for item in raw:
+            if isinstance(item, str) and ":" in item:
+                k, v = item.split(":", 1)
+                out[k.strip()] = v.strip()
+        return out
+    if isinstance(raw, str):
+        out = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if ":" in line:
+                k, v = line.split(":", 1)
+                out[k.strip()] = v.strip()
+        return out
+    return {}
+
+
+def normalize_cookies(raw: Any) -> Dict[str, str]:
+    """Safely converts dicts or cookie strings ('k=v; a=b') into a {str: str} dict."""
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    if isinstance(raw, str):
+        out = {}
+        for part in raw.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                out[k.strip()] = v.strip()
+        return out
+    return {}
+
+
+def merge_global_context(options: Any, runtime_headers: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     """
     Merges global context (proxy, global_headers) into module options.
     Safely handles BugBounty headers and WAF bypasses.
     """
-    headers = runtime_headers or {}
+    headers: Dict[str, str] = {}
+    if isinstance(runtime_headers, dict):
+        headers = {str(k): str(v) for k, v in runtime_headers.items()}
+
+    opts_dict = options if isinstance(options, dict) else {}
 
     # 1. Check for researcher handle to inject X-Bugbounty header
-    handle = options.get("researcher_handle")
+    handle = opts_dict.get("researcher_handle")
     if not handle:
         from hellhound.core.ai_utils import load_config
         cfg = load_config()
         handle = cfg.get("researcher_handle", "")
     if handle and "X-Bugbounty" not in headers:
-        headers["X-Bugbounty"] = handle
+        headers["X-Bugbounty"] = str(handle)
 
     # 2. Apply Global Headers (Bug Bounty IDs, etc.)
-    gt = options.get("global_headers", {})
+    gt = opts_dict.get("global_headers", {})
     if gt:
-        headers.update(gt)
+        headers.update(normalize_headers(gt))
     
     # 3. Apply WAF Bypasses if requested
-    if options.get("enable_waf_bypass"):
+    if opts_dict.get("enable_waf_bypass"):
         headers.update(get_waf_bypass_header())
         
     return headers
+
 

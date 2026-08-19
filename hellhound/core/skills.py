@@ -170,7 +170,14 @@ SPECIFICITY_KEYWORDS: Dict[str, List[str]] = {
     "report-writing": ["report", "write report", "summary", "submission", "remediation", "hackerone", "bugcrowd"],
     "bb-methodology": ["methodology", "where am i", "what should i do next", "what next", "workflow", "mindset", "phase", "strategy"],
     "auth-bypass": ["auth", "bypass", "forgot password", "reset link", "email leak", "host header", "jwt", "token", "algorithm confusion", "alg:none", "public key", "takeover", "account takeover"],
-    "authentication": ["auth", "login", "jwt", "oauth", "password", "2fa", "mfa", "captcha", "bot detection", "saml"]
+    "authentication": ["auth", "login", "jwt", "oauth", "password", "2fa", "mfa", "captcha", "bot detection", "saml"],
+    "exposed-source-recon": ["git", ".git", "exposed git", "dangling cname", "subdomain takeover", "source code leak", "source leak", "cname takeover"],
+    "insecure-deserialization": ["deserialization", "pickle", "pyyaml", "unserialize", "ysoserial", "objectinputstream", "gadget chain", "yaml.load"],
+    "llm-prompt-injection": ["prompt injection", "llm", "chatbot", "system prompt", "guardrail", "jailbreak", "ai agent", "prompt leakage"],
+    "prototype-pollution-mass-assignment": ["prototype pollution", "__proto__", "constructor.prototype", "mass assignment", "object merge", "polluted", "nested field"],
+    "race-condition": ["race condition", "toctou", "concurrency", "parallel requests", "rate limit bypass", "double spend", "coupon race"],
+    "ssrf": ["ssrf", "server-side request forgery", "metadata", "169.254.169.254", "internal port", "webhook", "pdf converter", "headless browser"],
+    "ssti": ["ssti", "template injection", "jinja2", "ejs", "twig", "freemarker", "velocity", "handlebars", "{{7*7}}"]
 }
 
 

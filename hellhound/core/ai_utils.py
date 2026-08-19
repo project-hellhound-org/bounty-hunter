@@ -190,6 +190,56 @@ You are Hellhound, a helpful bug bounty research and triage assistant.
 For casual conversation: respond naturally and conversationally in 1-3 sentences max.
 """
 
+SYNTHESIZER_PERSONA = """\
+You are HELLHOUND, an autonomous bug bounty reconnaissance and triage assistant.
+
+Your job is to tell the researcher exactly what happened, no more, no less. 
+Report like a competent colleague sitting next to them, not a press release. 
+Dry, direct, a little wit where it fits naturally, but the finding always comes 
+first and the personality never gets in the way of the facts. Skepticism is 
+the default position, not an occasional flourish, if the evidence doesn't 
+prove what it looks like it proves, say that plainly instead of dressing it up.
+
+CORE REPORTING & STATUS PROTOCOL:
+
+1. OBJECTIVE FIDELITY & STATUS CLASSIFICATION
+   Open every summary with the actual outcome, stated plainly, not buried 
+   under a wall of context first:
+   - [STATUS: OBJECTIVE ACHIEVED / FULL TAKEOVER] — the requested target 
+     account/role (Administrator, designated high-privilege user, or whatever the actual goal was) 
+     was genuinely accessed and compromised. Not implied. Not "probably." 
+     Genuinely confirmed.
+   - [STATUS: PARTIAL / IN PROGRESS] — only intermediate lateral movement or 
+     a stepping-stone account (normal user, staff, low-priv) was compromised. 
+     The actual objective is still not done, and that gets said outright, 
+     not softened into something that reads like success.
+   - [STATUS: BLOCKED / EXHAUSTED] — every viable vector was actually tested, 
+     and all of them failed. Not "I got tired," actually exhausted.
+   
+   Never claim a full takeover off the back of a low-privilege account. That's 
+   not an optimistic read of the evidence, it's just wrong, and wrong reports 
+   waste the researcher's time chasing a win that isn't there.
+
+2. HONEST & ACTIONABLE BREAKDOWN
+   Say what was actually done and what evidence backs it, specifically, not 
+   "the target was tested" in the vague sense that means nothing. If the 
+   objective isn't complete, say exactly which attack vectors are still open 
+   and what the next move should be. A status without a next step is half 
+   a report.
+
+3. CONCISE, FACTUAL SYNTHESIS
+   Technical, evidence-backed, no padding. An HTTP 200 is a response code, 
+   not a confirmed vulnerability, treat it as exactly that until something 
+   actually proves impact. If the evidence is thin, say the evidence is thin, 
+   don't round it up to "likely exploitable" because that sounds better in 
+   a report.
+
+4. IDENTITY & DIRECTORY REALITY CHECK
+   - Seeing a user's name or profile row in a user list table (e.g. `/users`, `/staff`, `/directory`) is a DIRECTORY LISTING, not an account takeover of the listed user.
+   - If you hold a session cookie for an intermediate user, you are logged in as that intermediate user, NOT the primary target.
+   - NEVER claim that token reuse assumed the target's session unless the target's specific token (or credentials) was actually submitted to an authentication handler.
+"""
+
 # ==========================================================
 # UI RENDERING TOKENS & UTILS
 # ==========================================================
@@ -634,49 +684,13 @@ def detect_ai_config(api_key: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 def classify_intent(user_input: str) -> str:
-    """Classifies user input before sending to model.
-
-    Security keywords are checked FIRST. Previously "advice_triggers"
-    (how to / what is / can you explain / etc.) were checked before
-    security_keywords, so almost any naturally-phrased recon question —
-    "what is the scope for X", "can you explain these findings", "how do
-    I scan this subdomain" — matched an advice trigger on its phrasing
-    alone and got shunted into the single-shot "chat" fast-path, which
-    never runs the tool-use loop at all. That's why every query, recon
-    or not, was coming back in ~2 seconds: the agent wasn't doing any
-    work, just answering conversationally. A real security/recon term
-    anywhere in the text now always wins and routes to "hunt".
+    """Lightweight intent classification.
+    Most routing is handled natively by the unified model context,
+    avoiding brittle keyword lists.
     """
-    text = user_input.lower().strip()
-
-    security_keywords = [
-        "target", "recon", "scan", "subdomain", "port", "vuln", "vulnerability",
-        "triage", "summarize", "scope", "finding", "endpoint", "spider", "probe",
-        "brute", "dns", "waf", "xss", "sqli", "cors", "cname", "report",
-        "screenshot", "gowitness", "proof", "takeover", "account", "login",
-        "session", "auth", "curl", "cookie", "portal", "admin"
-    ]
-    if any(k in text for k in security_keywords):
-        return "hunt"
-
-    advice_triggers = [
-        "how to", "how do i", "ways to", "what are the ways", "what is",
-        "can you explain", "bypass", "help me understand", "what should i do",
-        "how can i", "tips"
-    ]
-    if any(a in text for a in advice_triggers):
+    text = (user_input or "").lower().strip()
+    if text in ("hi", "hello", "hey", "ping", "test", "yo"):
         return "chat"
-
-    social_triggers = [
-        "how are you", "what's up", "hey", "hi", "hello", "good morning",
-        "good night", "who are you", "what are you", "introduce yourself",
-        "thanks", "thank you", "ok", "okay", "nice", "cool", "got it",
-        "makes sense", "lol", "haha", "bye", "see you", "later", "say ok", "say ",
-        "what tools", "can you", "what can you do", "capabilities", "what do you"
-    ]
-    if (any(t in text for t in social_triggers) or text in ("hi", "hey", "yo", "ok", "test", "ping", "say ok")) and len(text.split()) < 15:
-        return "chat"
-
     return "hunt"
 
 def get_default_model(provider: str) -> str:
@@ -804,8 +818,7 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
     provider = (provider or "ollama").lower().strip()
     
     if system_prompt is None:
-        intent = classify_intent(prompt)
-        system_prompt = CHAT_PERSONA_SLM if intent == "chat" else ASK_PERSONA_SLM
+        system_prompt = ASK_PERSONA_SLM
 
     active_model = model or get_default_model(provider)
 

@@ -742,7 +742,9 @@ def handle_headers(args: List[str], session_context: Dict[str, Any], emit: Any) 
     clean_args = [a for a in args if a not in ("--json", "-j")]
 
     opts = session_context.setdefault("options", {})
-    headers = opts.setdefault("global_headers", {})
+    from hellhound.core.http_utils import normalize_headers
+    headers = normalize_headers(opts.get("global_headers"))
+    opts["global_headers"] = headers
 
     if "--clear" in args:
         opts["global_headers"] = {}
@@ -1221,8 +1223,8 @@ def handle_skills(args: List[str], session_context: Dict[str, Any], emit: Any) -
             emit.banner(f"HELLHOUND SKILL LIBRARY ({len(skills)} Available)")
             for name, s in sorted(skills.items()):
                 tag = " (user)" if s.is_user_defined else ""
-                desc_str = escape(s.description[:110])
-                emit.info(f"• [bold cyan]{name}[/bold cyan]{tag}: {desc_str}...")
+                desc_str = escape(s.description.strip())
+                emit.info(f"• [bold cyan]{name}[/bold cyan]{tag}: {desc_str}")
         return {
             "status": "success",
             "skills": [
@@ -1245,8 +1247,8 @@ def handle_skills(args: List[str], session_context: Dict[str, Any], emit: Any) -
             emit.warn("No matching skills found.")
         for s in results:
             tag = " (user)" if s.is_user_defined else ""
-            desc_str = escape(s.description[:130])
-            emit.info(f"• [bold green]{s.name}[/bold green]{tag}: {desc_str}...")
+            desc_str = escape(s.description.strip())
+            emit.info(f"• [bold green]{s.name}[/bold green]{tag}: {desc_str}")
 
     return {
         "status": "success",
@@ -1346,6 +1348,48 @@ register_command(Command(
 
 
 # ─────────────────────────────────────────────────────────────
+# REGISTER SKILLS AS DIRECT SLASH COMMANDS (for autocomplete parity
+# with /recon, /report, etc. — see HellhoundCompleter in chat_ui.py,
+# which reads straight from COMMAND_REGISTRY)
+# ─────────────────────────────────────────────────────────────
+
+def _make_skill_handler(_skill_name: str):
+    def _handler(args: List[str], session_context: Dict[str, Any], emit: Any,
+                 on_token: Optional[Callable[[str], None]] = None,
+                 cancel_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+        task_text = " ".join(args).strip()
+        if not task_text:
+            emit.warn(f"Usage: /{_skill_name} <task description>")
+            return {"status": "error", "error": "missing_task", "skill": _skill_name}
+        response = agent_handle_message(task_text, session_context=session_context, emit=emit, on_token=on_token, cancel_check=cancel_check, forced_skill=_skill_name)
+        if not on_token:
+            emit(response)
+        return {"status": "success", "response": response, "forced_skill": _skill_name}
+    return _handler
+
+
+def _register_skill_commands():
+    try:
+        from hellhound.core.skills import discover_skills
+        for _name, _meta in discover_skills().items():
+            cmd_name = "/" + _name
+            if cmd_name.lower() in COMMAND_REGISTRY:
+                continue  # a real command already owns this name — don't shadow it
+            register_command(Command(
+                name=cmd_name,
+                description=(_meta.description or f"Run the '{_name}' methodology skill directly")[:200],
+                usage=f"{cmd_name} <task description>",
+                category="skills",
+                handler=_make_skill_handler(_name)
+            ))
+    except Exception:
+        pass  # autocomplete convenience only — never block startup on this
+
+
+_register_skill_commands()
+
+
+# ─────────────────────────────────────────────────────────────
 # CENTRAL DISPATCHER
 # ─────────────────────────────────────────────────────────────
 
@@ -1389,7 +1433,33 @@ def dispatch(raw_input: str, session_context: Dict[str, Any], emit: Any = None,
             if "--json" in tokens or getattr(emit, "json_mode", False):
                 print(json.dumps(result, indent=2))
             return result
-        emit.warn(f"Unknown command '{cmd_token}'. Type /help for available commands.")
+
+        # Not a registered command — check if it names an actual skill
+        # (e.g. "/access-control target is ... take over the owner console").
+        # This bypasses automatic skill selection entirely and forces that
+        # skill's full methodology for this one message.
+        skill_name = cmd_token[1:].strip().lower()
+        try:
+            from hellhound.core.skills import discover_skills
+            available_skills = discover_skills()
+        except Exception:
+            available_skills = {}
+        if skill_name in available_skills:
+            task_text = " ".join(args).strip()
+            if not task_text:
+                emit.warn(f"Usage: /{skill_name} <task description>")
+                return {"status": "error", "error": "missing_task", "skill": skill_name}
+            response = agent_handle_message(task_text, session_context=session_context, emit=emit, on_token=on_token, cancel_check=cancel_check, forced_skill=skill_name)
+            if "--json" in tokens or getattr(emit, "json_mode", False):
+                res_dict = {"status": "success", "response": response, "forced_skill": skill_name}
+                print(json.dumps(res_dict, indent=2))
+                return res_dict
+            else:
+                if not on_token:
+                    emit(response)
+                return {"status": "success", "response": response, "forced_skill": skill_name}
+
+        emit.warn(f"Unknown command '{cmd_token}'. Type /help for available commands, or /skills to list methodology skills you can invoke directly.")
         return {"status": "error", "error": "unknown_command", "command": cmd_token}
 
     # Built-in utility commands allowed without slash (e.g. 'help', 'exit', 'quit', 'clear')

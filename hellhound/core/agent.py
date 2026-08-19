@@ -33,8 +33,13 @@ from hellhound.core.ai_utils import (
     ask_neural_core,
     thinking_animation,
     render_chat_bubble,
+    SYNTHESIZER_PERSONA,
 )
-from hellhound.core.http_utils import merge_global_context
+from hellhound.core.http_utils import (
+    merge_global_context,
+    normalize_headers,
+    normalize_cookies,
+)
 from hellhound.memory import (
     build_investigation_summary,
     update_from_subfinder,
@@ -320,19 +325,18 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
         cmd.extend(["-of", "json", "-o", temp_json])
 
     # Pass authenticated headers/cookies if available
-    req_headers = args.get("headers") or {}
+    req_headers = normalize_headers(args.get("headers"))
     if not req_headers and hasattr(target, "state") and isinstance(target.state, dict):
-        req_headers = target.state.get("headers", {})
-    if isinstance(req_headers, dict):
-        for hk, hv in req_headers.items():
-            if isinstance(hv, str) and hv.strip():
-                cmd.extend(["-H", f"{hk}: {hv.strip()}"])
+        req_headers = normalize_headers(target.state.get("headers"))
+    for hk, hv in req_headers.items():
+        if isinstance(hv, str) and hv.strip():
+            cmd.extend(["-H", f"{hk}: {hv.strip()}"])
 
     # Pass cookies
-    req_cookies = args.get("cookies") or {}
+    req_cookies = normalize_cookies(args.get("cookies") or args.get("cookie"))
     if not req_cookies and hasattr(target, "state") and isinstance(target.state, dict):
-        req_cookies = target.state.get("cookies", {})
-    if req_cookies and isinstance(req_cookies, dict):
+        req_cookies = normalize_cookies(target.state.get("cookies") or target.state.get("session_cookie"))
+    if req_cookies:
         cookie_str = "; ".join(f"{k}={v}" for k, v in req_cookies.items())
         cmd.extend(["-H", f"Cookie: {cookie_str}"])
 
@@ -1153,32 +1157,324 @@ def _execute_dig(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, A
     }
 
 
+# =========================================================================
+# Structured Artifact Store & Extraction Engine (Token / Secret Inventory)
+# =========================================================================
+
+ARTIFACT_KEY_PATTERNS = [
+    r"token", r"auth", r"key", r"secret", r"session", 
+    r"cred", r"password", r"pass", r"api_key", r"jwt", r"bearer",
+    r"sid", r"cookie", r"delegation", r"reset", r"mfa", r"otp",
+    r"seed", r"code", r"hash", r"admin", r"hint", r"flag"
+]
+
+
+def _flatten_json_dict(obj: Any, prefix: str = "") -> Dict[str, Any]:
+    items: Dict[str, Any] = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            k_str = str(k)
+            new_prefix = f"{prefix}.{k_str}" if prefix else k_str
+            if isinstance(v, (dict, list)):
+                items.update(_flatten_json_dict(v, new_prefix))
+            else:
+                items[new_prefix] = v
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            new_prefix = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            if isinstance(item, (dict, list)):
+                items.update(_flatten_json_dict(item, new_prefix))
+            else:
+                items[new_prefix] = item
+    return items
+
+
+def _infer_identity_from_context(obj_or_parent: Any, source_url: str) -> str:
+    """Extract identity context (username, user_id, role) from structured object or source URL."""
+    ident_parts = []
+    if isinstance(obj_or_parent, dict):
+        for field in ("username", "user", "identity", "name", "email", "login"):
+            v = obj_or_parent.get(field)
+            if v and isinstance(v, (str, int)) and str(v).strip() and len(str(v).strip()) < 50:
+                ident_parts.append(str(v).strip())
+                break
+        for field in ("role", "title", "designation", "position"):
+            v = obj_or_parent.get(field)
+            if v and isinstance(v, (str, int)) and str(v).strip() and len(str(v).strip()) < 50:
+                ident_parts.append(str(v).strip())
+                break
+        for field in ("id", "user_id", "uid", "account_id"):
+            v = obj_or_parent.get(field)
+            if v is not None and isinstance(v, (str, int)) and str(v).strip():
+                ident_parts.append(f"user_id={v}")
+                break
+
+    if not ident_parts and source_url:
+        m_id = re.search(r'/(?:users?|profiles?|accounts?|members?|staff)/([a-zA-Z0-9_.-]+)', source_url, re.I)
+        if m_id:
+            val = m_id.group(1)
+            ident_parts.append(f"user_id={val}" if val.isdigit() else str(val))
+
+    return " / ".join(ident_parts) if ident_parts else "unspecified identity"
+
+
+def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_output: Any, target: Target, turn_number: int = 1) -> List[Dict[str, Any]]:
+    """
+    Scans every tool output for credentials, tokens, session cookies, keys, and hints,
+    storing deduplicated artifacts into target.state["artifacts"] with associated identity.
+    Exempt from context pruning.
+    """
+    if not hasattr(target, "state") or not isinstance(target.state, dict):
+        return []
+
+    if "artifacts" not in target.state or not isinstance(target.state["artifacts"], list):
+        target.state["artifacts"] = []
+
+    source_url = ""
+    if isinstance(tool_args, dict):
+        source_url = str(tool_args.get("url") or tool_args.get("request_ref") or "")
+    if not source_url and tool_name:
+        source_url = tool_name
+
+    new_artifacts: List[Dict[str, Any]] = []
+
+    # 1. Process structured dictionary output from tool
+    if isinstance(tool_output, dict):
+        # A. Directly process credentials exposed by spider/recon
+        for cred in tool_output.get("credentials_exposed", []) + tool_output.get("credentials", []):
+            if isinstance(cred, dict):
+                c_ident = cred.get("identity") or cred.get("username") or cred.get("user") or "identity"
+                c_url = cred.get("url") or cred.get("source_url") or source_url
+                for k, v in cred.items():
+                    if k in ("token", "auth_token", "password", "pass", "mfa_secret", "mfa", "key", "secret", "value"):
+                        if v and isinstance(v, (str, int)) and str(v).strip():
+                            new_artifacts.append({
+                                "field_name": k,
+                                "value": str(v).strip(),
+                                "source": c_url,
+                                "associated_identity": c_ident,
+                                "turn": turn_number
+                            })
+
+        # B. Directly process secrets exposed
+        for sec in tool_output.get("secrets_exposed", []) + tool_output.get("secrets", []):
+            if isinstance(sec, dict):
+                s_ident = sec.get("identity") or "secret"
+                s_url = sec.get("url") or sec.get("source_url") or source_url
+                s_val = sec.get("value") or sec.get("secret") or sec.get("token")
+                if s_val and isinstance(s_val, (str, int)) and str(s_val).strip():
+                    new_artifacts.append({
+                        "field_name": sec.get("type", "secret"),
+                        "value": str(s_val).strip(),
+                        "source": s_url,
+                        "associated_identity": s_ident,
+                        "turn": turn_number
+                    })
+
+        # C. Flatten entire dictionary to find key-pattern matches
+        flattened = _flatten_json_dict(tool_output)
+        identity_context = _infer_identity_from_context(tool_output, source_url)
+
+        for key, value in flattened.items():
+            if value is None or isinstance(value, (dict, list)):
+                continue
+            v_str = str(value).strip()
+            if not v_str or v_str.lower() in ("true", "false", "none", "null", "undefined", "{}", "[]"):
+                continue
+            leaf_key = key.split(".")[-1].split("[")[0].lower()
+            if any(re.search(p, leaf_key, re.I) for p in ARTIFACT_KEY_PATTERNS) or any(re.search(p, key, re.I) for p in ARTIFACT_KEY_PATTERNS):
+                if leaf_key in ("status", "status_code", "content_type", "allow_credentials", "is_admin", "admin"):
+                    continue
+                new_artifacts.append({
+                    "field_name": leaf_key,
+                    "value": v_str,
+                    "source": f"{tool_name.upper()} {source_url}".strip(),
+                    "associated_identity": identity_context,
+                    "turn": turn_number
+                })
+
+        # D. Extract from raw HTTP headers or set-cookie in tool_output
+        hdrs = tool_output.get("headers") or {}
+        if isinstance(hdrs, dict):
+            for hk, hv in hdrs.items():
+                if "cookie" in hk.lower() or "authorization" in hk.lower() or "token" in hk.lower():
+                    new_artifacts.append({
+                        "field_name": hk,
+                        "value": str(hv),
+                        "source": f"{tool_name.upper()} {source_url}".strip(),
+                        "associated_identity": "session context",
+                        "turn": turn_number
+                    })
+
+        # E. Extract from cookies dictionary in tool_output
+        cks = tool_output.get("cookies") or {}
+        if isinstance(cks, dict):
+            for ck, cv in cks.items():
+                if cv and isinstance(cv, (str, int)) and str(cv).strip():
+                    new_artifacts.append({
+                        "field_name": str(ck),
+                        "value": str(cv).strip(),
+                        "source": f"{tool_name.upper()} {source_url}".strip(),
+                        "associated_identity": "session cookie",
+                        "turn": turn_number
+                    })
+
+        # F. Extract JSON objects or tokens embedded inside response text
+        raw_text = tool_output.get("body_preview") or tool_output.get("body") or tool_output.get("text") or tool_output.get("response") or ""
+        if isinstance(raw_text, str) and raw_text.strip():
+            raw_clean = raw_text.strip()
+            # F1. Try direct JSON parsing of the body
+            if (raw_clean.startswith("{") and raw_clean.endswith("}")) or (raw_clean.startswith("[") and raw_clean.endswith("]")):
+                try:
+                    direct_json = json.loads(raw_clean)
+                    if isinstance(direct_json, (dict, list)):
+                        d_ident = _infer_identity_from_context(direct_json, source_url)
+                        for dk, dv in _flatten_json_dict(direct_json).items():
+                            d_leaf = dk.split(".")[-1].split("[")[0].lower()
+                            if any(re.search(p, d_leaf, re.I) for p in ARTIFACT_KEY_PATTERNS) or any(re.search(p, dk, re.I) for p in ARTIFACT_KEY_PATTERNS):
+                                if d_leaf in ("status", "status_code", "content_type", "allow_credentials", "is_admin", "admin"):
+                                    continue
+                                dv_str = str(dv).strip()
+                                if dv_str and dv_str.lower() not in ("true", "false", "none", "null", "undefined", "{}", "[]"):
+                                    new_artifacts.append({
+                                        "field_name": d_leaf,
+                                        "value": dv_str,
+                                        "source": f"{tool_name.upper()} {source_url}".strip(),
+                                        "associated_identity": d_ident,
+                                        "turn": turn_number
+                                    })
+                except Exception:
+                    pass
+
+            # F2. Scan for embedded state objects (window.INIT_PROFILE = {...}, data-profile='{...}')
+            for match in re.finditer(r'(?:window\.[a-zA-Z0-9_$]+\s*=\s*|data-profile\s*=\s*[\'"]|INIT_STATE\s*=\s*)({.*?});?', raw_text, re.DOTALL):
+                try:
+                    parsed_embedded = json.loads(match.group(1))
+                    if isinstance(parsed_embedded, dict):
+                        emb_ident = _infer_identity_from_context(parsed_embedded, source_url)
+                        for ek, ev in _flatten_json_dict(parsed_embedded).items():
+                            e_leaf = ek.split(".")[-1].split("[")[0].lower()
+                            if any(re.search(p, e_leaf, re.I) for p in ARTIFACT_KEY_PATTERNS):
+                                ev_str = str(ev).strip()
+                                if ev_str and ev_str.lower() not in ("true", "false", "none", "null", "undefined"):
+                                    new_artifacts.append({
+                                        "field_name": e_leaf,
+                                        "value": ev_str,
+                                        "source": f"{tool_name.upper()} {source_url}".strip(),
+                                        "associated_identity": emb_ident,
+                                        "turn": turn_number
+                                    })
+                except Exception:
+                    pass
+
+            # F3. Scan for hints or delegation parameters in text (e.g. "Use at /login/impersonate?token=...")
+            for hint_m in re.finditer(r'(?:use\s+at\s+|endpoint:\s*|url:\s*)(/[a-zA-Z0-9_/?&=.-]+)', raw_text, re.I):
+                new_artifacts.append({
+                    "field_name": "delegation_endpoint",
+                    "value": hint_m.group(1),
+                    "source": f"{tool_name.upper()} {source_url}".strip(),
+                    "associated_identity": "delegation hint",
+                    "turn": turn_number
+                })
+
+    # Deduplicate and merge into target.state["artifacts"]
+    existing_entries = target.state["artifacts"]
+    existing_keys = {(a.get("field_name"), a.get("value")) for a in existing_entries if isinstance(a, dict)}
+
+    for art in new_artifacts:
+        sig = (art.get("field_name"), art.get("value"))
+        if sig not in existing_keys and art.get("value"):
+            existing_keys.add(sig)
+            existing_entries.append(art)
+
+    try:
+        save_target(target)
+    except Exception:
+        pass
+    return new_artifacts
+
+
+def format_artifact_inventory(target: Target) -> str:
+    """Builds a formatted, high-visibility Harvested Artifact Inventory ledger for prompt injection."""
+    artifacts = target.state.get("artifacts", []) if hasattr(target, "state") and isinstance(target.state, dict) else []
+    
+    legacy_creds = target.state.get("credentials", []) if hasattr(target, "state") and isinstance(target.state, dict) else []
+    active_cookies = target.state.get("cookies") or target.state.get("session_cookie") if hasattr(target, "state") and isinstance(target.state, dict) else None
+    active_auth = target.state.get("auth_token") if hasattr(target, "state") and isinstance(target.state, dict) else None
+
+    if not artifacts and not legacy_creds and not active_cookies and not active_auth:
+        return ""
+
+    lines = []
+    seen_sigs = set()
+
+    for art in artifacts:
+        if isinstance(art, dict):
+            ident = art.get("associated_identity") or "identity"
+            field = art.get("field_name", "artifact")
+            val = art.get("value", "")
+            src = art.get("source", "")
+            turn = art.get("turn")
+            sig = (ident, field, val)
+            if sig not in seen_sigs and val:
+                seen_sigs.add(sig)
+                src_part = f" [source: {src}" + (f", turn {turn}]" if turn is not None else "]") if src else ""
+                lines.append(f"- {ident}: {field}='{val}'{src_part}")
+
+    for cred in legacy_creds:
+        if isinstance(cred, dict):
+            ident = cred.get("identity") or cred.get("username") or "user"
+            src = cred.get("url") or cred.get("source_url") or ""
+            tok = cred.get("token") or cred.get("auth_token") or cred.get("value")
+            pwd = cred.get("password") or cred.get("pass")
+            mfa = cred.get("mfa_secret") or cred.get("mfa")
+            details = []
+            if tok and (ident, "token", str(tok)) not in seen_sigs:
+                details.append(f"token='{tok}'")
+                seen_sigs.add((ident, "token", str(tok)))
+            if pwd and (ident, "password", str(pwd)) not in seen_sigs:
+                details.append(f"password='{pwd}'")
+                seen_sigs.add((ident, "password", str(pwd)))
+            if mfa and (ident, "mfa", str(mfa)) not in seen_sigs:
+                details.append(f"mfa='{mfa}'")
+                seen_sigs.add((ident, "mfa", str(mfa)))
+            if details:
+                lines.append(f"- {ident}: {', '.join(details)}" + (f" [source: {src}]" if src else ""))
+
+    if active_cookies and ("session", "cookies", str(active_cookies)) not in seen_sigs:
+        lines.append(f"- Active Session: cookies='{active_cookies}'")
+    if active_auth and ("session", "auth_token", str(active_auth)) not in seen_sigs:
+        lines.append(f"- Active Bearer: auth_token='{active_auth}'")
+
+    if not lines:
+        return ""
+
+    return "================== HARVESTED ARTIFACT INVENTORY ==================\n" + "\n".join(lines) + "\n=================================================================="
+
+
 def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     url = args.get("url") or target.name
     method = args.get("method", "GET").upper()
-    custom_headers = dict(args.get("headers") or {})
+    custom_headers = normalize_headers(args.get("headers"))
     
     body = args.get("json") or args.get("body") or args.get("data")
     
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
-    cookies_arg = args.get("cookies") or args.get("cookie")
-    req_cookies = {}
-    if isinstance(cookies_arg, dict):
-        req_cookies = dict(cookies_arg)
-    elif isinstance(cookies_arg, str) and cookies_arg.strip():
-        if not any(k.lower() == "cookie" for k in custom_headers.keys()):
-            custom_headers["Cookie"] = cookies_arg.strip()
+    req_cookies = normalize_cookies(args.get("cookies") or args.get("cookie"))
 
     # If no Cookie header or cookies provided, auto-attach session cookies from target state if available
     if not req_cookies and not any(k.lower() == "cookie" for k in custom_headers.keys()) and hasattr(target, "state") and isinstance(target.state, dict):
-        saved_cookie = target.state.get("session_cookie")
-        saved_cookies_dict = target.state.get("cookies")
-        if saved_cookie:
-            custom_headers["Cookie"] = str(saved_cookie)
-        elif saved_cookies_dict and isinstance(saved_cookies_dict, dict):
-            req_cookies = dict(saved_cookies_dict)
+        saved_cookies = normalize_cookies(target.state.get("cookies") or target.state.get("session_cookie"))
+        if saved_cookies:
+            req_cookies = saved_cookies
+
+    # If auth header not provided, auto-attach from target state
+    if not any(k.lower() == "authorization" for k in custom_headers.keys()) and hasattr(target, "state") and isinstance(target.state, dict):
+        saved_token = target.state.get("auth_token") or target.state.get("forged_token")
+        if saved_token:
+            custom_headers["Authorization"] = f"Bearer {saved_token}"
 
     headers = merge_global_context({"global_headers": custom_headers})
     
@@ -1315,7 +1611,7 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                         "alg": hdr.get("alg")
                     }
                     if str(role_val).lower() not in ("admin", "administrator", "root", "true"):
-                        jwt_info["privilege_escalation_hint"] = "Non-admin JWT detected. Use jwt_forge tool or forge alg:none with role: admin to escalate."
+                        jwt_info["privilege_escalation_hint"] = "Non-admin JWT detected. Test algorithm confusion (alg:none / None), RS256->HS256 key confusion, claim manipulation (role/groups/sub/permissions), or JWKS header injection."
             except Exception:
                 pass
 
@@ -1375,13 +1671,44 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                     target.state["endpoints"].append(full_url)
             save_target(target)
 
+        # Clean HTML response body so styles/svgs don't crowd out the actual forms/content/comments
+        body_text = r.text or ""
+        is_html = "text/html" in r.headers.get("Content-Type", "").lower() or body_text.strip().startswith("<!doctype") or body_text.strip().startswith("<html")
+        if is_html:
+            # Strip large <style> and <svg> blocks to prevent cutting off forms, hints, and test accounts
+            body_text = re.sub(r'<style\b[^>]*>[\s\S]*?</style>', '<!-- [CSS style block omitted for brevity] -->', body_text, flags=re.I)
+            body_text = re.sub(r'<svg\b[^>]*>[\s\S]*?</svg>', '<!-- [SVG omitted] -->', body_text, flags=re.I)
+
+        # Detect HTML comments
+        html_comments = []
+        if is_html:
+            for c in re.findall(r'<!--([\s\S]*?)-->', r.text):
+                c_str = c.strip()
+                if c_str and not c_str.startswith("[") and len(c_str) < 500:
+                    html_comments.append(c_str)
+
         resp_dict: Dict[str, Any] = {
             "url": url,
             "status_code": r.status_code,
             "headers": dict(r.headers),
             "cookies": r.cookies.get_dict(),
-            "body_preview": r.text[:20000]
+            "body_preview": body_text[:35000]
         }
+
+        # Code-level detection of authentication failures
+        if method == "POST" and any(k in url.lower() for k in ("login", "auth", "signin", "session")):
+            if any(err in r.text.lower() for err in ("invalid username or password", "invalid credentials", "incorrect password", "login failed", "authentication failed")):
+                resp_dict["auth_status"] = "FAILED: Server returned an authentication failure message ('Invalid username or password'). This login attempt did NOT succeed."
+            elif (r.status_code in (200, 302, 303) and (target.state.get("session_cookie") or target.state.get("auth_token"))):
+                resp_dict["auth_status"] = "SUCCESSFUL LOGIN: Active session established."
+                resp_dict["authenticated_recon_directive"] = (
+                    "AUTHENTICATED SESSION ACQUIRED. Next actions: "
+                    "1) Run 'spider' on the internal portal (e.g. url='https://.../portal') or systematically fetch all internal routes with 'curl'. "
+                    "2) Thoroughly inspect all accessible internal staff, directory, user, and profile pages for leaked target personal information, bios, security question answers, or password reset flows."
+                )
+
+        if html_comments:
+            resp_dict["discovered_html_comments"] = html_comments[:10]
         if jwt_info:
             resp_dict["jwt_info"] = jwt_info
         if detected_scripts:
@@ -1607,6 +1934,22 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
                     if p and str(p) not in parameters:
                         parameters.append(str(p))
 
+        # Save discovered credentials and secrets into target state
+        creds = intel.get("credentials", []) if isinstance(intel, dict) else []
+        secrets = intel.get("secrets", []) if isinstance(intel, dict) else []
+        if creds and hasattr(target, "state") and isinstance(target.state, dict):
+            if "credentials" not in target.state or not isinstance(target.state["credentials"], list):
+                target.state["credentials"] = []
+            for c in creds:
+                if c not in target.state["credentials"]:
+                    target.state["credentials"].append(c)
+        if secrets and hasattr(target, "state") and isinstance(target.state, dict):
+            if "secrets" not in target.state or not isinstance(target.state["secrets"], list):
+                target.state["secrets"] = []
+            for s in secrets:
+                if s not in target.state["secrets"]:
+                    target.state["secrets"].append(s)
+
         try:
             update_from_spider(
                 target,
@@ -1623,6 +1966,8 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
             "endpoints_found": len(endpoints),
             "js_routes_found": len(js_routes),
             "parameters_found": len(parameters),
+            "credentials_exposed": creds[:20],
+            "secrets_exposed": secrets[:20],
             "sample_endpoints": endpoints[:30],
             "forms_found": len(intel.get("forms", [])),
             "parameters": parameters[:20],
@@ -1925,37 +2270,19 @@ def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     fullpage = bool(args.get("fullpage", False))
 
     # Resolve headers and session cookies for authenticated screenshots
-    custom_headers = dict(args.get("headers") or {})
-    cookies_input = args.get("cookies") or args.get("cookie")
-    cookies_dict: Dict[str, str] = {}
-
-    if cookies_input:
-        if isinstance(cookies_input, dict):
-            cookies_dict.update({str(k): str(v) for k, v in cookies_input.items()})
-        else:
-            for pair in str(cookies_input).split(";"):
-                if "=" in pair:
-                    k, v = pair.strip().split("=", 1)
-                    cookies_dict[k.strip()] = v.strip()
+    custom_headers = normalize_headers(args.get("headers"))
+    cookies_dict = normalize_cookies(args.get("cookies") or args.get("cookie"))
 
     # Auto-attach saved session cookies and headers from target.state
     if hasattr(target, "state") and isinstance(target.state, dict):
-        saved_cookies = target.state.get("cookies")
-        if saved_cookies and isinstance(saved_cookies, dict):
-            for k, v in saved_cookies.items():
-                cookies_dict.setdefault(str(k), str(v))
-        saved_cookie = target.state.get("session_cookie")
-        if saved_cookie and "=" in str(saved_cookie):
-            for pair in str(saved_cookie).split(";"):
-                if "=" in pair:
-                    k, v = pair.strip().split("=", 1)
-                    cookies_dict.setdefault(k.strip(), v.strip())
-        saved_headers = target.state.get("headers")
-        if saved_headers and isinstance(saved_headers, dict):
-            for k, v in saved_headers.items():
-                custom_headers.setdefault(k, str(v))
+        saved_cookies = normalize_cookies(target.state.get("cookies") or target.state.get("session_cookie"))
+        for k, v in saved_cookies.items():
+            cookies_dict.setdefault(k, v)
+        saved_headers = normalize_headers(target.state.get("headers"))
+        for k, v in saved_headers.items():
+            custom_headers.setdefault(k, v)
         saved_token = target.state.get("auth_token") or target.state.get("forged_token")
-        if saved_token and "Authorization" not in custom_headers:
+        if saved_token and not any(k.lower() == "authorization" for k in custom_headers):
             custom_headers["Authorization"] = f"Bearer {saved_token}"
 
     # Build cookie header if cookies present
@@ -2849,11 +3176,21 @@ class Agent:
                 return str(val)
         return self.target.name
 
-    def execute_tool_call(self, tool_name: str, args: Dict[str, Any], emit: Any = None) -> Dict[str, Any]:
+    def execute_tool_call(self, tool_name: str, args: Any, emit: Any = None) -> Dict[str, Any]:
         """
         Executes a tool with hard code-level scope validation, safe method policy,
         circuit breaker checking, and rate-limiting pacing.
         """
+        if not isinstance(args, dict):
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args)
+                    args = parsed if isinstance(parsed, dict) else {"input": args}
+                except Exception:
+                    args = {"input": args}
+            else:
+                args = {}
+
         spec = TOOL_REGISTRY.get(tool_name)
         if not spec:
             return {"error": f"Tool '{tool_name}' not found in registry."}
@@ -2961,6 +3298,13 @@ class Agent:
                 self.guard.record_failure(host)
             else:
                 self.guard.record_success(host)
+
+            # Auto-extract & persist harvested security artifacts (tokens, passwords, session cookies, keys)
+            try:
+                extract_and_store_artifacts(tool_name, args, result, self.target, turn_number=getattr(self, "_current_turn", len(self.history)))
+            except Exception:
+                pass
+
             return result
         except Exception as e:
             self.guard.record_failure(host)
@@ -2979,12 +3323,9 @@ class Agent:
                 self.target.scope_rules = session_context["scope_rules"]
 
         # Check if the user is asking to recon a target without any scope loaded or defined
-        from hellhound.core.ai_utils import classify_intent, CHAT_PERSONA_SLM
-        intent = classify_intent(user_text)
-
         lower_text = user_text.lower()
         recon_words = ["recon", "scan", "enumerate", "subdomains", "crawl", "spider", "hunt"]
-        has_recon_intent = (intent != "chat") and any(rw in lower_text for rw in recon_words)
+        has_recon_intent = any(rw in lower_text for rw in recon_words)
         
         # Check if there is a target defined in the prompt or active context
         domain_match = re.search(r'([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.[a-zA-Z]{2,})', user_text)
@@ -3065,12 +3406,51 @@ class Agent:
 
             known_eps = (self.target.state.get("endpoints") or [])[:35]
             known_params = (self.target.state.get("spider_intel") or {}).get("parameters", [])[:15]
+            known_creds = self.target.state.get("credentials") or (self.target.state.get("spider_intel") or {}).get("credentials", [])
+            known_secrets = self.target.state.get("secrets") or (self.target.state.get("spider_intel") or {}).get("secrets", [])
+            active_cookies = self.target.state.get("cookies") or self.target.state.get("session_cookie")
+            active_auth = self.target.state.get("auth_token")
+
+            artifact_ledger = format_artifact_inventory(self.target)
+            artifact_header = f"\n{artifact_ledger}\n" if artifact_ledger else ""
+
+            intel_parts = []
             if known_eps:
-                intel_block = "Endpoints already discovered:\n" + "\n".join(f"  - {e}" for e in known_eps)
-                if known_params:
-                    intel_block += "\nParameters already mapped:\n" + "\n".join(f"  - {p}" for p in known_params)
+                intel_parts.append("Endpoints already discovered:\n" + "\n".join(f"  - {e}" for e in known_eps))
+            if known_params:
+                intel_parts.append("Parameters already mapped:\n" + "\n".join(f"  - {p}" for p in known_params))
+            if known_creds:
+                cred_lines = []
+                for c in known_creds[:15]:
+                    if isinstance(c, dict):
+                        ident = c.get("identity") or c.get("username") or c.get("user") or "identity"
+                        tok = c.get("token") or c.get("auth_token") or c.get("value")
+                        pwd = c.get("password") or c.get("pass")
+                        mfa = c.get("mfa_secret") or c.get("mfa")
+                        src = c.get("url") or c.get("source_url") or ""
+                        details = []
+                        if tok: details.append(f"Token={tok}")
+                        if pwd: details.append(f"Password={pwd}")
+                        if mfa: details.append(f"MFA={mfa}")
+                        if not details: details.append(str(c))
+                        cred_lines.append(f"  - [{ident}] {', '.join(details)}" + (f" (source: {src})" if src else ""))
+                    else:
+                        cred_lines.append(f"  - {c}")
+                if cred_lines:
+                    intel_parts.append("HARVESTED IDENTITIES, CREDENTIALS & LEAKED TOKENS:\n" + "\n".join(cred_lines))
+            if active_cookies or active_auth:
+                session_lines = []
+                if active_cookies:
+                    session_lines.append(f"  - Cookies: {active_cookies}")
+                if active_auth:
+                    session_lines.append(f"  - Auth Token / Bearer: {active_auth}")
+                intel_parts.append("ACTIVE SESSION STATE:\n" + "\n".join(session_lines))
+
+            if intel_parts:
+                intel_block = "\n\n".join(intel_parts)
             else:
                 intel_block = "(nothing gathered yet this session)"
+
             try:
                 intel_block += "\n\n" + build_investigation_summary(self.target)
             except Exception:
@@ -3084,8 +3464,9 @@ class Agent:
 You are HELLHOUND Orchestrator. Your sole job is to evaluate if a tool should be executed next or if tool execution is complete.
 
 TARGET: {self.target.name}
+RESEARCHER MISSION & OBJECTIVE: {original_user_text}
 SCOPE: {scope_summary}{path_scope_prompt}
-
+{artifact_header}
 {skills_block}
 
 SKILL MENU (call load_skill(name) if none of the above matches this task — do this BEFORE your first recon/exploit tool call):
@@ -3098,41 +3479,85 @@ ALREADY GATHERED THIS SESSION (do not re-run a tool to re-discover this):
 {intel_block}
 
 RULES:
-1. ONLY call tools when the user explicitly requests active reconnaissance, scanning, enumeration, or analysis of a target.
-2. If the user asks a complex question, hypothetical scenario, asks for cybersecurity advice, or requests a report/summary based on existing findings, do NOT call unnecessary tools. Output "DONE".
-3. For greetings, casual questions, or general discussion, do NOT call any tools. Output "DONE".
-4. Systematic Route, Script & Client Intelligence Discovery (NEVER GUESS BLIND):
-   - When tools return HTML or JSON, check `discovered_script_assets` or script tags (e.g. `/assets/*.js`, `/static/js/*.js`, `main.js`, `app.js`).
-   - If JavaScript bundle files are present, you MUST fetch and read the `.js` files using `curl` BEFORE probing or guessing backend API endpoints.
-   - Analyze the downloaded JavaScript to extract the real route tables, actual API endpoints (`/api/...`), and client-side authorization conditions.
-   - DO NOT run blind directory fuzzers or invent random API paths when the application's actual JavaScript defines the exact endpoints.
-5. Evidence-Driven Multi-Vector Testing & Exploitation:
+1. DECISION & TOOL SELECTION:
+   - If the user's message is a question, discussion, methodology reflection (e.g. "why did you...", "why didn't you...", "what about..."), request for explanation, or if no new tool execution is required, output "DONE".
+   - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a target endpoint is required right now.
+
+2. MISSION OBJECTIVE FIDELITY & IDENTITY VERIFICATION (CRITICAL):
+   - TARGET ACCOUNT / ROLE: Pay close attention to the specific target requested (e.g. Administrator, Chief of Medicine, designated high-privilege role, or specific user ID requested by the researcher).
+   - DIRECTORY ROSTERS ARE NOT ACCOUNT TAKEOVER: Requesting directory or user roster endpoints (e.g. `/users`, `/staff`, `/directory`, `/team`) returns a shared or public list of accounts. Seeing the target user in a list table does NOT mean you have taken over their account. To check your active identity, inspect your session cookie, profile endpoint (e.g. `/profile`, `/me`, `/account`), or the user avatar/menu in the page header.
+   - STEPPING STONES ARE NOT OBJECTIVE COMPLETION: Gaining access to a stepping-stone account (e.g. standard user, support account, or intermediate role) is solely an intermediate step to learn mechanics.
+     * DO NOT call `record_finding` claiming takeover of the primary target.
+     * DO NOT call `gowitness` as proof of the primary target.
+     * DO NOT output "DONE" or stop the hunt!
+   - IDOR ON TARGET PROFILE ENDPOINTS:
+     * When authenticated as a stepping-stone or normal user, probe for IDOR across target IDs: `curl` GET `/profile/1`, `/portal/profile/1`, `/api/user/1`, `/users/1/profile`.
+     * Inspect the raw HTML/JSON and embedded JavaScript state (`window.INIT_PROFILE`, `window.__INITIAL_STATE__`, JSON objects) to harvest the target's `auth_token`, API keys, session tokens, MFA seeds, or password hashes.
+   - MECHANICAL FIELD-NAME MATCHING & CROSS-CHECKING (CRITICAL):
+     * Before constructing a request to any endpoint accepting a parameter matching `token|key|secret|auth|session|sid|delegation`, cross-check every entry in the HARVESTED ARTIFACT INVENTORY for a plausible match, regardless of exact field-name spelling. A field named `auth_token`, `access_token`, `delegation_key`, or `cmo_secret` are all candidates for a parameter named `token`. Do not conclude a new token must be found until the existing inventory has been checked.
+   - PRE-FLIGHT RECON GATING (PREVENT REACTIVE TOOL BIAS):
+     * When a token-accepting or delegation handler is discovered (e.g. `/login/impersonate?token=...`, `/auth/claim`, `/reset-password?code=...`), check the HARVESTED ARTIFACT INVENTORY first.
+     * DO NOT trigger new recon, spidering, or fuzzing if a matching artifact for the primary target is already present in the inventory. Prioritize testing the existing harvested artifact immediately!
+   - AUTONOMOUS ARTIFACT & TOKEN CHAINING (CRITICAL):
+     * When an impersonation or delegation handler is discovered (e.g. delegation endpoint or token redemption URL like `/login/impersonate?token=...`):
+     * Check the HARVESTED ARTIFACT INVENTORY for the PRIMARY TARGET's leaked token (e.g. Dr. Harlan's `auth_token` obtained from `/portal/profile/1`).
+     * IMMEDIATELY execute `curl` with `GET /login/impersonate?token=<target_leaked_token>` (or the corresponding discovered handler URL) to redeem the target's token.
+     * When the redemption request succeeds (HTTP 302 with a new `Set-Cookie`), use that new session cookie in subsequent `curl` requests to explore privileged routes (`/portal/records`, `/portal/admin`, `/portal/profile`), find all flags and sensitive data, capture `gowitness` proof, and record the finding.
+
+3. Low-Noise Surgical Reconnaissance First (curl over spider):
+   - On production targets, running an automated multi-depth spider immediately generates excessive noise, triggers WAF blocks, and floods logs.
+   - ALWAYS start reconnaissance by using `curl` to fetch the landing page HTML, `/login`, comments, embedded `<script>` tags, forms, and HTTP response headers.
+   - Inspect JavaScript bundle files (e.g. `main.js`, `app.js`, `/static/js/*`) with `curl` to extract real route tables, actual API endpoints (`/api/...`), and client-side authorization conditions.
+   - DO NOT run blind directory fuzzers or launch heavy spider crawls when surgical probing with `curl` can discover and inspect the endpoints directly.
+   - Run `spider` ONLY as a fallback if low-noise `curl` probing yields no internal endpoints or when comprehensive multi-depth crawling is specifically needed.
+
+4. Evidence-Driven Multi-Vector Testing & Exploitation:
    - Base all attacks on real data structures and routes discovered from application responses and JavaScript analysis.
+   - EXHAUSTIVE RECON FIRST: Fully enumerate HTML source, JavaScript, and parameters before ever attempting to guess default credentials (e.g., admin:admin).
    - When testing authentication and access control:
      a) Register/Login to establish a valid session, and note the session mechanism (opaque cookie vs JWT).
-     b) NEVER attempt JWT attacks (`jwt_forge`, `alg: none`) on opaque session tokens (`sess_...`, `PHPSESSID`, `connect.sid`).
-     c) Map and probe the actual authenticated API endpoints identified in the JavaScript (e.g. account update routes, workspace management, user settings).
-     d) Deep Mass Assignment: When an endpoint rejects direct modification of top-level fields (e.g. `role`), test the secondary or nested property structures discovered during JavaScript analysis.
-     e) Post-Exploitation Verification: When a state-changing request (`PATCH`/`PUT`/`POST`) succeeds (HTTP 200), IMMEDIATELY verify elevated access by re-requesting the previously restricted/forbidden route (e.g. `GET /api/admin/overview` or administrative console) with `curl` to confirm privileged data is now accessible.
-     f) If JWTs are used: test unsigned `alg: none` tokens, algorithm confusion (`RS256` -> `HS256`), and claim tampering (`role`, `sub`, `email`).
-     g) Pivot across discovered endpoints and HTTP verbs (GET, POST, PUT, PATCH, DELETE).
-6. Strict Verification Gate, Visual Proof & Finding Recording (gowitness / record_finding):
+     b) VERIFY LOGIN SUCCESS: HTTP 200 on a login POST often means the server returned the login page again with an error. You MUST read the response body or check for returned session cookies to prove the login actually worked. Do NOT claim account takeover just because the server responded with HTTP 200.
+     c) AUTHENTICATED LOW-NOISE CONTENT MINING: Once logged in, use `curl` to fetch and inspect accessible internal pages (directory, user list, profile views, settings, reset pages) before running automated tools:
+        - Mine intelligence about target or administrative accounts — such as identifiers, personal details, security question answers (personal history, education, dates), or password reset hints.
+        - Check client-side JavaScript state (e.g. `window.__INITIAL_STATE__`, `window.__CONFIG__`, or embedded JSON objects in `<script>` tags) across profile and account views for leaked secrets, identifiers, or tokens.
+     d) DIFFERENTIAL PROBING & IMPERSONATION TOKEN SWAPPING (CRITICAL):
+        - If an action targeting a high-privilege or victim account (e.g. `<endpoint>/<victim_id>/impersonate` or `<endpoint>/<victim_id>/switch`) returns 403 Forbidden or 404, DO NOT STOP!
+        - Probe the exact same endpoint against allowed/normal accounts (e.g. `<endpoint>/<allowed_user_id>/...` or your own account ID) with `GET` and `POST` to understand the underlying delegation mechanism.
+        - If the working response reveals a one-time token, delegation URL, or parameter redirect (e.g., `<auth_handler>?token=<token>`), chain this with any target token harvested earlier by directly requesting `<auth_handler>?token=<victim_token>` to bypass the front-end guard and acquire the victim's session.
+     e) MULTI-VECTOR EXHAUSTION BEFORE GIVING UP:
+        - Never declare failure or output "DONE" after only one vector fails. Systematically evaluate:
+          1. Direct Credential & Secret Leaks (embedded JS objects, comments, profile responses, leaked passwords).
+          2. Differential Mechanism Learning & Token Swapping (delegation/impersonation parameter injection).
+          3. Perimeter & 403/401 Header Bypasses (X-Original-URL, X-Rewrite-URL, X-Forwarded-For: 127.0.0.1, X-Custom-IP-Authorization, path normalization like /admin; or /./admin, and HTTP verb tampering).
+          4. Password Reset & Security Question Intelligence Correlation.
+          5. Mass Assignment & IDOR on user mutation/update endpoints.
+          6. JWT / Session Manipulation (if applicable).
+     f) NEVER attempt JWT attacks (`jwt_forge`, `alg: none`) on opaque session tokens (`sess_...`, `PHPSESSID`, `connect.sid`).
+     g) Map and probe the actual authenticated API endpoints identified in the JavaScript (e.g. account update routes, workspace management, user settings).
+     h) Deep Mass Assignment: When an endpoint rejects direct modification of top-level fields (e.g. `role`), test the secondary or nested property structures discovered during JavaScript analysis.
+     i) Post-Exploitation Verification: When a state-changing request (`PATCH`/`PUT`/`POST`) succeeds (HTTP 200), IMMEDIATELY verify elevated access by re-requesting the previously restricted/forbidden route (e.g. administrative console or protected resource) with `curl` to confirm privileged data is now accessible.
+     j) If JWTs are used: test unsigned `alg: none` tokens, algorithm confusion (`RS256` -> `HS256`), and claim tampering (`role`, `sub`, `email`).
+     k) Pivot across discovered endpoints and HTTP verbs (GET, POST, PUT, PATCH, DELETE).
+
+5. Strict Verification Gate, Visual Proof & Finding Recording (gowitness / record_finding):
    - In modern Single-Page Applications (SPAs), HTTP 200 merely returns the frontend shell. Inspect the response body or screenshot for error states: "403", "Owner access required", "Access Denied", "Forbidden", or login prompts.
-   - A privilege escalation or bypass is ONLY confirmed when privileged data (billing secrets, API keys, member directories, configuration settings) is genuinely returned or unlocked.
-   - MANDATORY ACTION BEFORE OUTPUTTING 'DONE': Whenever you successfully authenticate, escalate privileges (e.g. customer -> ops_admin/admin/owner), or access internal/restricted tooling:
+   - A privilege escalation or bypass is ONLY confirmed when privileged data (billing secrets, API keys, member directories, configuration settings) of the TARGET role/account is genuinely returned or unlocked.
+   - PROOF OF PRIMARY TARGET ONLY: Capture `gowitness` screenshots and record findings for the PRIMARY target account once compromised. Do NOT capture a screenshot of an allowed stepping-stone user and treat it as proof of the primary goal's completion.
+   - MANDATORY ACTION BEFORE OUTPUTTING 'DONE': Whenever you successfully authenticate as the PRIMARY requested target role/account:
      1. Capture visual proof of the unlocked page or dashboard using `gowitness`.
      2. Record the confirmed vulnerability and reproduction proof using `record_finding`.
      3. ONLY after executing both tools, output "DONE".
-7. To call a tool, respond ONLY with pure JSON (do NOT output natural language commentary or '(Suggested next tool: ...)'):
+
+6. To call a tool, respond ONLY with pure JSON (do NOT output natural language commentary or '(Suggested next tool: ...)'):
 ```json
 {{
   "tool": "<tool_name>",
   "args": {{ ... }}
 }}
 ```
-8. When testing authentication or password recovery workflows, harvest real user identities/emails from application content or endpoints rather than inventing dummy emails.{path_rule}
-9. If no further tools are needed, or after recording all findings and capturing visual proof, respond with "DONE".
-10. If the task doesn't clearly match the skill content already provided above, check the SKILL MENU and call `load_skill` with the best-matching name before doing anything else — don't guess a methodology blind when a better-fitting one is available by name.
+7. When testing authentication or password recovery workflows, harvest real user identities/emails from application content or endpoints rather than inventing dummy emails.{path_rule}
+8. If no further tools are needed, or after recording all findings and capturing visual proof of the PRIMARY target, respond with "DONE".
+9. If the task doesn't clearly match the skill content already provided above, check the SKILL MENU and call `load_skill` with the best-matching name before doing anything else.
 """
 
         # Build live investigation context summary
@@ -3148,7 +3573,7 @@ RULES:
         if self._turn_path_scope:
             path_scope_synth = f"\nACTIVE PATH SCOPE: '{self._turn_path_scope}'"
 
-        report_requested = any(kw in original_user_text.lower() for kw in ("report", "hackerone", "bug bounty", "poc report", "draft report", "submission", "writeup", "finding", "findings", "proof", "takeover", "summary", "document"))
+        report_requested = any(kw in original_user_text.lower() for kw in ("report", "hackerone", "bug bounty", "poc report", "draft report", "submission", "writeup"))
         has_critical_findings = (
             len(self.target.findings) > 0 
             or any(f.get("severity") in ("CRITICAL", "HIGH", "critical", "high") for f in self.target.findings)
@@ -3159,46 +3584,32 @@ RULES:
         if report_requested and has_critical_findings:
             report_directive = f"""
 CRITICAL INSTRUCTION - VULNERABILITY REPORT & PROOF OF CONCEPT DIRECTIVE:
-When a vulnerability (such as Account Takeover, Auth Bypass, JWT Algorithm Confusion, Token Leakage, or IDOR) is confirmed or the researcher requests a report, format your response as a complete, professional, ready-to-submit HackerOne markdown vulnerability report:
-
-# [Vulnerability Title: e.g. Critical Authentication Bypass via Password Reset Token Leakage leading to Account Takeover OR JWT Algorithm Confusion leading to Full Account Takeover]
-
-## Summary
-[Concise executive summary of the vulnerability, root cause, and how it was discovered.]
-
-## Vulnerability Classification
-- **Vulnerability Type**: Authentication Bypass / Token Leakage / Account Takeover / Improper Cryptographic Signature Verification
-- **Weakness**: CWE-640 (Weak Password Recovery Mechanism) / CWE-287 (Improper Authentication) / CWE-347 (Improper Verification of Cryptographic Signature) / CWE-200 (Exposure of Sensitive Information)
-- **Severity**: Critical (CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H - 9.8)
-
-## Affected Asset & Endpoints
-- **Target Host**: `{self.target.name}`
-- **Vulnerable Endpoints / Parameters**:
-  - Discovered Endpoint / Parameter: `POST/GET https://{self.target.name}{self._turn_path_scope or ''}/...`
-  - Discovered Authenticated UI / Dashboard: `GET https://{self.target.name}{self._turn_path_scope or ''}/...`
-
-## Step-by-Step Proof of Concept (PoC)
-[Provide exact, reproducible curl commands with real request bodies, forged JWT tokens or reset codes, and response snippets harvested during testing.]
-
-## Evidence & Screenshots
-[Detail the captured gowitness visual screenshots in ~/.hellhound/targets/{self.target.name}/screenshots/ and authenticated session tokens demonstrating privileged access to confidential records or administrator settings.]
-
-## Business & Security Impact
-[Explain the impact of full account takeover: access to confidential records/PII, unauthorized actions, takeover of administrator/staff accounts, and data exfiltration.]
-
-## Remediation & Mitigation
-[Exact developer remediation recommendations, e.g. enforce strict algorithm allowlists rejecting 'none' and symmetric HMAC when expecting asymmetric RSA, deliver tokens strictly via out-of-band email, invalidate tokens on use, enforce rate limits, and sanitize debug previews in production API responses.]
+You must provide a structured, professional HackerOne-ready bug bounty submission report formatted in clean GitHub Markdown:
+1. Vulnerability Title (Clear, concise, HackerOne style).
+2. Vulnerability Details & Attack Chain Narrative: Detail the entire attack path step-by-step.
+3. Steps to Reproduce (Deterministic PoC): Exact HTTP requests and curl commands.
+4. Business Impact & Risk Analysis.
+5. Remediation Guidance.
 """
 
         # ── 2. Comprehensive Synthesizer System Prompt (Deep Reasoning & Synthesis)
+        custom_synth_persona = (
+            session_context.get("synthesizer_persona") 
+            or session_context.get("options", {}).get("synthesizer_persona")
+            or cfg.get("synthesizer_persona")
+            or SYNTHESIZER_PERSONA
+        )
+
+        artifact_inventory_synth = format_artifact_inventory(self.target)
+        artifact_block_synth = f"\n{artifact_inventory_synth}\n" if artifact_inventory_synth else ""
+
         synthesizer_system_prompt = f"""\
-You are HELLHOUND, an autonomous bug bounty reconnaissance and triage assistant.
-Your role: Provide the researcher with deep, factual analysis, evidence evaluation, severity classification, and actionable bug bounty triage recommendations.
+{custom_synth_persona}
 
 TARGET: {self.target.name}
 SCOPE CONSTRAINTS: {scope_summary}{path_scope_synth}
 CURRENT FINDINGS: {len(self.target.findings)} verified findings
-
+{artifact_block_synth}
 AVAILABLE TOOLS (this is the complete, real list — you have no other tools):
 {tools_summary}
 
@@ -3208,49 +3619,20 @@ AVAILABLE TOOLS (this is the complete, real list — you have no other tools):
 {report_directive}
 INSTRUCTIONS:
 - Review the entire conversation history, executed tools, and gathered evidence.
-- When security vulnerabilities, authentication bypasses, or data exposures are discovered:
-  1. Concrete Proof of Concept & Evidence: Detail the exact endpoints, parameters, harvested identities, leaked tokens/passwords, and specific sensitive assets accessed (e.g., exposed API keys, environment secrets, PHI/PII records, bucket URLs) discovered in tool outputs.
-  2. Attack Chain & Reproduction: Provide a clean, step-by-step reproduction sequence.
-  3. Severity & Bounty Impact Escalation: Provide the vulnerability classification (e.g., Critical / High under VRT / CVSS), explain the full business and security impact (e.g., unauthorized access to protected records, privilege escalation), and highlight key evidence researchers can emphasize to maximize bounty rewards.
-  4. Next Triage & Reporting Action: Outline immediate reporting recommendations and safe remediation guidance.
-- When asked about your capabilities, tools, or what you can do: answer ONLY
-  from the AVAILABLE TOOLS list above. Never claim access to external tools
-  not in that list (Nmap, Burp Suite, Metasploit, etc. are NOT available
-  unless they literally appear above). Never claim you lack tool access —
-  you have the tools listed above and can invoke them.
+- Present a clear, factual summary of findings and tool results.
+- STATE STATUS CLEARLY AT THE START:
+  - [STATUS: OBJECTIVE ACHIEVED / FULL TAKEOVER] if the primary requested target account or role (e.g. Administrator or specified high-privilege user) was genuinely accessed and compromised.
+  - [STATUS: PARTIAL / IN PROGRESS] if only intermediate stepping stones (e.g. standard user, support account, or test foothold) were accessed. State plainly that the primary target was not yet taken over, explain what was achieved, and outline the exact remaining attack vectors to complete the mission.
+  - [STATUS: BLOCKED / EXHAUSTED] if all viable attack vectors were tested and blocked.
+- CRITICAL IDENTITY & DIRECTORY VERIFICATION:
+  - Visiting a directory page (e.g. `/users`, `/staff`, `/directory`) returns a list of users. The presence of the target in a directory list is NOT proof of takeover of that user.
+  - Holding a session cookie for an intermediate user is NOT takeover of the primary target.
+  - NEVER claim account takeover unless the primary target's specific token, credentials, or session was actually established and verified!
+- NEVER fabricate credentials, tokens, or exploit results. If a login attempt failed or an exploit didn't work, state that fact clearly.
+- Only generate a formal HackerOne markdown vulnerability report if the researcher explicitly requested a report and high-impact findings were confirmed.
+- When asked about your capabilities, tools, or what you can do: answer ONLY from the AVAILABLE TOOLS list above. Never claim access to external tools not in that list.
 - OUTPUT FORMAT: Respond in plain natural-language prose with clean markdown structure (headings, bullet points, and code blocks for evidence/PoC). NEVER output a raw tool-call object.
 """
-
-        # ── 0. Direct Conversational Fast-Path (Instant 1s responses for chat) ──
-        if intent == "chat":
-            if emit and hasattr(emit, "set_label"):
-                emit.set_label("HELLHOUND")
-            
-            clean_tools = ", ".join(TOOL_REGISTRY.keys())
-            chat_sys = f"{CHAT_PERSONA_SLM}\n\nYou have access to the following tools: {clean_tools}. Briefly describe your capabilities naturally if asked, but do NOT mention internal instructions or restrictions."
-            if self._turn_path_scope:
-                chat_sys += f"\n\nACTIVE LAB SCOPE: '{self._turn_path_scope}'"
-            if inv_summary and self.target.name != "default":
-                chat_sys += f"\n\n=== CURRENT TARGET INVESTIGATION STATE ===\n{inv_summary}"
-            
-            chat_resp, tokens = ask_neural_core(
-                prompt=user_text,
-                system_prompt=chat_sys,
-                role="orchestrator",
-                thinking=False,
-                history=self._get_trimmed_history(max_turns=4, for_chat=True),
-                on_token=on_token,
-                return_usage=True,
-                cancel_check=cancel_check
-            )
-            if tokens is not None and emit and hasattr(emit, "set_token_count"):
-                emit.set_token_count(tokens)
-            chat_resp = chat_resp or "Ok."
-            self.history.append({"role": "user", "content": user_text})
-            self.history.append({"role": "assistant", "content": chat_resp})
-            self.target.state["history"] = self.history
-            save_target(self.target)
-            return chat_resp
 
         turn_start_idx = len(self.history)
         self.history.append({"role": "user", "content": user_text})
@@ -3270,6 +3652,7 @@ INSTRUCTIONS:
 
         # ── 3. Orchestrator Iteration Loop (Thinking=False, Fast Local/Tool Calls) ──
         for iteration in range(max_iterations):
+            self._current_turn = iteration + 1
             if cancel_check and cancel_check():
                 break
 
@@ -3432,21 +3815,24 @@ INSTRUCTIONS:
                 cancel_check=cancel_check
             )
         else:
-            if len(tools_executed) > 0 or (report_requested and has_critical_findings):
+            if report_requested and has_critical_findings:
                 synth_prompt = (
-                    f"The researcher requested/instructed: \"{original_user_text}\"\n\n"
+                    f"The researcher requested: \"{original_user_text}\"\n\n"
                     f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
-                    f"CRITICAL: Synthesize all results for target '{self.target.name}' into a complete, professional, deep technical vulnerability breakdown and triage report. Include:\n"
-                    f"- Executive Summary & Root Cause: What vulnerability or authorization bypass was identified and how it functions.\n"
-                    f"- Step-by-Step Proof of Concept (PoC): Provide exact, reproducible curl commands with real request bodies, headers, JSON payloads, and response snippets harvested during testing.\n"
-                    f"- Unlocked Access & Impact: Detail elevated roles (e.g. customer -> ops_admin/owner), exposed tenant data, sensitive endpoints, or internal tooling accessed.\n"
-                    f"- Severity Classification & Business Risk (VRT / CVSS rating).\n"
-                    f"- Concrete Next Steps for the researcher."
+                    f"Generate a complete, professional HackerOne vulnerability report based strictly on the verified findings and actual evidence gathered."
                 )
             else:
                 synth_prompt = (
-                    f"The researcher asked: \"{original_user_text}\"\n\n"
-                    f"Synthesize the investigation state for target '{self.target.name}' and provide concrete security recommendations."
+                    f"The researcher asked/instructed: \"{original_user_text}\"\n\n"
+                    f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
+                    f"Synthesize the investigation results factually, clearly, and concisely based strictly on real tool outputs.\n"
+                    f"- Check: What was the primary requested target account/role? Did tool outputs prove compromise of THAT exact account, or only an intermediate stepping-stone account?\n"
+                    f"- Explain what was tested and what was observed in the tool outputs (status codes, returned HTML/JSON, cookies, credentials/comments).\n"
+                    f"- If a user directory or member table was returned, note that this is a directory listing, not an account takeover of the members in that table.\n"
+                    f"- If only an intermediate session or low-privilege foothold was obtained, set [STATUS: PARTIAL / IN PROGRESS] and explain the exact next step to achieve full takeover of the primary target.\n"
+                    f"- If a login attempt failed (e.g. returned 'Invalid username or password' or login form despite HTTP 200), state that it failed and do NOT claim account takeover.\n"
+                    f"- Outline the next logical testing steps.\n"
+                    f"- Do NOT generate a rigid, multi-section formal vulnerability report unless the user explicitly requested a report."
                 )
 
             if len(tools_executed) > 0 and cfg.get("show_recaps", True):
