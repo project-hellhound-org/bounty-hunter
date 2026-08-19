@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from typing import Dict, Any, List, Optional, Callable, Tuple, Set
 from urllib.parse import urlparse
 
@@ -2838,8 +2839,6 @@ def _execute_load_skill(args: Dict[str, Any], target: Target, emit: Any) -> Dict
     body = load_skill_body(name)
     if not body:
         return {"error": f"Skill '{name}' has no content."}
-    if emit and hasattr(emit, "success"):
-        emit.success(f"[✓] Loaded skill: {name}")
     return {"skill": name, "methodology": body}
 
 
@@ -3533,9 +3532,66 @@ class Agent:
 
         if guard_result.get("decision") == "require_approval":
             reason = guard_result.get("reason", "Method requires human approval")
-            if emit and hasattr(emit, "warn"):
-                emit.warn(f"[!] GUARD APPROVAL REQUIRED: {reason}")
-            return {"error": f"requires human approval: {reason}", "requires_approval": True}
+            approved = False
+            # Check if interactive session with stdin attached
+            if sys.stdin and sys.stdin.isatty():
+                was_running = False
+                if emit:
+                    if hasattr(emit, "stop_indicator"):
+                        emit.stop_indicator()
+                        was_running = True
+                    elif hasattr(emit, "stop"):
+                        emit.stop()
+                        was_running = True
+
+                print("\n")
+                try:
+                    from rich.console import Console
+                    from rich.panel import Panel
+                    _c = Console()
+                    _c.print(Panel(
+                        f"[bold yellow]Tool:[/bold yellow] [white]{tool_name}[/white]\n"
+                        f"[bold yellow]Action:[/bold yellow] [bold red]{method}[/bold red] [white]{url}[/white]\n"
+                        f"[bold yellow]Reason:[/bold yellow] [white]{reason}[/white]",
+                        title="[bold red] ⚠️  GUARD APPROVAL REQUIRED [/bold red]",
+                        border_style="bold red",
+                        expand=False
+                    ))
+                except Exception:
+                    print(f" [!] GUARD APPROVAL REQUIRED: {reason}")
+                    print(f" [!] Tool: {tool_name} | Action: {method} {url}")
+
+                try:
+                    ans = input(" \033[1;33m[?] Authorize this destructive action? [y/N]:\033[0m ").strip().lower()
+                    approved = ans in ("y", "yes")
+                except (KeyboardInterrupt, EOFError):
+                    approved = False
+
+                if was_running and emit:
+                    if hasattr(emit, "restart_indicator"):
+                        emit.restart_indicator()
+                    elif hasattr(emit, "start"):
+                        emit.start()
+
+                if approved:
+                    if emit and hasattr(emit, "success"):
+                        emit.success(f"Action authorized by user — executing {tool_name}")
+                else:
+                    if emit and hasattr(emit, "warn"):
+                        emit.warn(f"Action rejected by user — blocked {tool_name}")
+                    return {
+                        "error": f"Action rejected by user: {reason}. The destructive request '{method} {url}' was NOT executed.",
+                        "blocked": True,
+                        "approval_denied": True
+                    }
+            else:
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(f"[!] GUARD APPROVAL REQUIRED: {reason} (non-interactive session)")
+                return {
+                    "error": f"requires human approval (non-interactive session): {reason}",
+                    "requires_approval": True,
+                    "blocked": True
+                }
 
         # 4. Rate Limiter (Pacing)
         is_recon = tool_name in ("subfinder", "dns_bruteforce", "httpx", "dig", "subzy", "vhost_fuzz", "gowitness")
@@ -3574,7 +3630,7 @@ class Agent:
         original_user_text = user_text
         if session_context:
             t_name = session_context.get("target") or session_context.get("target_name")
-            if t_name and t_name != self.target.name:
+            if t_name and t_name != "default" and t_name != self.target.name:
                 self.set_target(t_name)
             if session_context.get("scope_rules"):
                 self.target.scope_rules = session_context["scope_rules"]
@@ -3595,6 +3651,10 @@ class Agent:
             primary_domain = self.target.scope_rules.in_scope[0].lstrip("*.")
             if primary_domain and "." in primary_domain:
                 self.set_target(primary_domain)
+
+        if session_context is not None:
+            session_context["target"] = self.target.name
+            session_context["scope_rules"] = self.target.scope_rules
 
         # Auto-scope shortcut ONLY when CTF/lab target criteria are met
         if domain_match and is_ctf_auto_scope_eligible(self.target.name, user_text):
@@ -3749,33 +3809,24 @@ RULES:
    - CONVERSATIONAL & EDUCATIONAL QUERIES: If the user's message is a question, discussion, explanation request, concept breakdown, or methodology inquiry (e.g. "explain...", "how does...", "what is...", "why did..."), output "DONE" immediately.
    - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a valid, in-scope target endpoint is required right now.
 
-2. MISSION OBJECTIVE FIDELITY & IDENTITY VERIFICATION (CRITICAL):
-   - TARGET ACCOUNT / ROLE: Pay close attention to the specific target requested (e.g. Administrator, Chief of Medicine, designated high-privilege role, or specific user ID requested by the researcher).
-   - DIRECTORY ROSTERS ARE NOT ACCOUNT TAKEOVER: Requesting directory or user roster endpoints (e.g. `/users`, `/staff`, `/directory`, `/team`) returns a shared or public list of accounts. Seeing the target user in a list table does NOT mean you have taken over their account. To check your active identity, inspect your session cookie, profile endpoint (e.g. `/profile`, `/me`, `/account`), or the user avatar/menu in the page header.
-   - STEPPING STONES ARE NOT OBJECTIVE COMPLETION: Gaining access to a stepping-stone account (e.g. standard user, support account, or intermediate role) is solely an intermediate step to learn mechanics.
-     * DO NOT call `record_finding` claiming takeover of the primary target.
-     * DO NOT call `gowitness` as proof of the primary target.
-     * DO NOT output "DONE" or stop the hunt!
-   - IDOR ON TARGET PROFILE ENDPOINTS:
-     * When authenticated as a stepping-stone or normal user, probe for IDOR across target IDs: `curl` GET `/profile/1`, `/portal/profile/1`, `/api/user/1`, `/users/1/profile`.
-     * Inspect the raw HTML/JSON and embedded JavaScript state (`window.INIT_PROFILE`, `window.__INITIAL_STATE__`, JSON objects) to harvest the target's `auth_token`, API keys, session tokens, MFA seeds, or password hashes.
-   - MECHANICAL FIELD-NAME MATCHING & CROSS-CHECKING (CRITICAL):
-     * Before constructing a request to any endpoint accepting a parameter matching `token|key|secret|auth|session|sid|delegation`, cross-check every entry in the HARVESTED ARTIFACT INVENTORY for a plausible match, regardless of exact field-name spelling. A field named `auth_token`, `access_token`, `delegation_key`, or `cmo_secret` are all candidates for a parameter named `token`. Do not conclude a new token must be found until the existing inventory has been checked.
-   - PRE-FLIGHT RECON GATING (PREVENT REACTIVE TOOL BIAS):
-     * When a token-accepting or delegation handler is discovered (e.g. `/login/impersonate?token=...`, `/auth/claim`, `/reset-password?code=...`), check the HARVESTED ARTIFACT INVENTORY first.
-     * DO NOT trigger new recon, spidering, or fuzzing if a matching artifact for the primary target is already present in the inventory. Prioritize testing the existing harvested artifact immediately!
-   - AUTONOMOUS ARTIFACT & TOKEN CHAINING (CRITICAL):
-     * When an impersonation or delegation handler is discovered (e.g. delegation endpoint or token redemption URL like `/login/impersonate?token=...`):
-     * Check the HARVESTED ARTIFACT INVENTORY for the PRIMARY TARGET's leaked token (e.g. Dr. Harlan's `auth_token` obtained from `/portal/profile/1`).
-     * IMMEDIATELY execute `curl` with `GET /login/impersonate?token=<target_leaked_token>` (or the corresponding discovered handler URL) to redeem the target's token.
-     * When the redemption request succeeds (HTTP 302 with a new `Set-Cookie`), use that new session cookie in subsequent `curl` requests to explore privileged routes (`/portal/records`, `/portal/admin`, `/portal/profile`), find all flags and sensitive data, capture `gowitness` proof, and record the finding.
+2. MISSION OBJECTIVE FIDELITY & AUTONOMOUS EXPLOIT PROGRESSION (CRITICAL):
+   - TARGET ACCOUNT / ROLE: Focus strictly on the primary requested target (e.g. Administrator or specified high-privilege role/user).
+   - AUTONOMOUS ARTIFACT & TOKEN CHAINING (NEVER STOP HALFWAY):
+     * When you successfully exfiltrate, leak, or discover a token, password reset key, session secret, API credential, or OTP (e.g. via SSPP, IDOR, or JavaScript state):
+     * DO NOT STOP to output natural-language summaries, partial reports, or disclaimers stating "this is not account takeover yet".
+     * Dynamically trace how the application consumes this artifact: inspect the target's client JavaScript, form action attributes, route handlers, or API specifications (e.g. URL query/route parameters, JSON payload keys, form input fields, or authentication headers).
+     * IMMEDIATELY execute the next tool call with `curl` to submit the token to the discovered consumption handler, parse any required form/API schema, complete the credential update or redemption, and acquire the elevated session.
+     * Continue testing until the target account is genuinely compromised, the administrative/privileged dashboard is reached, mission objectives are fulfilled, visual proof (`gowitness`) is captured, and the finding is recorded!
+   - STEPPING STONES VS PRIMARY TARGET:
+     * Gaining access to a stepping-stone account (e.g. standard user, support account) is an intermediate step to learn mechanics.
+     * When authenticated as a stepping-stone user, probe for IDOR or parameter escalation on profile/setting endpoints (`curl` GET `/api/user/<target_id>`, `/profile/<target_id>`) and inspect client-side JavaScript state (`window.__INITIAL_STATE__`, embedded objects) to harvest the target's credentials or tokens.
+     * Before constructing a request accepting tokens or keys, cross-check every entry in the HARVESTED ARTIFACT INVENTORY.
 
-3. Low-Noise Surgical Reconnaissance First (curl over spider):
-   - On production targets, running an automated multi-depth spider immediately generates excessive noise, triggers WAF blocks, and floods logs.
-   - ALWAYS start reconnaissance by using `curl` to fetch the landing page HTML, `/login`, comments, embedded `<script>` tags, forms, and HTTP response headers.
-   - Inspect JavaScript bundle files (e.g. `main.js`, `app.js`, `/static/js/*`) with `curl` to extract real route tables, actual API endpoints (`/api/...`), and client-side authorization conditions.
-   - DO NOT run blind directory fuzzers or launch heavy spider crawls when surgical probing with `curl` can discover and inspect the endpoints directly.
-   - Run `spider` ONLY as a fallback if low-noise `curl` probing yields no internal endpoints or when comprehensive multi-depth crawling is specifically needed.
+3. Low-Noise Surgical Reconnaissance First (HTML & JavaScript Inspection Over Blind Fuzzing):
+   - Always start reconnaissance by using `curl` to fetch the landing page HTML, comments, embedded `<script src="...">` tags, forms, and HTTP response headers.
+   - Inspect JavaScript bundle files (e.g. `main.js`, `app.js`, `/static/js/*`, Webpack chunks) with `curl` to extract real route tables, actual API endpoints (`/api/...`), and client-side form submission logic.
+   - DO NOT run blind directory fuzzers or heavy spider crawls when surgical probing of HTML and JavaScript files directly reveals the endpoints, parameters, and routes.
+   - Run `spider` ONLY as a fallback if low-noise probing yields no internal endpoints.
 
 4. Evidence-Driven Multi-Vector Testing & Exploitation:
    - Base all attacks on real data structures and routes discovered from application responses and JavaScript analysis.
@@ -3803,12 +3854,22 @@ RULES:
      h) Deep Mass Assignment: When an endpoint rejects direct modification of top-level fields (e.g. `role`), test the secondary or nested property structures discovered during JavaScript analysis.
      i) Post-Exploitation Verification: When a state-changing request (`PATCH`/`PUT`/`POST`) succeeds (HTTP 200), IMMEDIATELY verify elevated access by re-requesting the previously restricted/forbidden route (e.g. administrative console or protected resource) with `curl` to confirm privileged data is now accessible.
      j) If JWTs are used: test unsigned `alg: none` tokens, algorithm confusion (`RS256` -> `HS256`), and claim tampering (`role`, `sub`, `email`).
-     k) Pivot across discovered endpoints and HTTP verbs (GET, POST, PUT, PATCH, DELETE).
+     k) SERVER-SIDE PARAMETER POLLUTION (SSPP) & BACKEND QUERY INJECTION:
+        - When testing user-supplied input points (e.g. authentication/recovery, user lookup, profile updates, search filters, webhooks, or API proxies):
+          * Client-Side Asset & Route Recon: Fetch any `<script>` tags, Webpack chunks, or bundle files referenced on the page with `curl` to dynamically discover internal API routes, query parameters, property names, and client submission schemas.
+          * Form & Schema Inspection: Inspect the actual HTML form inputs (`<input name="...">`, hidden fields, CSRF tokens) or JSON API schemas on target endpoints. Always construct requests strictly matching the target's discovered schema.
+          * Delimiter & Truncation Probing: Submit delimiter probes (`%26` / `&`) and truncation probes (`%23` / `#`, or path/JSON breakouts) to determine if user input is concatenated unencoded into internal backend/microservice requests.
+          * HTTP 400 Error Oracles Are Positive Proof of Injection (DO NOT ABORT): In SSPP, error messages like 'Parameter is not supported', 'Field not specified', or 'Invalid field' are CONFIRMATION that the backend query parser received the injected parameter! Never declare failure or stop on 400 errors. Use them to identify backend parameter names and immediately test field overrides.
+          * Internal Field Overriding & Token Extraction: Construct the override payload `<param>=<target_id>%26<discovered_field>=<target_property>%23` using candidate property names mined from JS or error messages to leak sensitive internal data, tokens, or configuration in the response.
+          * Exploit Chaining & Authentication Verification: Immediately chain harvested tokens/credentials into the target's corresponding submission flow. Ensure all required parameters are provided in the payload body and verify HTTP success before proceeding to authenticated testing.
+          * Post-Takeover Verification: Authenticate with the newly established credentials/session, confirm elevated role/privileges on administrative dashboards or restricted APIs, execute required task objectives, capture visual proof (`gowitness`) of the authenticated dashboard, and record the finding.
+     l) Pivot across discovered endpoints and HTTP verbs (GET, POST, PUT, PATCH, DELETE).
 
 5. Strict Verification Gate, Visual Proof & Finding Recording (gowitness / record_finding):
    - In modern Single-Page Applications (SPAs), HTTP 200 merely returns the frontend shell. Inspect the response body or screenshot for error states: "403", "Owner access required", "Access Denied", "Forbidden", or login prompts.
    - A privilege escalation or bypass is ONLY confirmed when privileged data (billing secrets, API keys, member directories, configuration settings) of the TARGET role/account is genuinely returned or unlocked.
-   - PROOF OF PRIMARY TARGET ONLY: Capture `gowitness` screenshots and record findings for the PRIMARY target account once compromised. Do NOT capture a screenshot of an allowed stepping-stone user and treat it as proof of the primary goal's completion.
+   - GUARD / HUMAN APPROVAL & ERROR HONESTY: If a tool returns an error indicating that a request was blocked, required approval, or was rejected by the user (e.g. 'requires human approval', 'Action rejected by user', 'blocked'), the requested action DID NOT HAPPEN. You must NEVER claim that an action was executed, completed, or initiated if the underlying tool call was blocked or rejected.
+   - PROOF OF PRIMARY TARGET ONLY: Capture `gowitness` screenshots and record findings for the PRIMARY target account once compromised. Screenshot the authenticated administrative dashboard (`/admin`), user list, or target view, rather than re-requesting destructive action URLs. Do NOT capture a screenshot of an allowed stepping-stone user and treat it as proof of the primary goal's completion.
    - MANDATORY ACTION BEFORE OUTPUTTING 'DONE': Whenever you successfully authenticate as the PRIMARY requested target role/account:
      1. Capture visual proof of the unlocked page or dashboard using `gowitness`.
      2. Record the confirmed vulnerability and reproduction proof using `record_finding`.
@@ -3890,10 +3951,9 @@ INSTRUCTIONS:
   - [STATUS: OBJECTIVE ACHIEVED / FULL TAKEOVER] if the primary requested target account or role (e.g. Administrator or specified high-privilege user) was genuinely accessed and compromised.
   - [STATUS: PARTIAL / IN PROGRESS] if only intermediate stepping stones (e.g. standard user, support account, or test foothold) were accessed. State plainly that the primary target was not yet taken over, explain what was achieved, and outline the exact remaining attack vectors to complete the mission.
   - [STATUS: BLOCKED / EXHAUSTED] if all viable attack vectors were tested and blocked.
-- CRITICAL IDENTITY & DIRECTORY VERIFICATION:
-  - Visiting a directory page (e.g. `/users`, `/staff`, `/directory`) returns a list of users. The presence of the target in a directory list is NOT proof of takeover of that user.
-  - Holding a session cookie for an intermediate user is NOT takeover of the primary target.
+- CRITICAL IDENTITY VERIFICATION:
   - NEVER claim account takeover unless the primary target's specific token, credentials, or session was actually established and verified!
+  - Holding a session cookie for an intermediate stepping-stone user is NOT takeover of the primary target.
 - NEVER fabricate credentials, tokens, or exploit results. If a login attempt failed or an exploit didn't work, state that fact clearly.
 - Only generate a formal HackerOne markdown vulnerability report if the researcher explicitly requested a report and high-impact findings were confirmed.
 - When asked about your capabilities, tools, or what you can do: answer ONLY from the AVAILABLE TOOLS list above. Never claim access to external tools not in that list.
@@ -4135,11 +4195,12 @@ _global_agent: Optional[Agent] = None
 
 def get_agent(target_name: Optional[str] = None) -> Agent:
     global _global_agent
-    name = target_name or (_global_agent.target.name if _global_agent else "default")
     if _global_agent is None:
+        name = target_name or "default"
         _global_agent = Agent(create_or_load_target(name))
     else:
-        _global_agent.set_target(name)
+        if target_name and target_name != "default" and target_name != _global_agent.target.name:
+            _global_agent.set_target(target_name)
     return _global_agent
 
 def handle_message(user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, on_token: Optional[Callable[[str], None]] = None, forced_skill: Optional[str] = None, cancel_check: Optional[Callable[[], bool]] = None) -> str:

@@ -177,7 +177,8 @@ SPECIFICITY_KEYWORDS: Dict[str, List[str]] = {
     "prototype-pollution-mass-assignment": ["prototype pollution", "__proto__", "constructor.prototype", "mass assignment", "object merge", "polluted", "nested field"],
     "race-condition": ["race condition", "toctou", "concurrency", "parallel requests", "rate limit bypass", "double spend", "coupon race"],
     "ssrf": ["ssrf", "server-side request forgery", "metadata", "169.254.169.254", "internal port", "webhook", "pdf converter", "headless browser"],
-    "ssti": ["ssti", "template injection", "jinja2", "ejs", "twig", "freemarker", "velocity", "handlebars", "{{7*7}}"]
+    "ssti": ["ssti", "template injection", "jinja2", "ejs", "twig", "freemarker", "velocity", "handlebars", "{{7*7}}"],
+    "server-side-parameter-pollution": ["sspp", "parameter pollution", "http parameter pollution", "hpp", "query string pollution", "%23", "%26", "truncat", "server-side parameter pollution", "parameter injection", "internal api query"]
 }
 
 

@@ -561,6 +561,12 @@ class InteractiveAgentEmit(PlainEmit):
                 pass
             self.indicator = None
 
+    def restart_indicator(self, label="HELLHOUND IS ANALYZING & EXECUTING"):
+        if self.indicator is None:
+            from hellhound.core.ai_utils import ThinkingIndicator
+            self.indicator = ThinkingIndicator(label)
+            self.indicator.start()
+
     def __call__(self, msg):
         self.stop_indicator()
         if not msg or not msg.strip():
@@ -685,18 +691,26 @@ def start_chat_session(initial_target: Optional[str] = None):
                     "options": {}
                 }
 
-                # Determine if this is a long-running AI command that needs the live spinner
-                ai_commands = {"/recon", "/scan", "/audit", "/hunt", "/spider", "/surface"}
+                # Determine if this is an AI / methodology skill command that needs live spinner and streaming
                 cmd_base = cmd_line.split()[0].lower()
-                if cmd_base in ai_commands:
-                    # Start spinner IMMEDIATELY so user sees activity from the first ms
-                    emit = InteractiveAgentEmit(f"EXECUTING {cmd_base.upper()[1:]}")
+                cmd_obj = get_command(cmd_base)
+                is_ai_cmd = cmd_base in {"/recon", "/scan", "/audit", "/hunt", "/auto", "/spider", "/surface", "/ask", "/chat", "/howl"}
+                if not is_ai_cmd and cmd_obj and getattr(cmd_obj, "category", "") in ("skills", "hunting"):
+                    is_ai_cmd = True
+                if not is_ai_cmd:
+                    try:
+                        from hellhound.core.skills import discover_skills
+                        if cmd_base.lstrip("/").lower() in discover_skills():
+                            is_ai_cmd = True
+                    except Exception:
+                        pass
+
+                if is_ai_cmd:
+                    label = f"EXECUTING {cmd_base.lstrip('/').replace('-', ' ').upper()}"
+                    emit = InteractiveAgentEmit(label)
                     streamer = StreamRenderer(title="HELLHOUND")
 
                     def on_token_callback(token: str):
-                        # Tool-start/tool-result lines (Fix 4) already print via
-                        # the indicator; the first synthesis token replaces the
-                        # spinner with the live response panel.
                         emit.stop_indicator()
                         streamer.on_token(token)
 
@@ -708,13 +722,30 @@ def start_chat_session(initial_target: Optional[str] = None):
                         final_text = None
                         if isinstance(res, dict):
                             final_text = res.get("advice") or res.get("response")
+                        elif isinstance(res, str):
+                            final_text = res
+
+                        recap_line = None
+                        if final_text:
+                            lines = final_text.splitlines()
+                            for i, line in enumerate(lines):
+                                if line.strip().lower().startswith("recap:"):
+                                    recap_line = line.strip()
+                                    lines.pop(i)
+                                    final_text = "\n".join(lines)
+                                    break
+
                         streamer.finish(final_text)
+
+                        if recap_line:
+                            print_formatted_text(HTML(f"<i><ansigray>{html.escape(recap_line)}</ansigray></i>"))
+
                         t1 = time.monotonic()
                         elapsed = t1 - t0
                         elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
                         print_formatted_text(HTML(f"<ansigray>✳ Cooked for {elapsed_str}</ansigray>"))
                 else:
-                    # Simple non-AI commands (/help, /setup, /scope, etc.) don't need a spinner
+                    # Simple non-AI utility commands (/help, /setup, /scope, /model, etc.)
                     from hellhound.core.emit import PlainEmit as _PlainEmit
                     res = dispatch(cmd_line, session_ctx, _PlainEmit())
 
@@ -748,6 +779,8 @@ def start_chat_session(initial_target: Optional[str] = None):
                     emit=indicator,
                     on_token=on_token_callback
                 )
+                if session_ctx.get("target") and session_ctx["target"] != "default":
+                    agent.set_target(session_ctx["target"])
             finally:
                 indicator.stop()
                 

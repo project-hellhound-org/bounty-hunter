@@ -379,6 +379,7 @@ class ThinkingIndicator:
             self.token_count = n
 
     def start(self):
+        self.stop_event.clear()
         self.start_time = time.time()
         self.token_count = 0
         self.thread = threading.Thread(target=self._animate, daemon=True)
@@ -595,6 +596,9 @@ class ThinkingIndicator:
             if routes:
                 parts.append(f"{len(routes)} route(s) extracted")
             return f"{' · '.join(parts)} — {url_val}"
+        elif tool_name == "load_skill":
+            skill_val = result.get("skill", "")
+            return f"Loaded skill methodology: {skill_val}"
         elif tool_name == "run_terminal_command":
             code = result.get("exit_code", 0)
             out = (result.get("stdout") or result.get("stderr") or "").strip()

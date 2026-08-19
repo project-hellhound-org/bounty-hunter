@@ -75,7 +75,7 @@ Hellhound enforces deterministic rules to prevent reactive tool-use bias and gue
 
 ## 4. Dynamic Methodology Skills Engine
 
-Hellhound houses **26 specialized offensive methodology skills** loaded dynamically into the agent reasoning context:
+Hellhound houses **27 specialized offensive methodology skills** loaded dynamically into the agent reasoning context:
 
 ```
 hellhound/skills/
@@ -88,6 +88,7 @@ hellhound/skills/
 ├── web2-recon/                         # Subdomain Discovery, Port Mapping, Tech Fingerprinting
 ├── web2-vuln-classes/                  # Core Web Flaws (IDOR, SSRF, SQLi, XSS, SSTI, CSRF)
 ├── security-arsenal/                   # Curated Payloads, Filter Bypasses, WAF Evasion
+├── server-side-parameter-pollution/    # SSPP Query/Path Injection, Internal API Pollution, Truncation
 ├── triage-validation/                  # PoC Verification & Strict False-Positive Filtering
 ├── report-writing/                     # Submission Templates (HackerOne, Bugcrowd, Intigriti)
 ├── graphql-audit/                      # Introspection, Batching, Field Suggestion Mining
