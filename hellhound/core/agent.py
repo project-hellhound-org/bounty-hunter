@@ -7,6 +7,7 @@ manages target task context, and triages verified findings.
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import base64
 import hashlib
 import hmac
@@ -17,7 +18,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Dict, Any, List, Optional, Callable, Tuple
+from typing import Dict, Any, List, Optional, Callable, Tuple, Set
 from urllib.parse import urlparse
 
 import requests
@@ -1168,6 +1169,26 @@ ARTIFACT_KEY_PATTERNS = [
     r"seed", r"code", r"hash", r"admin", r"hint", r"flag"
 ]
 
+DISCOVERY_TOOLS: Set[str] = {
+    "spider",
+    "vhost_fuzz",
+    "content_discovery",
+    "fuzz_hunter",
+    "subfinder",
+    "dns_bruteforce",
+    "permute_subdomains",
+    "resolve_candidates",
+    "port_scan",
+    "tls_cert_scan",
+}
+
+ACTIONABLE_ARTIFACT_PATTERNS = [
+    r"token", r"auth", r"jwt", r"bearer", r"api_key", r"access_token", r"refresh_token",
+    r"password", r"pass", r"pwd", r"secret", r"credential",
+    r"session", r"cookie", r"sid", r"phpsessid", r"connect\.sid",
+    r"reset_token", r"reset_link", r"delegation_endpoint", r"mfa", r"otp", r"hash", r"flag"
+]
+
 
 def _flatten_json_dict(obj: Any, prefix: str = "") -> Dict[str, Any]:
     items: Dict[str, Any] = {}
@@ -1218,6 +1239,21 @@ def _infer_identity_from_context(obj_or_parent: Any, source_url: str) -> str:
     return " / ".join(ident_parts) if ident_parts else "unspecified identity"
 
 
+def _is_actionable_artifact(art: Dict[str, Any]) -> bool:
+    """Checks whether an artifact represents an actionable credential, token, session, or delegation handler."""
+    if not isinstance(art, dict):
+        return False
+    field = str(art.get("field_name", "")).strip().lower()
+    val = str(art.get("value", "")).strip()
+    if not val or len(val) < 2:
+        return False
+    if val.lower() in ("true", "false", "null", "none", "undefined", "{}", "[]"):
+        return False
+    if field in ("status", "status_code", "content_type", "allow_credentials", "is_admin", "admin"):
+        return False
+    return any(re.search(p, field, re.I) for p in ACTIONABLE_ARTIFACT_PATTERNS)
+
+
 def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_output: Any, target: Target, turn_number: int = 1) -> List[Dict[str, Any]]:
     """
     Scans every tool output for credentials, tokens, session cookies, keys, and hints,
@@ -1253,7 +1289,10 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                                 "value": str(v).strip(),
                                 "source": c_url,
                                 "associated_identity": c_ident,
-                                "turn": turn_number
+                                "turn": turn_number,
+                                "consumed": False,
+                                "consumed_at": None,
+                                "consumed_by": None
                             })
 
         # B. Directly process secrets exposed
@@ -1268,7 +1307,10 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                         "value": str(s_val).strip(),
                         "source": s_url,
                         "associated_identity": s_ident,
-                        "turn": turn_number
+                        "turn": turn_number,
+                        "consumed": False,
+                        "consumed_at": None,
+                        "consumed_by": None
                     })
 
         # C. Flatten entire dictionary to find key-pattern matches
@@ -1290,7 +1332,10 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                     "value": v_str,
                     "source": f"{tool_name.upper()} {source_url}".strip(),
                     "associated_identity": identity_context,
-                    "turn": turn_number
+                    "turn": turn_number,
+                    "consumed": False,
+                    "consumed_at": None,
+                    "consumed_by": None
                 })
 
         # D. Extract from raw HTTP headers or set-cookie in tool_output
@@ -1303,7 +1348,10 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                         "value": str(hv),
                         "source": f"{tool_name.upper()} {source_url}".strip(),
                         "associated_identity": "session context",
-                        "turn": turn_number
+                        "turn": turn_number,
+                        "consumed": False,
+                        "consumed_at": None,
+                        "consumed_by": None
                     })
 
         # E. Extract from cookies dictionary in tool_output
@@ -1316,7 +1364,10 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                         "value": str(cv).strip(),
                         "source": f"{tool_name.upper()} {source_url}".strip(),
                         "associated_identity": "session cookie",
-                        "turn": turn_number
+                        "turn": turn_number,
+                        "consumed": False,
+                        "consumed_at": None,
+                        "consumed_by": None
                     })
 
         # F. Extract JSON objects or tokens embedded inside response text
@@ -1341,7 +1392,10 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                                         "value": dv_str,
                                         "source": f"{tool_name.upper()} {source_url}".strip(),
                                         "associated_identity": d_ident,
-                                        "turn": turn_number
+                                        "turn": turn_number,
+                                        "consumed": False,
+                                        "consumed_at": None,
+                                        "consumed_by": None
                                     })
                 except Exception:
                     pass
@@ -1362,7 +1416,10 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                                         "value": ev_str,
                                         "source": f"{tool_name.upper()} {source_url}".strip(),
                                         "associated_identity": emb_ident,
-                                        "turn": turn_number
+                                        "turn": turn_number,
+                                        "consumed": False,
+                                        "consumed_at": None,
+                                        "consumed_by": None
                                     })
                 except Exception:
                     pass
@@ -1374,7 +1431,10 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                     "value": hint_m.group(1),
                     "source": f"{tool_name.upper()} {source_url}".strip(),
                     "associated_identity": "delegation hint",
-                    "turn": turn_number
+                    "turn": turn_number,
+                    "consumed": False,
+                    "consumed_at": None,
+                    "consumed_by": None
                 })
 
     # Deduplicate and merge into target.state["artifacts"]
@@ -1392,6 +1452,187 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
     except Exception:
         pass
     return new_artifacts
+
+
+def mark_consumed_artifacts(tool_name: str, tool_args: Dict[str, Any], target: Target) -> None:
+    """
+    Inspects tool arguments (headers, cookies, body, url, token) to detect when an
+    artifact (token, credential, session cookie, delegation endpoint) was actively tested/submitted,
+    marking it as consumed so it no longer blocks discovery tools.
+    """
+    if not hasattr(target, "state") or not isinstance(target.state, dict):
+        return
+
+    artifacts = target.state.get("artifacts", [])
+    if not artifacts or not isinstance(artifacts, list):
+        return
+
+    # Extract all candidate strings from tool_args
+    arg_strings: Set[str] = set()
+    if isinstance(tool_args, dict):
+        # 1. URL / query
+        url = str(tool_args.get("url") or tool_args.get("request_ref") or "")
+        if url:
+            arg_strings.add(url.lower())
+            arg_strings.add(url)
+        # 2. Token parameter
+        if tool_args.get("token"):
+            arg_strings.add(str(tool_args.get("token")).strip())
+        # 3. Headers
+        hdrs = tool_args.get("headers")
+        if isinstance(hdrs, dict):
+            for k, v in hdrs.items():
+                arg_strings.add(str(v).strip())
+                arg_strings.add(f"{k}: {v}")
+        elif isinstance(hdrs, str):
+            arg_strings.add(hdrs.strip())
+        # 4. Cookies
+        cks = tool_args.get("cookies") or tool_args.get("cookie")
+        if isinstance(cks, dict):
+            for k, v in cks.items():
+                arg_strings.add(str(v).strip())
+                arg_strings.add(f"{k}={v}")
+        elif isinstance(cks, str):
+            arg_strings.add(cks.strip())
+        # 5. Body / JSON / Data
+        for key in ("json", "data", "body"):
+            val = tool_args.get(key)
+            if isinstance(val, dict):
+                for sub_k, sub_v in _flatten_json_dict(val).items():
+                    if sub_v is not None and not isinstance(sub_v, (dict, list)):
+                        arg_strings.add(str(sub_v).strip())
+            elif isinstance(val, str) and val:
+                arg_strings.add(val.strip())
+
+    # If curl auto-attached active credentials/tokens from target state, those are active
+    if tool_name == "curl":
+        if target.state.get("auth_token"):
+            arg_strings.add(str(target.state.get("auth_token")).strip())
+        if target.state.get("session_cookie"):
+            arg_strings.add(str(target.state.get("session_cookie")).strip())
+
+    modified = False
+    for art in artifacts:
+        if not isinstance(art, dict):
+            continue
+        if art.get("consumed"):
+            continue
+
+        val = str(art.get("value", "")).strip()
+        field = str(art.get("field_name", "")).strip().lower()
+
+        if not val or len(val) < 2:
+            continue
+
+        # Check if delegation endpoint matches URL path
+        if field == "delegation_endpoint":
+            if any(val.lower() in s.lower() for s in arg_strings if s):
+                art["consumed"] = True
+                art["consumed_at"] = datetime.now(timezone.utc).isoformat()
+                art["consumed_by"] = tool_name
+                modified = True
+            continue
+
+        # Check if artifact value appears in any argument string
+        if any(val in s or val.lower() in s.lower() for s in arg_strings if s):
+            art["consumed"] = True
+            art["consumed_at"] = datetime.now(timezone.utc).isoformat()
+            art["consumed_by"] = tool_name
+            modified = True
+
+    if modified:
+        try:
+            save_target(target)
+        except Exception:
+            pass
+
+
+def find_unconsumed_artifacts(target: Target, history: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, Any]]:
+    """
+    Returns high-value actionable artifacts stored in target state that have not yet
+    been consumed or tested in active requests.
+    """
+    if not hasattr(target, "state") or not isinstance(target.state, dict):
+        return []
+
+    artifacts = target.state.get("artifacts", [])
+    if not artifacts or not isinstance(artifacts, list):
+        return []
+
+    unconsumed = []
+    for art in artifacts:
+        if not _is_actionable_artifact(art):
+            continue
+        if art.get("consumed"):
+            continue
+
+        val = str(art.get("value", "")).strip()
+        # Retroactive history check: If the artifact value was passed in a tool command in history
+        if history and len(val) >= 3:
+            used_in_history = False
+            for h in history:
+                content = str(h.get("content", ""))
+                if f"'{val}'" in content or f'"{val}"' in content or f"={val}" in content or f"Bearer {val}" in content:
+                    art["consumed"] = True
+                    art["consumed_by"] = "prior_turn"
+                    used_in_history = True
+                    break
+            if used_in_history:
+                continue
+
+        unconsumed.append(art)
+
+    return unconsumed
+
+
+def check_artifact_preflight_gate(tool_name: str, args: Dict[str, Any], target: Target, history: Optional[List[Dict[str, str]]] = None) -> Optional[Dict[str, Any]]:
+    """
+    Hard mechanical pre-flight gate: Blocks broad discovery/recon tools (spider, vhost_fuzz,
+    content_discovery, etc.) if high-value actionable security artifacts (tokens, credentials,
+    cookies, delegation endpoints) have already been discovered but not yet tested.
+    """
+    if tool_name not in DISCOVERY_TOOLS:
+        return None
+
+    if isinstance(args, dict):
+        if args.get("force") or args.get("ignore_artifacts") or args.get("skip_artifact_gate"):
+            return None
+
+    unconsumed = find_unconsumed_artifacts(target, history=history)
+    if not unconsumed:
+        return None
+
+    primary = unconsumed[0]
+    field = primary.get("field_name", "credential")
+    val = primary.get("value", "")
+    ident = primary.get("associated_identity", "target account")
+    src = primary.get("source", "previous tool response")
+    val_disp = val if len(val) <= 24 else f"{val[:20]}..."
+
+    all_unconsumed_summary = ", ".join([
+        f"{a.get('field_name')} for '{a.get('associated_identity', 'identity')}' ({a.get('value', '')[:16]}...)"
+        for a in unconsumed[:3]
+    ])
+
+    return {
+        "error": (
+            f"ARTIFACT_PRE_FLIGHT_GATE: Discovered unconsumed security artifact '{field}' "
+            f"associated with '{ident}' (value: '{val_disp}') from {src}. "
+            f"You MUST test/verify this existing artifact (e.g. using curl targeting application endpoints "
+            f"with this token/credential in headers/cookies) before running broad discovery tool '{tool_name}'."
+        ),
+        "blocked": True,
+        "gate": "ARTIFACT_PRE_FLIGHT_GATE",
+        "unconsumed_artifact": {
+            "field_name": field,
+            "value": val,
+            "associated_identity": ident,
+            "source": src
+        },
+        "all_unconsumed_count": len(unconsumed),
+        "unconsumed_artifacts_preview": all_unconsumed_summary,
+        "suggested_action": f"Execute curl with {field}='{val_disp}' (in Authorization header or Cookie) to test access or privilege escalation on target endpoints."
+    }
 
 
 def format_artifact_inventory(target: Target) -> str:
@@ -1415,11 +1656,13 @@ def format_artifact_inventory(target: Target) -> str:
             val = art.get("value", "")
             src = art.get("source", "")
             turn = art.get("turn")
+            consumed = art.get("consumed", False)
             sig = (ident, field, val)
             if sig not in seen_sigs and val:
                 seen_sigs.add(sig)
                 src_part = f" [source: {src}" + (f", turn {turn}]" if turn is not None else "]") if src else ""
-                lines.append(f"- {ident}: {field}='{val}'{src_part}")
+                status_tag = " [TESTED]" if consumed else " [UNTESTED - TEST THIS FIRST]"
+                lines.append(f"- {ident}: {field}='{val}'{src_part}{status_tag}")
 
     for cred in legacy_creds:
         if isinstance(cred, dict):
@@ -3269,6 +3512,14 @@ class Agent:
                     "blocked": True
                 }
 
+        # 2b. Enforce Artifact Pre-Flight Gate (Block redundant discovery when unconsumed artifacts exist)
+        if tool_name in DISCOVERY_TOOLS:
+            gate_result = check_artifact_preflight_gate(tool_name, args, self.target, getattr(self, "history", []))
+            if gate_result:
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(f"[!] ARTIFACT PRE-FLIGHT GATE: Blocked '{tool_name}' — unconsumed security artifact requires testing first.")
+                return gate_result
+
         # 3. Autopilot Guard (CircuitBreaker + SafeMethodPolicy)
         method = str(args.get("method", "GET")).upper()
         url = args.get("url") or (target_candidate if target_candidate.startswith(("http://", "https://")) else f"https://{target_candidate}")
@@ -3298,6 +3549,12 @@ class Agent:
                 self.guard.record_failure(host)
             else:
                 self.guard.record_success(host)
+
+            # Mark consumed artifacts if this tool tested/submitted any discovered tokens or credentials
+            try:
+                mark_consumed_artifacts(tool_name, args, self.target)
+            except Exception:
+                pass
 
             # Auto-extract & persist harvested security artifacts (tokens, passwords, session cookies, keys)
             try:
@@ -3359,7 +3616,15 @@ class Agent:
                     f"program's in-scope/out-of-scope rules first (e.g. `/scope <paste>`)."
                 )
 
-        # Hardcoded Capability Question Fast-Path removed.
+        # Hard safety gate: if target is "default" with no scope, the orchestrator
+        # has no valid domain to hit — skip the tool loop entirely and let the
+        # synthesizer handle it conversationally. The AI model itself decides
+        # whether to use tools or just answer — no keyword classification needed.
+        has_real_target = (
+            (self.target.name != "default" and "." in self.target.name)
+            or bool(domain_match)
+            or bool(self.target.scope_rules and self.target.scope_rules.in_scope)
+        )
 
         # Build System Prompt with registered tools and current target scope
         tools_summary = "\n".join([
@@ -3479,9 +3744,10 @@ ALREADY GATHERED THIS SESSION (do not re-run a tool to re-discover this):
 {intel_block}
 
 RULES:
-1. DECISION & TOOL SELECTION:
-   - If the user's message is a question, discussion, methodology reflection (e.g. "why did you...", "why didn't you...", "what about..."), request for explanation, or if no new tool execution is required, output "DONE".
-   - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a target endpoint is required right now.
+1. DECISION & TOOL SELECTION (CRITICAL):
+   - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network tools (curl, spider, subfinder, httpx, etc.). Output "DONE" immediately.
+   - CONVERSATIONAL & EDUCATIONAL QUERIES: If the user's message is a question, discussion, explanation request, concept breakdown, or methodology inquiry (e.g. "explain...", "how does...", "what is...", "why did..."), output "DONE" immediately.
+   - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a valid, in-scope target endpoint is required right now.
 
 2. MISSION OBJECTIVE FIDELITY & IDENTITY VERIFICATION (CRITICAL):
    - TARGET ACCOUNT / ROLE: Pay close attention to the specific target requested (e.g. Administrator, Chief of Medicine, designated high-privilege role, or specific user ID requested by the researcher).
@@ -3650,142 +3916,146 @@ INSTRUCTIONS:
         if _new_scope:
             self._turn_path_scope = _new_scope
 
-        # ── 3. Orchestrator Iteration Loop (Thinking=False, Fast Local/Tool Calls) ──
-        for iteration in range(max_iterations):
-            self._current_turn = iteration + 1
-            if cancel_check and cancel_check():
-                break
+        # ── 3. Orchestrator Iteration Loop ──
+        # Only enter the tool loop when there's a real target to hit.
+        # The model decides whether to use tools or just answer — Rule 1
+        # in the orchestrator prompt handles conversational queries with DONE.
+        if has_real_target:
+            for iteration in range(max_iterations):
+                self._current_turn = iteration + 1
+                if cancel_check and cancel_check():
+                    break
 
-            if emit and hasattr(emit, "set_label"):
-                emit.set_label("HELLHOUND IS THINKING")
+                if emit and hasattr(emit, "set_label"):
+                    emit.set_label("HELLHOUND IS THINKING")
 
-            ai_resp, tokens = ask_neural_core(
-                prompt=user_text if iteration == 0 else "Continue analysis based on tool results. Choose next tool or output 'DONE'.",
-                system_prompt=_get_orchestrator_system_prompt(),
-                role="orchestrator",
-                thinking=False,
-                history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
-                return_usage=True,
-                cancel_check=cancel_check
-            )
-            
-            if tokens is not None and emit and hasattr(emit, "set_token_count"):
-                emit.set_token_count(tokens)
+                ai_resp, tokens = ask_neural_core(
+                    prompt=user_text if iteration == 0 else "Continue analysis based on tool results. Choose next tool or output 'DONE'.",
+                    system_prompt=_get_orchestrator_system_prompt(),
+                    role="orchestrator",
+                    thinking=False,
+                    history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
+                    return_usage=True,
+                    cancel_check=cancel_check
+                )
+                
+                if tokens is not None and emit and hasattr(emit, "set_token_count"):
+                    emit.set_token_count(tokens)
 
-            if not ai_resp or not ai_resp.strip():
-                break
+                if not ai_resp or not ai_resp.strip():
+                    break
 
-            # Guard against the orchestrator re-entering with the exact same
-            # output it just produced (identical plan/tool-call regenerated
-            # instead of progressing) — treat that as "done planning" and
-            # fall through to synthesis rather than burning iterations.
-            if ai_resp.strip() == (_prev_ai_resp or "").strip():
-                break
-            _prev_ai_resp = ai_resp
+                # Guard against the orchestrator re-entering with the exact same
+                # output it just produced (identical plan/tool-call regenerated
+                # instead of progressing) — treat that as "done planning" and
+                # fall through to synthesis rather than burning iterations.
+                if ai_resp.strip() == (_prev_ai_resp or "").strip():
+                    break
+                _prev_ai_resp = ai_resp
 
-            # Check for JSON tool invocation in the response (markdown, pure JSON, or tool prefix patterns)
-            tool_call = None
-            json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', ai_resp)
-            if json_match:
-                try:
-                    parsed = json.loads(json_match.group(1))
-                    if isinstance(parsed, dict) and "tool" in parsed:
-                        tool_call = parsed
-                except Exception:
-                    pass
-
-            if not tool_call:
-                tool_json_match = re.search(r'(\{\s*"tool"\s*:\s*[\s\S]*\})', ai_resp)
-                if tool_json_match:
+                # Check for JSON tool invocation in the response (markdown, pure JSON, or tool prefix patterns)
+                tool_call = None
+                json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', ai_resp)
+                if json_match:
                     try:
-                        parsed = json.loads(tool_json_match.group(1))
+                        parsed = json.loads(json_match.group(1))
                         if isinstance(parsed, dict) and "tool" in parsed:
                             tool_call = parsed
                     except Exception:
                         pass
 
-            if not tool_call:
-                # Catch patterns like: record_finding { ... } or (Suggested next tool: record_finding { ... })
-                for reg_tool in TOOL_REGISTRY.keys():
-                    pattern = rf'(?:Suggested next tool:\s*)?\b({reg_tool})\b\s*(\{{[\s\S]*\}})'
-                    m = re.search(pattern, ai_resp, re.IGNORECASE)
-                    if m:
-                        t_name_matched = m.group(1).lower()
-                        t_args_str = m.group(2).rstrip(" \t\n\r)")
+                if not tool_call:
+                    tool_json_match = re.search(r'(\{\s*"tool"\s*:\s*[\s\S]*\})', ai_resp)
+                    if tool_json_match:
                         try:
-                            parsed_args = json.loads(t_args_str)
-                            if isinstance(parsed_args, dict):
-                                tool_call = {"tool": t_name_matched, "args": parsed_args}
-                                break
+                            parsed = json.loads(tool_json_match.group(1))
+                            if isinstance(parsed, dict) and "tool" in parsed:
+                                tool_call = parsed
                         except Exception:
                             pass
 
-            if tool_call and tool_call.get("tool") in TOOL_REGISTRY:
-                t_name = tool_call["tool"]
-                t_args = tool_call.get("args") or tool_call.get("parameters") or tool_call.get("arguments") or {}
+                if not tool_call:
+                    # Catch patterns like: record_finding { ... } or (Suggested next tool: record_finding { ... })
+                    for reg_tool in TOOL_REGISTRY.keys():
+                        pattern = rf'(?:Suggested next tool:\s*)?\b({reg_tool})\b\s*(\{{[\s\S]*\}})'
+                        m = re.search(pattern, ai_resp, re.IGNORECASE)
+                        if m:
+                            t_name_matched = m.group(1).lower()
+                            t_args_str = m.group(2).rstrip(" \t\n\r)")
+                            try:
+                                parsed_args = json.loads(t_args_str)
+                                if isinstance(parsed_args, dict):
+                                    tool_call = {"tool": t_name_matched, "args": parsed_args}
+                                    break
+                            except Exception:
+                                pass
 
-                # Already ran this exact tool+args earlier THIS turn (not just
-                # last iteration) -> the orchestrator is repeating itself, not
-                # progressing. Stop calling and move to synthesis with what's
-                # already gathered, instead of re-crawling and re-saving.
-                _sig = (t_name, json.dumps(t_args, sort_keys=True, default=str))
-                if _sig in _executed_signatures:
-                    _dup_skip_count += 1
-                    if _dup_skip_count >= 2:
-                        # Repeating itself even after being told not to — stop
-                        # burning iterations and move straight to synthesis.
-                        break
+                if tool_call and tool_call.get("tool") in TOOL_REGISTRY:
+                    t_name = tool_call["tool"]
+                    t_args = tool_call.get("args") or tool_call.get("parameters") or tool_call.get("arguments") or {}
+
+                    # Already ran this exact tool+args earlier THIS turn (not just
+                    # last iteration) -> the orchestrator is repeating itself, not
+                    # progressing. Stop calling and move to synthesis with what's
+                    # already gathered, instead of re-crawling and re-saving.
+                    _sig = (t_name, json.dumps(t_args, sort_keys=True, default=str))
+                    if _sig in _executed_signatures:
+                        _dup_skip_count += 1
+                        if _dup_skip_count >= 2:
+                            # Repeating itself even after being told not to — stop
+                            # burning iterations and move straight to synthesis.
+                            break
+                        self.history.append({
+                            "role": "user",
+                            "content": f"[TOOL SKIPPED] '{t_name}' with these exact args already ran earlier this turn — reuse those results instead of repeating it."
+                        })
+                        user_text = f"You already ran '{t_name}' with identical args. Do not repeat it — synthesize from the results you already have, or choose a different tool/target."
+                        continue
+                    _executed_signatures.add(_sig)
+
+                    tools_executed.append(t_name)
+                    
+                    if emit and hasattr(emit, "set_label"):
+                        emit.set_label(f"EXECUTING {t_name.upper()}")
+
+                    if emit and hasattr(emit, "tool_start"):
+                        emit.tool_start(t_name, t_args)
+                    elif emit and hasattr(emit, "info"):
+                        emit.info(f"[*] Executing tool: {t_name} with args: {t_args}")
+
+                    tool_result = self.execute_tool_call(t_name, t_args, emit)
+
+                    if emit and hasattr(emit, "tool_result"):
+                        emit.tool_result(t_name, tool_result)
+
+                    if emit and hasattr(emit, "set_label"):
+                        emit.set_label("ANALYZING RESULTS")
+
+                    # Feed result back to conversation
+                    self.history.append({"role": "assistant", "content": ai_resp})
                     self.history.append({
                         "role": "user",
-                        "content": f"[TOOL SKIPPED] '{t_name}' with these exact args already ran earlier this turn — reuse those results instead of repeating it."
+                        "content": f"[TOOL RESULT: {t_name}]\n{json.dumps(tool_result, indent=2)}"
                     })
-                    user_text = f"You already ran '{t_name}' with identical args. Do not repeat it — synthesize from the results you already have, or choose a different tool/target."
+                    user_text = f"Tool '{t_name}' returned:\n{json.dumps(tool_result, indent=2)}\nEvaluate these findings."
                     continue
-                _executed_signatures.add(_sig)
 
-                tools_executed.append(t_name)
-                
-                if emit and hasattr(emit, "set_label"):
-                    emit.set_label(f"EXECUTING {t_name.upper()}")
+                elif tool_call:
+                    # Hallucinated or unregistered tool name
+                    unregistered_name = tool_call.get("tool", "unknown")
+                    if emit and hasattr(emit, "set_label"):
+                        emit.set_label("ANALYZING RESULTS")
 
-                if emit and hasattr(emit, "tool_start"):
-                    emit.tool_start(t_name, t_args)
-                elif emit and hasattr(emit, "info"):
-                    emit.info(f"[*] Executing tool: {t_name} with args: {t_args}")
+                    self.history.append({"role": "assistant", "content": ai_resp})
+                    self.history.append({
+                        "role": "user",
+                        "content": f"[TOOL ERROR] '{unregistered_name}' is not a valid tool. Available tools: {', '.join(TOOL_REGISTRY.keys())}"
+                    })
+                    user_text = f"Tool '{unregistered_name}' is invalid. Please select from available tools: {', '.join(TOOL_REGISTRY.keys())}"
+                    continue
 
-                tool_result = self.execute_tool_call(t_name, t_args, emit)
-
-                if emit and hasattr(emit, "tool_result"):
-                    emit.tool_result(t_name, tool_result)
-
-                if emit and hasattr(emit, "set_label"):
-                    emit.set_label("ANALYZING RESULTS")
-
-                # Feed result back to conversation
-                self.history.append({"role": "assistant", "content": ai_resp})
-                self.history.append({
-                    "role": "user",
-                    "content": f"[TOOL RESULT: {t_name}]\n{json.dumps(tool_result, indent=2)}"
-                })
-                user_text = f"Tool '{t_name}' returned:\n{json.dumps(tool_result, indent=2)}\nEvaluate these findings."
-                continue
-
-            elif tool_call:
-                # Hallucinated or unregistered tool name
-                unregistered_name = tool_call.get("tool", "unknown")
-                if emit and hasattr(emit, "set_label"):
-                    emit.set_label("ANALYZING RESULTS")
-
-                self.history.append({"role": "assistant", "content": ai_resp})
-                self.history.append({
-                    "role": "user",
-                    "content": f"[TOOL ERROR] '{unregistered_name}' is not a valid tool. Available tools: {', '.join(TOOL_REGISTRY.keys())}"
-                })
-                user_text = f"Tool '{unregistered_name}' is invalid. Please select from available tools: {', '.join(TOOL_REGISTRY.keys())}"
-                continue
-
-            # Non-tool response / "DONE" / conversational output from orchestrator -> exit tool loop
-            break
+                # Non-tool response / "DONE" / conversational output from orchestrator -> exit tool loop
+                break
 
         # ── 4. Final Answer Generation (Streaming, Fast & Context-Specific) ───────
         if emit and hasattr(emit, "set_label"):
