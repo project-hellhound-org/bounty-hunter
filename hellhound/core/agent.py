@@ -2256,8 +2256,37 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     return {"status": "recorded", "title": title, "kind": kind, "severity": severity}
 
 
+def _execute_load_skill(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Loads a skill's full methodology content on demand, by name, from the skill menu."""
+    name = str(args.get("name", "")).strip()
+    if not name:
+        return {"error": "name is required — see the SKILL MENU in your system prompt for available names."}
+    registry = discover_skills()
+    if name not in registry:
+        available = ", ".join(sorted(registry.keys()))
+        return {"error": f"No skill named '{name}'. Available: {available}"}
+    body = load_skill_body(name)
+    if not body:
+        return {"error": f"Skill '{name}' has no content."}
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[✓] Loaded skill: {name}")
+    return {"skill": name, "methodology": body}
+
+
 # Tool Registry Map
 TOOL_REGISTRY: Dict[str, ToolSpec] = {
+    "load_skill": ToolSpec(
+        name="load_skill",
+        description="Load the full methodology for a named skill from the SKILL MENU in your system prompt, when the task needs a specific methodology that hasn't already been auto-injected. Call this BEFORE your first recon/exploit tool call if you recognize the task matches a listed skill better than what's already provided.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Exact skill name from the SKILL MENU, e.g. 'access-control', 'graphql-audit'."}
+            },
+            "required": ["name"]
+        },
+        executor=_execute_load_skill
+    ),
     "record_finding": ToolSpec(
         name="record_finding",
         description="Log a finding you have ALREADY CONFIRMED (via curl/spider/other tools — not a plan or a guess) into the investigation's structured memory, so it persists across turns and feeds the running investigation summary. Use this once you've verified something real: a confirmed IDOR, a role you successfully escalated to, a token leak, etc. Do not use this to record intentions or untested hypotheses.",
@@ -2738,6 +2767,7 @@ class Agent:
             safe_methods_only=True
         )
         self._turn_path_scope: Optional[str] = None  # e.g. "/app" — set per-turn in handle_message
+        self._forced_skill: Optional[str] = None  # set by /skill-name slash command — one-shot, consumed next turn
 
     def set_target(self, target_name: str) -> Target:
         self.target = create_or_load_target(target_name)
@@ -3004,13 +3034,29 @@ class Agent:
         cfg = load_config()
         ai_prov = (cfg.get("synthesizer_provider") or cfg.get("ai_provider") or "ollama").lower()
         is_small = (ai_prov == "ollama")
-        skills_block = get_relevant_skills_prompt(
-            user_text=user_text,
-            history_len=len(self.history),
-            has_target=(self.target.name != "default"),
-            is_small_model=is_small,
-            max_skills=2
-        )
+
+        forced_skill = getattr(self, "_forced_skill", None)
+        if forced_skill:
+            forced_body = load_skill_body(forced_skill)
+            if forced_body:
+                skills_block = f"--- SKILL EXPLICITLY REQUESTED BY USER: {forced_skill} ---\n{forced_body}\n--- END REQUESTED SKILL ---"
+            else:
+                skills_block = get_relevant_skills_prompt(
+                    user_text=user_text, history_len=len(self.history),
+                    has_target=(self.target.name != "default"), is_small_model=is_small, max_skills=2
+                )
+            self._forced_skill = None  # one-shot: applies to this message only
+        else:
+            skills_block = get_relevant_skills_prompt(
+                user_text=user_text, history_len=len(self.history),
+                has_target=(self.target.name != "default"), is_small_model=is_small, max_skills=2
+            )
+
+        try:
+            _all_skills = discover_skills()
+            skills_menu = "\n".join(f"  - {n}: {s.description}" for n, s in sorted(_all_skills.items()))
+        except Exception:
+            skills_menu = "(skill menu unavailable)"
 
         def _get_orchestrator_system_prompt() -> str:
             path_scope_prompt = ""
@@ -3041,6 +3087,9 @@ TARGET: {self.target.name}
 SCOPE: {scope_summary}{path_scope_prompt}
 
 {skills_block}
+
+SKILL MENU (call load_skill(name) if none of the above matches this task — do this BEFORE your first recon/exploit tool call):
+{skills_menu}
 
 AVAILABLE TOOLS:
 {tools_summary}
@@ -3083,6 +3132,7 @@ RULES:
 ```
 8. When testing authentication or password recovery workflows, harvest real user identities/emails from application content or endpoints rather than inventing dummy emails.{path_rule}
 9. If no further tools are needed, or after recording all findings and capturing visual proof, respond with "DONE".
+10. If the task doesn't clearly match the skill content already provided above, check the SKILL MENU and call `load_skill` with the best-matching name before doing anything else — don't guess a methodology blind when a better-fitting one is available by name.
 """
 
         # Build live investigation context summary
@@ -3106,7 +3156,7 @@ RULES:
         )
 
         report_directive = ""
-        if report_requested or has_critical_findings:
+        if report_requested and has_critical_findings:
             report_directive = f"""
 CRITICAL INSTRUCTION - VULNERABILITY REPORT & PROOF OF CONCEPT DIRECTIVE:
 When a vulnerability (such as Account Takeover, Auth Bypass, JWT Algorithm Confusion, Token Leakage, or IDOR) is confirmed or the researcher requests a report, format your response as a complete, professional, ready-to-submit HackerOne markdown vulnerability report:
@@ -3362,7 +3412,7 @@ INSTRUCTIONS:
         self.last_tool_count = len(tools_executed)
 
         if not tools_executed:
-            if report_requested or has_critical_findings:
+            if report_requested and has_critical_findings:
                 synth_prompt = (
                     f"The researcher requested: \"{original_user_text}\"\n\n"
                     f"Target: '{self.target.name}'.\n"
@@ -3382,7 +3432,7 @@ INSTRUCTIONS:
                 cancel_check=cancel_check
             )
         else:
-            if len(tools_executed) > 0 or report_requested or has_critical_findings:
+            if len(tools_executed) > 0 or (report_requested and has_critical_findings):
                 synth_prompt = (
                     f"The researcher requested/instructed: \"{original_user_text}\"\n\n"
                     f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
@@ -3436,8 +3486,10 @@ def get_agent(target_name: Optional[str] = None) -> Agent:
         _global_agent.set_target(name)
     return _global_agent
 
-def handle_message(user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, on_token: Optional[Callable[[str], None]] = None) -> str:
+def handle_message(user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, on_token: Optional[Callable[[str], None]] = None, forced_skill: Optional[str] = None, cancel_check: Optional[Callable[[], bool]] = None) -> str:
     """Entrypoint for conversational chat queries."""
     target_name = (session_context or {}).get("target")
     agent = get_agent(target_name)
-    return agent.handle_message(user_text, session_context=session_context, emit=emit, on_token=on_token)
+    if forced_skill:
+        agent._forced_skill = forced_skill
+    return agent.handle_message(user_text, session_context=session_context, emit=emit, on_token=on_token, cancel_check=cancel_check)
