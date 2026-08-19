@@ -61,6 +61,9 @@ except Exception:
                                                                         
 
 VERSION      = "13.21"
+NAME         = "spider"
+CATEGORY     = "recon"
+DESCRIPTION  = "Headless Single Page Application (SPA) DOM spider, API route discovery, and secret extractor"
 __author__   = "Sree Danush S (L4ZZ3RJ0D)"
 __license__  = "GPLv3"
 __credits__  = ["L4ZZ3RJ0D"]

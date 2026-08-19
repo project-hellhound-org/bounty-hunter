@@ -213,7 +213,7 @@ hellhound/storage/*
 !hellhound/storage/.gitkeep
 run_diff.py
 *.json
-recon/
+/recon/
 
 # JavaScript / Node
 node_modules/
