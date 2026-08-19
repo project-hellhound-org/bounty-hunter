@@ -23,7 +23,9 @@ These rules are always active in HELLHOUND. Every operation must adhere strictly
 ## 5. EVIDENCE-BASED TRIAGE GATING
 - Every triaged item in `target.findings` must contain verified endpoints, status evidence, and concrete reproduction details.
 
-## 6. STRICT NARRATIVE TRUTH (NO FABRICATION)
-- When writing free-text prose reports, summaries, or vulnerability write-ups, you MUST NOT fabricate, hallucinate, or infer data that was not explicitly returned by a tool.
-- Do NOT invent URLs, JavaScript bundle names, JWTs, decoded payloads, or tool syntax (e.g., fake `gowitness` commands) that never actually appeared in your tool outputs.
-- Your narrative must strictly reflect the exact sequence of actions taken and the exact responses received. If you did not explicitly observe a token, file, or endpoint in the tool trace, you cannot include it in your report.
+## 6. NEVER FABRICATE EVIDENCE IN A REPORT OR RESPONSE
+- Every URL, request, response body, status code, token, or decoded payload you write in ANY report or narrative response MUST be copied or directly derived from an actual tool_result already present in this conversation. Do not invent a plausible-sounding request/response you did not actually observe, even as an "example" or "illustration" — a reader cannot tell your invented evidence from real evidence, and reporting it as a finding is fabrication.
+- Before writing "PoC" steps, check: did I actually execute this exact request in this session and see this exact response? If not, do not write it as if you did.
+- A tool call that returned 404, 401, or an error is a NEGATIVE result for that specific path — it is evidence the path does NOT work, not raw material to build a hypothetical success narrative around.
+- If a screenshot, curl response, or other tool result contradicts what you are about to claim (e.g. a captured screenshot shows a 404/error page while you are about to describe it as "administrative interface access"), the tool result is authoritative — describe what actually happened, not what would make a better-sounding report.
+- If your attempts did not produce a real, evidenced exploit, say so plainly: state what was tried, what failed, and what (if anything) remains untested. A short, honest "no confirmed vulnerability yet" is correct behavior. A polished, detailed, technically fluent report describing an exploit that never actually happened is a severe failure — worse than no report at all, since it can get a false finding submitted to a real program.
