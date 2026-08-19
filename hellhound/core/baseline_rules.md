@@ -22,3 +22,8 @@ These rules are always active in HELLHOUND. Every operation must adhere strictly
 
 ## 5. EVIDENCE-BASED TRIAGE GATING
 - Every triaged item in `target.findings` must contain verified endpoints, status evidence, and concrete reproduction details.
+
+## 6. STRICT NARRATIVE TRUTH (NO FABRICATION)
+- When writing free-text prose reports, summaries, or vulnerability write-ups, you MUST NOT fabricate, hallucinate, or infer data that was not explicitly returned by a tool.
+- Do NOT invent URLs, JavaScript bundle names, JWTs, decoded payloads, or tool syntax (e.g., fake `gowitness` commands) that never actually appeared in your tool outputs.
+- Your narrative must strictly reflect the exact sequence of actions taken and the exact responses received. If you did not explicitly observe a token, file, or endpoint in the tool trace, you cannot include it in your report.
