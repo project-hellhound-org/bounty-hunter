@@ -70,6 +70,26 @@ When an action or mutation targeting a high-privilege victim (e.g., `<endpoint>/
 ## 3. Response Body Token Disclosure (Direct Flaw Check)
 Before testing out-of-band vectors or complex chains, check if the application leaks the password recovery token directly back to the client:
 
+### A. Parameter Type Confusion (test this FIRST — one request, high signal)
+Before checking the response body at all, test whether the recovery
+endpoint's identity field can be turned from a scalar into an array or
+object. A disclosed GitLab report (CVE-2023-7028, CVSS 10.0, $35,000
+bounty) found that converting a single-value `email` field into a JSON
+array containing BOTH the victim's email and an attacker-controlled email
+caused the backend to treat both as valid recipients and deliver the reset
+link to both addresses — full unauthenticated account takeover, no
+response-body leak required at all:
+```json
+{"user": {"email": ["<harvested_victim_email>", "<attacker_controlled_email>"]}}
+```
+Try this on any endpoint that normally accepts a single scalar identity
+value (`email`, `username`, `phone`) in a JSON body — the same
+array-wrapping test applies to login, MFA-recovery, and account-linking
+endpoints, not just password reset. Note this specific technique doesn't
+work if the account has 2FA enabled — mention that in your report if you
+can't reach a 2FA-protected account this way, rather than treating it as
+a dead end for the whole endpoint.
+
 1. **Submit Recovery Request:**
    Send a `POST` request to the application's discovered recovery/forgot endpoint using a harvested, valid identity:
    ```json
@@ -118,7 +138,7 @@ Before testing out-of-band vectors or complex chains, check if the application l
        }
      }
      ```
-   - Verify access to privileged or authenticated areas (e.g., user profiles, admin consoles, internal records) using the resulting session.
+   - Verify access to privileged or authenticated areas (e.g., user profiles, admin consoles, internal records) using the resulting session — and apply Section 5's Verification Gate before treating this as confirmed (read the actual response body; confirm the old password no longer works).
    - **MANDATORY VISUAL PROOF (gowitness):** Immediately capture visual Proof of Concept using `gowitness` on the authenticated web UI (e.g. the discovered user dashboard, settings, or administrative console) using the acquired session cookie/token:
      ```json
      {
@@ -190,6 +210,8 @@ When an application uses RS256 (asymmetric signing where the server signs with a
    - Send the forged token to discovered authenticated API routes or web dashboards.
 
 ### D. Mandatory Verification & Evidence for JWT Flaws
+
+**First, apply Section 5's Verification Gate below** — read the actual response body from your forged-token request; do not proceed to capture proof or record a finding on a bare 200 status alone.
 1. **Capture Visual Proof (gowitness):**
    ```json
    {
@@ -214,19 +236,79 @@ When an application uses RS256 (asymmetric signing where the server signs with a
    }
    ```
 
-## 5. Host Header Injection (Password Reset Poisoning)
+## 5. Mandatory Verification Gate (read this before capturing proof or recording ANY finding)
+
+A `200 OK` after a JWT forgery attempt, a password reset, or a login is
+NOT proof of success on its own — this is exactly how false positives (and
+worse, fabricated-sounding reports) happen. Before doing anything in
+Section 3D/6D below:
+
+- **Read the actual response body**, not just the status code. Does it
+  contain real account/session data (a profile object, a role field
+  matching what you tried to forge, actual privileged content) — or a
+  generic app shell, an error object with a 200 wrapper, or a login page
+  that happens to return 200?
+- **Confirm the OLD credentials now fail** (for a completed password
+  reset) — if the original password still works, the reset didn't
+  actually take effect server-side even if the API call itself returned
+  200.
+- **Never write a request/response in a report that you did not actually
+  execute and observe in this session.** If you're describing a JWT
+  payload, a leaked token, or an API response, it must be copied from a
+  real tool result — not reconstructed from memory of "what it probably
+  looked like." An invented PoC is a fabricated finding, not a real one,
+  even if the underlying vulnerability class is genuinely plausible.
+- If verification fails at any of the above, the attempt did NOT work —
+  say so plainly and try the next technique, rather than proceeding to
+  "capture visual proof" of something that didn't actually happen.
+
+## 6. Real-World Battle-Testing Notes (labs vs. live programs)
+
+These bugs behave differently once you're off a training lab and onto a
+real program — know the difference before you rely on lab experience:
+
+- **Rate limiting & account lockout.** CTF/lab targets usually have none.
+  Real apps commonly lock an account or start returning 429s after a
+  handful of failed logins or reset requests. If you're testing multiple
+  identities or retrying a chain, space requests out and watch for 429/423
+  responses — don't just retry blindly, since a lockout can look like "the
+  bug doesn't work" when actually you tripped a defense.
+- **MFA/step-up auth.** A successful password reset or login on a real
+  target may still be gated by a second factor before reaching anything
+  sensitive. Getting past the password layer is real progress and worth
+  recording as a partial finding even if MFA stops you from going further
+  — don't discard it as "not a full bypass, not worth reporting."
+- **Session invalidation on password change is expected behavior, not a
+  bug.** If resetting a password logs out other active sessions, that's
+  correct security behavior — don't report it as a flaw.
+- **CRITICAL — do not actually complete an account takeover against a
+  real person's live account without explicit authorization to do so.**
+  Labs seed fake accounts specifically so you can complete the full chain
+  consequence-free. Most real bug bounty programs' rules of engagement do
+  NOT permit actually taking over a real employee's or customer's live
+  account — only demonstrating that the flaw exists (e.g., showing the
+  reset token is disclosed in the response) and stopping there, unless the
+  program explicitly provides a designated test account for this purpose.
+  Actually changing a real, non-test person's password is a disruptive
+  action against a third party and can violate program scope even when
+  the underlying vulnerability is 100% real and reportable. Check the
+  program's rules before deciding whether "harvested identity" in this
+  skill means "a real staff email" (demonstrate only, do not complete) or
+  "a test account you registered/were given" (safe to complete fully).
+
+## 7. Host Header Injection (Password Reset Poisoning)
 If the response body does not directly leak the token:
 - Test if the backend dynamically constructs the reset URL using the client-supplied `Host` header:
   - Submit the password recovery request with a modified `Host` or `X-Forwarded-Host` header pointing to an external domain or controlled listener.
   - If the server accepts the header and issues a reset email containing the poisoned host, the reset token will be delivered to the attacker-controlled server upon user click.
 
-## 6. Post-Authentication Privilege Assessment
+## 8. Post-Authentication Privilege Assessment
 Once authenticated into any account:
 - Inspect session tokens, user profile endpoints, and role attributes.
 - If access is restricted or non-privileged, identify high-privilege accounts (administrators, managers, owners) from initial discovery data and re-apply the recovery/forgery flow against the elevated account.
 - Probe for access to administrative panels, sensitive endpoints, or internal data APIs to evaluate total business impact.
 
-## 7. Proof of Concept & Bounty Escalation Documentation
+## 9. Proof of Concept & Bounty Escalation Documentation
 When reporting an authentication bypass or account takeover:
 1. **Concrete Evidence / PoC:**
    - Document the full reproduction chain with exact requests, response snippets, leaked/forged tokens, and resulting authenticated session cookies.
@@ -237,7 +319,7 @@ When reporting an authentication bypass or account takeover:
    - **Business Impact:** Clearly explain how taking over a privileged identity allows unauthorized data exfiltration, compliance violations (e.g., HIPAA/GDPR), and complete administrative compromise.
    - **Remediation Steps:** Advise on generating cryptographically secure, out-of-band delivery of reset tokens, enforcing strict JWT algorithm allowlists (rejecting `none` and symmetric HMAC when expecting RSA), validating signatures strictly, and removing debug previews in production API responses.
 
-## 8. Multi-Vector Attack Progression & Artifact Correlation Checklist
+## 10. Multi-Vector Attack Progression & Artifact Correlation Checklist
 When tasked with account takeover or high-bounty hunting, execute the full attack progression across all orthogonal vectors:
 
 ```

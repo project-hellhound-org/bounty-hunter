@@ -77,12 +77,25 @@ Always distinguish between cosmetic UI unlocks and genuine backend privilege esc
 
 ## 5. IDOR / Broken Object Reference Strategy
 
+**IDOR isn't only about the object ID being read — check the PARENT/tenant
+ID in creation requests too.** A disclosed PayPal report ($10,500 bounty)
+found the IDOR not in a resource being fetched, but in the `business_id`
+field of a request that CREATES a new sub-account: the endpoint blindly
+trusted whatever `business_id` was submitted, so swapping it to a
+different organization's ID let the attacker create a fully-privileged
+sub-user (fund transfers, refunds, balance access) inside a business
+account they didn't own. Any "create X under organization/team/business Y"
+endpoint is an IDOR target on the container ID, not just endpoints that
+read or update an existing object by its own ID — test swapping the
+parent/tenant ID on every creation request, not only the target-object ID
+on read/update requests.
+
 1. **Check for Leaked IDs First:** Look for UUIDs, account IDs, or tenant slugs in public profiles, comments, team member lists, or API metadata.
 2. **Numeric vs UUID IDs:**
-   - Numeric IDs (`1001`, `1002`): Test decrementing/incrementing, especially `0` and `1` (often the system admin or organization owner).
+   - Numeric IDs (`1001`, `1002`): Test decrementing/incrementing, especially `0` and `1` (often the system admin or organization owner). Trying a known/likely admin ID directly is a legitimate, low-cost first probe on its own — you don't need a second account to justify it. If it returns real data, apply Section 6's minimal-access discipline (confirm it's real, don't page through more than needed, report) — the same discipline that applies to any other confirmed access.
    - UUIDs: Do not attempt to brute-force; extract real IDs from member lists, invitations, or API responses.
-3. **Ground-Truth Two-Account Validation:**
-   - When testing horizontal access (Tenant A accessing Tenant B's records), always verify with a second registered test account to confirm cross-tenant data leakage.
+3. **Cross-Tenant Horizontal Confirmation Needs Two Contexts, Not Just Two IDs:**
+   - A single ID swap (even a successful one) shows an object reference is guessable/enumerable — it doesn't by itself prove a TENANT boundary is broken, since you need two separate tenant contexts to demonstrate that. For horizontal access specifically (Tenant/Org A reaching Tenant/Org B's records, not just "user A reaching admin"), register or use a second test account in a genuinely different tenant/organization and confirm the swap works from that side too. This is about building a clean, unambiguous, reproducible PoC for the cross-tenant case — not a requirement to gate every ID-guessing attempt behind owning a second account first.
 4. **Test All HTTP Verbs on Sibling Endpoints:**
    - If `GET /api/documents/123` is blocked, test `POST /api/documents/123/export`, `PUT /api/documents/123`, or `DELETE /api/documents/123`.
 
@@ -113,43 +126,15 @@ Always distinguish between cosmetic UI unlocks and genuine backend privilege esc
    - Capture the newly issued session cookie from `Set-Cookie: session=...` or the returned privileged JWT.
    - Use the newly elevated session to access protected endpoints (`/portal/records`, `/portal/admin`, `/portal/profile`), extract all target flags/proof, capture `gowitness` visual evidence, and record the finding.
 
-## 5.2 403 Forbidden / 401 Unauthorized Perimeter & Reverse-Proxy Bypass Probing
-When an administrative endpoint, internal API, or sensitive route (e.g. `/portal/admin`, `/admin`, `/api/v1/management`, `/internal`) returns `403 Forbidden` or `401 Unauthorized`:
-Reverse proxies, load balancers, and API gateways (Nginx, HAProxy, Cloudflare, Envoy, IIS) often enforce access control at the perimeter while delegating routing or trust to headers parsed by the upstream application framework (Spring, Flask/Werkzeug, Express, Rails, ASP.NET). Systematically probe:
+## 5.2 403 Forbidden / 401 Unauthorized Perimeter Bypass
 
-1. **URL Rewrite & Path Override Headers:**
-   - Request the allowed landing page or root `/` while instructing the upstream framework to route to the restricted endpoint:
-     ```json
-     {
-       "tool": "curl",
-       "args": {
-         "url": "https://<target>/",
-         "method": "GET",
-         "headers": {
-           "X-Original-URL": "/portal/admin",
-           "X-Rewrite-URL": "/portal/admin",
-           "X-Custom-IP-Authorization": "127.0.0.1"
-         }
-       }
-     }
-     ```
-2. **IP Spoofing & Trust Headers (Localhost / Internal Bypass):**
-   - Probe the restricted route directly with internal origin headers:
-     - `X-Forwarded-For: 127.0.0.1` / `X-Forwarded-For: localhost`
-     - `X-Real-IP: 127.0.0.1`
-     - `X-Client-IP: 127.0.0.1`
-     - `X-Remote-IP: 127.0.0.1`
-     - `X-Originating-IP: 127.0.0.1`
-     - `X-Forwarded-Host: localhost`
-     - `X-Host: localhost`
-3. **URL Normalization & Path Obfuscation:**
-   - Web servers and backend routing engines often differ in how they parse URL delimiters and directory traversals:
-     - Semicolon delimiters (Tomcat/Spring): `/portal/admin;`, `/portal/admin;/`, `/portal/;/admin`
-     - Path traversal & dots: `/portal/./admin`, `/portal//admin`, `/portal/users/../admin`, `/portal/%2e%2e/admin`, `/portal/admin/.`
-     - URL encoded characters: `/%61%64%6d%69%6e`, `/portal/%2fadmin`
-4. **HTTP Verb & Method Tampering:**
-   - If `GET /portal/admin` is 403, test with `POST`, `HEAD`, `OPTIONS`, `PUT`, or custom verbs (`TRACK`, `DEBUG`, `TRACE`).
-   - Add method override headers: `X-HTTP-Method-Override: GET`, `X-Method-Override: GET`.
+If an administrative endpoint, internal API, or sensitive route returns
+`403 Forbidden` or `401 Unauthorized` rather than requiring a privilege
+you don't have on a resource you CAN reach, that's a perimeter/reverse-
+proxy bypass problem, not an access-control-logic problem — use the
+`403-bypass` skill (`load_skill("403-bypass")`), which covers path
+manipulation, header-based trust spoofing, method override, and the
+false-positive discipline specific to that bug class in full depth.
 
 ---
 
