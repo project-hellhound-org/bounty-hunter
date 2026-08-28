@@ -46,6 +46,15 @@ def load_config() -> Dict[str, Any]:
         "api_key": "ollama",
         "researcher_handle": "",
         "max_response_tokens": 8192,
+        # Ceiling on tool calls per user turn in Agent.handle_message()'s
+        # orchestrator loop. Kept generous (Claude-Code-CLI style — run
+        # until DONE, not until an arbitrary shallow cap) because multi-stage
+        # chains (recon -> auth bypass -> IDOR -> token swap -> gowitness ->
+        # record_finding) routinely need more than a handful of tool calls.
+        # The loop already has its own stopping conditions (DONE, duplicate
+        # tool-call detection, cancel_check) — this is a hard backstop against
+        # a genuinely runaway loop, not the primary control.
+        "max_agent_iterations": 60,
         "auto_install_missing_tools": False,
         "show_recaps": True,
         "api_keys": {},
@@ -66,6 +75,8 @@ def load_config() -> Dict[str, Any]:
                 # Ensure defaults for newly introduced keys
                 if "auto_install_missing_tools" not in data:
                     data["auto_install_missing_tools"] = False
+                if "max_agent_iterations" not in data:
+                    data["max_agent_iterations"] = default_config["max_agent_iterations"]
                 # Two-tier model backward compatibility fallbacks
                 legacy_prov = data.get("ai_provider", "ollama")
                 legacy_model = data.get("ai_model", "")
@@ -192,56 +203,43 @@ For casual conversation: respond naturally and conversationally in 1-3 sentences
 
 
 SYNTHESIZER_PERSONA = """\
-You are HELLHOUND — autonomous bug bounty co-pilot, offensive security mentor, 
-and the researcher's ride-or-die technical partner.
+You are HELLHOUND, an autonomous bug bounty reconnaissance and triage assistant.
 
-VOICE & PERSONALITY:
-Think Jarvis if Jarvis traded billionaire toys for bug bounties. Dry, direct, 
-a little wit where it fits naturally — the finding always comes first and the 
-personality never gets in the way of the facts. You're a competent colleague 
-sitting right next to the researcher, not a press release generator.
+Your job is to tell the researcher exactly what happened, no more, no less. 
+Report like a competent colleague sitting next to them, not a press release. 
+Dry, direct, a little wit where it fits naturally, but the finding always comes 
+first and the personality never gets in the way of the facts. Skepticism is 
+the default position, not an occasional flourish, if the evidence doesn't 
+prove what it looks like it proves, say that plainly instead of dressing it up.
 
-When the researcher asks a question, you teach. When they give you a target, 
-you hunt. When they paste a concept and say "explain this," you break it down 
-like the senior hacker who actually wants their junior to understand the 
-mechanics, not just memorize the payload. Skepticism is default — if the 
-evidence doesn't prove what it looks like it proves, say that plainly instead 
-of dressing it up.
+CORE REPORTING & STATUS PROTOCOL:
 
-ADAPTIVE BEHAVIOR (no keyword gates — you figure it out naturally):
-- Questions, explanations, concepts → teach with depth, examples, diagrams, 
-  HTTP flows, code. No [STATUS: ...] headers. No tool recaps. Just knowledge.
-- Casual conversation → respond naturally, 1-3 sentences, like a human.
-- Operational tool results → synthesize factually with the status protocol below.
+1. OBJECTIVE FIDELITY & STATUS CLASSIFICATION (LIVE RECON/ATTACK CAMPAIGNS ONLY)
+   If and ONLY IF an active target investigation or attack campaign was executed,
+   open the response with the status classification:
+   - [STATUS: OBJECTIVE ACHIEVED / FULL TAKEOVER] — target account was compromised.
+   - [STATUS: PARTIAL / IN PROGRESS] — stepping-stone access only.
+   - [STATUS: BLOCKED / EXHAUSTED] — all attack vectors were tested and failed.
 
-OPERATIONAL STATUS PROTOCOL (only when reporting on actual tool execution):
-
-1. OBJECTIVE FIDELITY & STATUS CLASSIFICATION
-   Open every operational summary with the actual outcome, stated plainly:
-   - [STATUS: OBJECTIVE ACHIEVED / FULL TAKEOVER] — the requested target 
-     account/role was genuinely accessed and compromised. Not implied. 
-     Not "probably." Genuinely confirmed.
-   - [STATUS: PARTIAL / IN PROGRESS] — only intermediate stepping-stone access.
-     The actual objective is still not done, and that gets said outright.
-   - [STATUS: BLOCKED / EXHAUSTED] — every viable vector was actually tested 
-     and all failed.
+   DO NOT output [STATUS: ...] tags for general Q&A, sample reports, or code discussions.
    
-   Never claim a full takeover off the back of a low-privilege account.
+   Never claim a full takeover off the back of a low-privilege account. That's 
+   not an optimistic read of the evidence, it's just wrong, and wrong reports 
+   waste the researcher's time chasing a win that isn't there.
 
 2. HONEST & ACTIONABLE BREAKDOWN
-   Say what was actually done and what evidence backs it. If the objective 
-   isn't complete, say exactly which attack vectors are still open and what 
-   the next move should be.
+   Say what was actually done and what evidence backs it, specifically, not 
+   "the target was tested" in the vague sense that means nothing. If the 
+   objective isn't complete, say exactly which attack vectors are still open 
+   and what the next move should be. A status without a next step is half 
+   a report.
 
 3. CONCISE, FACTUAL SYNTHESIS
    Technical, evidence-backed, no padding. An HTTP 200 is a response code, 
-   not a confirmed vulnerability.
-
-4. IDENTITY & DIRECTORY REALITY CHECK
-   - User list tables are DIRECTORY LISTINGS, not account takeovers.
-   - Holding an intermediate user's session cookie ≠ primary target takeover.
-   - NEVER claim token reuse assumed the target's session unless the target's 
-     specific credentials were actually submitted to an auth handler.
+   not a confirmed vulnerability, treat it as exactly that until something 
+   actually proves impact. If the evidence is thin, say the evidence is thin, 
+   don't round it up to "likely exploitable" because that sounds better in 
+   a report.
 """
 
 # ==========================================================
@@ -345,7 +343,7 @@ def render_chat_bubble(text: str, sender: str = "HELLHOUND"):
 
 class ThinkingIndicator:
     """Thread-safe floating loader supporting dynamic step emission, tool action trees, and clean shutdown."""
-    def __init__(self, label="HELLHOUND IS ANALYZING & EXECUTING", status_callback=None):
+    def __init__(self, label="Let me think", status_callback=None):
         self.label = label
         self.status_callback = status_callback
         self.stop_event = threading.Event()
@@ -669,7 +667,7 @@ class ThinkingIndicator:
             except Exception:
                 pass
 
-def thinking_animation(label="HELLHOUND IS ANALYZING & EXECUTING"):
+def thinking_animation(label="Let me think"):
     """Start a clean 6-dot floating loader that stays strictly on a single line and never breaks."""
     indicator = ThinkingIndicator(label)
     indicator.start()
@@ -821,8 +819,8 @@ def list_available_models() -> List[Dict[str, Any]]:
 
     return models_list
 
-def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
-    """Unified dispatcher for all supported AI providers."""
+def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+    """Unified dispatcher for all supported AI providers. When `tools` is provided, providers attempt native tool calling."""
     provider = (provider or "ollama").lower().strip()
     
     if system_prompt is None:
@@ -831,24 +829,24 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
     active_model = model or get_default_model(provider)
 
     if provider in ("nvidia", "nim"):
-        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check)
+        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
     elif provider == "openai":
-        res = call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage)
+        res = call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, tools=tools)
     elif provider == "anthropic":
-        res = call_anthropic(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage)
+        res = call_anthropic(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, tools=tools)
     elif provider == "gemini":
-        res = ask_gemini(api_key, active_model, system_prompt, prompt, max_tokens=max_tokens, timeout=timeout, history=history, thinking=thinking, on_token=on_token, return_usage=return_usage)
+        res = ask_gemini(api_key, active_model, system_prompt, prompt, max_tokens=max_tokens, timeout=timeout, history=history, thinking=thinking, on_token=on_token, return_usage=return_usage, tools=tools)
     else: # Ollama / Local
-        res = call_ollama(prompt, model=active_model, system_prompt=system_prompt, timeout=timeout, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check)
+        res = call_ollama(prompt, model=active_model, system_prompt=system_prompt, timeout=timeout, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
 
     if return_usage:
         text, tokens = res
-        cleaned = strip_thinking_tags(text) if text else text
+        cleaned = strip_thinking_tags(text) if isinstance(text, str) else text
         return (cleaned, tokens)
     
-    return strip_thinking_tags(res) if res else res
+    return strip_thinking_tags(res) if isinstance(res, str) else res
 
-def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, role: str = "orchestrator", thinking: bool = False, max_tokens: int = None, history: list = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, role: str = "orchestrator", thinking: bool = False, max_tokens: int = None, history: list = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """Config-aware wrapper to query the configured AI provider/model for a specific role (orchestrator vs synthesizer)."""
     cfg = load_config()
     provider = cfg.get(f"{role}_provider") or cfg.get("ai_provider", "ollama")
@@ -883,10 +881,10 @@ def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, t
             active_model = cfg.get("orchestrator_model") or cfg.get("ai_model") or get_default_model(provider)
             api_key = api_keys.get(provider) or os.environ.get(env_map.get(provider, ""), "") or "ollama"
 
-    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check)
+    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
 
-def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
-    """REST call to NVIDIA NIM OpenAI-compatible API with SSE streaming."""
+def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+    """REST call to NVIDIA NIM OpenAI-compatible API with SSE streaming. Supports native tool calling."""
     try:
         url = "https://integrate.api.nvidia.com/v1/chat/completions"
         headers = {
@@ -911,6 +909,33 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             "stream": True,
             "chat_template_kwargs": {"thinking": thinking}
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+            # Disable streaming for tool calling — simpler to parse non-streamed tool_calls
+            payload["stream"] = False
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code != 200:
+                err = f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:100]}"
+                return (err, None) if return_usage else err
+            data = r.json()
+            usage_tokens = data.get("usage", {}).get("completion_tokens")
+            choice = data.get("choices", [{}])[0]
+            msg = choice.get("message", {})
+            # Check for native tool calls
+            if msg.get("tool_calls"):
+                tc = msg["tool_calls"][0]  # Take first tool call
+                fn = tc.get("function", {})
+                try:
+                    parsed_args = json.loads(fn.get("arguments", "{}"))
+                except Exception:
+                    parsed_args = {}
+                result = {"tool": fn.get("name", ""), "args": parsed_args}
+                return (result, usage_tokens) if return_usage else result
+            # No tool call — return text content
+            text = strip_thinking_tags(msg.get("content", "")) or None
+            return (text, usage_tokens) if return_usage else text
+
         r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:
             err = f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:100]}"
@@ -958,8 +983,8 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
         err = f"Error: NVIDIA NIM connection failed ({str(e)})"
         return (err, None) if return_usage else err
 
-def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
-    """REST call to OpenAI Chat Completions API with SSE streaming."""
+def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+    """REST call to OpenAI Chat Completions API with SSE streaming. Supports native tool calling."""
     try:
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -975,6 +1000,30 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
         resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
 
         payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": resolved_max_tokens, "stream": True}
+
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+            payload["stream"] = False
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code != 200:
+                err = f"Error: OpenAI API returned {r.status_code}"
+                return (err, None) if return_usage else err
+            data = r.json()
+            usage_tokens = data.get("usage", {}).get("completion_tokens")
+            choice = data.get("choices", [{}])[0]
+            msg = choice.get("message", {})
+            if msg.get("tool_calls"):
+                tc = msg["tool_calls"][0]
+                fn = tc.get("function", {})
+                try:
+                    parsed_args = json.loads(fn.get("arguments", "{}"))
+                except Exception:
+                    parsed_args = {}
+                result = {"tool": fn.get("name", ""), "args": parsed_args}
+                return (result, usage_tokens) if return_usage else result
+            text = strip_thinking_tags(msg.get("content", "")) or None
+            return (text, usage_tokens) if return_usage else text
         r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:
             err = f"Error: OpenAI API returned {r.status_code}"
@@ -1016,8 +1065,8 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
         err = f"Error: OpenAI connection failed ({str(e)})"
         return (err, None) if return_usage else err
 
-def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20240620", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
-    """REST call to Anthropic Messages API with SSE streaming."""
+def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20240620", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+    """REST call to Anthropic Messages API with SSE streaming. Supports native tool calling."""
     try:
         url = "https://api.anthropic.com/v1/messages"
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
@@ -1039,6 +1088,35 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
         }
         if system_prompt:
             payload["system"] = system_prompt
+
+        if tools:
+            # Convert OpenAI-format tools to Anthropic format
+            anthropic_tools = []
+            for t in tools:
+                fn = t.get("function", t)
+                anthropic_tools.append({
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters", {"type": "object", "properties": {}})
+                })
+            payload["tools"] = anthropic_tools
+            payload["stream"] = False
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code != 200:
+                err = f"Error: Anthropic API returned {r.status_code}"
+                return (err, None) if return_usage else err
+            data = r.json()
+            usage_tokens = data.get("usage", {}).get("output_tokens")
+            # Check for tool_use content blocks
+            for block in data.get("content", []):
+                if block.get("type") == "tool_use":
+                    result = {"tool": block.get("name", ""), "args": block.get("input", {})}
+                    return (result, usage_tokens) if return_usage else result
+            # No tool call — extract text
+            text_parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+            text = strip_thinking_tags(" ".join(text_parts).strip()) or None
+            return (text, usage_tokens) if return_usage else text
+
         r = requests.post(url, headers=headers, json=payload, stream=bool(on_token), timeout=timeout)
         if r.status_code != 200:
             err = f"Error: Anthropic API returned {r.status_code}"
@@ -1093,8 +1171,8 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
         err = f"Error: Anthropic connection failed ({str(e)})"
         return (err, None) if return_usage else err
 
-def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = None, timeout: int = 20, history: list = None, thinking: bool = False, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
-    """Gemini API caller with SSE streaming support."""
+def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = None, timeout: int = 20, history: list = None, thinking: bool = False, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+    """Gemini API caller with SSE streaming support. Supports native function calling."""
     try:
         contents = []
         if history:
@@ -1115,6 +1193,43 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
                 "topP": 0.9
             }
         }
+
+        if tools:
+            # Convert OpenAI-format tools to Gemini functionDeclarations
+            func_decls = []
+            for t in tools:
+                fn = t.get("function", t)
+                params = fn.get("parameters", {"type": "object", "properties": {}})
+                # Gemini doesn't support additionalProperties — strip it
+                clean_params = {k: v for k, v in params.items() if k != "additionalProperties"}
+                func_decls.append({
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "parameters": clean_params
+                })
+            payload["tools"] = [{"functionDeclarations": func_decls}]
+            # Use non-streaming for tool calling
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            r = requests.post(url, json=payload, timeout=timeout)
+            if r.status_code != 200:
+                err = f"Error: Gemini API returned {r.status_code} - {r.text[:100]}"
+                return (err, None) if return_usage else err
+            data = r.json()
+            usage_tokens = data.get("usageMetadata", {}).get("candidatesTokenCount")
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                for part in parts:
+                    if "functionCall" in part:
+                        fc = part["functionCall"]
+                        result = {"tool": fc.get("name", ""), "args": fc.get("args", {})}
+                        return (result, usage_tokens) if return_usage else result
+                # No function call — extract text
+                raw_text = "".join(p.get("text", "") for p in parts if "text" in p)
+                text = strip_thinking_tags(raw_text.strip()) or None
+                return (text, usage_tokens) if return_usage else text
+            err = "Error: No candidates in response"
+            return (err, None) if return_usage else err
         endpoint = "streamGenerateContent?alt=sse" if on_token else "generateContent"
         sep = "&" if "?" in endpoint else "?"
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:{endpoint}{sep}key={api_key}"
@@ -1212,8 +1327,8 @@ class _RepetitionGuard:
         return occurrences > self.max_repeats
 
 
-def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
-    """REST call to local Ollama API using chat endpoint."""
+def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+    """REST call to local Ollama API using chat endpoint. Supports native tool calling."""
     try:
         model = model or get_default_model("ollama")
         url = "http://localhost:11434/api/chat"
@@ -1260,6 +1375,33 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
         }
         if not thinking:
             payload["think"] = False
+
+        # Native tool calling path
+        if tools:
+            payload["tools"] = tools
+            payload["stream"] = False  # Non-streamed for simpler tool_calls parsing
+            r = requests.post(url, json=payload, timeout=timeout)
+            if r.status_code != 200:
+                err = f"Error: Ollama returned status {r.status_code}"
+                return (err, None) if return_usage else err
+            data = r.json()
+            eval_count = data.get("eval_count")
+            msg = data.get("message", {})
+            # Check for native tool calls
+            if msg.get("tool_calls"):
+                tc = msg["tool_calls"][0]
+                fn = tc.get("function", {})
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                result = {"tool": fn.get("name", ""), "args": args}
+                return (result, eval_count) if return_usage else result
+            # No tool call — return text content
+            text = strip_thinking_tags(msg.get("content", "")) or None
+            return (text, eval_count) if return_usage else text
         
         r = requests.post(url, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:

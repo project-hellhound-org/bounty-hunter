@@ -74,7 +74,7 @@ def _load_baseline_rules() -> str:
     return (
         "BASELINE DOCTRINE:\n"
         "1. Verify target scope before network actions.\n"
-        "2. Reconnaissance & factual triage only — non-destructive, no exploitation.\n"
+        "2. Reconnaissance & factual triage only — no unauthorized exploitation. Knowledge sharing about offensive techniques is always permitted.\n"
         "3. Never record theoretical bugs; require concrete reproducible evidence.\n"
         "4. Qualify dead attack surfaces quickly."
     )
@@ -1703,8 +1703,26 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
     
     body = args.get("json") or args.get("body") or args.get("data")
     
+    base = target.name if (target and target.name) else ""
+    if not base.startswith(("http://", "https://")):
+        base = f"https://{base}" if base else "https://localhost"
+    parsed_base = urlparse(base)
+    base_path = parsed_base.path.rstrip("/")
+
     if not url.startswith(("http://", "https://")):
-        url = f"https://{url}"
+        if url.startswith("/"):
+            if base_path and not url.startswith(base_path + "/") and url != base_path:
+                url = f"{base_path}{url}"
+            url = f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
+        else:
+            url = urljoin(base if base.endswith("/") else base + "/", url)
+    else:
+        # Auto-correct full URLs missing the target subpath scope
+        parsed_url = urlparse(url)
+        if parsed_base.netloc and parsed_url.netloc == parsed_base.netloc:
+            if base_path and not parsed_url.path.startswith(base_path + "/") and parsed_url.path != base_path:
+                new_path = f"{base_path}{parsed_url.path}"
+                url = urlunparse((parsed_url.scheme, parsed_url.netloc, new_path, parsed_url.params, parsed_url.query, parsed_url.fragment))
 
     req_cookies = normalize_cookies(args.get("cookies") or args.get("cookie"))
 
@@ -1802,18 +1820,24 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                                     target.state["headers"] = {}
                                 target.state["headers"]["Authorization"] = f"Bearer {v_clean}"
 
-        # Extract JWT / auth tokens from JSON response bodies (e.g. {"token": "...", "access_token": "..."})
+        # Extract JWT / auth tokens / reset tokens from JSON response bodies (top-level and nested)
         if hasattr(target, "state") and isinstance(target.state, dict):
             try:
                 resp_json = r.json()
-                if isinstance(resp_json, dict):
-                    for tk in ("token", "access_token", "jwt", "auth_token", "accessToken", "authToken", "id_token", "session_token"):
-                        if tk in resp_json and isinstance(resp_json[tk], str) and resp_json[tk].strip():
-                            token_val = resp_json[tk].strip()
-                            target.state["auth_token"] = token_val
+                if isinstance(resp_json, (dict, list)):
+                    flattened_json = _flatten_json_dict(resp_json)
+                    for full_k, v in flattened_json.items():
+                        if not v or not isinstance(v, (str, int)):
+                            continue
+                        val_str = str(v).strip()
+                        if not val_str or len(val_str) < 3:
+                            continue
+                        leaf_k = full_k.split(".")[-1].split("[")[0].lower()
+                        if leaf_k in ("token", "access_token", "jwt", "auth_token", "accesstoken", "authtoken", "id_token", "session_token", "reset_token", "token_id"):
+                            target.state["auth_token"] = val_str
                             if "headers" not in target.state or not isinstance(target.state["headers"], dict):
                                 target.state["headers"] = {}
-                            target.state["headers"]["Authorization"] = f"Bearer {token_val}"
+                            target.state["headers"]["Authorization"] = f"Bearer {val_str}"
                             break
             except Exception:
                 pass
@@ -1939,6 +1963,60 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
             "body_preview": body_text[:35000]
         }
 
+        # Code-level detection of authentication leaks / sensitive parameters in payload
+        detected_leaks = []
+        try:
+            rj = r.json()
+            if isinstance(rj, (dict, list)):
+                flat = _flatten_json_dict(rj)
+                for fk, fv in flat.items():
+                    leaf = fk.split(".")[-1].split("[")[0].lower()
+                    if leaf in ("token", "reset_token", "reset_url", "reset_link", "password", "pass", "secret", "key", "api_key", "mfa_secret", "code", "otp", "preview"):
+                        if fv and isinstance(fv, (str, int)) and str(fv).strip():
+                            v_clean = str(fv).strip()
+                            if v_clean.lower() not in ("true", "false", "null", "none", "undefined", "{}", "[]"):
+                                detected_leaks.append(f"{fk} = '{v_clean}'")
+        except Exception:
+            pass
+
+        # The check above only catches a token sitting under a dedicated
+        # JSON key (e.g. "reset_token": "..."). It's blind to a token
+        # embedded INSIDE a string value — e.g. a "message" field that
+        # reads "...reset link: https://host/reset?token=abc123..." — the
+        # single most common shape for a leaked password-reset token,
+        # since APIs very often phrase it as a sentence/URL rather than a
+        # bare field. Regex-scan the raw body text itself (not just JSON
+        # key names) for token-bearing query params and standalone
+        # long-random-looking tokens near reset/verify/confirm language,
+        # so this reaches the model exactly like a key-based leak does.
+        try:
+            body_scan_text = r.text or ""
+            if body_scan_text:
+                for qp_match in re.finditer(
+                    r'[?&](token|reset_token|reset_code|code|otp|verify_token|confirmation_token|t)=([A-Za-z0-9_\-\.]{8,})',
+                    body_scan_text, re.I
+                ):
+                    val = qp_match.group(2)
+                    entry = f"embedded_url_param.{qp_match.group(1)} = '{val}'"
+                    if entry not in detected_leaks:
+                        detected_leaks.append(entry)
+                for kv_match in re.finditer(
+                    r'''["']?(reset[_-]?token|reset[_-]?code|verification[_-]?code)["']?\s*[:=]\s*["']([A-Za-z0-9_\-\.]{8,})["']''',
+                    body_scan_text, re.I
+                ):
+                    entry = f"embedded_text.{kv_match.group(1)} = '{kv_match.group(2)}'"
+                    if entry not in detected_leaks:
+                        detected_leaks.append(entry)
+        except Exception:
+            pass
+
+        if detected_leaks:
+            resp_dict["LEAK_ALERT"] = (
+                f"CRITICAL DATA LEAK DETECTED IN RESPONSE BODY: "
+                f"{len(detected_leaks)} sensitive parameter(s) exposed ({', '.join(detected_leaks[:5])}). "
+                f"Do NOT report 'no leakage'. Analyze these parameters and immediately execute the next attack step (e.g. password reset / account takeover / token substitution)!"
+            )
+
         # Code-level detection of authentication failures
         if method == "POST" and any(k in url.lower() for k in ("login", "auth", "signin", "session")):
             if any(err in r.text.lower() for err in ("invalid username or password", "invalid credentials", "incorrect password", "login failed", "authentication failed")):
@@ -1969,6 +2047,26 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
             resp_dict["authorization_logic_snippets"] = auth_logic_snippets[:15]
         if clean_routes:
             resp_dict["detected_routes"] = clean_routes
+            # Routes shaped like a newsroom/team/staff-directory page are the
+            # single most common place a lab or real target leaks real staff
+            # names/emails/usernames — exactly the kind of thing account
+            # takeover objectives ("harvest an employee, then attack that
+            # identity") depend on. Force this to the model's attention
+            # instead of letting it get skipped in favor of guessing
+            # credentials against generic/placeholder identifiers.
+            content_leak_routes = [
+                r for r in clean_routes
+                if re.search(r'(blog|news|press|posts?|article|about|team|staff|author|people|newsroom)',
+                             r, re.I)
+            ]
+            if content_leak_routes:
+                resp_dict["content_recon_hint"] = (
+                    f"ROUTE(S) LIKELY TO LEAK REAL STAFF IDENTITIES DETECTED: {content_leak_routes[:8]}. "
+                    f"Fetch these with curl BEFORE testing any credentials — content/blog/team pages are "
+                    f"the most common source of real employee names, emails, and usernames on a target. "
+                    f"Any identifier you haven't personally observed in an actual tool result against this "
+                    f"target is not real and must not be tested."
+                )
         return resp_dict
     except Exception as e:
         return {
@@ -2839,14 +2937,101 @@ def _execute_load_skill(args: Dict[str, Any], target: Target, emit: Any) -> Dict
     body = load_skill_body(name)
     if not body:
         return {"error": f"Skill '{name}' has no content."}
-    return {"skill": name, "methodology": body}
+    return {
+        "skill": name,
+        "content_type": "REFERENCE_DOCUMENTATION — not target data",
+        "warning": (
+            "Everything below is generic methodology reference material. It is NOT "
+            "reconnaissance output and contains NO information about the current "
+            "target. Any email address, domain, username, token, or identifier that "
+            "appears in this content (e.g. 'admin@target.com', 'victim@x.com', "
+            "'Admin@X.com') is a placeholder used to illustrate a technique's SYNTAX "
+            "— it was never observed on the actual target and must NEVER be tested "
+            "against it, submitted in a login/reset/API request, or reported as a "
+            "'harvested' or 'discovered' credential. Only identifiers that appear in "
+            "the response of an actual curl/spider/tool call against the real target "
+            "are real. If this skill's methodology calls for a specific identifier "
+            "(a username, an email), get it from your own prior tool results on this "
+            "target, not from this document."
+        ),
+        "methodology": body,
+    }
+
+
+def _execute_read_artifact(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Reads a line-range slice of a raw tool output artifact saved under the target's raw/ directory."""
+    path = str(args.get("path", "")).strip()
+    if not path:
+        return {"error": "path is required."}
+
+    try:
+        offset = int(args.get("offset", 0))
+    except (ValueError, TypeError):
+        offset = 0
+
+    try:
+        length = int(args.get("length", 200))
+    except (ValueError, TypeError):
+        length = 200
+
+    target_name = target.name if (target and hasattr(target, "name") and target.name) else "default"
+    base_dir = os.path.realpath(os.path.expanduser(f"~/.hellhound/targets/{target_name}/raw"))
+    abs_path = os.path.realpath(os.path.expanduser(path))
+
+    # Path traversal validation: path must be strictly within target's raw/ directory
+    try:
+        if os.path.commonpath([abs_path, base_dir]) != base_dir:
+            return {"error": f"Access denied: Path '{path}' is not within target raw directory '{base_dir}'."}
+    except Exception:
+        return {"error": f"Access denied: Path '{path}' is outside target raw directory '{base_dir}'."}
+
+    if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+        return {"error": f"File not found: '{path}'."}
+
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+
+        total_lines = len(all_lines)
+        start_line = max(0, offset)
+        end_line = start_line + max(1, length)
+        lines_slice = all_lines[start_line:end_line]
+        content_slice = "".join(lines_slice)
+
+        if emit and hasattr(emit, "info"):
+            emit.info(f"[read_artifact] Reading lines {start_line}-{start_line + len(lines_slice)} from {os.path.basename(abs_path)}")
+
+        return {
+            "status": "success",
+            "path": abs_path,
+            "offset": start_line,
+            "length": len(lines_slice),
+            "total_lines": total_lines,
+            "content": content_slice,
+        }
+    except Exception as e:
+        return {"error": f"Failed to read artifact file '{path}': {e}"}
 
 
 # Tool Registry Map
 TOOL_REGISTRY: Dict[str, ToolSpec] = {
+    "read_artifact": ToolSpec(
+        name="read_artifact",
+        description="Read a line-range slice of a raw tool output artifact saved to target storage (~/.hellhound/targets/<target>/raw/). Use this tool when previous tool output was truncated (indicated by [FULL OUTPUT SAVED: ...]) and you need to inspect a specific line range or middle section of the output.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Full file path of the saved raw artifact (e.g. ~/.hellhound/targets/example.com/raw/spider_20260828T120000.txt)."},
+                "offset": {"type": "integer", "description": "Starting line number (0-indexed). Default is 0.", "default": 0},
+                "length": {"type": "integer", "description": "Number of lines to read. Default is 200.", "default": 200}
+            },
+            "required": ["path"]
+        },
+        executor=_execute_read_artifact
+    ),
     "load_skill": ToolSpec(
         name="load_skill",
-        description="Load the full methodology for a named skill from the SKILL MENU in your system prompt, when the task needs a specific methodology that hasn't already been auto-injected. Call this BEFORE your first recon/exploit tool call if you recognize the task matches a listed skill better than what's already provided.",
+        description="Load the full methodology for a named skill from the SKILL MENU in your system prompt. This is how you get methodology content — nothing is auto-injected for you. Check the menu and call this whenever a task would benefit from a specific methodology, before your first recon/exploit tool call.",
         parameters={
             "type": "object",
             "properties": {
@@ -3277,18 +3462,17 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
 
 def extract_path_scope(user_text: str) -> Optional[str]:
     """
-    If the user's task text names a specific URL or path
-    (e.g. "...from this endpoint https://host/app" or "/app/dashboard"), return that first
-    path segment (e.g. "/app") as the task's path scope.
+    If the user's task text names a specific URL (e.g. "...from this endpoint https://host/app"),
+    return that first path segment (e.g. "/app") as the task's path scope.
 
     Multi-tenant hosts (several independent applications or challenges living under
     different top-level paths on the same domain) — a task scoped to one endpoint should
-    not wander into the others. Returns None if no path is present (task is domain-wide)
-    so nothing is restricted.
+    not wander into the others. Returns None if no explicit full URL path is present
+    so an existing established target path scope is not accidentally overwritten by casual path mentions.
     """
     if not user_text:
         return None
-    # 1. Full URL check
+    # 1. Full URL check (e.g. https://host/pulse or http://target/app/login)
     m = re.search(r'https?://[^\s"\']+', user_text)
     if m:
         raw_url = m.group(0).rstrip(".,;:!?)>\"'")
@@ -3301,8 +3485,8 @@ def extract_path_scope(user_text: str) -> Optional[str]:
         except Exception:
             pass
 
-    # 2. Explicit path references like "/app", "/app/dashboard", "/service"
-    m_path = re.search(r'(?:^|\s)(/[a-zA-Z0-9_\-\.]+)', user_text)
+    # 2. Explicit scope specification command (e.g. "scope /app", "target /pulse")
+    m_path = re.search(r'(?:scope|target|path)\s+(/[a-zA-Z0-9_\-\.]+)', user_text, re.IGNORECASE)
     if m_path:
         cand = m_path.group(1).rstrip(".,;:!?)>\"'")
         segments = [s for s in cand.split("/") if s]
@@ -3322,6 +3506,66 @@ def _url_in_path_scope(url: str, path_scope: str) -> bool:
     return p == scope or p.startswith(scope + "/")
 
 
+def extract_target_from_text(user_text: str) -> Optional[str]:
+    """
+    Extracts a target domain, IP address, or host from user text.
+    Handles:
+    - Full URLs: http://10.49.135.46/ -> 10.49.135.46
+    - IPv4 addresses: 10.49.135.46, 192.168.1.1:8080
+    - Standard domain names: example.com, sub.target.ctf.io
+    - Local hostnames: localhost, htb.local
+    """
+    if not user_text:
+        return None
+    url_match = re.search(r'https?://([a-zA-Z0-9._-]+(?::\d+)?)', user_text)
+    if url_match:
+        return sanitize_target_name(url_match.group(1))
+    ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b', user_text)
+    if ip_match:
+        return sanitize_target_name(ip_match.group(0))
+    dom_match = re.search(r'([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.[a-zA-Z0-9]{2,})', user_text)
+    if dom_match:
+        return sanitize_target_name(dom_match.group(1))
+    local_match = re.search(r'\b(localhost|htb\.local)\b', user_text, re.IGNORECASE)
+    if local_match:
+        return sanitize_target_name(local_match.group(0))
+    return None
+
+
+def _extract_preserved_artifacts(content: str) -> str:
+    """
+    Scans untruncated tool output content for high-value security artifacts
+    (JWTs, Bearer tokens, Session/API keys, URLs, Emails) and returns a formatted
+    [PRESERVED ARTIFACTS ...] header block, or empty string if none found.
+    """
+    if not content:
+        return ""
+
+    jwts = sorted(set(re.findall(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", content)))
+    bearer_tokens = sorted(set(re.findall(r"Bearer\s+[A-Za-z0-9._~+/-]+=*", content)))
+    session_keys = sorted(set(re.findall(r"(?:session|sid|token|auth|api[_-]?key)[\"'=:\s]+[A-Za-z0-9._-]{8,}", content, re.IGNORECASE)))
+    urls = sorted(set(re.findall(r"https?://[^\s\"'<>]+", content)))
+    emails = sorted(set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", content)))
+
+    lines = []
+    if jwts:
+        lines.append(f"JWTs: {', '.join(jwts)}")
+    if bearer_tokens:
+        lines.append(f"Bearer tokens: {', '.join(bearer_tokens)}")
+    if session_keys:
+        lines.append(f"Session/API keys: {', '.join(session_keys)}")
+    if urls:
+        lines.append(f"URLs: {', '.join(urls)}")
+    if emails:
+        lines.append(f"Emails: {', '.join(emails)}")
+
+    if not lines:
+        return ""
+
+    header = "[PRESERVED ARTIFACTS — extracted before truncation, may include entries from the cut middle section]\n"
+    return header + "\n".join(lines) + "\n\n"
+
+
 class Agent:
     def __init__(self, target: Optional[Target] = None):
         self.target = target or create_or_load_target("default")
@@ -3337,6 +3581,21 @@ class Agent:
         )
         self._turn_path_scope: Optional[str] = None  # e.g. "/app" — set per-turn in handle_message
         self._forced_skill: Optional[str] = None  # set by /skill-name slash command — one-shot, consumed next turn
+
+    @staticmethod
+    def _build_native_tools() -> List[Dict[str, Any]]:
+        """Convert TOOL_REGISTRY specs into OpenAI-compatible tool definitions for native API tool calling."""
+        tools = []
+        for name, spec in TOOL_REGISTRY.items():
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": spec.description[:200],  # Keep descriptions concise for token efficiency
+                    "parameters": spec.parameters or {"type": "object", "properties": {}}
+                }
+            })
+        return tools
 
     def set_target(self, target_name: str) -> Target:
         self.target = create_or_load_target(target_name)
@@ -3399,9 +3658,35 @@ class Agent:
                 # highest-value content — provide full results up to 25,000 characters
                 # so the LLM can extract tokens, IDs, endpoints, and credentials without loss.
                 if len(content) > 25000:
-                    emails = sorted(set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", content)))
-                    prefix = f"[EMAILS FOUND IN THIS RESULT: {', '.join(emails)}]\n" if emails else ""
-                    content = prefix + content[:24000] + "\n...[truncated remainder of large output]..."
+                    artifacts_prefix = _extract_preserved_artifacts(content)
+
+                    target_name = self.target.name if (hasattr(self, "target") and self.target and hasattr(self.target, "name") and self.target.name) else "default"
+                    tool_match = re.search(r"\[TOOL RESULT:\s*([a-zA-Z0-9_-]+)\]", content)
+                    tool_name = tool_match.group(1) if tool_match else "tool_output"
+
+                    saved_msg = ""
+                    try:
+                        raw_dir = os.path.expanduser(f"~/.hellhound/targets/{target_name}/raw")
+                        os.makedirs(raw_dir, exist_ok=True)
+                        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                        filename = f"{tool_name}_{timestamp}.txt"
+                        saved_path = os.path.join(raw_dir, filename)
+
+                        with open(saved_path, "w", encoding="utf-8", errors="replace") as f:
+                            f.write(content)
+
+                        char_count = len(content)
+                        line_count = len(content.splitlines())
+                        saved_msg = f"\n[FULL OUTPUT SAVED: {saved_path} — {char_count:,} chars, {line_count:,} lines. Use read_artifact(path=..., offset=..., length=...) if you need a section not shown above.]"
+                    except Exception:
+                        pass
+
+                    head = content[:12000]
+                    tail = content[-8000:]
+                    truncated_len = len(content) - 12000 - 8000
+                    middle_marker = f"\n...[{truncated_len:,} chars truncated from middle]...\n"
+
+                    content = artifacts_prefix + head + middle_marker + tail + saved_msg
             elif len(content) > 4000:
                 content = content[:3800] + "\n...[truncated]..."
             trimmed.append({"role": h.get("role", "user"), "content": content})
@@ -3614,7 +3899,12 @@ class Agent:
 
             # Auto-extract & persist harvested security artifacts (tokens, passwords, session cookies, keys)
             try:
-                extract_and_store_artifacts(tool_name, args, result, self.target, turn_number=getattr(self, "_current_turn", len(self.history)))
+                harvested = extract_and_store_artifacts(tool_name, args, result, self.target, turn_number=getattr(self, "_current_turn", len(self.history)))
+                if harvested and isinstance(result, dict):
+                    result["harvested_security_artifacts"] = harvested
+                    if "LEAK_ALERT" not in result:
+                        summary_str = ", ".join([f"{a.get('field_name')}='{a.get('value')}'" for a in harvested[:3]])
+                        result["LEAK_ALERT"] = f"CRITICAL SECURITY FINDING: {len(harvested)} sensitive artifact(s) harvested from response ({summary_str}). You MUST analyze and use these credentials/tokens!"
             except Exception:
                 pass
 
@@ -3623,7 +3913,7 @@ class Agent:
             self.guard.record_failure(host)
             return {"error": f"Tool execution failed: {str(e)}"}
 
-    def handle_message(self, user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, max_iterations: int = 15, on_token: Optional[Callable[[str], None]] = None, cancel_check: Optional[Callable[[], bool]] = None) -> str:
+    def handle_message(self, user_text: str, session_context: Optional[Dict[str, Any]] = None, emit: Any = None, max_iterations: Optional[int] = None, on_token: Optional[Callable[[str], None]] = None, cancel_check: Optional[Callable[[], bool]] = None) -> str:
         """
         Main autonomous reasoning and conversational loop.
         """
@@ -3635,29 +3925,24 @@ class Agent:
             if session_context.get("scope_rules"):
                 self.target.scope_rules = session_context["scope_rules"]
 
-        # Check if the user is asking to recon a target without any scope loaded or defined
-        lower_text = user_text.lower()
-        recon_words = ["recon", "scan", "enumerate", "subdomains", "crawl", "spider", "hunt"]
-        has_recon_intent = any(rw in lower_text for rw in recon_words)
-        
         # Check if there is a target defined in the prompt or active context
-        domain_match = re.search(r'([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.[a-zA-Z]{2,})', user_text)
-        if domain_match:
-            detected_domain = sanitize_target_name(domain_match.group(1))
-            if self.target.name == "default" or (self.target.name != detected_domain and "." in detected_domain and self.target.name != detected_domain):
-                if self.target.name != detected_domain:
-                    self.set_target(detected_domain)
+        target_match = extract_target_from_text(user_text)
+        domain_match = target_match
+        if target_match:
+            detected_target = target_match
+            if self.target.name == "default" or (self.target.name != detected_target):
+                self.set_target(detected_target)
         elif self.target.name == "default" and self.target.scope_rules.in_scope:
-            primary_domain = self.target.scope_rules.in_scope[0].lstrip("*.")
-            if primary_domain and "." in primary_domain:
-                self.set_target(primary_domain)
+            primary_target = self.target.scope_rules.in_scope[0].lstrip("*.")
+            if primary_target:
+                self.set_target(primary_target)
 
         if session_context is not None:
             session_context["target"] = self.target.name
             session_context["scope_rules"] = self.target.scope_rules
 
         # Auto-scope shortcut ONLY when CTF/lab target criteria are met
-        if domain_match and is_ctf_auto_scope_eligible(self.target.name, user_text):
+        if (target_match or self.target.name != "default") and is_ctf_auto_scope_eligible(self.target.name, user_text):
             if not self.target.scope_raw or not self.target.scope_rules.in_scope:
                 set_scope(self.target, "")  # empty raw_text auto-populates in_scope with [*.target, target]
                 if emit and hasattr(emit, "info"):
@@ -3666,23 +3951,13 @@ class Agent:
                         f"{self.target.name} (no manual /scope needed for lab targets)"
                     )
 
-        # Scope enforcement gate for fresh un-scoped network recon requests
-        if has_recon_intent:
-            if not self.target.scope_rules.in_scope and not self.target.scope_raw:
-                return (
-                    f"No authorized scope is defined for '{self.target.name}'. "
-                    f"I won't start reconnaissance without it — testing outside scope "
-                    f"risks chasing something that's actually disallowed. Provide the "
-                    f"program's in-scope/out-of-scope rules first (e.g. `/scope <paste>`)."
-                )
-
         # Hard safety gate: if target is "default" with no scope, the orchestrator
-        # has no valid domain to hit — skip the tool loop entirely and let the
+        # has no valid domain/IP to hit — skip the tool loop entirely and let the
         # synthesizer handle it conversationally. The AI model itself decides
         # whether to use tools or just answer — no keyword classification needed.
         has_real_target = (
-            (self.target.name != "default" and "." in self.target.name)
-            or bool(domain_match)
+            (self.target.name != "default")
+            or bool(target_match)
             or bool(self.target.scope_rules and self.target.scope_rules.in_scope)
         )
 
@@ -3700,6 +3975,14 @@ class Agent:
         cfg = load_config()
         ai_prov = (cfg.get("synthesizer_provider") or cfg.get("ai_provider") or "ollama").lower()
         is_small = (ai_prov == "ollama")
+
+        # Iteration ceiling: explicit arg wins, else the configured value
+        # (default 60 — see ai_utils.load_config), never below 1.
+        if max_iterations is None:
+            try:
+                max_iterations = max(1, int(cfg.get("max_agent_iterations", 60)))
+            except (TypeError, ValueError):
+                max_iterations = 60
 
         forced_skill = getattr(self, "_forced_skill", None)
         if forced_skill:
@@ -3788,13 +4071,15 @@ class Agent:
             return f"""\
 You are HELLHOUND Orchestrator. Your sole job is to evaluate if a tool should be executed next or if tool execution is complete.
 
+NON-NEGOTIABLE, before anything else in this prompt: every response you give is EITHER pure tool-call JSON (`{{"tool": ..., "args": ...}}`, nothing else — no lead-in sentence, no "let me...", no "I'll now...") OR the literal word DONE. Never describe an action you're about to take in prose — describing it is not doing it, and the person you're working for gets nothing if you only narrate. If you find yourself writing "let me", "I'll", "I will now", "I need to", "I should", "First I", "Starting with", "Let me check", "Let me run", "proceed to", or any other forward-looking action language — stop, delete that sentence, and emit the JSON instead. Any response that contains English prose describing a planned action WITHOUT a JSON tool-call block is treated as a FAILURE and will be discarded. The full rules below explain HOW to decide what to do; this line governs the actual shape of every single response regardless of what those rules say.
+
 TARGET: {self.target.name}
 RESEARCHER MISSION & OBJECTIVE: {original_user_text}
 SCOPE: {scope_summary}{path_scope_prompt}
 {artifact_header}
 {skills_block}
 
-SKILL MENU (call load_skill(name) if none of the above matches this task — do this BEFORE your first recon/exploit tool call):
+SKILL MENU — call load_skill(name) to load any of these before your first recon/exploit tool call; nothing here is loaded for you automatically, check this list and decide for yourself what the task actually needs:
 {skills_menu}
 
 AVAILABLE TOOLS:
@@ -3806,7 +4091,7 @@ ALREADY GATHERED THIS SESSION (do not re-run a tool to re-discover this):
 RULES:
 1. DECISION & TOOL SELECTION (CRITICAL):
    - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network tools (curl, spider, subfinder, httpx, etc.). Output "DONE" immediately.
-   - CONVERSATIONAL & EDUCATIONAL QUERIES: If the user's message is a question, discussion, explanation request, concept breakdown, or methodology inquiry (e.g. "explain...", "how does...", "what is...", "why did..."), output "DONE" immediately.
+   - CONVERSATIONAL & EDUCATIONAL QUERIES: If the user's message is a question, discussion, explanation request, concept breakdown, methodology inquiry (e.g. "explain...", "how does...", "what is...", "why did..."), OR a plain greeting/small talk/capability question with no testing request in it at all (e.g. "hi", "hello", "hey", "what can you do", "who are you", "how does this work") — output "DONE" immediately with a normal conversational reply. Being the first message in a session, or a target already being scoped, is NOT on its own a reason to start testing — the message itself has to actually ask for that.
    - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a valid, in-scope target endpoint is required right now.
 
 2. MISSION OBJECTIVE FIDELITY & AUTONOMOUS EXPLOIT PROGRESSION (CRITICAL):
@@ -3853,17 +4138,24 @@ RULES:
      g) Map and probe the actual authenticated API endpoints identified in the JavaScript (e.g. account update routes, workspace management, user settings).
      h) Deep Mass Assignment: When an endpoint rejects direct modification of top-level fields (e.g. `role`), test the secondary or nested property structures discovered during JavaScript analysis.
      i) Post-Exploitation Verification: When a state-changing request (`PATCH`/`PUT`/`POST`) succeeds (HTTP 200), IMMEDIATELY verify elevated access by re-requesting the previously restricted/forbidden route (e.g. administrative console or protected resource) with `curl` to confirm privileged data is now accessible.
-     j) If JWTs are used: test unsigned `alg: none` tokens, algorithm confusion (`RS256` -> `HS256`), and claim tampering (`role`, `sub`, `email`).
+     j) FULL JWT ATTACK COVERAGE (DO NOT STOP AT ALG:NONE): If JWTs are present, NEVER test just a single vector! You MUST systematically test ALL JWT attack vectors: 1) Unsigned `alg: none` (uppercase/lowercase/mixed case `None`), 2) Algorithm Confusion (`RS256` -> `HS256` HMAC signed with the target's public key or SSL cert), 3) Claim Tampering (`role`, `is_owner`, `admin`, `sub`, `email`), 4) Header Parameter Injection (`kid` path traversal `/dev/null`, SQLi, `jku` SSRF, `x5u`), 5) Blank/empty signature. Finding and chaining multiple vectors on the same token maximizes vulnerability severity and bounty payout!
      k) SERVER-SIDE PARAMETER POLLUTION (SSPP) & BACKEND QUERY INJECTION:
         - When testing user-supplied input points (e.g. authentication/recovery, user lookup, profile updates, search filters, webhooks, or API proxies):
           * Client-Side Asset & Route Recon: Fetch any `<script>` tags, Webpack chunks, or bundle files referenced on the page with `curl` to dynamically discover internal API routes, query parameters, property names, and client submission schemas.
           * Form & Schema Inspection: Inspect the actual HTML form inputs (`<input name="...">`, hidden fields, CSRF tokens) or JSON API schemas on target endpoints. Always construct requests strictly matching the target's discovered schema.
           * Delimiter & Truncation Probing: Submit delimiter probes (`%26` / `&`) and truncation probes (`%23` / `#`, or path/JSON breakouts) to determine if user input is concatenated unencoded into internal backend/microservice requests.
           * HTTP 400 Error Oracles Are Positive Proof of Injection (DO NOT ABORT): In SSPP, error messages like 'Parameter is not supported', 'Field not specified', or 'Invalid field' are CONFIRMATION that the backend query parser received the injected parameter! Never declare failure or stop on 400 errors. Use them to identify backend parameter names and immediately test field overrides.
-          * Internal Field Overriding & Token Extraction: Construct the override payload `<param>=<target_id>%26<discovered_field>=<target_property>%23` using candidate property names mined from JS or error messages to leak sensitive internal data, tokens, or configuration in the response.
+          * Internal Field Overriding & Token Extraction: Construct the override payload `<param>=<target_id>%26<discovered_field>=<target_property>%23` using candidate property names mined from JS or error messages.
           * Exploit Chaining & Authentication Verification: Immediately chain harvested tokens/credentials into the target's corresponding submission flow. Ensure all required parameters are provided in the payload body and verify HTTP success before proceeding to authenticated testing.
           * Post-Takeover Verification: Authenticate with the newly established credentials/session, confirm elevated role/privileges on administrative dashboards or restricted APIs, execute required task objectives, capture visual proof (`gowitness`) of the authenticated dashboard, and record the finding.
      l) Pivot across discovered endpoints and HTTP verbs (GET, POST, PUT, PATCH, DELETE).
+     m) NESTED PAYLOAD & DEBUG DISCLOSURE INSPECTION (CRITICAL):
+        When sending requests to authentication, password reset, account recovery, registration, or API endpoints, NEVER inspect top-level status messages (e.g. "message": "link sent") in isolation. Response payloads, debug objects, or UI notification previews frequently embed sensitive tokens, password reset URLs, temporary credentials, or administrative keys in nested keys (e.g. "notification", "preview", "debug", "data", "result", "user"). If a tool result contains "LEAK_ALERT" or "harvested_security_artifacts", YOU MUST IMMEDIATELY extract and use those tokens/links to perform the password reset or login! NEVER claim "no leakage" when tokens or reset links are present in the response body!
+     n) SKILL PRIORITIZATION FOR TARGETED OBJECTIVES:
+        - Account Takeover / Password Reset / Auth Flaws -> IMMEDIATELY call `load_skill(name="auth-bypass")` as your very first tool call.
+        - Owner Console / Privilege Escalation / Admin Access -> IMMEDIATELY call `load_skill(name="access-control")` as your very first tool call.
+        - Parameter Pollution / Debug Leakage -> IMMEDIATELY call `load_skill(name="server-side-parameter-pollution")` as your very first tool call.
+        - DO NOT load `bb-methodology` or run 60-second broad spiders when given a specific target objective!
 
 5. Strict Verification Gate, Visual Proof & Finding Recording (gowitness / record_finding):
    - In modern Single-Page Applications (SPAs), HTTP 200 merely returns the frontend shell. Inspect the response body or screenshot for error states: "403", "Owner access required", "Access Denied", "Forbidden", or login prompts.
@@ -3883,8 +4175,9 @@ RULES:
 }}
 ```
 7. When testing authentication or password recovery workflows, harvest real user identities/emails from application content or endpoints rather than inventing dummy emails.{path_rule}
-8. If no further tools are needed, or after recording all findings and capturing visual proof of the PRIMARY target, respond with "DONE".
-9. If the task doesn't clearly match the skill content already provided above, check the SKILL MENU and call `load_skill` with the best-matching name before doing anything else.
+8. Resetting credentials or obtaining a password reset token is NOT mission completion. You MUST execute the login request (e.g. POST /api/auth/login with the new credentials), store/send the resulting session cookie or token, and access the target's internal staff console/portal (e.g., /portal, /dashboard, /admin, staff charts) to verify true end-to-end access before outputting DONE. If all tools and end-to-end access steps are complete, respond with "DONE".
+8b. Modifying user role or metadata via PATCH/POST/PUT (e.g. PATCH /meridian/api/account) is NOT mission completion. You MUST immediately execute curl to verify access to the target restricted route (e.g., GET /meridian/api/account and GET /meridian/api/admin/overview with the session cookie), capture visual proof with gowitness on the unlocked dashboard/overview, and record the confirmed vulnerability via record_finding BEFORE outputting DONE or ending your response!
+9. Skill methodology is never provided automatically — check the SKILL MENU yourself and call `load_skill` with whatever name actually fits the task, before doing anything else. This applies to every message, including what looks like the start of a new session — there's no default "starting" skill loaded for you; if you judge that a session is beginning and methodology would help, that's your call to make by loading one, not something decided for you in advance.
 """
 
         # Build live investigation context summary
@@ -3908,10 +4201,10 @@ RULES:
         )
 
         report_directive = ""
-        if report_requested and has_critical_findings:
+        if report_requested:
             report_directive = f"""
 CRITICAL INSTRUCTION - VULNERABILITY REPORT & PROOF OF CONCEPT DIRECTIVE:
-You must provide a structured, professional HackerOne-ready bug bounty submission report formatted in clean GitHub Markdown:
+The researcher explicitly requested a formal report. Provide a structured, professional HackerOne-ready bug bounty submission report formatted in clean GitHub Markdown:
 1. Vulnerability Title (Clear, concise, HackerOne style).
 2. Vulnerability Details & Attack Chain Narrative: Detail the entire attack path step-by-step.
 3. Steps to Reproduce (Deterministic PoC): Exact HTTP requests and curl commands.
@@ -3921,8 +4214,8 @@ You must provide a structured, professional HackerOne-ready bug bounty submissio
 
         # ── 2. Comprehensive Synthesizer System Prompt (Deep Reasoning & Synthesis)
         custom_synth_persona = (
-            session_context.get("synthesizer_persona") 
-            or session_context.get("options", {}).get("synthesizer_persona")
+            (session_context or {}).get("synthesizer_persona") 
+            or (session_context or {}).get("options", {}).get("synthesizer_persona")
             or cfg.get("synthesizer_persona")
             or SYNTHESIZER_PERSONA
         )
@@ -3947,16 +4240,18 @@ AVAILABLE TOOLS (this is the complete, real list — you have no other tools):
 INSTRUCTIONS:
 - Review the entire conversation history, executed tools, and gathered evidence.
 - Present a clear, factual summary of findings and tool results.
-- STATE STATUS CLEARLY AT THE START:
-  - [STATUS: OBJECTIVE ACHIEVED / FULL TAKEOVER] if the primary requested target account or role (e.g. Administrator or specified high-privilege user) was genuinely accessed and compromised.
-  - [STATUS: PARTIAL / IN PROGRESS] if only intermediate stepping stones (e.g. standard user, support account, or test foothold) were accessed. State plainly that the primary target was not yet taken over, explain what was achieved, and outline the exact remaining attack vectors to complete the mission.
-  - [STATUS: BLOCKED / EXHAUSTED] if all viable attack vectors were tested and blocked.
+- STATE STATUS CLEARLY AT THE START ONLY IF AN ACTIVE TARGET RECON/TESTING CAMPAIGN WAS EXECUTED THIS TURN:
+  - [STATUS: OBJECTIVE ACHIEVED / FULL TAKEOVER] if the primary requested target account or role was genuinely accessed and compromised.
+  - [STATUS: PARTIAL / IN PROGRESS] if only intermediate stepping stones were accessed.
+  - [STATUS: BLOCKED / EXHAUSTED] if a live campaign was executed and all viable attack vectors failed.
+  - DO NOT output a [STATUS: ...] line for general conversation, Q&A, sample report requests, or coding assistance.
 - CRITICAL IDENTITY VERIFICATION:
   - NEVER claim account takeover unless the primary target's specific token, credentials, or session was actually established and verified!
   - Holding a session cookie for an intermediate stepping-stone user is NOT takeover of the primary target.
 - NEVER fabricate credentials, tokens, or exploit results. If a login attempt failed or an exploit didn't work, state that fact clearly.
 - Only generate a formal HackerOne markdown vulnerability report if the researcher explicitly requested a report and high-impact findings were confirmed.
 - When asked about your capabilities, tools, or what you can do: answer ONLY from the AVAILABLE TOOLS list above. Never claim access to external tools not in that list.
+- EDUCATIONAL & TECHNIQUE QUERIES: When the researcher asks about offensive security techniques (e.g. 403 bypass, IDOR, SQLi, XSS, SSRF, JWT attacks, auth bypass, privilege escalation, parameter pollution), provide comprehensive, detailed technical explanations with concrete examples, payloads, headers, and methodology. This is educational content essential to bug bounty work — NEVER refuse to explain a technique. You are a bug bounty assistant, not a content filter.
 - OUTPUT FORMAT: Respond in plain natural-language prose with clean markdown structure (headings, bullet points, and code blocks for evidence/PoC). NEVER output a raw tool-call object.
 """
 
@@ -3966,6 +4261,7 @@ INSTRUCTIONS:
         _prev_ai_resp = None
         _executed_signatures = set()  # every (tool, args) run this turn — not just the last one
         _dup_skip_count = 0
+        _narration_retry_count = 0
 
         # A path scope set in an earlier turn (e.g. "...from this endpoint
         # https://host/app") persists across the session — most follow-up
@@ -3987,7 +4283,7 @@ INSTRUCTIONS:
                     break
 
                 if emit and hasattr(emit, "set_label"):
-                    emit.set_label("HELLHOUND IS THINKING")
+                    emit.set_label("Let me think")
 
                 ai_resp, tokens = ask_neural_core(
                     prompt=user_text if iteration == 0 else "Continue analysis based on tool results. Choose next tool or output 'DONE'.",
@@ -3996,35 +4292,47 @@ INSTRUCTIONS:
                     thinking=False,
                     history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
                     return_usage=True,
-                    cancel_check=cancel_check
+                    cancel_check=cancel_check,
+                    tools=Agent._build_native_tools()
                 )
                 
                 if tokens is not None and emit and hasattr(emit, "set_token_count"):
                     emit.set_token_count(tokens)
 
-                if not ai_resp or not ai_resp.strip():
+                if not ai_resp:
+                    break
+
+                # Check if ask_neural_core returned a native tool call object (dict)
+                tool_call = None
+                if isinstance(ai_resp, dict) and "tool" in ai_resp:
+                    tool_call = ai_resp
+                    # Create a string representation for logging & prev check
+                    ai_resp = json.dumps(tool_call)
+
+                if isinstance(ai_resp, str) and not ai_resp.strip():
                     break
 
                 # Guard against the orchestrator re-entering with the exact same
                 # output it just produced (identical plan/tool-call regenerated
                 # instead of progressing) — treat that as "done planning" and
                 # fall through to synthesis rather than burning iterations.
-                if ai_resp.strip() == (_prev_ai_resp or "").strip():
+                if isinstance(ai_resp, str) and ai_resp.strip() == (_prev_ai_resp or "").strip():
                     break
-                _prev_ai_resp = ai_resp
+                if isinstance(ai_resp, str):
+                    _prev_ai_resp = ai_resp
 
-                # Check for JSON tool invocation in the response (markdown, pure JSON, or tool prefix patterns)
-                tool_call = None
-                json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', ai_resp)
-                if json_match:
-                    try:
-                        parsed = json.loads(json_match.group(1))
-                        if isinstance(parsed, dict) and "tool" in parsed:
-                            tool_call = parsed
-                    except Exception:
-                        pass
+                # Check for JSON tool invocation in text response (if native tool call didn't return a dict)
+                if not tool_call and isinstance(ai_resp, str):
+                    json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', ai_resp)
+                    if json_match:
+                        try:
+                            parsed = json.loads(json_match.group(1))
+                            if isinstance(parsed, dict) and "tool" in parsed:
+                                tool_call = parsed
+                        except Exception:
+                            pass
 
-                if not tool_call:
+                if not tool_call and isinstance(ai_resp, str):
                     tool_json_match = re.search(r'(\{\s*"tool"\s*:\s*[\s\S]*\})', ai_resp)
                     if tool_json_match:
                         try:
@@ -4076,7 +4384,7 @@ INSTRUCTIONS:
                     tools_executed.append(t_name)
                     
                     if emit and hasattr(emit, "set_label"):
-                        emit.set_label(f"EXECUTING {t_name.upper()}")
+                        emit.set_label(f"Yep, here we go — running {t_name}")
 
                     if emit and hasattr(emit, "tool_start"):
                         emit.tool_start(t_name, t_args)
@@ -4089,7 +4397,7 @@ INSTRUCTIONS:
                         emit.tool_result(t_name, tool_result)
 
                     if emit and hasattr(emit, "set_label"):
-                        emit.set_label("ANALYZING RESULTS")
+                        emit.set_label("Got there — checking results")
 
                     # Feed result back to conversation
                     self.history.append({"role": "assistant", "content": ai_resp})
@@ -4104,7 +4412,7 @@ INSTRUCTIONS:
                     # Hallucinated or unregistered tool name
                     unregistered_name = tool_call.get("tool", "unknown")
                     if emit and hasattr(emit, "set_label"):
-                        emit.set_label("ANALYZING RESULTS")
+                        emit.set_label("Got there — checking results")
 
                     self.history.append({"role": "assistant", "content": ai_resp})
                     self.history.append({
@@ -4114,12 +4422,104 @@ INSTRUCTIONS:
                     user_text = f"Tool '{unregistered_name}' is invalid. Please select from available tools: {', '.join(TOOL_REGISTRY.keys())}"
                     continue
 
-                # Non-tool response / "DONE" / conversational output from orchestrator -> exit tool loop
+                # Non-tool response — could be a genuine "DONE"/conversational
+                # reply, OR the model narrating an intended action instead of
+                # actually emitting the tool-call JSON (e.g. "Let me check the
+                # target now.") — the latter must NOT be allowed to silently
+                # end the turn, or the whole session does nothing but talk.
+                _narration_markers = (
+                    "let me ", "i'll ", "i will ", "let's ", "going to ",
+                    "i'm going to", "proceed to", "next, i", "now i",
+                    "i'll now", "i will now", "i need to", "i should",
+                    "first, i", "starting with", "beginning", "let me execute",
+                    "executing now", "initiating", "i'm about to",
+                    "i can ", "i want to", "my plan", "here's my",
+                    "let me check", "let me run", "let me fetch",
+                    "i'm now", "i shall", "allow me", "i'm going",
+                    "next:", "next step", "the next step", "will fetch",
+                    "will probe", "will analyze", "will inspect", "harvest",
+                    "examine", "investigate",
+                )
+                _next_step_markers = ("next:", "next step", "the next step", "proceed to", "will fetch", "will probe", "will analyze", "will inspect", "harvest", "let me ")
+                _resp_lower = ai_resp.lower()
+                _has_explicit_completion = bool(re.search(r"^\s*done\b|^\s*\[status:\s*(objective achieved|full takeover|exhausted)\]", _resp_lower, re.MULTILINE))
+                _has_next_step = any(m in _resp_lower for m in _next_step_markers)
+
+                _looks_like_narration = (
+                    (_has_next_step or any(m in _resp_lower for m in _narration_markers))
+                    and not _has_explicit_completion
+                )
+
+                # Primary narration guard: enforce continuous tool execution until explicit completion
+                if _looks_like_narration and _narration_retry_count < 5:
+                    _narration_retry_count += 1
+                    self.history.append({"role": "assistant", "content": ai_resp})
+                    # Build a target-aware example so the model knows what to emit
+                    _target_url = self.target.name
+                    if not _target_url.startswith(("http://", "https://")):
+                        _target_url = f"http://{_target_url}"
+                    self.history.append({
+                        "role": "user",
+                        "content": (
+                            f"SYSTEM: Your previous text was DISCARDED — it performed no action and produced no results. "
+                            f"The target is '{self.target.name}'. The mission is: '{original_user_text}'. "
+                            f"Emit ONLY tool-call JSON. Example: "
+                            f'{{"tool": "curl", "args": {{"url": "{_target_url}", "method": "GET"}}}}. '
+                            f"No English text. No explanation. No preamble. Just the raw JSON object."
+                        )
+                    })
+                    user_text = "Execute the tool now — respond with ONLY the JSON, no narration."
+                    continue
+
+                # Secondary narration guard: tools already executed but model narrates next step
+                if _looks_like_narration and tools_executed and _narration_retry_count < 5:
+                    _narration_retry_count += 1
+                    self.history.append({"role": "assistant", "content": ai_resp})
+                    self.history.append({
+                        "role": "user",
+                        "content": (
+                            "SYSTEM: You described an intended next action instead of executing it. "
+                            "Emit the tool-call JSON now or output 'DONE' if no further tools are needed. "
+                            "No narration, no explanation — just JSON or DONE."
+                        )
+                    })
+                    user_text = "Emit the tool-call JSON or DONE."
+                    continue
+
+                # Safety net: all narration retries exhausted, zero tools executed,
+                # real target exists — auto-inject a starter curl probe rather than
+                # giving up with zero work done.
+                if not tools_executed and has_real_target and _narration_retry_count >= 5:
+                    _target_url = self.target.name
+                    if not _target_url.startswith(("http://", "https://")):
+                        _target_url = f"http://{_target_url}"
+                    tool_call = {"tool": "curl", "args": {"url": _target_url, "method": "GET"}}
+                    t_name = tool_call["tool"]
+                    t_args = tool_call["args"]
+                    tools_executed.append(t_name)
+                    if emit and hasattr(emit, "set_label"):
+                        emit.set_label(f"Let me cook — probing {self.target.name}")
+                    if emit and hasattr(emit, "tool_start"):
+                        emit.tool_start(t_name, t_args)
+                    elif emit and hasattr(emit, "info"):
+                        emit.info(f"[*] Auto-probe: {t_name} {t_args}")
+                    tool_result = self.execute_tool_call(t_name, t_args, emit)
+                    if emit and hasattr(emit, "tool_result"):
+                        emit.tool_result(t_name, tool_result)
+                    self.history.append({"role": "assistant", "content": '{"tool": "curl", "args": ' + json.dumps(t_args) + '}'})
+                    self.history.append({
+                        "role": "user",
+                        "content": f"[TOOL RESULT: {t_name}]\n{json.dumps(tool_result, indent=2)}"
+                    })
+                    user_text = f"Tool '{t_name}' returned results. Analyze these findings and choose the next tool or output 'DONE'."
+                    _narration_retry_count = 0  # Reset for the next phase
+                    continue
+
                 break
 
         # ── 4. Final Answer Generation (Streaming, Fast & Context-Specific) ───────
         if emit and hasattr(emit, "set_label"):
-            emit.set_label("FINALIZING RESPONSE")
+            emit.set_label("Got there — wrapping up")
 
         cfg = load_config()
         self.last_tool_count = len(tools_executed)

@@ -10,9 +10,12 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Any, Tuple
 import inspect
 import os
+import re
 import sys
 import json
 import shlex
+import subprocess
+from pathlib import Path
 from urllib.parse import urlparse
 import requests
 
@@ -930,6 +933,25 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
                     emit.warn("Usage: /setup recaps [on|off]")
                 return {"status": "error", "error": "invalid_option", "message": "Usage: /setup recaps [on|off]"}
 
+        if first in ("max-iterations", "max-iter", "iterations"):
+            if len(clean_args) < 2:
+                current = int(cfg.get("max_agent_iterations", 60))
+                if not is_json:
+                    emit.info(f"Max tool-call iterations per turn: {current}")
+                    emit.info("Set with: /setup max-iterations <n>")
+                return {"status": "success", "max_agent_iterations": current}
+            try:
+                n = max(1, min(500, int(clean_args[1])))
+            except ValueError:
+                if not is_json:
+                    emit.warn("Usage: /setup max-iterations <positive integer>")
+                return {"status": "error", "error": "invalid_option"}
+            cfg["max_agent_iterations"] = n
+            save_config(cfg)
+            if not is_json:
+                emit.success(f"Max tool-call iterations per turn set to {n}.")
+            return {"status": "success", "max_agent_iterations": n}
+
         if first in ("install-all", "install") or (first == "tools" and len(clean_args) > 1 and clean_args[1].lower() in ("install-all", "install")):
             tool_status = check_all_tools()
             missing_pd = tool_status.get("missing_pd", [])
@@ -1305,7 +1327,7 @@ register_command(Command(
     name="/setup",
     aliases=["/health", "/doctor"],
     description="Verify AI connectivity, external tool dependencies, and auto-install settings",
-    usage="/setup [tools [auto-install on|off]]\n/setup tools install-all",
+    usage="/setup [tools [auto-install on|off]]\n/setup tools install-all\n/setup max-iterations <n>",
     category="config",
     handler=handle_setup
 ))
@@ -1337,6 +1359,160 @@ register_command(Command(
     handler=handle_ask
 ))
 
+def handle_handle(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """
+    /handle [name]
+    Sets (or shows) the researcher_handle used to personalize the
+    "Happy hacking" sign-off and the X-Bugbounty header. GUI Settings
+    already had a field for this; CLI had no way to set it at all.
+    """
+    is_json = "--json" in args or getattr(emit, "json_mode", False)
+    clean_args = [a for a in args if a not in ("--json", "-j")]
+    cfg = load_config()
+
+    if not clean_args:
+        current = cfg.get("researcher_handle", "")
+        if not is_json:
+            emit.info(f"Researcher handle: {current or '(not set)'}")
+            emit.info("To set: /handle <name>")
+        return {"status": "success", "researcher_handle": current}
+
+    new_handle = " ".join(clean_args).strip()
+    cfg["researcher_handle"] = new_handle
+    save_config(cfg)
+    if not is_json:
+        emit.success(f"Researcher handle set to: {new_handle}")
+    return {"status": "success", "researcher_handle": new_handle}
+
+
+def handle_uninstall(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """
+    /uninstall [--yes] [--keep-data] [--purge-tools] [--purge-source]
+
+    Fully removes the local HELLHOUND install (venv, symlinks, shell
+    aliases, desktop entry, icons, and — unless --keep-data is passed —
+    ~/.hellhound config/targets/findings).
+
+    This is destructive and irreversible, so it is intentionally NOT part
+    of the agent's TOOL_REGISTRY (which the LLM drives autonomously against
+    network targets). Uninstall requests are matched by a deterministic
+    keyword check in dispatch() before anything reaches the model, and the
+    handler itself always stops and asks for explicit confirmation before
+    deleting anything — the one place in the tool where the agent is
+    required to halt rather than act on its own judgment.
+    """
+    flags = {a.lower() for a in args if a.startswith("-")}
+    auto_confirm = ("--yes" in flags) or ("-y" in flags)
+    keep_data = "--keep-data" in flags
+    purge_tools = "--purge-tools" in flags
+    purge_source = "--purge-source" in flags
+
+    is_json = "--json" in flags or getattr(emit, "json_mode", False)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "uninstall.sh"
+
+    home = Path.home()
+    plan = {
+        "venv": home / ".hellhound-env",
+        "local_bin_symlink": home / ".local" / "bin" / "hellhound",
+        "global_bin_symlink": Path("/usr/local/bin/hellhound"),
+        "desktop_entry": home / ".local" / "share" / "applications" / "hellhound.desktop",
+        "icon_assets": home / ".local" / "share" / "hellhound",
+        "icon_file": home / ".local" / "share" / "icons" / "hellhound.png",
+        "config_and_data": home / ".hellhound",
+    }
+    existing = {k: str(v) for k, v in plan.items() if v.exists() or v.is_symlink()}
+
+    if not auto_confirm:
+        # Hard stop: never delete anything without the user explicitly
+        # confirming this exact action. This is a valid, deliberate place
+        # for the agent/dispatcher to refuse to "just do it".
+        msg = (
+            "Uninstall requested. This will permanently remove:\n"
+            + "\n".join(f"  - {k}: {v}" for k, v in existing.items())
+            + ("\n\n  ~/.hellhound (config, targets, findings) will be KEPT (--keep-data)." if keep_data
+               else "\n\n  Including ~/.hellhound — ALL saved targets, scope, and findings.")
+            + "\n\nNothing has been deleted. Re-run with explicit confirmation to proceed:"
+            + "\n  /uninstall --yes" + (" --keep-data" if keep_data else "")
+        )
+        if not is_json:
+            emit.warn(msg)
+        return {
+            "status": "needs_confirmation",
+            "would_remove": existing,
+            "keep_data": keep_data,
+            "confirm_with": "/uninstall --yes" + (" --keep-data" if keep_data else ""),
+        }
+
+    if not script_path.exists():
+        # Package was installed without the repo tree alongside it (e.g. a
+        # bare pip install) — fall back to performing the same steps in
+        # Python instead of failing outright.
+        import shutil as _shutil
+        removed = []
+        try:
+            if plan["venv"].exists():
+                _shutil.rmtree(plan["venv"], ignore_errors=True)
+                removed.append(str(plan["venv"]))
+            for key in ("local_bin_symlink", "global_bin_symlink", "desktop_entry", "icon_file"):
+                p = plan[key]
+                if p.exists() or p.is_symlink():
+                    try:
+                        p.unlink()
+                        removed.append(str(p))
+                    except PermissionError:
+                        if not is_json:
+                            emit.warn(f"Permission denied removing {p} — remove manually (may need sudo).")
+            if plan["icon_assets"].exists():
+                _shutil.rmtree(plan["icon_assets"], ignore_errors=True)
+                removed.append(str(plan["icon_assets"]))
+            if not keep_data and plan["config_and_data"].exists():
+                _shutil.rmtree(plan["config_and_data"], ignore_errors=True)
+                removed.append(str(plan["config_and_data"]))
+        except Exception as e:  # noqa: BLE001
+            if not is_json:
+                emit.error(f"Uninstall hit an error partway through: {e}")
+            return {"status": "error", "error": str(e), "removed": removed}
+        if not is_json:
+            emit.success("HELLHOUND uninstalled.")
+            emit.info("Shell alias lines were not touched (uninstall.sh not found alongside the install) — remove 'alias hellhound=' / 'alias hellhound-gui=' from your shell rc file manually.")
+        return {"status": "success", "removed": removed, "method": "python_fallback"}
+
+    cmd = [str(script_path), "--yes"]
+    if keep_data:
+        cmd.append("--keep-data")
+    if purge_tools:
+        cmd.append("--purge-tools")
+    if purge_source:
+        cmd.append("--purge-source")
+
+    if not is_json:
+        emit.info(f"Running {script_path.name} --yes ...")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        output = (proc.stdout or "") + (proc.stderr or "")
+        if not is_json:
+            emit(output)
+        status = "success" if proc.returncode == 0 else "error"
+        if status == "success" and not is_json:
+            emit.success("HELLHOUND uninstalled. This process should now exit.")
+        return {"status": status, "returncode": proc.returncode, "output": output}
+    except Exception as e:  # noqa: BLE001
+        if not is_json:
+            emit.error(f"Failed to run uninstall.sh: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+register_command(Command(
+    name="/uninstall",
+    aliases=["/remove-hellhound"],
+    description="Permanently remove HELLHOUND (venv, symlinks, aliases, desktop entry, and config/data unless --keep-data). Always asks for confirmation first.",
+    usage="/uninstall [--yes] [--keep-data] [--purge-tools] [--purge-source]",
+    category="general",
+    handler=handle_uninstall
+))
+
 register_command(Command(
     name="/help",
     aliases=["/?"],
@@ -1344,6 +1520,15 @@ register_command(Command(
     usage="/help",
     category="general",
     handler=handle_help
+))
+
+register_command(Command(
+    name="/handle",
+    aliases=["/researcher-handle"],
+    description="Set or show your researcher handle — personalizes the exit message and X-Bugbounty header",
+    usage="/handle [name]",
+    category="config",
+    handler=handle_handle
 ))
 
 
@@ -1387,6 +1572,34 @@ def _register_skill_commands():
 
 
 _register_skill_commands()
+
+
+# ─────────────────────────────────────────────────────────────
+# UNINSTALL INTENT DETECTION
+#
+# Deliberately NOT delegated to the LLM agent loop: TOOL_REGISTRY tools are
+# meant to be chosen autonomously by the model against a network target, and
+# a filesystem-deleting action has no business being one more entry an LLM
+# can reach for on a bad turn. This is a small, deterministic keyword gate
+# instead — cheap, auditable, and it only ever routes into handle_uninstall(),
+# which itself always stops for confirmation before deleting anything unless
+# the user has already said so explicitly in the same message.
+# ─────────────────────────────────────────────────────────────
+
+_UNINSTALL_VERB_RE = re.compile(r"\buninstall(?:ed|ing|s)?\b", re.I)
+_DESTRUCTIVE_VERB_RE = re.compile(r"\b(remove|delete|wipe|purge|nuke|get rid of)\b", re.I)
+_TOOL_SCOPE_RE = re.compile(r"\b(hellhound|this tool|the tool|everything|all (my )?data|completely)\b", re.I)
+_UNINSTALL_CONFIRM_RE = re.compile(
+    r"\b(--yes|confirm(ed)?|i confirm|yes[, ]+(please )?(do it|uninstall|remove)|really uninstall|i'?m sure|go ahead)\b",
+    re.I,
+)
+
+
+def _looks_like_uninstall_intent(text: str) -> bool:
+    """Deterministic (non-LLM) check for 'remove HELLHOUND entirely' requests."""
+    if _UNINSTALL_VERB_RE.search(text):
+        return True
+    return bool(_DESTRUCTIVE_VERB_RE.search(text) and _TOOL_SCOPE_RE.search(text))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1470,6 +1683,16 @@ def dispatch(raw_input: str, session_context: Dict[str, Any], emit: Any = None,
             if "--json" in tokens or getattr(emit, "json_mode", False):
                 print(json.dumps(result, indent=2))
             return result
+
+    # Uninstall intent, spoken in plain language rather than as /uninstall.
+    # Caught here — before the message ever reaches the LLM — precisely
+    # because it's destructive; see comment above _looks_like_uninstall_intent.
+    if _looks_like_uninstall_intent(raw_clean):
+        uninstall_args = ["--yes"] if _UNINSTALL_CONFIRM_RE.search(raw_clean) else []
+        result = handle_uninstall(uninstall_args, session_context, emit)
+        if "--json" in tokens or getattr(emit, "json_mode", False):
+            print(json.dumps(result, indent=2))
+        return result
 
     # Plain natural language input -> Route directly to Agent Reasoning Loop
     response = agent_handle_message(raw_clean, session_context=session_context, emit=emit, on_token=on_token, cancel_check=cancel_check)

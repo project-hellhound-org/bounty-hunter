@@ -15,12 +15,12 @@ init(autoreset=True)
 R   = Style.RESET_ALL
 CR  = "\033[91;1m"       # Bright Red
 CW  = "\033[97;1m"       # Bold White
-CC  = "\033[96;1m"       # Cyan
-CY  = "\033[93;1m"       # Yellow
-CO  = "\033[38;5;208;1m" # Orange
-CDM = "\033[37m"         # Light Grey (Brighter for visibility)
-CM  = "\033[35;1m"       # Magenta
-CBL = "\033[94;1m"       # Bright Blue
+CC  = "\033[38;5;203m"   # Soft Coral Red (Key titles & arrows)
+CY  = "\033[38;5;208;1m" # Neon Orange (Parameters & curl PoCs)
+CO  = "\033[38;5;208;1m" # Neon Orange (Medium severity)
+CDM = "\033[37m"         # Light Grey
+CM  = "\033[38;5;208;1m" # Orange
+CBL = "\033[38;5;203m"   # Soft Coral Red
 
 # Author metadata
 AUTHOR_META = "[ Created by L4ZZ3RJ0D — @l4zz3rj0d ]"

@@ -45,12 +45,13 @@ mgr.store_credential(target="example.com", username="test", password="pass")
 
 ## Reference
 
+- `skills/auth-bypass/SKILL.md` - Complete Password Reset 22-Pattern Matrix, CAPTCHA 20-Method Bypass, Token Prediction, and SQLi Cheat Sheet
 - `reference/authentication*.md` - Auth bypass techniques, payloads, and resources
 - `reference/jwt*.md` - JWT attack techniques and cheat sheets
 - `reference/oauth*.md` - OAuth vulnerability testing
 - `reference/scenarios/password-attacks/*.md` - Password attack vectors (spray, stuffing, cracking, PtH)
 - `reference/adfs-exploitation.md` - ADFS, Golden SAML, federation attacks
 - `reference/scenarios/2fa/*.md` - 2FA bypass methods
-- `reference/CAPTCHA_BYPASS.md` - 11 CAPTCHA bypass techniques
+- `reference/CAPTCHA_BYPASS.md` - 20 CAPTCHA bypass techniques
 - `reference/BOT_DETECTION.md` - Bot detection evasion strategies
 - `reference/PASSWORD_CREDENTIAL_MANAGEMENT.md` - Tool usage guide

@@ -24,7 +24,18 @@ init(autoreset=True)
 
 try:
     from rich.console import Console
-    _rich_console = Console()
+    from rich.theme import Theme
+    _HELLHOUND_THEME = Theme({
+        "cyan": "bold #ff5555",
+        "yellow": "bold #ff8800",
+        "magenta": "bold #ff5555",
+        "markdown.code": "bold #55ff55",
+        "markdown.item.bullet": "#ff8800",
+        "markdown.h1": "bold #ff0000",
+        "markdown.h2": "bold #ff3333",
+        "markdown.h3": "bold #ff5555",
+    })
+    _rich_console = Console(theme=_HELLHOUND_THEME)
 except Exception:
     _rich_console = None
 
@@ -74,10 +85,10 @@ class PlainEmit:
         self._send(msg)
 
     def info(self, msg):
-        self._send(f"[bold cyan][*][/bold cyan] {msg}")
+        self._send(f"[bold red][*][/bold red] {msg}")
 
     def warn(self, msg):
-        self._send(f"[bold yellow][!][/bold yellow] {msg}")
+        self._send(f"[bold orange1][!][/bold orange1] {msg}")
 
     def warning(self, msg):
         """Compatibility alias for warn."""
@@ -90,7 +101,7 @@ class PlainEmit:
     def tool_start(self, tool_name: str, args: dict):
         """Emits start of tool execution."""
         args_str = ", ".join(f"{k}={repr(v)}" for k, v in (args or {}).items())
-        self._send(f"[bold cyan][*][/bold cyan] Executing tool: [bold white]{tool_name}[/bold white]({args_str})")
+        self._send(f"[bold red][*][/bold red] Executing tool: [bold white]{tool_name}[/bold white]({args_str})")
 
     def tool_result(self, tool_name: str, result: any):
         """Emits tool execution result."""

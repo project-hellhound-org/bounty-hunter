@@ -834,35 +834,6 @@ body.clean-interface .ambient-bg {
 }
 
 /* Welcome Hero — Mission Briefing style status card, not a photo backdrop */
-.voice-indicator-dot {
-    display: inline-block;
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--text-dim);
-    margin-right: 6px;
-    transition: background 0.2s, box-shadow 0.2s;
-}
-
-.btn-voice-toggle.voice-off .voice-indicator-dot {
-    background: var(--text-dim);
-    box-shadow: none;
-}
-
-.btn-voice-toggle:not(.voice-off) .voice-indicator-dot {
-    background: var(--primary);
-    box-shadow: 0 0 6px var(--primary-glow);
-}
-
-.btn-voice-toggle.speaking .voice-indicator-dot {
-    animation: voice-pulse 0.9s ease-in-out infinite;
-}
-
-@keyframes voice-pulse {
-    0%, 100% { box-shadow: 0 0 4px var(--primary-glow); transform: scale(1); }
-    50% { box-shadow: 0 0 14px var(--primary); transform: scale(1.35); }
-}
-
 .welcome-hero {
     display: flex;
     flex-direction: column;
@@ -2196,62 +2167,6 @@ body.clean-interface .ambient-bg {
     border: 1px solid rgba(239, 68, 68, 0.3);
 }
 
-.voice-status-indicator {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 14px;
-    font-size: 12px;
-    color: var(--text-dim, #9ca3af);
-}
-
-.voice-status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #f87171;
-    box-shadow: 0 0 6px rgba(239, 68, 68, 0.6);
-}
-
-.voice-status-dot.connected {
-    background: #4ade80;
-    box-shadow: 0 0 6px rgba(34, 197, 94, 0.6);
-}
-
-.voice-status-dot.testing {
-    background: #fbbf24;
-    box-shadow: 0 0 6px rgba(251, 191, 36, 0.6);
-    animation: thinking-bounce 1s ease-in-out infinite;
-}
-
-.voice-diagnose-link {
-    background: none;
-    border: none;
-    color: var(--text-dim, #9ca3af);
-    text-decoration: underline;
-    font-size: 11px;
-    cursor: pointer;
-    padding: 0;
-    margin-left: 4px;
-}
-
-.voice-diagnose-link:hover {
-    color: #ffffff;
-}
-
-.voice-diagnostics-output {
-    margin-top: 8px;
-    padding: 10px 12px;
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid var(--surface-border);
-    border-radius: 6px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 11px;
-    color: var(--text-dim, #9ca3af);
-    white-space: pre-wrap;
-    word-break: break-all;
-}
-
 .settings-modal-footer {
     display: flex;
     align-items: center;
@@ -2328,6 +2243,135 @@ body.clean-interface .ambient-bg {
     border-left-color: var(--success);
     background: rgba(34, 197, 94, 0.04);
 }
+
+/* ── Collapsible tool-result cards ────────────────────────────────
+   Click the header (icon + summary + arrow) to reveal the exact
+   executed request and full raw result; click again to collapse. */
+.tool-card-collapsible {
+    background: rgba(15, 17, 23, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-left: 3px solid #38bdf8;
+    border-radius: 6px;
+    margin-top: 6px;
+    overflow: hidden;
+}
+
+.tool-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 12px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-family: 'Space Grotesk', monospace;
+    font-size: 11px;
+    color: var(--text-main);
+    text-align: left;
+}
+
+.tool-card-header:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.tool-card-summary {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tool-card-arrow {
+    flex-shrink: 0;
+    color: var(--text-dim, #9ca3af);
+    font-size: 10px;
+    transition: transform 0.1s ease;
+}
+
+.tool-card-body {
+    padding: 0 12px 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.tool-card-body.collapsed {
+    display: none;
+}
+
+.tool-card-section {
+    margin-top: 8px;
+}
+
+.tool-card-section-label {
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    color: var(--text-dim, #9ca3af);
+    margin-bottom: 4px;
+    font-weight: 600;
+}
+
+.tool-card-code {
+    background: rgba(0, 0, 0, 0.35);
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 320px;
+    overflow-y: auto;
+    margin: 0;
+    color: var(--text-main);
+}
+
+/* ── Inline finding card ──────────────────────────────────────────
+   Appears in the chat itself the moment record_finding fires — the
+   automatic, primary way findings surface. The findings drawer
+   (opened manually via the header badge) remains as a secondary,
+   full-list view of everything recorded so far, not the default one. */
+.finding-card {
+    border-left-width: 4px;
+}
+
+.finding-card.sev-critical { border-left-color: #ef4444; }
+.finding-card.sev-high { border-left-color: #f97316; }
+.finding-card.sev-medium { border-left-color: #eab308; }
+.finding-card.sev-low { border-left-color: #38bdf8; }
+
+.node-status-icon.finding-icon {
+    font-size: 13px;
+}
+.node-status-icon.finding-icon.sev-critical { color: #ef4444; }
+.node-status-icon.finding-icon.sev-high { color: #f97316; }
+.node-status-icon.finding-icon.sev-medium { color: #eab308; }
+.node-status-icon.finding-icon.sev-low { color: #38bdf8; }
+
+.finding-card-meta {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.finding-card-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    border-radius: 4px;
+    padding: 2px 7px;
+}
+
+.finding-card-badge.kind {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-dim, #9ca3af);
+}
+
+.finding-card-badge.sev-critical { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+.finding-card-badge.sev-high { background: rgba(249, 115, 22, 0.15); color: #f97316; }
+.finding-card-badge.sev-medium { background: rgba(234, 179, 8, 0.15); color: #eab308; }
+.finding-card-badge.sev-low { background: rgba(56, 189, 248, 0.15); color: #38bdf8; }
 
 .node-exec-header {
     display: flex;

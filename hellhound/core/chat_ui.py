@@ -42,6 +42,54 @@ from rich.panel import Panel
 
 rich_console = Console()
 
+
+def _exit_message() -> str:
+    """'Happy hacking' sign-off, personalized with researcher_handle from
+    config when set — otherwise a generic version plus a hint on how to
+    add one, so the personalization is discoverable rather than silently
+    absent.
+    """
+    cfg = load_config()
+    handle = (cfg.get("researcher_handle") or "").strip()
+    if handle:
+        return f" {C_RED_MAIN}[+] Happy hacking :) {handle}!{RST}\n"
+    return (
+        f" {C_RED_MAIN}[+] Happy hacking, researcher!{RST}\n"
+        f" {C_TEXT_DIM}    Want your name here next time? Run /handle <name>.{RST}\n"
+    )
+
+
+def _auto_markdown_emphasis(text: str) -> str:
+    """
+    Safely highlights key signals in plain text.
+    If the text already contains rich markdown formatting (code blocks, headers, bold, bullets),
+    returns text untouched to prevent markdown corruption.
+    """
+    if not text:
+        return text
+
+    # If text already has markdown syntax, do not mutate it
+    if any(sig in text for sig in ("```", "# ", "## ", "**", "__", "`http", "• ", "  - ")):
+        return text
+
+    out = text
+
+    # HTTP status codes -> inline code
+    out = re.sub(r'(?<![`\d])\b(1\d{2}|2\d{2}|3\d{2}|4\d{2}|5\d{2})\b(?![`\d])', r'`\1`', out)
+
+    # Severity / impact keywords -> bold
+    severity_words = (
+        "CRITICAL", "VULNERABLE", "TAKEOVER", "BYPASS", "EXPOSED",
+        "COMPROMISED", "SUCCESSFUL LOGIN", "AUTHENTICATED", "ACHIEVED",
+    )
+    for w in severity_words:
+        out = re.sub(rf'(?<!\*)\b({re.escape(w)})\b(?!\*)', r'**\1**', out, flags=re.I)
+
+    # Bare URLs -> inline code
+    out = re.sub(r'(?<!`)(https?://[^\s`)]+)(?!`)', r'`\1`', out)
+
+    return out
+
 from hellhound.core.tasks import list_targets, create_or_load_target, Target
 from hellhound.core.ai_utils import load_config
 from hellhound.core.agent import get_agent
@@ -51,18 +99,19 @@ from hellhound.core.commands import dispatch, get_command, COMMAND_REGISTRY
 # -------------------------------------------------------------
 # Color & Style Palette (Hellhound Bounty Hunter Theme)
 # -------------------------------------------------------------
-C_RED_MAIN   = "\033[38;5;196;1m"   # Vibrant Crimson Red (Main borders & brand)
-C_RED_ACCENT = "\033[38;5;203m"     # Soft Coral Red
-C_ORANGE     = "\033[38;5;208;1m"   # Neon Orange
-C_CYAN       = "\033[38;5;51;1m"    # Electric Cyan
+C_RED_MAIN   = "\033[38;5;196;1m"   # Vibrant Crimson Red (Main headers & brand)
+C_RED_ACCENT = "\033[38;5;203m"     # Soft Coral Red (Status errors, prompt & accents)
+C_ORANGE     = "\033[38;5;208;1m"   # Neon Orange (Bullets, inline code & HTTP verbs)
 C_GRAY_BOX   = "\033[38;5;240m"     # Subtle Box Gray
 C_TEXT_WHITE = "\033[97;1m"         # Crisp Bold White
-C_TEXT_DIM   = "\033[38;5;244m"     # Dim Secondary Text
-C_BG_PROMPT  = "\033[48;5;234m"     # Dark Slate Prompt Highlight
+C_TEXT_DIM   = "\033[38;5;244m"        # Dim Gray Text
+C_BOLD          = "\033[1m"
+C_GREEN         = "\033[38;5;114;1m"   # Emerald Green (Code & 200 OK)
+C_RESET         = "\033[0m"
 RST          = Style.RESET_ALL
 
 PT_CUSTOM_STYLE = PTStyle.from_dict({
-    'prompt': '#00ffff bold',
+    'prompt': '#ff1a1a bold',
     'frame.border': '#555555',
     'frame.label': '#888888',
     'completion-menu': 'bg:#1e1e1e #cccccc',
@@ -268,7 +317,7 @@ def render_banner_card(target_name: Optional[str] = None):
         center_ansi(f"{C_RED_MAIN}\\__\\ ▼ ▼ ▼ /__/{RST}", col1_w),
         "",
         center_ansi(f"{C_TEXT_DIM}{active_model} ({active_prov}){handle_str}{RST}", col1_w),
-        center_ansi(f"{C_TEXT_DIM}Target: {C_TEXT_WHITE}{curr_target[:18]}{C_TEXT_DIM} • {C_CYAN}{scope_status}{RST}", col1_w),
+        center_ansi(f"{C_TEXT_DIM}Target: {C_TEXT_WHITE}{curr_target[:18]}{C_TEXT_DIM} • {C_RED_ACCENT}{scope_status}{RST}", col1_w),
         ""
     ]
 
@@ -287,7 +336,7 @@ def render_banner_card(target_name: Optional[str] = None):
         f"{C_ORANGE}Recent activity{RST}",
         f"{C_TEXT_DIM}{recent_str[:col2_w-2]}{RST}",
         "",
-        f"{C_TEXT_DIM}Type {C_CYAN}/help{C_TEXT_DIM} or ask naturally below{RST}",
+        f"{C_TEXT_DIM}Type {C_ORANGE}/help{C_TEXT_DIM} or ask naturally below{RST}",
         ""
     ]
 
@@ -336,7 +385,7 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
 
     text_area = TextArea(
         multiline=False,
-        prompt=HTML("<ansicyan><b>❯ </b></ansicyan>"),
+        prompt=HTML("<ansired><b>❯ </b></ansired>"),
         completer=HellhoundCompleter(),
         complete_while_typing=True,
         history=history,
@@ -412,115 +461,117 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
         if text:
             history.append_string(text)
             # Print collapsed input line with breathing room: ❯ user input
-            print(f" {C_CYAN}❯{RST} {text}\n")
+            print(f" {C_RED_MAIN}❯{RST} {text}\n")
         return text
     except (KeyboardInterrupt, EOFError):
         return None
 
+def _sanitize_h1(text: str) -> str:
+    """Convert lone H1 headers (# Title) to H2 (## Title) for left-aligned rendering.
+    Rich centers H1 across the terminal width; H2 stays left-aligned."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            line = re.sub(r'^(\s*)#\s+(.+)', r'\1## \2', line)
+        out.append(line)
+    return "".join(out)
+
 
 class StreamRenderer:
     """
-    Renders streaming tokens incrementally inside a Rich Markdown Panel with Live display.
+    Smooth in-place markdown streaming via rich.live.Live.
 
-    The in-progress Live frame is held at a FIXED height (last N lines of the
-    accumulated text, always exactly N lines regardless of total length) —
-    never the full, growing content. Rich's Live erases the previous frame by
-    moving the cursor up by however many terminal lines that frame occupied;
-    if that height changes between updates (as it does when you naively
-    render the entire, ever-growing response every frame), the erase can
-    desync from what's actually on screen and leave a stale copy behind in
-    scrollback — which is what caused the duplicate-panel glitch. A constant-
-    height frame makes that desync impossible by construction, not just less
-    likely. Once streaming finishes, the COMPLETE, untruncated response is
-    printed exactly once as a normal static block (never during Live).
+    Tokens are accumulated into a buffer. On each token, the entire
+    buffer is re-rendered as a Rich Markdown document in-place at
+    ~12 fps, giving smooth visual growth identical to Claude Code.
+    No state machine, no block-flush, no separate code-fence handling.
     """
-    _LIVE_TAIL_LINES = 12
-
     def __init__(self, title: str = "HELLHOUND", border_style: str = "bold red"):
         self.title = title
         self.border_style = border_style
-        self.accumulated_text = ""
-        self.live: Optional[Live] = None
-        self._started = False
+        self.buffer = ""
+        self._recap_line = None
+        self._live = None
+        self._token_count = 0
 
     def on_token(self, token: str):
         if not token:
             return
-        self.accumulated_text += token
-        if not self._started:
-            self._started = True
-            self.live = Live(
-                self._render_live_panel(),
-                console=rich_console,
+        self.buffer += token
+        self._token_count += 1
+
+        # Start Live context lazily on first token
+        if self._live is None:
+            self._live = Live(
+                Markdown(""),
                 refresh_per_second=12,
-                vertical_overflow="crop",
-                transient=True,
+                console=rich_console,
+                vertical_overflow="visible",
             )
-            self.live.start()
-        else:
-            if self.live:
-                self.live.update(self._render_live_panel())
+            self._live.start()
 
-    def _render_live_panel(self) -> Panel:
-        # Fixed-height tail view only — see class docstring for why.
-        lines = (self.accumulated_text or " ").splitlines() or [" "]
-        tail = lines[-self._LIVE_TAIL_LINES:]
-        preview = "\n".join(tail)
-        if len(lines) > self._LIVE_TAIL_LINES:
-            preview = f"...({len(lines) - self._LIVE_TAIL_LINES} lines above)\n" + preview
-        md = Markdown(preview)
-        return Panel(
-            md,
-            title=f"[bold red] {self.title} [/bold red]",
-            title_align="left",
-            border_style=self.border_style,
-            padding=(0, 1)
-        )
+        # Throttle: update display every 3 tokens to avoid excessive re-renders
+        # on very fast streams while keeping visual feedback smooth
+        if self._token_count % 3 == 0 or "\n" in token:
+            display = _sanitize_h1(self._strip_recap(self.buffer))
+            try:
+                self._live.update(Markdown(display))
+            except Exception:
+                pass
 
-    def _render_panel(self) -> Panel:
-        md = Markdown(self.accumulated_text or " ")
-        return Panel(
-            md,
-            title=f"[bold red] {self.title} [/bold red]",
-            title_align="left",
-            border_style=self.border_style,
-            padding=(0, 1)
-        )
+    def _strip_recap(self, text: str) -> str:
+        """Extract and suppress any recap line from the buffer."""
+        lines = text.splitlines(keepends=True)
+        out = []
+        for line in lines:
+            if line.strip().lower().startswith("recap:"):
+                self._recap_line = line.strip()
+            else:
+                out.append(line)
+        return "".join(out)
 
-    def finish(self, final_text: Optional[str] = None):
-        if final_text:
-            self.accumulated_text = final_text
-        elif not self.accumulated_text:
-            return
+    def finish(self, final_text=None):
+        """Final render: update Live with complete document, then stop."""
+        if self._live is not None:
+            try:
+                clean = _sanitize_h1(self._strip_recap(self.buffer))
+                self._live.update(Markdown(clean))
+            except Exception:
+                pass
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+        elif self.buffer.strip():
+            # Fallback: if Live was never started (empty stream), print directly
+            clean = _sanitize_h1(self._strip_recap(self.buffer))
+            rich_console.print()
+            rich_console.print(Markdown(clean))
+            rich_console.print()
 
-        if self.live and self._started:
-            # transient=True erases the cropped in-progress frame from the
-            # terminal on stop — nothing from the live phase is committed
-            # to scrollback.
-            self.live.stop()
-            self.live = None
-
-        # Print the complete, un-cropped response exactly once. This is the
-        # only thing that ends up in permanent scrollback.
-        rich_console.print(self._render_panel())
-
+        if self._recap_line:
+            print_formatted_text(HTML(f"<i><ansigray>{html.escape(self._recap_line)}</ansigray></i>"))
+            print()
 
 
 def render_response_bubble(response_text: str, sender: str = "HELLHOUND"):
     """
-    Renders AI findings and assistant responses in a visually distinct Rich Markdown Panel.
+    Renders AI findings and assistant responses as clean unboxed Markdown (Claude Code style).
+    Used for non-streaming responses (e.g. short status messages routed through emit.__call__).
     """
     if not response_text or not response_text.strip():
         return
-    clean_sender = re_strip_ansi(sender)
-    md = Markdown(response_text.strip())
-    rich_console.print(Panel(
-        md,
-        title=f"[bold red] {clean_sender} [/bold red]",
-        title_align="left",
-        border_style="bold red",
-        padding=(0, 1)
-    ))
+    clean = _sanitize_h1(response_text.strip())
+    rich_console.print()
+    rich_console.print(Markdown(clean))
+    rich_console.print()
+
+def format_completion_phrase(elapsed_str: str) -> str:
+    """Returns the user-preferred completion phrase for Hellhound."""
+    return f"✳ Cooked for {elapsed_str}"
+
 
 from hellhound.core.emit import PlainEmit
 class InteractiveAgentEmit(PlainEmit):
@@ -531,7 +582,7 @@ class InteractiveAgentEmit(PlainEmit):
     inline alongside the running spinner (just like Claude Code does).
     Only the final response output (__call__) kills the spinner.
     """
-    def __init__(self, label="HELLHOUND IS ANALYZING & EXECUTING"):
+    def __init__(self, label="Let me think"):
         super().__init__()
         from hellhound.core.ai_utils import ThinkingIndicator
         self.indicator = ThinkingIndicator(label)
@@ -561,7 +612,7 @@ class InteractiveAgentEmit(PlainEmit):
                 pass
             self.indicator = None
 
-    def restart_indicator(self, label="HELLHOUND IS ANALYZING & EXECUTING"):
+    def restart_indicator(self, label="Let me think"):
         if self.indicator is None:
             from hellhound.core.ai_utils import ThinkingIndicator
             self.indicator = ThinkingIndicator(label)
@@ -652,14 +703,14 @@ def start_chat_session(initial_target: Optional[str] = None):
         try:
             user_input = prompt_user_input(agent, session=history)
             if user_input is None:
-                print(f" {C_RED_MAIN}[+] Exiting Hellhound Bounty Hunter. Happy Hunting!{RST}\n")
+                print(_exit_message())
                 break
 
             if not user_input:
                 continue
 
             if user_input.lower() in ("exit", "quit", "q", ":q"):
-                print(f" {C_RED_MAIN}[+] Exiting Hellhound Bounty Hunter. Happy Hunting!{RST}\n")
+                print(_exit_message())
                 break
 
             if user_input in ("?", "/help", "help"):
@@ -706,7 +757,7 @@ def start_chat_session(initial_target: Optional[str] = None):
                         pass
 
                 if is_ai_cmd:
-                    label = f"EXECUTING {cmd_base.lstrip('/').replace('-', ' ').upper()}"
+                    label = f"Let me cook — {cmd_base.lstrip('/').replace('-', ' ')}"
                     emit = InteractiveAgentEmit(label)
                     streamer = StreamRenderer(title="HELLHOUND")
 
@@ -725,25 +776,12 @@ def start_chat_session(initial_target: Optional[str] = None):
                         elif isinstance(res, str):
                             final_text = res
 
-                        recap_line = None
-                        if final_text:
-                            lines = final_text.splitlines()
-                            for i, line in enumerate(lines):
-                                if line.strip().lower().startswith("recap:"):
-                                    recap_line = line.strip()
-                                    lines.pop(i)
-                                    final_text = "\n".join(lines)
-                                    break
-
                         streamer.finish(final_text)
-
-                        if recap_line:
-                            print_formatted_text(HTML(f"<i><ansigray>{html.escape(recap_line)}</ansigray></i>"))
 
                         t1 = time.monotonic()
                         elapsed = t1 - t0
                         elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
-                        print_formatted_text(HTML(f"<ansigray>✳ Cooked for {elapsed_str}</ansigray>"))
+                        print_formatted_text(HTML(f"<ansigray>{format_completion_phrase(elapsed_str)}</ansigray>"))
                 else:
                     # Simple non-AI utility commands (/help, /setup, /scope, /model, etc.)
                     from hellhound.core.emit import PlainEmit as _PlainEmit
@@ -756,7 +794,7 @@ def start_chat_session(initial_target: Optional[str] = None):
 
             # Natural Language Query → Route to Agent reasoning loop with live thinking indicator and streaming
             from hellhound.core.ai_utils import ThinkingIndicator
-            indicator = ThinkingIndicator("HELLHOUND IS ANALYZING & EXECUTING")
+            indicator = ThinkingIndicator("Let me think")
             indicator.start()
 
             streamer = StreamRenderer(title="HELLHOUND")
@@ -784,31 +822,17 @@ def start_chat_session(initial_target: Optional[str] = None):
             finally:
                 indicator.stop()
                 
-                # Check for recap before finishing stream to strip it out
-                recap_line = None
-                if ai_response:
-                    lines = ai_response.splitlines()
-                    for i, line in enumerate(lines):
-                        if line.strip().lower().startswith("recap:"):
-                            recap_line = line.strip()
-                            lines.pop(i)
-                            ai_response = "\n".join(lines)
-                            break
-                            
                 streamer.finish(ai_response)
-                
-                if recap_line:
-                    print_formatted_text(HTML(f"<i><ansigray>{html.escape(recap_line)}</ansigray></i>"))
                 
                 t1 = time.monotonic()
                 elapsed = t1 - t0
                 elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
-                print_formatted_text(HTML(f"<ansigray>✳ Cooked for {elapsed_str}</ansigray>"))
+                print_formatted_text(HTML(f"<ansigray>{format_completion_phrase(elapsed_str)}</ansigray>"))
 
             print_turn_separator()
 
         except (KeyboardInterrupt, EOFError):
-            print(f"\n {C_RED_MAIN}[+] Exiting Hellhound Bounty Hunter.{RST}\n")
+            print(f"\n{_exit_message()}")
             break
         except Exception as e:
             print(f"\n {Fore.RED}[x] Error: {e}{RST}\n")

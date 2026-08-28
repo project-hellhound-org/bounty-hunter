@@ -71,7 +71,7 @@ class HellhoundEngine:
 
         try:
             # AUTO-ANIMATION START
-            active_emit.progress_start(module_name.upper())
+            active_emit.progress_start(f"WAIT, LET ME COOK — {module_name.upper()}")
 
             # Check if run is a coroutine function or a regular function returning a coroutine
             result = module.run(target, active_emit, options=options)

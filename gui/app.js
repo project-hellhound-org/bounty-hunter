@@ -10,6 +10,9 @@ let currentTarget = null;
 let targetsList = [];
 let isExecuting = false;
 let findingsComponent = null;
+// Args from the matching tool_start, keyed by tool name, so the
+// tool_result card can show exactly what was executed on expand.
+const _lastToolArgsByName = new Map();
 
 // Slash Command Registry for Autocomplete
 const SLASH_COMMANDS = [
@@ -106,16 +109,59 @@ function showConfirmModal({ title = "CONFIRM ACTION", message = "Are you sure yo
 //                                Python traceback
 // ══════════════════════════════════════════════════════
 const ChatRenderer = {
-    render(emit) {
+    render(emit, executedArgs) {
         const type = emit.type || 'info';
         const payload = emit.payload;
 
         if (type === 'tool_start') return this._toolStart(payload);
-        if (type === 'tool_result') return this._toolResult(payload);
+        if (type === 'tool_result') return this._toolResult(payload, executedArgs);
         if (type === 'status' || type === 'info' || type === 'warn' || type === 'error' || type === 'success') {
             return this._statusLine(payload);
         }
         return this._inline(String(payload));
+    },
+
+    // Wraps any rendered card body in a collapsible shell: a one-line
+    // header (icon + summary + arrow) always visible, and a detail body
+    // — the exact executed request plus the full raw result — hidden
+    // until the arrow is clicked. Click again to collapse back down.
+    // This is the general mechanism every tool-result card (not just the
+    // specialized ones below) goes through, so "what command did it
+    // actually run" is always one click away, uniformly.
+    _collapsible({ icon = '✓', iconClass = 'success-icon', summaryHtml, bodyHtml, extraClass = '' }) {
+        const id = `tc-${_toolCardIdCounter++}`;
+        return `
+            <div class="tool-card-collapsible ${extraClass}" id="${id}">
+                <button type="button" class="tool-card-header" data-toggle-target="${id}" aria-expanded="false">
+                    <span class="node-status-icon ${iconClass}">${icon}</span>
+                    <span class="tool-card-summary">${summaryHtml}</span>
+                    <span class="tool-card-arrow">▸</span>
+                </button>
+                <div class="tool-card-body collapsed">${bodyHtml}</div>
+            </div>
+        `;
+    },
+
+    // Pretty-prints the exact call that was made (method/url/headers/body
+    // — whatever the tool's args actually contained) plus the raw JSON
+    // result, so expanding a card answers "what did it actually run and
+    // what did it actually get back", not a re-summarized version of it.
+    _executedRequestBlock(tool, executedArgs, result) {
+        const argsStr = executedArgs && Object.keys(executedArgs).length
+            ? JSON.stringify(executedArgs, null, 2)
+            : null;
+        const resultStr = JSON.stringify(result, null, 2);
+        return `
+            ${argsStr ? `
+            <div class="tool-card-section">
+                <div class="tool-card-section-label">EXECUTED · ${escapeHtml(tool)}</div>
+                <pre class="tool-card-code">${escapeHtml(argsStr)}</pre>
+            </div>` : ''}
+            <div class="tool-card-section">
+                <div class="tool-card-section-label">RESULT</div>
+                <pre class="tool-card-code">${escapeHtml(resultStr)}</pre>
+            </div>
+        `;
     },
 
     // Strips raw Python tracebacks / exception noise down to one plain
@@ -157,7 +203,32 @@ const ChatRenderer = {
         return this._inline(this.friendlyError(msg));
     },
 
-    _toolResult(payload) {
+    // Dedicated inline card for a confirmed finding (record_finding),
+    // distinct from a normal tool-result card — this is what makes a
+    // finding visible in the chat itself, at the moment it's recorded,
+    // rather than only in the separate findings drawer.
+    _findingCard(result, executedArgs) {
+        const title = result.title || 'Finding recorded';
+        const kind = result.kind || 'finding';
+        const severity = (result.severity || 'medium').toLowerCase();
+        const sevClass = ['critical', 'high', 'medium', 'low'].includes(severity) ? severity : 'medium';
+        const bodyHtml = `
+            <div class="finding-card-meta">
+                <span class="finding-card-badge kind">${escapeHtml(kind)}</span>
+                <span class="finding-card-badge sev-${sevClass}">${escapeHtml(severity.toUpperCase())}</span>
+            </div>
+            ${this._executedRequestBlock('record_finding', executedArgs, result)}
+        `;
+        return this._collapsible({
+            icon: '◆',
+            iconClass: `finding-icon sev-${sevClass}`,
+            summaryHtml: `<strong>Finding:</strong> ${escapeHtml(title)}`,
+            bodyHtml,
+            extraClass: `finding-card sev-${sevClass}`
+        });
+    },
+
+    _toolResult(payload, executedArgs) {
         const tool = payload?.tool || 'Tool';
         const result = payload?.result || {};
 
@@ -172,40 +243,36 @@ const ChatRenderer = {
             return this._inline(this.friendlyError(result.error, `the ${tool} step`), { icon: '!', iconClass: 'error-icon' });
         }
 
+        if (tool === 'record_finding' && result.status === 'recorded') {
+            return this._findingCard(result, executedArgs);
+        }
+
         if (tool === 'dns_bruteforce' || tool === 'subfinder') {
-            return this._subdomainCard(tool, result);
+            return this._subdomainCard(tool, result, executedArgs);
         }
         if (tool === 'permute_subdomains' || tool === 'resolve_candidates') {
-            return this._permutationCard(tool, result);
+            return this._permutationCard(tool, result, executedArgs);
         }
         if (tool === 'httpx') {
-            return this._httpxCard(result);
+            return this._httpxCard(result, executedArgs);
         }
 
         const keys = Object.keys(result).filter(k => k !== 'status');
         const isLightweight = keys.length <= 3 && keys.every(k => typeof result[k] !== 'object' || result[k] === null);
-        if (isLightweight) {
-            const summary = keys.map(k => `${k}: ${result[k]}`).join(' · ');
-            return this._inline(`${tool} completed${summary ? ' — ' + summary : ''}`, { icon: '✓', iconClass: 'success-icon' });
-        }
+        const summary = keys.map(k => `${k}: ${result[k]}`).join(' · ');
+        const summaryHtml = isLightweight
+            ? `${escapeHtml(tool)}${summary ? ' — ' + escapeHtml(summary) : ' completed'}`
+            : `<strong>${escapeHtml(tool)}</strong> completed`;
 
-        const keySummary = keys.map(k => {
-            const val = result[k];
-            const valStr = Array.isArray(val) ? `${val.length} items` : (typeof val === 'object' ? 'object' : String(val));
-            return `<div><strong>${escapeHtml(k)}:</strong> ${escapeHtml(valStr)}</div>`;
-        }).join('');
-        return `
-            <div class="node-exec-card success">
-                <div class="node-exec-header">
-                    <span class="node-status-icon">✓</span>
-                    <span class="node-tool-name">${escapeHtml(tool)} Completed</span>
-                </div>
-                <div class="node-exec-body">${keySummary || 'Completed successfully'}</div>
-            </div>
-        `;
+        return this._collapsible({
+            icon: '✓',
+            iconClass: 'success-icon',
+            summaryHtml,
+            bodyHtml: this._executedRequestBlock(tool, executedArgs, result)
+        });
     },
 
-    _subdomainCard(tool, result) {
+    _subdomainCard(tool, result, executedArgs) {
         const subs = result.subdomains || [];
         const count = result.total_discovered || result.count || subs.length;
         const rootDomain = result.domain || 'Target';
@@ -215,7 +282,7 @@ const ChatRenderer = {
             return `<div class="node-branch-item"><span class="tree-line">${prefix}</span><span class="node-sub-dot online"></span><span class="node-sub-name">${escapeHtml(sub)}</span></div>`;
         }).join('');
         const remaining = subs.length > limit ? `<div class="node-branch-more">+ ${subs.length - limit} more subdomains</div>` : '';
-        return `
+        const topoHtml = `
             <div class="node-topology-card">
                 <div class="node-topo-header">
                     <span class="node-topo-title">DOMAIN TOPOLOGY MAP (${tool})</span>
@@ -227,9 +294,14 @@ const ChatRenderer = {
                 </div>
             </div>
         `;
+        return this._collapsible({
+            icon: '✓', iconClass: 'success-icon',
+            summaryHtml: `<strong>${escapeHtml(tool)}</strong> — ${count} discovered`,
+            bodyHtml: topoHtml + this._executedRequestBlock(tool, executedArgs, result)
+        });
     },
 
-    _permutationCard(tool, result) {
+    _permutationCard(tool, result, executedArgs) {
         const cands = result.candidates || result.subdomains || [];
         const count = result.resolved_count || result.count || cands.length;
         const limit = 10;
@@ -237,7 +309,7 @@ const ChatRenderer = {
             const prefix = (idx === Math.min(cands.length, limit) - 1) ? '└──' : '├──';
             return `<div class="node-branch-item"><span class="tree-line">${prefix}</span><span class="node-sub-dot resolved"></span><span class="node-sub-name">${escapeHtml(item)}</span></div>`;
         }).join('');
-        return `
+        const topoHtml = `
             <div class="node-topology-card">
                 <div class="node-topo-header">
                     <span class="node-topo-title">PERMUTATION & RESOLUTION (${tool})</span>
@@ -246,9 +318,14 @@ const ChatRenderer = {
                 <div class="node-topo-tree"><div class="node-tree-branches">${itemsHtml}</div></div>
             </div>
         `;
+        return this._collapsible({
+            icon: '✓', iconClass: 'success-icon',
+            summaryHtml: `<strong>${escapeHtml(tool)}</strong> — ${count} resolved`,
+            bodyHtml: topoHtml + this._executedRequestBlock(tool, executedArgs, result)
+        });
     },
 
-    _httpxCard(result) {
+    _httpxCard(result, executedArgs) {
         const liveServices = result.live_hosts || result.services || [];
         const rowsHtml = Array.isArray(liveServices) ? liveServices.slice(0, 10).map(srv => {
             const urlStr = typeof srv === 'string' ? srv : (srv.url || srv.host);
@@ -257,7 +334,7 @@ const ChatRenderer = {
             const statusClass = status >= 200 && status < 300 ? 'status-200' : (status >= 300 && status < 400 ? 'status-300' : 'status-400');
             return `<div class="httpx-service-row"><span class="http-status-code ${statusClass}">${status}</span><span class="service-url">${escapeHtml(urlStr)}</span><span class="service-title">${escapeHtml(title)}</span></div>`;
         }).join('') : `<div>Probed ${liveServices} live hosts</div>`;
-        return `
+        const httpxHtml = `
             <div class="node-topology-card">
                 <div class="node-topo-header">
                     <span class="node-topo-title">HTTP SERVICE PROBES (httpx)</span>
@@ -266,12 +343,36 @@ const ChatRenderer = {
                 <div class="httpx-services-list">${rowsHtml}</div>
             </div>
         `;
+        return this._collapsible({
+            icon: '✓', iconClass: 'success-icon',
+            summaryHtml: `<strong>httpx</strong> — ${Array.isArray(liveServices) ? liveServices.length : ''} services probed`,
+            bodyHtml: httpxHtml + this._executedRequestBlock('httpx', executedArgs, result)
+        });
     },
 };
 
+let _toolCardIdCounter = 0;
+
+// Event delegation: cards are added dynamically, so bind once on the
+// document rather than per-card. Click the header to expand; click again
+// (or click elsewhere on the same header) to collapse back down.
+document.addEventListener('click', (e) => {
+    const header = e.target.closest('.tool-card-header');
+    if (!header) return;
+    const id = header.getAttribute('data-toggle-target');
+    const card = document.getElementById(id);
+    if (!card) return;
+    const body = card.querySelector('.tool-card-body');
+    const arrow = card.querySelector('.tool-card-arrow');
+    const isCollapsed = body.classList.contains('collapsed');
+    body.classList.toggle('collapsed', !isCollapsed);
+    header.setAttribute('aria-expanded', String(isCollapsed));
+    if (arrow) arrow.textContent = isCollapsed ? '▾' : '▸';
+});
+
 // Back-compat wrapper — existing call sites use this name.
-function renderToolEmitCard(emit) {
-    return ChatRenderer.render(emit);
+function renderToolEmitCard(emit, executedArgs) {
+    return ChatRenderer.render(emit, executedArgs);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -286,7 +387,6 @@ window.addEventListener('pywebviewready', async () => {
     console.log("[HELLHOUND] PyWebView API bridge initialized.");
     await refreshSystemInfo();
     await loadTargetsList();
-    await initVoiceState();
 });
 
 // Setup agent emit handler called from Python
@@ -421,9 +521,6 @@ async function switchTarget(targetName) {
     // 5. Instantiate fresh Findings Component for this target
     findingsComponent = new IsolatedFindingsComponent(targetName);
     await findingsComponent.refreshData();
-
-    // 5b. Speak the mission briefing — built from the findings data just fetched above
-    speakBriefing(buildBriefingText(targetName, findingsComponent.data));
 
     // 6. Reload Chat History for this target
     await loadTargetChatHistory(targetName);
@@ -619,167 +716,6 @@ async function loadTargetChatHistory(targetName) {
     } catch (e) {
         console.error("Error loading chat history:", e);
     }
-}
-
-// ══════════════════════════════════════════════════════
-// MISSION BRIEFING VOICE
-// Backend-driven TTS via Fish Audio (see VoiceService in
-// hellhound/core/voice_service.py, exposed through HellhoundAPI in
-// gui_app.py) — NOT the browser's speechSynthesis, NOT pyttsx3/edge-tts.
-// Each user configures their own Fish Audio API key + reference voice
-// in Settings > Voice; nothing is hardcoded and nothing lives in .env.
-//
-// window.onVoiceEvent(...) is pushed by VoiceService's event callback via
-// evaluate_js — real start/end/unavailable/error callbacks, not a timer.
-// ══════════════════════════════════════════════════════
-let voiceEnabled = true;
-let voiceConfigured = false; // set from get_voice_settings() on load
-let lastBriefingText = '';
-
-async function initVoiceState() {
-    try {
-        const settings = await callApi('get_voice_settings');
-        voiceEnabled = settings?.enabled !== false;
-        voiceConfigured = !!settings?.configured;
-        setVoiceUI(!voiceConfigured ? 'unavailable' : (voiceEnabled ? 'idle' : 'off'));
-    } catch (err) {
-        console.warn('[Voice] could not load voice settings:', err);
-    }
-}
-
-function setVoiceUI(state, reason) {
-    // state: 'idle' | 'speaking' | 'off' | 'unavailable'
-    const btn = document.getElementById('voiceToggleBtn');
-    const label = document.getElementById('voiceToggleLabel');
-    const logo = document.querySelector('.header-logo-img, .brand-logo');
-    if (btn && label) {
-        btn.classList.toggle('voice-off', state === 'off' || state === 'unavailable');
-        btn.classList.toggle('speaking', state === 'speaking');
-        label.innerText = state === 'unavailable' ? 'VOICE UNAVAILABLE' : (state === 'off' ? 'MUTE VOICE' : (state === 'speaking' ? 'SPEAKING' : 'SPEAK BRIEFING'));
-        btn.title = (state === 'unavailable' && reason) ? reason : 'Click to open Voice Settings';
-    }
-    // Wolf-eye glow: intensify the existing logo glow while actually speaking
-    logo?.classList.toggle('eyes-glowing', state === 'speaking');
-}
-
-function pushWaveformTick() {
-    const wave = document.getElementById('voiceWaveform');
-    if (!wave) return;
-    wave.querySelectorAll('.wave-bar').forEach(bar => {
-        bar.style.height = `${30 + Math.random() * 70}%`;
-    });
-}
-
-window.onVoiceEvent = function (evt) {
-    if (evt.type === 'start') {
-        setVoiceUI('speaking');
-    } else if (evt.type === 'word') {
-        pushWaveformTick(); // real per-word callback from the engine, not a fake interval
-    } else if (evt.type === 'end') {
-        setVoiceUI(voiceEnabled ? 'idle' : 'off');
-        document.getElementById('voiceWaveform')?.querySelectorAll('.wave-bar').forEach(bar => {
-            bar.style.height = '8%';
-        });
-    } else if (evt.type === 'unavailable') {
-        setVoiceUI('unavailable', evt.payload?.reason);
-        console.warn('[Voice] unavailable:', evt.payload?.reason);
-    } else if (evt.type === 'error') {
-        console.error('[Voice] engine error:', evt.payload?.error);
-        setVoiceUI('unavailable', evt.payload?.error);
-    }
-};
-
-// Opens Settings straight to the Voice tab — the "Open Voice Settings"
-// escape hatch shown whenever voice is unavailable, per spec.
-async function openVoiceSettingsTab() {
-    await openSettingsModal();
-    document.querySelector('.settings-tab[data-settings-tab="voice"]')?.click();
-}
-
-function buildBriefingText(targetName, findingsData) {
-    const total = findingsData?.total_count || 0;
-    if (total === 0) {
-        return `Welcome back, hunter. Target ${targetName} is engaged with no findings on record yet. Ready for your first command.`;
-    }
-    const cats = findingsData?.categories || {};
-    const parts = [];
-    const label = (key) => ({
-        takeover_candidates: 'takeover candidate',
-        subdomains: 'subdomain',
-        open_ports: 'open port',
-        live_hosts: 'live host',
-        endpoints: 'endpoint',
-        vulnerabilities: 'vulnerability',
-        tls_info: 'T L S finding',
-    }[key] || key.replace(/_/g, ' '));
-    for (const [cat, items] of Object.entries(cats)) {
-        const n = Array.isArray(items) ? items.length : 0;
-        if (n > 0) parts.push(`${n} ${label(cat)}${n === 1 ? '' : 's'}`);
-    }
-    const highPriority = (cats.takeover_candidates?.length || 0) + (cats.vulnerabilities?.length || 0);
-    let text = `Welcome back, hunter. Target ${targetName} has ${total} total findings on record: ${parts.join(', ')}.`;
-    if (highPriority > 0) {
-        text += ` ${highPriority} of those require verification before they're report-ready.`;
-    }
-    return text;
-}
-
-async function speakBriefing(text) {
-    if (!voiceEnabled || !text) return;
-    if (!voiceConfigured) {
-        setVoiceUI('unavailable');
-        return;
-    }
-    lastBriefingText = text;
-    try {
-        const res = await callApi('speak_briefing', text);
-        if (res?.status === 'unavailable' || res?.status === 'error') {
-            console.error('[Voice] speak_briefing failed:', res.reason || res);
-            setVoiceUI('unavailable', res.reason);
-        }
-    } catch (err) {
-        console.error('[Voice] speak_briefing call failed:', err);
-        setVoiceUI('unavailable', err?.message);
-    }
-}
-
-async function stopSpeaking() {
-    try { await callApi('stop_speaking'); } catch (err) { /* engine may already be idle */ }
-    setVoiceUI(voiceEnabled ? 'idle' : 'off');
-}
-
-async function replayBriefing() {
-    // Replays the cached audio from the last generation instead of
-    // re-hitting the Fish Audio API.
-    if (!voiceConfigured) {
-        setVoiceUI('unavailable');
-        return;
-    }
-    try {
-        const res = await callApi('replay_voice');
-        if (res?.status === 'unavailable') setVoiceUI('unavailable');
-    } catch (err) {
-        console.error('[Voice] replay_voice call failed:', err);
-    }
-}
-
-// Single header button, three behaviors depending on state:
-//   unavailable      -> jump to Settings > Voice
-//   currently speaking -> Mute (stop playback)
-//   idle             -> toggle voice on/off for future briefings
-function toggleVoice() {
-    if (!voiceConfigured) {
-        openVoiceSettingsTab();
-        return;
-    }
-    const btn = document.getElementById('voiceToggleBtn');
-    if (btn?.classList.contains('speaking')) {
-        stopSpeaking();
-        return;
-    }
-    voiceEnabled = !voiceEnabled;
-    if (!voiceEnabled) stopSpeaking();
-    setVoiceUI(voiceEnabled ? 'idle' : 'off');
 }
 
 function showWelcomeHero() {
@@ -1157,6 +1093,7 @@ function handleIncomingEmit(data) {
     if (data.type === 'tool_start') {
         _turnHasToolRun = true;
         const tool = data.payload?.tool || 'tool';
+        _lastToolArgsByName.set(tool, data.payload?.args || {});
         if (statusTextEl) statusTextEl.textContent = `Running ${tool}`;
         if (chipRow) {
             const existing = chipRow.querySelector(`[data-chip-tool="${cssEscape(tool)}"]`);
@@ -1185,8 +1122,13 @@ function handleIncomingEmit(data) {
             const chip = chipRow.querySelector(`[data-chip-tool="${cssEscape(tool)}"]`);
             if (chip) chip.remove();
         }
+        // The exact call that produced this result — retrieved from the
+        // matching tool_start, then cleared so a later same-named tool
+        // call this turn doesn't inherit stale args.
+        const executedArgs = tool && _lastToolArgsByName.has(tool) ? _lastToolArgsByName.get(tool) : null;
+        if (tool) _lastToolArgsByName.delete(tool);
         if (resultsContainer) {
-            const cardHtml = renderToolEmitCard(data);
+            const cardHtml = renderToolEmitCard(data, executedArgs);
             const tempDiv = document.createElement('div');
             tempDiv.innerHTML = cardHtml;
             resultsContainer.appendChild(tempDiv.firstElementChild || tempDiv);
@@ -1571,9 +1513,6 @@ function setupDOMEventHandlers() {
         document.body.classList.toggle('clean-interface');
     });
 
-    // Voice Toggle
-    document.getElementById('voiceToggleBtn')?.addEventListener('click', toggleVoice);
-
     // Slash Palette
     setupSlashPalette();
 
@@ -1793,61 +1732,6 @@ function setupDOMEventHandlers() {
         }
     });
 
-    // Voice: Test / Replay Last Test
-    const testVoiceBtn = document.getElementById('testVoiceBtn');
-    const replayTestVoiceBtn = document.getElementById('replayTestVoiceBtn');
-
-    testVoiceBtn?.addEventListener('click', async () => {
-        testVoiceBtn.disabled = true;
-        const original = testVoiceBtn.textContent;
-        testVoiceBtn.textContent = 'TESTING...';
-        updateVoiceStatusIndicator(null, 'Testing...');
-        try {
-            await callApi('save_voice_settings', {
-                enabled: document.getElementById('cfgVoiceEnabled')?.checked ?? true,
-                api_key: document.getElementById('cfgVoiceApiKey')?.value || '',
-                reference_id: document.getElementById('cfgVoiceReferenceId')?.value || '',
-                model: document.getElementById('cfgVoiceModel')?.value || 's2.1-pro-free',
-                speed: parseFloat(document.getElementById('cfgVoiceSpeed')?.value) || 1.08,
-            });
-            const res = await callApi('test_voice');
-            if (res?.status === 'ok') {
-                updateVoiceStatusIndicator(true, '✓ Connected');
-            } else {
-                console.warn('[Voice] test failed:', res);
-                updateVoiceStatusIndicator(false, res?.reason || 'Voice unavailable.');
-            }
-        } catch (e) {
-            console.error('[Voice] test_voice failed:', e);
-            updateVoiceStatusIndicator(false, 'Call failed: ' + (e?.message || e));
-        } finally {
-            testVoiceBtn.disabled = false;
-            testVoiceBtn.textContent = original;
-        }
-    });
-
-    replayTestVoiceBtn?.addEventListener('click', async () => {
-        try { await callApi('replay_voice'); } catch (e) { console.error('[Voice] replay failed:', e); }
-    });
-
-    document.getElementById('installFishAudioBtn')?.addEventListener('click', async (e) => {
-        const btn = e.target;
-        btn.disabled = true;
-        btn.textContent = 'INSTALLING...';
-        try {
-            const res = await callApi('install_fish_audio_sdk');
-            await refreshVoiceDiagnostics();
-            if (res?.status !== 'ok') {
-                updateVoiceStatusIndicator(false, 'Install failed — see diagnostics below.');
-            }
-        } catch (err) {
-            updateVoiceStatusIndicator(false, 'Install call failed: ' + (err?.message || err));
-        } finally {
-            btn.disabled = false;
-            btn.textContent = 'INSTALL AUTOMATICALLY';
-        }
-    });
-
     // API Key Eye Toggle (Show/Hide)
     document.querySelectorAll('.btn-toggle-key').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -1930,63 +1814,7 @@ async function openSettingsModal() {
         console.warn('Could not load settings from backend:', e);
     }
 
-    try {
-        const voice = await callApi('get_voice_settings');
-        if (voice) {
-            const enabled = document.getElementById('cfgVoiceEnabled');
-            const apiKey = document.getElementById('cfgVoiceApiKey');
-            const refId = document.getElementById('cfgVoiceReferenceId');
-            const model = document.getElementById('cfgVoiceModel');
-            const speed = document.getElementById('cfgVoiceSpeed');
-            if (enabled) enabled.checked = voice.enabled !== false;
-            // Never populate the real key back into the field — only show a
-            // masked placeholder so the user knows one is already saved.
-            if (apiKey) {
-                apiKey.value = '';
-                apiKey.placeholder = voice.api_key_set ? voice.api_key_masked : 'Paste your Fish Audio API key';
-            }
-            if (refId) refId.value = voice.reference_id || '';
-            if (model) model.value = voice.model || 's2.1-pro-free';
-            if (speed) speed.value = voice.speed || 1.08;
-            updateVoiceStatusIndicator(voice.configured);
-            await refreshVoiceDiagnostics();
-        }
-    } catch (e) {
-        console.warn('Could not load voice settings from backend:', e);
-    }
-
     modal?.classList.add('open');
-}
-
-function updateVoiceStatusIndicator(connected, message) {
-    const dot = document.getElementById('voiceStatusDot');
-    const text = document.getElementById('voiceStatusText');
-    if (dot) {
-        dot.classList.toggle('connected', connected === true);
-        dot.classList.toggle('testing', connected === null);
-    }
-    if (text) {
-        text.textContent = message || (connected ? '✓ Connected' : 'Not configured');
-        text.style.color = connected === false ? '#f87171' : '';
-    }
-}
-
-async function refreshVoiceDiagnostics() {
-    // Always reads sys.executable live from the running process — never a
-    // cached or hardcoded interpreter path.
-    const block = document.getElementById('voiceDiagBlock');
-    const installBtn = document.getElementById('installFishAudioBtn');
-    if (!block) return;
-    try {
-        const d = await callApi('get_voice_diagnostics');
-        block.textContent =
-            `Python           ${d.python_executable}\n` +
-            `Fish Audio       ${d.fishaudio_importable ? '✓ Installed' : '✗ Not installed for this interpreter'}\n` +
-            `Voice (ffplay)   ${d.ffplay_path ? '✓ Ready — ' + d.ffplay_path : '✗ Not found on PATH'}`;
-        if (installBtn) installBtn.style.display = d.fishaudio_importable ? 'none' : 'inline-block';
-    } catch (e) {
-        block.textContent = 'Could not read diagnostics: ' + (e?.message || e);
-    }
 }
 
 function closeSettingsModal() {
@@ -2055,21 +1883,8 @@ async function saveSettings() {
         auto_install_missing_tools: document.getElementById('cfgAutoInstallTools')?.checked || false,
     };
 
-    const voicePayload = {
-        enabled: document.getElementById('cfgVoiceEnabled')?.checked ?? true,
-        api_key: document.getElementById('cfgVoiceApiKey')?.value || '',
-        reference_id: document.getElementById('cfgVoiceReferenceId')?.value || '',
-        model: document.getElementById('cfgVoiceModel')?.value || 's2.1-pro-free',
-        speed: parseFloat(document.getElementById('cfgVoiceSpeed')?.value) || 1.08,
-    };
-
     try {
         const res = await callApi('save_settings', payload);
-        const voiceRes = await callApi('save_voice_settings', voicePayload);
-        voiceEnabled = voiceRes?.settings?.enabled !== false;
-        voiceConfigured = !!voiceRes?.settings?.configured;
-        updateVoiceStatusIndicator(voiceConfigured);
-        setVoiceUI(!voiceConfigured ? 'unavailable' : (voiceEnabled ? 'idle' : 'off'));
         if (statusSpan) {
             statusSpan.textContent = '✓ Configuration saved successfully';
             statusSpan.style.color = '#4ade80';

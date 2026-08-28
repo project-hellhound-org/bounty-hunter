@@ -478,69 +478,21 @@ def get_relevant_skills_prompt(
     max_skills: int = 2
 ) -> str:
     """
-    Context-sensitive skill injection builder for the agent's system prompt.
-    Enforces the following methodology rules:
-      1. Session Start / First Message / 'what next': load `bb-methodology`.
-      2. Triage / Validation / Report Intent: load `triage-validation` first.
-      3. General message queries: search and inject top 1-2 relevant skills.
-      4. Caps total skill injection and adapts for small context models.
-    An explicit, directed task (see is_directed_task) skips Rule 1 entirely —
-    the user's literal instruction should not compete with injected doctrine.
+    Deliberately inert. This used to auto-inject skill content by guessing
+    intent from the message text (session-start heuristics, "triage"/
+    "report" keyword matching, a fuzzy search-skills topic match) — three
+    separate Python-side heuristics all deciding what the user meant
+    before the model ever saw the message. All three turned out to
+    misfire in practice (a bare "hello" triggering full hunting
+    methodology; "what can you do for me" fuzzy-matching "403-bypass" and
+    "security-arsenal" via search_skills). Every one of those was the
+    same mistake: a keyword/string check standing in for the model's own
+    judgment on a genuinely ambiguous question — exactly what `load_skill`
+    and the always-visible SKILL MENU (see agent.py's orchestrator prompt)
+    already exist to solve properly. Skill selection now happens
+    entirely there: the model reads the menu and pulls what it decides it
+    needs via `load_skill(name)`, for every message, with zero Python-side
+    guessing. This function is kept only so its call sites and signature
+    don't need to change; it always returns "".
     """
-    q_lower = user_text.lower().strip()
-    selected_skills: List[str] = []
-    directed = is_directed_task(user_text)
-
-    # Rule 1: First target work / session start / 'what should I do next'
-    # Skipped for directed tasks — the user already said exactly what to do.
-    is_start_intent = (
-        not directed and (
-            history_len <= 1 or
-            any(p in q_lower for p in ["what should i do next", "what next", "where do i start", "where am i", "how to start"])
-        )
-    )
-    if is_start_intent and not any(p in q_lower for p in ["report", "validate", "finding", "triage"]):
-        if is_ctf_lab_context(user_text):
-            selected_skills.append("ctf-lab-recon")
-        else:
-            selected_skills.append("bb-methodology")
-
-    # Rule 2: Finding validation / triage / report stage
-    is_triage_intent = any(p in q_lower for p in ["validate", "validation", "triage", "finding", "confirm", "report", "write report", "submit"])
-    if is_triage_intent:
-        if "triage-validation" not in selected_skills:
-            selected_skills.append("triage-validation")
-        if "report" in q_lower and "report-writing" not in selected_skills and len(selected_skills) < max_skills:
-            selected_skills.append("report-writing")
-
-    # Rule 3: Search skills for specific technologies / bug classes
-    if len(selected_skills) < max_skills:
-        search_hits = search_skills(user_text, max_results=max_skills)
-        for s in search_hits:
-            if s.name not in selected_skills:
-                selected_skills.append(s.name)
-            if len(selected_skills) >= max_skills:
-                break
-
-    if not selected_skills:
-        return ""
-
-    # Build formatted prompt block
-    blocks = []
-    for skill_name in selected_skills[:max_skills]:
-        if is_small_model:
-            content = load_skill_section(skill_name, query=user_text)
-        else:
-            content = load_skill_body(skill_name)
-
-        if content:
-            blocks.append(f"### {skill_name}\n{content}")
-
-    if not blocks:
-        return ""
-
-    joined_blocks = "\n\n".join(blocks)
-    return (
-        "## Relevant methodology (from your skill library — use this to inform HOW you approach this, it is not a tool to call):\n\n"
-        f"{joined_blocks}\n"
-    )
+    return ""

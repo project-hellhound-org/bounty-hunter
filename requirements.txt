@@ -4,8 +4,7 @@ colorama
 aiohttp
 rich
 prompt_toolkit
-pywebview
-fish-audio-sdk  # GUI voice only — requires system ffmpeg (ffplay) for playback
+pywebview>=5.1
 qtpy
-PyQt6
-PyQt6-WebEngine
+PyQt6==6.6.1
+PyQt6-WebEngine==6.6.0

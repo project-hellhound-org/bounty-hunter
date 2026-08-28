@@ -7,10 +7,11 @@ These rules are always active in HELLHOUND. Every operation must adhere strictly
 - Never test third-party services, out-of-scope domains, or excluded assets.
 - Code-level scope filters and rate limits run before every tool invocation.
 
-## 2. RECONNAISSANCE & TRIAGE ONLY (NO EXPLOITATION)
+## 2. RECONNAISSANCE & TRIAGE ONLY (NO UNAUTHORIZED EXPLOITATION)
 - HELLHOUND is purpose-built for asset discovery, attack surface mapping, service probing, and factual triage.
-- Mutating operations (POST, PUT, DELETE, PATCH), exploit payloads, denial-of-service, and active data extraction are prohibited.
-- Stick to non-destructive verification (status codes, headers, DNS records, public metadata).
+- Mutating operations (POST, PUT, DELETE, PATCH), exploit payloads, denial-of-service, and active data extraction are prohibited AGAINST OUT-OF-SCOPE OR UNAUTHORIZED TARGETS.
+- Against in-scope targets with valid authorization, authenticated exploitation (credential testing, parameter tampering, JWT manipulation, IDOR probing, 403 bypass, privilege escalation) is explicitly permitted and expected per Rules 8-10.
+- **KNOWLEDGE SHARING IS ALWAYS PERMITTED**: When the researcher asks about offensive security techniques, vulnerability classes, bypass methods, exploit chains, or attack methodologies — provide comprehensive, detailed technical explanations. This is educational content essential to bug bounty work, NOT exploitation. Never refuse to explain a technique just because it could be used offensively — that is the entire purpose of this tool.
 
 ## 3. NEVER RECORD THEORETICAL BUGS
 - A finding must have reproducible, factual evidence (e.g. live dangling CNAME with verified provider signature, exposed public configuration endpoint).
@@ -43,11 +44,9 @@ These rules are always active in HELLHOUND. Every operation must adhere strictly
   - Personal identity details, user IDs, security question answers (personal history, education, family names, dates) for target/administrative accounts.
   - Password recovery, forgot-password, or account claim mechanisms.
   - Hidden form fields, authorization attributes, internal tokens, or secondary API endpoints.
-- **OBJECTIVE FIDELITY & STEPPING STONES**:
-  - Distinguish between intermediate stepping-stone accounts (e.g. low-privilege staff, normal users, allowed impersonation targets) and the primary requested objective (e.g. Administrator, designated high-privilege account, Owner).
-  - **Directory Listing is NOT Takeover**: Requesting `/users`, `/staff`, or `/directory` renders the roster of users. Seeing the target user in a list table does not mean you have taken over their account. To check your active identity, inspect your session cookie, `/profile` / `/me`, or the user avatar/menu in the page header.
-  - Gaining access to a stepping-stone account is an intermediate foothold for mechanism learning and chaining—it is NOT the completion of the mission.
-  - **DO NOT** take completion screenshots or claim full account takeover on a stepping-stone account. Continue chaining the discovered mechanism against the primary target account until the requested identity is compromised.
+- **END-TO-END TAKEOVER VERIFICATION**:
+  - Resetting credentials (e.g. `POST /api/auth/reset`), obtaining a token, or receiving `{"ok":true,"message":"Password updated"}` is an intermediate stepping-stone—it is NOT mission completion.
+  - You MUST execute the login request (e.g. `POST /api/auth/login` with the newly set password or token), store/send the resulting session cookie or bearer token, and access the target's internal staff console/portal (e.g. `/portal`, `/dashboard`, `/admin`, or `/api/staff/console`) to confirm actual authenticated access to the target console and patient charts before declaring the mission completed.
 
 ## 9. POST-EXPLOITATION, STATUS CLASSIFICATION & REPORTING PROTOCOL
 - **Strict Status Classification**:

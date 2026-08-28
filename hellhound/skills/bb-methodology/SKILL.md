@@ -1,11 +1,19 @@
 ---
 name: bb-methodology
-description: Use at the START of any bug bounty hunting session, when switching targets, or when feeling lost about what to do next. Master orchestrator that combines the 5-phase non-linear hunting workflow with the critical thinking framework (developer psychology, anomaly detection, What-If experiments). Routes to all other skills based on current hunting phase. Also use when asking "what should I do next" or "where am I in the process."
+description: Master orchestrator for general bug bounty hunting sessions. Use ONLY when given an unknown target with NO specific objective, or when feeling lost. If the user provides a specific target goal (e.g. account takeover, owner console, auth bypass, password reset), DO NOT use bb-methodology — call auth-bypass, access-control, or server-side-parameter-pollution directly!
 ---
 
 # Bug Bounty Methodology: Workflow + Mindset
 
-Master orchestrator for hunting sessions. Combines the 5-phase non-linear workflow with the critical thinking framework that separates top 1% hunters from the rest.
+Master orchestrator for general hunting sessions. Combines the 5-phase non-linear workflow with the critical thinking framework that separates top 1% hunters from the rest.
+
+> **CRITICAL FAST-TRACK RULE**:
+> If the user prompt defines a specific objective (e.g., "take over chief of medicine", "access owner console", "bypass 2FA"):
+> 1. **DO NOT run long broad spidering sessions (`depth=2` Chromium crawls)**.
+> 2. **IMMEDIATELY load the specific skill**:
+>    - Account Takeover / Password Reset / Auth Flaws -> `load_skill(name="auth-bypass")`
+>    - Privilege Escalation / Owner Console / Mass Assignment -> `load_skill(name="access-control")`
+>    - Parameter Pollution / Debug Leakage -> `load_skill(name="server-side-parameter-pollution")`
 
 ---
 
@@ -248,7 +256,7 @@ What input are you testing?
 +-- Price/quantity/coupon
 |   -> Business logic, race conditions
 +-- Login / 2FA / password reset
-|   -> Auth bypass
+|   -> Load skill `auth-bypass` (MANDATORY: Harvest email -> Reset password -> Immediately authenticate via `POST <subpath>/api/auth/login` with new credentials -> Save session cookie -> Verify role via `<subpath>/api/me` -> Access privileged staff APIs)
 +-- Profile update API
 |   -> Mass Assignment
 +-- Template / wiki editor
