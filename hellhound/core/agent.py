@@ -4162,10 +4162,12 @@ RULES:
    - A privilege escalation or bypass is ONLY confirmed when privileged data (billing secrets, API keys, member directories, configuration settings) of the TARGET role/account is genuinely returned or unlocked.
    - GUARD / HUMAN APPROVAL & ERROR HONESTY: If a tool returns an error indicating that a request was blocked, required approval, or was rejected by the user (e.g. 'requires human approval', 'Action rejected by user', 'blocked'), the requested action DID NOT HAPPEN. You must NEVER claim that an action was executed, completed, or initiated if the underlying tool call was blocked or rejected.
    - PROOF OF PRIMARY TARGET ONLY: Capture `gowitness` screenshots and record findings for the PRIMARY target account once compromised. Screenshot the authenticated administrative dashboard (`/admin`), user list, or target view, rather than re-requesting destructive action URLs. Do NOT capture a screenshot of an allowed stepping-stone user and treat it as proof of the primary goal's completion.
-   - MANDATORY ACTION BEFORE OUTPUTTING 'DONE': Whenever you successfully authenticate as the PRIMARY requested target role/account:
+   - MANDATORY ACTION BEFORE OUTPUTTING 'DONE': the FIRST time you successfully authenticate as the PRIMARY requested target role/account THIS TURN (i.e. you just executed the tool calls that achieved it, right now, not in an earlier turn):
      1. Capture visual proof of the unlocked page or dashboard using `gowitness`.
      2. Record the confirmed vulnerability and reproduction proof using `record_finding`.
      3. ONLY after executing both tools, output "DONE".
+   - THIS DOES NOT RE-APPLY to a later, unrelated message just because the conversation history shows a past turn already achieved and recorded the compromise. Check CURRENT FINDINGS / ALREADY GATHERED above — if the objective is already recorded there, a follow-up message (a question, an acknowledgment, "thanks", "good work", a request to check something else) does not need gowitness or record_finding run again. Re-verifying or re-screenshotting something already confirmed and recorded is not "more thorough," it's redundant work the researcher didn't ask for.
+   - PURE ACKNOWLEDGMENT / SOCIAL MESSAGES ("thanks", "nice work", "good job", "appreciate it" and similar, with no new question or task in them): these need NO tool calls and NO STATUS/evidence recap, ever, regardless of what's in the conversation history. Respond the way the persona above actually describes — a short, natural, personality-driven reply. Re-explaining the whole investigation again is not what was asked for.
 
 6. To call a tool, respond ONLY with pure JSON (do NOT output natural language commentary or '(Suggested next tool: ...)'):
 ```json
@@ -4176,7 +4178,7 @@ RULES:
 ```
 7. When testing authentication or password recovery workflows, harvest real user identities/emails from application content or endpoints rather than inventing dummy emails.{path_rule}
 8. Resetting credentials or obtaining a password reset token is NOT mission completion. You MUST execute the login request (e.g. POST /api/auth/login with the new credentials), store/send the resulting session cookie or token, and access the target's internal staff console/portal (e.g., /portal, /dashboard, /admin, staff charts) to verify true end-to-end access before outputting DONE. If all tools and end-to-end access steps are complete, respond with "DONE".
-8b. Modifying user role or metadata via PATCH/POST/PUT (e.g. PATCH /meridian/api/account) is NOT mission completion. You MUST immediately execute curl to verify access to the target restricted route (e.g., GET /meridian/api/account and GET /meridian/api/admin/overview with the session cookie), capture visual proof with gowitness on the unlocked dashboard/overview, and record the confirmed vulnerability via record_finding BEFORE outputting DONE or ending your response!
+8b. Modifying user role or metadata via PATCH/POST/PUT (e.g. PATCH /meridian/api/account) is NOT mission completion. You MUST immediately execute curl to verify access to the target restricted route (e.g., GET /meridian/api/account and GET /meridian/api/admin/overview with the session cookie), capture visual proof with gowitness on the unlocked dashboard/overview, and record the confirmed vulnerability via record_finding BEFORE outputting DONE or ending your response — but only the first time this happens THIS turn. If this was already verified, screenshotted, and recorded in an earlier turn (check CURRENT FINDINGS above), don't repeat it just because a later message touches the same topic.
 9. Skill methodology is never provided automatically — check the SKILL MENU yourself and call `load_skill` with whatever name actually fits the task, before doing anything else. This applies to every message, including what looks like the start of a new session — there's no default "starting" skill loaded for you; if you judge that a session is beginning and methodology would help, that's your call to make by loading one, not something decided for you in advance.
 """
 
@@ -4193,23 +4195,28 @@ RULES:
         if self._turn_path_scope:
             path_scope_synth = f"\nACTIVE PATH SCOPE: '{self._turn_path_scope}'"
 
-        report_requested = any(kw in original_user_text.lower() for kw in ("report", "hackerone", "bug bounty", "poc report", "draft report", "submission", "writeup"))
         has_critical_findings = (
             len(self.target.findings) > 0 
             or any(f.get("severity") in ("CRITICAL", "HIGH", "critical", "high") for f in self.target.findings)
             or bool(self.target.state.get("session_cookie"))
         )
 
-        report_directive = ""
-        if report_requested:
-            report_directive = f"""
-CRITICAL INSTRUCTION - VULNERABILITY REPORT & PROOF OF CONCEPT DIRECTIVE:
-The researcher explicitly requested a formal report. Provide a structured, professional HackerOne-ready bug bounty submission report formatted in clean GitHub Markdown:
+        # Always present, never Python-gated on keyword matching — "report",
+        # "writeup", etc. as bare substrings match far too much normal text
+        # ("no report needed", "reporting back") to reliably mean "produce
+        # the formal 5-part structure." The model reads the researcher's
+        # actual message directly and decides for itself whether a formal
+        # report was actually requested, same as it already correctly does
+        # for the STATUS-tag and everything-else formatting decisions above.
+        report_directive = """
+VULNERABILITY REPORT & PROOF OF CONCEPT — ONLY IF ACTUALLY REQUESTED:
+If, and only if, the researcher's message is explicitly asking for a formal, submittable report (not just discussing findings, asking a question, or continuing the investigation), provide a structured, professional HackerOne-ready bug bounty submission report formatted in clean GitHub Markdown:
 1. Vulnerability Title (Clear, concise, HackerOne style).
 2. Vulnerability Details & Attack Chain Narrative: Detail the entire attack path step-by-step.
 3. Steps to Reproduce (Deterministic PoC): Exact HTTP requests and curl commands.
 4. Business Impact & Risk Analysis.
 5. Remediation Guidance.
+Otherwise, ignore this section entirely and just answer what was actually asked.
 """
 
         # ── 2. Comprehensive Synthesizer System Prompt (Deep Reasoning & Synthesis)
@@ -4427,34 +4434,34 @@ INSTRUCTIONS:
                 # actually emitting the tool-call JSON (e.g. "Let me check the
                 # target now.") — the latter must NOT be allowed to silently
                 # end the turn, or the whole session does nothing but talk.
+                # Keep this list NARROW and specific to unexecuted-action
+                # phrasing — broad/generic words ("harvest", "examine",
+                # "investigate", "i can ") false-positive on completely
+                # normal explanatory or conversational writing, which forces
+                # a real tool call in response to something as simple as
+                # "good work brother" or a question about how recon works.
+                # This is a narrow output-format safety net, not a guess at
+                # what the user wants — that decision stays with the model.
                 _narration_markers = (
-                    "let me ", "i'll ", "i will ", "let's ", "going to ",
-                    "i'm going to", "proceed to", "next, i", "now i",
-                    "i'll now", "i will now", "i need to", "i should",
-                    "first, i", "starting with", "beginning", "let me execute",
-                    "executing now", "initiating", "i'm about to",
-                    "i can ", "i want to", "my plan", "here's my",
+                    "let me now", "i'll now", "i will now", "let me execute",
                     "let me check", "let me run", "let me fetch",
-                    "i'm now", "i shall", "allow me", "i'm going",
-                    "next:", "next step", "the next step", "will fetch",
-                    "will probe", "will analyze", "will inspect", "harvest",
-                    "examine", "investigate",
+                    "i'm about to", "i'm going to", "proceed to execute",
+                    "next i will", "next, i will", "the next step is to",
                 )
-                _next_step_markers = ("next:", "next step", "the next step", "proceed to", "will fetch", "will probe", "will analyze", "will inspect", "harvest", "let me ")
                 _resp_lower = ai_resp.lower()
                 _has_explicit_completion = bool(re.search(r"^\s*done\b|^\s*\[status:\s*(objective achieved|full takeover|exhausted)\]", _resp_lower, re.MULTILINE))
-                _has_next_step = any(m in _resp_lower for m in _next_step_markers)
 
                 _looks_like_narration = (
-                    (_has_next_step or any(m in _resp_lower for m in _narration_markers))
+                    not tools_executed  # only when NOTHING has run yet this turn —
+                                         # once real progress happened, wrap-up text
+                                         # using common words is not a failure to fix
+                    and any(m in _resp_lower for m in _narration_markers)
                     and not _has_explicit_completion
                 )
 
-                # Primary narration guard: enforce continuous tool execution until explicit completion
-                if _looks_like_narration and _narration_retry_count < 5:
+                if _looks_like_narration and _narration_retry_count < 2:
                     _narration_retry_count += 1
                     self.history.append({"role": "assistant", "content": ai_resp})
-                    # Build a target-aware example so the model knows what to emit
                     _target_url = self.target.name
                     if not _target_url.startswith(("http://", "https://")):
                         _target_url = f"http://{_target_url}"
@@ -4471,50 +4478,6 @@ INSTRUCTIONS:
                     user_text = "Execute the tool now — respond with ONLY the JSON, no narration."
                     continue
 
-                # Secondary narration guard: tools already executed but model narrates next step
-                if _looks_like_narration and tools_executed and _narration_retry_count < 5:
-                    _narration_retry_count += 1
-                    self.history.append({"role": "assistant", "content": ai_resp})
-                    self.history.append({
-                        "role": "user",
-                        "content": (
-                            "SYSTEM: You described an intended next action instead of executing it. "
-                            "Emit the tool-call JSON now or output 'DONE' if no further tools are needed. "
-                            "No narration, no explanation — just JSON or DONE."
-                        )
-                    })
-                    user_text = "Emit the tool-call JSON or DONE."
-                    continue
-
-                # Safety net: all narration retries exhausted, zero tools executed,
-                # real target exists — auto-inject a starter curl probe rather than
-                # giving up with zero work done.
-                if not tools_executed and has_real_target and _narration_retry_count >= 5:
-                    _target_url = self.target.name
-                    if not _target_url.startswith(("http://", "https://")):
-                        _target_url = f"http://{_target_url}"
-                    tool_call = {"tool": "curl", "args": {"url": _target_url, "method": "GET"}}
-                    t_name = tool_call["tool"]
-                    t_args = tool_call["args"]
-                    tools_executed.append(t_name)
-                    if emit and hasattr(emit, "set_label"):
-                        emit.set_label(f"Let me cook — probing {self.target.name}")
-                    if emit and hasattr(emit, "tool_start"):
-                        emit.tool_start(t_name, t_args)
-                    elif emit and hasattr(emit, "info"):
-                        emit.info(f"[*] Auto-probe: {t_name} {t_args}")
-                    tool_result = self.execute_tool_call(t_name, t_args, emit)
-                    if emit and hasattr(emit, "tool_result"):
-                        emit.tool_result(t_name, tool_result)
-                    self.history.append({"role": "assistant", "content": '{"tool": "curl", "args": ' + json.dumps(t_args) + '}'})
-                    self.history.append({
-                        "role": "user",
-                        "content": f"[TOOL RESULT: {t_name}]\n{json.dumps(tool_result, indent=2)}"
-                    })
-                    user_text = f"Tool '{t_name}' returned results. Analyze these findings and choose the next tool or output 'DONE'."
-                    _narration_retry_count = 0  # Reset for the next phase
-                    continue
-
                 break
 
         # ── 4. Final Answer Generation (Streaming, Fast & Context-Specific) ───────
@@ -4525,14 +4488,7 @@ INSTRUCTIONS:
         self.last_tool_count = len(tools_executed)
 
         if not tools_executed:
-            if report_requested and has_critical_findings:
-                synth_prompt = (
-                    f"The researcher requested: \"{original_user_text}\"\n\n"
-                    f"Target: '{self.target.name}'.\n"
-                    f"Generate the complete, professional HackerOne vulnerability report based on the confirmed findings and evidence gathered for this target."
-                )
-            else:
-                synth_prompt = original_user_text
+            synth_prompt = original_user_text
 
             final_answer, tokens = ask_neural_core(
                 prompt=synth_prompt,
@@ -4545,25 +4501,22 @@ INSTRUCTIONS:
                 cancel_check=cancel_check
             )
         else:
-            if report_requested and has_critical_findings:
-                synth_prompt = (
-                    f"The researcher requested: \"{original_user_text}\"\n\n"
-                    f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
-                    f"Generate a complete, professional HackerOne vulnerability report based strictly on the verified findings and actual evidence gathered."
-                )
-            else:
-                synth_prompt = (
-                    f"The researcher asked/instructed: \"{original_user_text}\"\n\n"
-                    f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
-                    f"Synthesize the investigation results factually, clearly, and concisely based strictly on real tool outputs.\n"
-                    f"- Check: What was the primary requested target account/role? Did tool outputs prove compromise of THAT exact account, or only an intermediate stepping-stone account?\n"
-                    f"- Explain what was tested and what was observed in the tool outputs (status codes, returned HTML/JSON, cookies, credentials/comments).\n"
-                    f"- If a user directory or member table was returned, note that this is a directory listing, not an account takeover of the members in that table.\n"
-                    f"- If only an intermediate session or low-privilege foothold was obtained, set [STATUS: PARTIAL / IN PROGRESS] and explain the exact next step to achieve full takeover of the primary target.\n"
-                    f"- If a login attempt failed (e.g. returned 'Invalid username or password' or login form despite HTTP 200), state that it failed and do NOT claim account takeover.\n"
-                    f"- Outline the next logical testing steps.\n"
-                    f"- Do NOT generate a rigid, multi-section formal vulnerability report unless the user explicitly requested a report."
-                )
+            synth_prompt = (
+                f"The researcher asked/instructed: \"{original_user_text}\"\n\n"
+                f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
+                f"First, judge what this specific message actually calls for — a full campaign-status recap is "
+                f"NOT automatically the right answer just because a tool ran. A minor follow-up, a small "
+                f"clarifying check, or a tool call that turned out to be unnecessary in hindsight can just get "
+                f"a short, direct answer. Use the checklist below only to the extent this message's own scope "
+                f"actually calls for it:\n"
+                f"- Check: What was the primary requested target account/role? Did tool outputs prove compromise of THAT exact account, or only an intermediate stepping-stone account?\n"
+                f"- Explain what was tested and what was observed in the tool outputs (status codes, returned HTML/JSON, cookies, credentials/comments).\n"
+                f"- If a user directory or member table was returned, note that this is a directory listing, not an account takeover of the members in that table.\n"
+                f"- If only an intermediate session or low-privilege foothold was obtained, set [STATUS: PARTIAL / IN PROGRESS] and explain the exact next step to achieve full takeover of the primary target.\n"
+                f"- If a login attempt failed (e.g. returned 'Invalid username or password' or login form despite HTTP 200), state that it failed and do NOT claim account takeover.\n"
+                f"- Outline the next logical testing steps.\n"
+                f"- Do NOT generate a rigid, multi-section formal vulnerability report unless the user explicitly requested a report."
+            )
 
             if len(tools_executed) > 0 and cfg.get("show_recaps", True):
                 synth_prompt += "\n\nIMPORTANT: Write your complete, detailed analysis, PoC commands, and findings with full markdown formatting first. ONLY on the very last line of your response, add a single summary line in this exact format:\nrecap: Goal was [goal]. Done: [what was accomplished]. Next: [recommended next step]."
