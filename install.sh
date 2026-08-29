@@ -332,7 +332,7 @@ fi
 # ── 7. System GUI (PyWebView HUD) ──────────────────────
 echo ""
 info "Registering HELLHOUND as a desktop application..."
-mkdir -p "$HOME/.local/share/applications" "$HOME/.local/share/hellhound"
+mkdir -p "$HOME/.local/share/applications" "$HOME/.local/share/hellhound" "$HOME/.local/share/icons/hicolor/512x512/apps" "$HOME/.local/share/pixmaps"
 
 # Ensure stable icon location (copied, not symlinked)
 if [ -f "$PROJECT_ROOT/Images/logo.png" ]; then
@@ -341,22 +341,41 @@ else
     ICON_SRC="$PROJECT_ROOT/Images/hellhound.png"
 fi
 cp "$ICON_SRC" "$HOME/.local/share/hellhound/logo.png" 2>/dev/null || true
-
-# Register Icon in universal icon directory as well
-mkdir -p "$HOME/.local/share/icons"
 cp "$ICON_SRC" "$HOME/.local/share/icons/hellhound.png" 2>/dev/null || true
+cp "$ICON_SRC" "$HOME/.local/share/pixmaps/hellhound.png" 2>/dev/null || true
+
+# Generate hicolor icon hierarchy for Linux application launchers
+"$VENV_DIR/bin/python" -c "
+import os
+from PIL import Image
+src = '$ICON_SRC'
+if os.path.exists(src):
+    try:
+        img = Image.open(src)
+        base = os.path.expanduser('~/.local/share/icons/hicolor')
+        for s in [16, 24, 32, 48, 64, 128, 256, 512]:
+            d = os.path.join(base, f'{s}x{s}', 'apps')
+            os.makedirs(d, exist_ok=True)
+            img.resize((s, s), Image.Resampling.LANCZOS).save(os.path.join(d, 'hellhound.png'))
+        os.makedirs(os.path.join(base, 'scalable', 'apps'), exist_ok=True)
+        img.save(os.path.join(base, 'scalable', 'apps', 'hellhound.png'))
+    except Exception: pass
+" 2>/dev/null || true
 
 chmod +x "$PROJECT_ROOT/gui/hellhound-gui.sh"
 
-# Install .desktop file with resolved absolute icon path
-sed "s|Icon=.*|Icon=$HOME/.local/share/hellhound/logo.png|" \
-    "$PROJECT_ROOT/packaging/hellhound.desktop" \
-    > "$HOME/.local/share/applications/hellhound.desktop"
+# Install .desktop file
+cp "$PROJECT_ROOT/packaging/hellhound.desktop" "$HOME/.local/share/applications/hellhound.desktop"
+chmod +x "$HOME/.local/share/applications/hellhound.desktop"
 
-# Update system desktop database for app menu visibility
+# Update system desktop database & GTK icon cache for app menu visibility
+if command -v gtk-update-icon-cache &>/dev/null; then
+    gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" &>/dev/null || true
+fi
 if command -v update-desktop-database &>/dev/null; then
     update-desktop-database "$HOME/.local/share/applications/" &>/dev/null || true
 fi
+touch "$HOME/.local/share/applications/hellhound.desktop"
 
 # Update system alias
 GUI_ALIAS="alias hellhound-gui='$VENV_DIR/bin/hellhound --gui'"
