@@ -478,15 +478,58 @@ def _sanitize_h1(text: str) -> str:
     return "".join(out)
 
 
+_STATUS_TAG_STYLES = (
+    (re.compile(r'\[STATUS:\s*OBJECTIVE ACHIEVED[^\]]*\]', re.IGNORECASE), "bold green"),
+    (re.compile(r'\[STATUS:\s*PARTIAL[^\]]*\]', re.IGNORECASE), "bold yellow"),
+    (re.compile(r'\[STATUS:\s*BLOCKED[^\]]*\]', re.IGNORECASE), "bold red"),
+)
+
+
+def _print_with_status_color(text: str):
+    """
+    Prints Markdown text through Rich, with any [STATUS: ...] tag pulled
+    out and printed with real color via Rich's console markup first — the
+    same tag the GUI colors as a badge (see status-tag CSS in app.css).
+    Rich's Markdown renderer doesn't support arbitrary color spans inside
+    CommonMark, so the tag is rendered separately, outside Markdown(), and
+    the remaining text goes through Markdown() exactly as before. Only
+    used for FINAL, settled output — not the live-streaming preview, where
+    a partially-typed tag would flicker in and out of color as it streams.
+    """
+    matched_style = None
+    remaining = text
+    for pattern, style in _STATUS_TAG_STYLES:
+        m = pattern.search(text)
+        if m:
+            matched_style = style
+            tag_text = m.group(0)
+            remaining = (text[:m.start()] + text[m.end():]).strip()
+            rich_console.print(f"[{style}]{tag_text}[/{style}]")
+            break
+    if remaining:
+        rich_console.print(Markdown(remaining))
+
+
 class StreamRenderer:
     """
     Smooth in-place markdown streaming via rich.live.Live.
 
-    Tokens are accumulated into a buffer. On each token, the entire
-    buffer is re-rendered as a Rich Markdown document in-place at
-    ~12 fps, giving smooth visual growth identical to Claude Code.
-    No state machine, no block-flush, no separate code-fence handling.
+    The Live region only ever renders a FIXED-HEIGHT TAIL of the buffer
+    (last N lines), never the whole growing document — the same fix
+    already applied to the tool-execution cards' StreamRenderer. Live
+    erases its previous frame by moving the cursor up exactly as many
+    lines as it last drew; if that line count keeps growing (streaming
+    a long response) or the terminal's actual scroll position shifts
+    underneath it (the user scrolling mid-stream), that erase math
+    desyncs from what's really on screen and leaves stale frames behind
+    — visible as the same paragraph repeating over and over. A constant-
+    height region makes that desync impossible by construction in the
+    growing-content case, and combined with `transient=True` (below) and
+    a single full-content print in `finish()`, removes almost the entire
+    window where a mid-stream scroll can cause visible duplication.
     """
+    _LIVE_TAIL_LINES = 12
+
     def __init__(self, title: str = "HELLHOUND", border_style: str = "bold red"):
         self.title = title
         self.border_style = border_style
@@ -507,16 +550,22 @@ class StreamRenderer:
                 Markdown(""),
                 refresh_per_second=12,
                 console=rich_console,
-                vertical_overflow="visible",
+                vertical_overflow="crop",
+                transient=True,
             )
             self._live.start()
 
         # Throttle: update display every 3 tokens to avoid excessive re-renders
         # on very fast streams while keeping visual feedback smooth
         if self._token_count % 3 == 0 or "\n" in token:
-            display = _sanitize_h1(self._strip_recap(self.buffer))
+            clean = _sanitize_h1(self._strip_recap(self.buffer))
+            lines = (clean or " ").splitlines() or [" "]
+            tail = lines[-self._LIVE_TAIL_LINES:]
+            preview = "\n".join(tail)
+            if len(lines) > self._LIVE_TAIL_LINES:
+                preview = f"...({len(lines) - self._LIVE_TAIL_LINES} lines above)\n" + preview
             try:
-                self._live.update(Markdown(display))
+                self._live.update(Markdown(preview))
             except Exception:
                 pass
 
@@ -532,23 +581,20 @@ class StreamRenderer:
         return "".join(out)
 
     def finish(self, final_text=None):
-        """Final render: update Live with complete document, then stop."""
+        """Final render: stop the (transient, tail-only) Live region, then
+        print the COMPLETE document exactly once — this is the only thing
+        that ends up permanently in scrollback, and the only place the
+        [STATUS: ...] color treatment needs to apply."""
+        clean = _sanitize_h1(self._strip_recap(self.buffer))
         if self._live is not None:
             try:
-                clean = _sanitize_h1(self._strip_recap(self.buffer))
-                self._live.update(Markdown(clean))
-            except Exception:
-                pass
-            try:
-                self._live.stop()
+                self._live.stop()  # transient=True erases the cropped tail cleanly
             except Exception:
                 pass
             self._live = None
-        elif self.buffer.strip():
-            # Fallback: if Live was never started (empty stream), print directly
-            clean = _sanitize_h1(self._strip_recap(self.buffer))
+        if clean.strip():
             rich_console.print()
-            rich_console.print(Markdown(clean))
+            _print_with_status_color(clean)
             rich_console.print()
 
         if self._recap_line:
@@ -565,7 +611,7 @@ def render_response_bubble(response_text: str, sender: str = "HELLHOUND"):
         return
     clean = _sanitize_h1(response_text.strip())
     rich_console.print()
-    rich_console.print(Markdown(clean))
+    _print_with_status_color(clean)
     rich_console.print()
 
 def format_completion_phrase(elapsed_str: str) -> str:
