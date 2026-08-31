@@ -512,21 +512,18 @@ def _print_with_status_color(text: str):
 
 class StreamRenderer:
     """
-    Smooth in-place markdown streaming via rich.live.Live.
+    Incremental-commit markdown streaming, matching how Claude Code does it.
 
-    The Live region only ever renders a FIXED-HEIGHT TAIL of the buffer
-    (last N lines), never the whole growing document — the same fix
-    already applied to the tool-execution cards' StreamRenderer. Live
-    erases its previous frame by moving the cursor up exactly as many
-    lines as it last drew; if that line count keeps growing (streaming
-    a long response) or the terminal's actual scroll position shifts
-    underneath it (the user scrolling mid-stream), that erase math
-    desyncs from what's really on screen and leaves stale frames behind
-    — visible as the same paragraph repeating over and over. A constant-
-    height region makes that desync impossible by construction in the
-    growing-content case, and combined with `transient=True` (below) and
-    a single full-content print in `finish()`, removes almost the entire
-    window where a mid-stream scroll can cause visible duplication.
+    Content is committed PERMANENTLY to real scrollback the instant a
+    paragraph finishes (a blank line, not mid-code-fence) — printed once,
+    outside any live-redraw region. From that moment it's ordinary
+    terminal text: the user can scroll up and read it immediately,
+    without waiting for the whole response to finish. Only the currently
+    still-typing trailing paragraph sits in a small `Live` region at the
+    bottom, capped to a few lines. This also removes almost the entire
+    surface area for the duplicate-rendering bug: Live never has more
+    than one short, in-progress paragraph to erase and redraw, instead
+    of the whole growing document.
     """
     _LIVE_TAIL_LINES = 12
 
@@ -534,9 +531,44 @@ class StreamRenderer:
         self.title = title
         self.border_style = border_style
         self.buffer = ""
+        self._committed_len = 0  # how much of self.buffer is already permanently printed
         self._recap_line = None
         self._live = None
         self._token_count = 0
+
+    def _find_safe_commit_point(self) -> int:
+        """Furthest index into self.buffer that ends on a completed
+        paragraph boundary (blank line) which isn't inside an open code
+        fence — safe to print permanently. Returns the current committed
+        length if nothing new is safely committable yet."""
+        text = self.buffer
+        best = self._committed_len
+        idx = self._committed_len
+        while True:
+            nl = text.find("\n\n", idx)
+            if nl == -1:
+                break
+            if text.count("```", 0, nl) % 2 == 0:  # not mid-fence at this point
+                best = nl + 2
+            idx = nl + 2
+        return best
+
+    def _commit_up_to(self, end_idx: int):
+        if end_idx <= self._committed_len:
+            return
+        chunk = self.buffer[self._committed_len:end_idx]
+        self._committed_len = end_idx
+        # Pull out any recap line before printing — same suppress-and-save
+        # behavior as before, just applied per-chunk instead of once at the end.
+        out_lines = []
+        for line in chunk.splitlines(keepends=True):
+            if line.strip().lower().startswith("recap:"):
+                self._recap_line = line.strip()
+            else:
+                out_lines.append(line)
+        printable = _sanitize_h1("".join(out_lines)).rstrip("\n")
+        if printable.strip():
+            _print_with_status_color(printable)
 
     def on_token(self, token: str):
         if not token:
@@ -544,7 +576,23 @@ class StreamRenderer:
         self.buffer += token
         self._token_count += 1
 
-        # Start Live context lazily on first token
+        # Commit any newly-completed, fence-safe paragraph(s) permanently.
+        # Stop the live tail first so the commit print doesn't visually
+        # collide with it; it restarts fresh below for whatever's left.
+        safe_point = self._find_safe_commit_point()
+        if safe_point > self._committed_len:
+            if self._live is not None:
+                try:
+                    self._live.stop()
+                except Exception:
+                    pass
+                self._live = None
+            self._commit_up_to(safe_point)
+
+        tail = self.buffer[self._committed_len:]
+        if not tail.strip():
+            return
+
         if self._live is None:
             self._live = Live(
                 Markdown(""),
@@ -558,44 +606,25 @@ class StreamRenderer:
         # Throttle: update display every 3 tokens to avoid excessive re-renders
         # on very fast streams while keeping visual feedback smooth
         if self._token_count % 3 == 0 or "\n" in token:
-            clean = _sanitize_h1(self._strip_recap(self.buffer))
-            lines = (clean or " ").splitlines() or [" "]
-            tail = lines[-self._LIVE_TAIL_LINES:]
-            preview = "\n".join(tail)
-            if len(lines) > self._LIVE_TAIL_LINES:
-                preview = f"...({len(lines) - self._LIVE_TAIL_LINES} lines above)\n" + preview
+            clean_tail = _sanitize_h1(tail)
+            lines = (clean_tail or " ").splitlines() or [" "]
+            preview = "\n".join(lines[-self._LIVE_TAIL_LINES:])
             try:
                 self._live.update(Markdown(preview))
             except Exception:
                 pass
 
-    def _strip_recap(self, text: str) -> str:
-        """Extract and suppress any recap line from the buffer."""
-        lines = text.splitlines(keepends=True)
-        out = []
-        for line in lines:
-            if line.strip().lower().startswith("recap:"):
-                self._recap_line = line.strip()
-            else:
-                out.append(line)
-        return "".join(out)
-
     def finish(self, final_text=None):
-        """Final render: stop the (transient, tail-only) Live region, then
-        print the COMPLETE document exactly once — this is the only thing
-        that ends up permanently in scrollback, and the only place the
-        [STATUS: ...] color treatment needs to apply."""
-        clean = _sanitize_h1(self._strip_recap(self.buffer))
+        """Stop the live tail and commit whatever's left (the final
+        paragraph, which never got a trailing blank line to trigger a
+        commit on its own)."""
         if self._live is not None:
             try:
-                self._live.stop()  # transient=True erases the cropped tail cleanly
+                self._live.stop()  # transient=True erases the live tail cleanly
             except Exception:
                 pass
             self._live = None
-        if clean.strip():
-            rich_console.print()
-            _print_with_status_color(clean)
-            rich_console.print()
+        self._commit_up_to(len(self.buffer))
 
         if self._recap_line:
             print_formatted_text(HTML(f"<i><ansigray>{html.escape(self._recap_line)}</ansigray></i>"))
