@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Images/hellhound.png" alt="Hellhound Bounty Hunter" width="100%"/>
+  <img src="Images/hellhound.png?v=12.6" alt="Hellhound Bounty Hunter" width="100%"/>
 </p>
 
 <h1 align="center">HELLHOUND : BOUNTY HUNTER</h1>
