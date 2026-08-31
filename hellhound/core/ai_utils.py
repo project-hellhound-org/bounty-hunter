@@ -203,14 +203,26 @@ For casual conversation: respond naturally and conversationally in 1-3 sentences
 
 
 SYNTHESIZER_PERSONA = """\
-You are HELLHOUND, an autonomous bug bounty reconnaissance and triage assistant.
+You are HELLHOUND — the researcher's own AI, running as their daily driver, not
+a tool that only wakes up for bug bounty work. Think JARVIS with a security
+clearance: sharp, witty, a little sarcastic, genuinely likeable — but the
+instant real work is on the table, the jokes take a back seat to the facts.
+You verify before you agree; you don't take a claim, a number, or a "looks
+exploitable" at face value just because it was handed to you — you check it
+against what the evidence actually shows and say so if it doesn't hold up.
 
-Your job is to tell the researcher exactly what happened, no more, no less. 
-Report like a competent colleague sitting next to them, not a press release. 
-Dry, direct, a little wit where it fits naturally, but the finding always comes 
-first and the personality never gets in the way of the facts. Skepticism is 
-the default position, not an occasional flourish, if the evidence doesn't 
-prove what it looks like it proves, say that plainly instead of dressing it up.
+HOW YOU TALK, DEPENDING ON WHAT'S IN FRONT OF YOU:
+- General chat, learning questions, movies, whatever's on the researcher's
+  mind, casual back-and-forth — just talk to them like a person. Give the
+  real answer plainly and directly, don't pad it out repeating yourself, and
+  feel free to close with a brief, dry, snarky aside if one actually fits —
+  never instead of the answer, never longer than the answer. Match their
+  energy: a quick question gets a quick, funny reply, not an essay with
+  headers and emoji.
+- Recon/triage/attack-campaign work — the finding always comes first and the
+  personality never gets in the way of the facts. Skepticism is the default
+  position, not an occasional flourish: if the evidence doesn't prove what it
+  looks like it proves, say that plainly instead of dressing it up.
 
 CORE REPORTING & STATUS PROTOCOL:
 
@@ -253,6 +265,21 @@ W   = "\033[97m"     # White
 DIM = "\033[90m"     # Dim Grey
 MUT = "\033[38;5;245m" # Muted
 RST = "\033[0m"      # Reset
+
+def format_rich_to_ansi(msg: str) -> str:
+    """Converts Rich markup strings like [bold cyan]foo[/bold cyan] to real ANSI escape sequences for direct terminal output."""
+    if not msg or "[" not in msg or "]" not in msg:
+        return msg
+    try:
+        from rich.console import Console
+        import io
+        buf = io.StringIO()
+        con = Console(file=buf, force_terminal=True, color_system="256", highlight=False)
+        con.print(msg, end="")
+        return buf.getvalue()
+    except Exception:
+        import re
+        return re.sub(r'\[/?[a-zA-Z0-9_ -]+\]', '', msg)
 
 def _cols():
     import shutil
@@ -630,8 +657,9 @@ class ThinkingIndicator:
         with self.lock:
             try:
                 if sys.stdout and not sys.stdout.closed:
+                    formatted_msg = format_rich_to_ansi(msg)
                     sys.stdout.write("\r" + " " * 80 + "\r")
-                    sys.stdout.write(f"   \033[38;5;240m└\033[0m {color}{icon}\033[0m \033[38;5;250m{msg}\033[0m\n")
+                    sys.stdout.write(f"   \033[38;5;240m└\033[0m {color}{icon}\033[0m \033[38;5;250m{formatted_msg}\033[0m\n")
                     sys.stdout.flush()
             except Exception:
                 pass

@@ -114,12 +114,12 @@ PT_CUSTOM_STYLE = PTStyle.from_dict({
     'prompt': '#ff1a1a bold',
     'frame.border': '#555555',
     'frame.label': '#888888',
-    'completion-menu': 'bg:#1e1e1e #cccccc',
-    'completion-menu.completion': 'bg:#1e1e1e #cccccc',
-    'completion-menu.completion.current': 'bg:#880000 #ffffff bold',
-    'completion-menu.meta': 'bg:#141414 #888888',
-    'completion-menu.meta.current': 'bg:#550000 #ffffff',
-    'scrollbar.background': 'bg:#1e1e1e',
+    'completion-menu': 'bg:#181818 #cccccc',
+    'completion-menu.completion': 'bg:#181818 #e0e0e0',
+    'completion-menu.completion.current': 'bg:#880000 #ffffff bold nounderline',
+    'completion-menu.meta': 'bg:#121212 #888888',
+    'completion-menu.meta.current': 'bg:#880000 #ffffff nounderline',
+    'scrollbar.background': 'bg:#181818',
     'scrollbar.button': 'bg:#444444',
 })
 
@@ -153,27 +153,54 @@ class HellhoundCompleter(Completer):
         # 1. Base command completion
         if len(tokens) == 1 and not text.endswith(" "):
             target = tokens[0].lower()
+            from hellhound.core.skills import get_short_description, get_skill_usage_counts
+            usage = get_skill_usage_counts()
+
             seen = set()
+            system_cmds = []
+            skill_cmds = []
+
             for name, cmd in COMMAND_REGISTRY.items():
                 if not name.startswith("/"):
                     continue
-                if name in seen or name != cmd.name.lower():
+                primary_name = cmd.name.lower()
+                if primary_name in seen:
                     continue
-                seen.add(name)
-                if name.startswith(target):
-                    meta_parts = []
-                    if cmd.description:
+                seen.add(primary_name)
+
+                if primary_name.startswith(target):
+                    is_skill = getattr(cmd, "category", "") == "skills"
+                    if is_skill:
+                        skill_cmds.append(cmd)
+                    else:
+                        system_cmds.append(cmd)
+
+            # System slash commands FIRST: sorted in ascending alphabetical order
+            system_cmds.sort(key=lambda c: c.name.lower())
+
+            # Methodology skills SECOND: sorted by frequency descending, then name ascending
+            skill_cmds.sort(key=lambda c: (-usage.get(c.name.lstrip("/").lower(), 0), c.name.lower()))
+
+            # Combine: System commands MUST come first, then skills
+            ordered_cmds = system_cmds + skill_cmds
+
+            for cmd in ordered_cmds:
+                meta_parts = []
+                if cmd.description:
+                    if getattr(cmd, "category", "") == "skills":
+                        meta_parts.append(get_short_description(cmd.description))
+                    else:
                         meta_parts.append(cmd.description)
-                    if cmd.usage:
-                        primary_usage = cmd.usage.split("\n")[0].strip()
-                        meta_parts.append(f"[{primary_usage}]")
-                    display_meta = " — ".join(meta_parts)
-                    yield Completion(
-                        cmd.name,
-                        start_position=-len(target),
-                        display=cmd.name,
-                        display_meta=display_meta,
-                    )
+                if cmd.usage:
+                    primary_usage = cmd.usage.split("\n")[0].strip()
+                    meta_parts.append(f"[{primary_usage}]")
+                display_meta = " — ".join(meta_parts)
+                yield Completion(
+                    cmd.name,
+                    start_position=-len(target),
+                    display=cmd.name,
+                    display_meta=display_meta,
+                )
             return
 
         # 2. Subcommand & argument hints for specific commands
@@ -817,19 +844,36 @@ def start_chat_session(initial_target: Optional[str] = None):
                     "options": {}
                 }
 
-                # Determine if this is an AI / methodology skill command that needs live spinner and streaming
+                # Explicit local utility commands that NEVER use the AI thinking spinner
+                LOCAL_UTILITY_COMMANDS = {
+                    "/skills", "/skill", "/help", "/scope", "/rules", "/model", "/ai",
+                    "/setup", "/health", "/doctor", "/headers", "/targets", "/target",
+                    "/handle", "/uninstall", "/clear", "/loot", "/report"
+                }
+
                 cmd_base = cmd_line.split()[0].lower()
                 cmd_obj = get_command(cmd_base)
-                is_ai_cmd = cmd_base in {"/recon", "/scan", "/audit", "/hunt", "/auto", "/spider", "/surface", "/ask", "/chat", "/howl"}
-                if not is_ai_cmd and cmd_obj and getattr(cmd_obj, "category", "") in ("skills", "hunting"):
-                    is_ai_cmd = True
-                if not is_ai_cmd:
-                    try:
-                        from hellhound.core.skills import discover_skills
-                        if cmd_base.lstrip("/").lower() in discover_skills():
-                            is_ai_cmd = True
-                    except Exception:
-                        pass
+
+                try:
+                    from hellhound.core.skills import record_skill_usage
+                    record_skill_usage(cmd_base)
+                except Exception:
+                    pass
+
+                is_ai_cmd = False
+                if cmd_base not in LOCAL_UTILITY_COMMANDS:
+                    if cmd_base in {"/recon", "/scan", "/audit", "/hunt", "/auto", "/spider", "/surface", "/ask", "/chat", "/howl"}:
+                        is_ai_cmd = True
+                    elif cmd_obj and getattr(cmd_obj, "category", "") in ("skills", "hunting"):
+                        is_ai_cmd = True
+                    else:
+                        try:
+                            from hellhound.core.skills import discover_skills
+                            skill_names = set(discover_skills().keys())
+                            if cmd_base.lstrip("/").lower() in skill_names:
+                                is_ai_cmd = True
+                        except Exception:
+                            pass
 
                 if is_ai_cmd:
                     label = f"Let me cook — {cmd_base.lstrip('/').replace('-', ' ')}"

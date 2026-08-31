@@ -165,9 +165,11 @@ class PlainEmit:
             try:
                 _rich_console.print(msg)
             except Exception:
-                print(msg)
+                from hellhound.core.ai_utils import format_rich_to_ansi
+                print(format_rich_to_ansi(msg))
         else:
-            print(msg)
+            from hellhound.core.ai_utils import format_rich_to_ansi
+            print(format_rich_to_ansi(msg))
         if self.socketio:
             self.socketio.emit("log", {"message": msg})
 

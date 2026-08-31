@@ -139,6 +139,67 @@ def discover_skills() -> Dict[str, SkillMeta]:
     return registry
 
 
+SKILL_USAGE_FILE = USER_SKILLS_DIR.parent / "skill_usage.json"
+
+
+def get_short_description(desc: str, max_len: int = 90) -> str:
+    """Extracts a concise, single-line human-friendly summary from a skill description."""
+    if not desc:
+        return ""
+    clean = " ".join(desc.strip().split())
+    # Strip common AI prompt triggers if substantial text exists before them
+    for trigger in [" Use when ", " Covers ", " Guide ", " Never use "]:
+        if trigger in clean:
+            idx = clean.find(trigger)
+            if idx > 20:
+                clean = clean[:idx].strip()
+
+    # Check if em-dash split yields a meaningful > 20 char prefix
+    parts = re.split(r"\s+[—–]\s+", clean)
+    if parts and len(parts[0]) >= 20 and len(parts[0]) <= max_len:
+        return parts[0].strip().rstrip(".")
+    elif parts and len(parts) > 1:
+        combined = f"{parts[0]} — {parts[1]}"
+        if len(combined) <= max_len:
+            return combined.strip().rstrip(".")
+        clean = combined
+
+    # Fallback sentence split
+    sentence = re.split(r"\.\s+", clean)[0]
+    if len(sentence) > max_len:
+        truncated = sentence[:max_len].rsplit(" ", 1)[0]
+        return truncated.rstrip(",.-;:—") + "..."
+    return sentence.strip().rstrip(".")
+
+
+def get_skill_usage_counts() -> Dict[str, int]:
+    """Retrieves stored execution frequency counts for methodology skills and commands."""
+    if not SKILL_USAGE_FILE.exists():
+        return {}
+    try:
+        import json
+        with open(SKILL_USAGE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def record_skill_usage(skill_name: str):
+    """Increments the execution frequency count for a given skill or slash command."""
+    if not skill_name:
+        return
+    try:
+        import json
+        counts = get_skill_usage_counts()
+        name = skill_name.lstrip("/").lower()
+        counts[name] = counts.get(name, 0) + 1
+        SKILL_USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SKILL_USAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(counts, f, indent=2)
+    except Exception as e:
+        logger.debug(f"Failed to record skill usage for {skill_name}: {e}")
+
+
 def _tokenize(text: str) -> Set[str]:
     """Tokenizes text into lowercase alphanumeric keywords and subwords."""
     # Split on whitespace, punctuation, hyphens, underscores

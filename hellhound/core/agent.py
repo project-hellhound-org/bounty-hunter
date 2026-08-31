@@ -3992,6 +3992,17 @@ class Agent:
         ai_prov = (cfg.get("synthesizer_provider") or cfg.get("ai_provider") or "ollama").lower()
         is_small = (ai_prov == "ollama")
 
+        # Who's actually on the other end of this conversation — set via
+        # /handle. Previously only used for the CLI sign-off; the model
+        # itself never saw it, so "who am I" / "who am I talking to" had no
+        # way to be answered correctly even after the researcher set a handle.
+        researcher_handle = (cfg.get("researcher_handle") or "").strip()
+        researcher_line = (
+            f"RESEARCHER: {researcher_handle}"
+            if researcher_handle
+            else "RESEARCHER: not set — they haven't run /handle <name> yet, so you don't have a name for them."
+        )
+
         # Iteration ceiling: explicit arg wins, else the configured value
         # (default 60 — see ai_utils.load_config), never below 1.
         if max_iterations is None:
@@ -4242,6 +4253,7 @@ The researcher explicitly requested a formal report. Provide a structured, profe
         synthesizer_system_prompt = f"""\
 {custom_synth_persona}
 
+{researcher_line}
 TARGET: {self.target.name}
 SCOPE CONSTRAINTS: {scope_summary}{path_scope_synth}
 CURRENT FINDINGS: {len(self.target.findings)} verified findings

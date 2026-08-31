@@ -1242,11 +1242,14 @@ def handle_skills(args: List[str], session_context: Dict[str, Any], emit: Any) -
     if not clean_args:
         skills = discover_skills()
         if not is_json:
+            from hellhound.core.skills import get_short_description, get_skill_usage_counts
+            usage = get_skill_usage_counts()
+            sorted_skills = sorted(skills.items(), key=lambda item: (-usage.get(item[0].lower(), 0), item[0].lower()))
             emit.banner(f"HELLHOUND SKILL LIBRARY ({len(skills)} Available)")
-            for name, s in sorted(skills.items()):
+            for name, s in sorted_skills:
                 tag = " (user)" if s.is_user_defined else ""
-                desc_str = escape(s.description.strip())
-                emit.info(f"• [bold cyan]{name}[/bold cyan]{tag}: {desc_str}")
+                short_desc = escape(get_short_description(s.description))
+                emit(f"  • [bold cyan]{name}[/bold cyan]{tag}: {short_desc}")
         return {
             "status": "success",
             "skills": [
@@ -1264,13 +1267,14 @@ def handle_skills(args: List[str], session_context: Dict[str, Any], emit: Any) -
     query = " ".join(clean_args)
     results = search_skills(query, max_results=5)
     if not is_json:
+        from hellhound.core.skills import get_short_description
         emit.banner(f"SKILL SEARCH RESULTS FOR: '{query}'")
         if not results:
             emit.warn("No matching skills found.")
         for s in results:
             tag = " (user)" if s.is_user_defined else ""
-            desc_str = escape(s.description.strip())
-            emit.info(f"• [bold green]{s.name}[/bold green]{tag}: {desc_str}")
+            short_desc = escape(get_short_description(s.description))
+            emit(f"  • [bold green]{s.name}[/bold green]{tag}: {short_desc}")
 
     return {
         "status": "success",
@@ -1556,7 +1560,7 @@ def _make_skill_handler(_skill_name: str):
 def _register_skill_commands():
     try:
         from hellhound.core.skills import discover_skills
-        for _name, _meta in discover_skills().items():
+        for _name, _meta in sorted(discover_skills().items()):
             cmd_name = "/" + _name
             if cmd_name.lower() in COMMAND_REGISTRY:
                 continue  # a real command already owns this name — don't shadow it
