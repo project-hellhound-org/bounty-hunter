@@ -142,7 +142,7 @@ def discover_skills() -> Dict[str, SkillMeta]:
 SKILL_USAGE_FILE = USER_SKILLS_DIR.parent / "skill_usage.json"
 
 
-def get_short_description(desc: str, max_len: int = 90) -> str:
+def get_short_description(desc: str, max_len: int = 160) -> str:
     """Extracts a concise, single-line human-friendly summary from a skill description."""
     if not desc:
         return ""

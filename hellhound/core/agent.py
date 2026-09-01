@@ -4250,7 +4250,52 @@ The researcher explicitly requested a formal report. Provide a structured, profe
         artifact_inventory_synth = format_artifact_inventory(self.target)
         artifact_block_synth = f"\n{artifact_inventory_synth}\n" if artifact_inventory_synth else ""
 
-        synthesizer_system_prompt = f"""\
+        # A target only exists for prompt purposes once the researcher has
+        # actually configured one (via /target, /scope, or a domain named in
+        # this turn) — has_real_target already encodes exactly that check.
+        # The untouched "default" target every fresh session starts with must
+        # never be surfaced to the model; showing "TARGET: default" on every
+        # message is what causes the model to compulsively narrate scope
+        # constraints nobody set.
+        target_configured = has_real_target
+
+        light_context_block = ""
+        if target_configured:
+            light_context_block = f"""
+CURRENT SESSION CONTEXT (background only — do not mention scope, targets, or
+status mechanics unless the researcher's message is actually about them):
+TARGET: {self.target.name}
+SCOPE: {scope_summary}
+FINDINGS SO FAR: {len(self.target.findings)}{artifact_block_synth}"""
+
+        # ── Lightweight persona-only prompt for turns where no hunting tool
+        # ran (the Claude-Code-style default: most turns are just talk, not a
+        # scan). No baseline pentest doctrine, no tool schema dump, no skill
+        # methodology injection — those only belong on turns that actually do
+        # recon/exploitation work. This is what fixes both the "TARGET:
+        # default" noise and the doctrine-quoting-itself-back symptom.
+        casual_synth_prompt = f"""\
+{custom_synth_persona}
+
+{researcher_line}{light_context_block}
+
+INSTRUCTIONS:
+- No hunting tool executed this turn — this is general conversation, a
+  question, or casual chat, not an active recon/attack campaign.
+- Respond naturally and directly, like a capable assistant talking to
+  someone they know — not a pentest report generator reciting doctrine.
+- Do NOT open with a [STATUS: ...] tag, do NOT recite scope/baseline rules,
+  and do NOT bring up the target/scope unless the researcher's message is
+  actually about it.
+- When asked about your capabilities or tools, answer only from what you
+  actually have access to — don't invent or imply capabilities.
+"""
+
+        # ── Full hunting-turn prompt — target header, scope, baseline
+        # doctrine, tool schema, skill methodology, status classification.
+        # Used only when this turn actually executed tools (or is generating
+        # a report from prior findings), never for plain conversation.
+        full_synth_prompt = f"""\
 {custom_synth_persona}
 
 {researcher_line}
@@ -4555,6 +4600,18 @@ INSTRUCTIONS:
 
         cfg = load_config()
         self.last_tool_count = len(tools_executed)
+
+        # Branch point: only turns that actually ran a hunting tool (or are
+        # generating a report off prior confirmed findings) get the heavy
+        # target/scope/doctrine prompt. Everything else — plain conversation,
+        # Q&A, "no real target" turns — gets the lightweight persona prompt.
+        # This is the fix for both the TARGET:-default leak and the model
+        # quoting its own baseline doctrine back in casual replies.
+        synthesizer_system_prompt = (
+            full_synth_prompt
+            if (tools_executed or (report_requested and has_critical_findings))
+            else casual_synth_prompt
+        )
 
         if not tools_executed:
             if report_requested and has_critical_findings:
