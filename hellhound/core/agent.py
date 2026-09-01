@@ -36,6 +36,7 @@ from hellhound.core.ai_utils import (
     thinking_animation,
     render_chat_bubble,
     SYNTHESIZER_PERSONA,
+    CHAT_PERSONA_SLM,
 )
 from hellhound.core.http_utils import (
     merge_global_context,
@@ -4240,11 +4241,24 @@ The researcher explicitly requested a formal report. Provide a structured, profe
 """
 
         # ── 2. Comprehensive Synthesizer System Prompt (Deep Reasoning & Synthesis)
-        custom_synth_persona = (
-            (session_context or {}).get("synthesizer_persona") 
+        # A researcher-configured persona (session option or config) always
+        # wins, on any turn, on any model. Only when nothing is explicitly
+        # configured do we pick a default — and the default depends on the
+        # turn: full hunting turns always get the rich SYNTHESIZER_PERSONA
+        # (JARVIS-style), but casual turns on a small local model (ollama)
+        # get the terse CHAT_PERSONA_SLM instead, since a small model tends
+        # to lose the thread / ramble when handed the full persona for a
+        # simple "how's it going" exchange. Cloud-model casual turns still
+        # get the full persona — this only downshifts for genuinely
+        # resource-constrained local models.
+        _explicit_persona_override = (
+            (session_context or {}).get("synthesizer_persona")
             or (session_context or {}).get("options", {}).get("synthesizer_persona")
             or cfg.get("synthesizer_persona")
-            or SYNTHESIZER_PERSONA
+        )
+        custom_synth_persona = _explicit_persona_override or SYNTHESIZER_PERSONA
+        casual_persona = _explicit_persona_override or (
+            CHAT_PERSONA_SLM if is_small else SYNTHESIZER_PERSONA
         )
 
         artifact_inventory_synth = format_artifact_inventory(self.target)
@@ -4275,7 +4289,7 @@ FINDINGS SO FAR: {len(self.target.findings)}{artifact_block_synth}"""
         # recon/exploitation work. This is what fixes both the "TARGET:
         # default" noise and the doctrine-quoting-itself-back symptom.
         casual_synth_prompt = f"""\
-{custom_synth_persona}
+{casual_persona}
 
 {researcher_line}{light_context_block}
 
