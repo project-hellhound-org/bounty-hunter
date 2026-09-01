@@ -228,12 +228,14 @@ CORE REPORTING & STATUS PROTOCOL:
 
 1. OBJECTIVE FIDELITY & STATUS CLASSIFICATION (LIVE RECON/ATTACK CAMPAIGNS ONLY)
    If and ONLY IF an active target investigation or attack campaign was executed,
-   open the response with the status classification:
-   - [STATUS: OBJECTIVE ACHIEVED / FULL TAKEOVER] — target account was compromised.
-   - [STATUS: PARTIAL / IN PROGRESS] — stepping-stone access only.
-   - [STATUS: BLOCKED / EXHAUSTED] — all attack vectors were tested and failed.
+   open the response with a short, plain-language status line — no bracket tags,
+   no all-caps labels, just say it like you'd tell the researcher out loud:
+   - Full takeover — the target account/role was genuinely accessed and compromised.
+   - Partial / in progress — only a stepping-stone account or intermediate access
+     was reached, not the actual target yet.
+   - Blocked / exhausted — a live campaign ran and every viable attack vector failed.
 
-   DO NOT output [STATUS: ...] tags for general Q&A, sample reports, or code discussions.
+   DO NOT output a status line for general Q&A, sample reports, or code discussions.
    
    Never claim a full takeover off the back of a low-privilege account. That's 
    not an optimistic read of the evidence, it's just wrong, and wrong reports 
@@ -924,7 +926,13 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             messages.append({"role": "system", "content": system_prompt})
         if history:
             messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
+        # turn_start_idx-based history from Agent._get_trimmed_history always
+        # includes the current turn's just-appended user message, so it's
+        # frequently identical to `prompt` — appending it again sends the
+        # same user message twice, back-to-back. Skip the re-append when
+        # the trimmed history already ends with this exact turn.
+        if not (messages and messages[-1].get("role") == "user" and messages[-1].get("content") == prompt):
+            messages.append({"role": "user", "content": prompt})
 
         cfg = load_config()
         resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
@@ -943,6 +951,12 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             # Disable streaming for tool calling — simpler to parse non-streamed tool_calls
             payload["stream"] = False
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code >= 500:
+                # Transient upstream fault (NVIDIA NIM 500s under load) — one
+                # quick retry before giving up, since these routinely succeed
+                # a moment later.
+                time.sleep(1.5)
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code != 200:
                 err = f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:100]}"
                 return (err, None) if return_usage else err
@@ -965,6 +979,9 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             return (text, usage_tokens) if return_usage else text
 
         r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
+        if r.status_code >= 500:
+            time.sleep(1.5)
+            r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:
             err = f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:100]}"
             return (err, None) if return_usage else err
@@ -1022,7 +1039,11 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
             messages.append({"role": "system", "content": system_prompt})
         if history:
             messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
+        # See call_nvidia for why this guard exists: turn_start_idx-based
+        # history already includes the current user turn, so avoid sending
+        # it a second time as a duplicate trailing user message.
+        if not (messages and messages[-1].get("role") == "user" and messages[-1].get("content") == prompt):
+            messages.append({"role": "user", "content": prompt})
 
         cfg = load_config()
         resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
@@ -1102,7 +1123,11 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
         messages = []
         if history:
             messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
+        # See call_nvidia for why this guard exists: turn_start_idx-based
+        # history already includes the current user turn, so avoid sending
+        # it a second time as a duplicate trailing user message.
+        if not (messages and messages[-1].get("role") == "user" and messages[-1].get("content") == prompt):
+            messages.append({"role": "user", "content": prompt})
 
         cfg = load_config()
         resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
@@ -1365,7 +1390,11 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
             messages.append({"role": "system", "content": system_prompt})
         if history:
             messages.extend(history)
-        messages.append({"role": "user", "content": prompt})
+        # See call_nvidia for why this guard exists: turn_start_idx-based
+        # history already includes the current user turn, so avoid sending
+        # it a second time as a duplicate trailing user message.
+        if not (messages and messages[-1].get("role") == "user" and messages[-1].get("content") == prompt):
+            messages.append({"role": "user", "content": prompt})
         
         cfg = load_config()
         resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)

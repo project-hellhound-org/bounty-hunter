@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 import os
 from pathlib import Path
 import re
@@ -4154,6 +4155,10 @@ RULES:
         - If an action targeting a high-privilege or victim account (e.g. `<endpoint>/<victim_id>/impersonate` or `<endpoint>/<victim_id>/switch`) returns 403 Forbidden or 404, DO NOT STOP!
         - Probe the exact same endpoint against allowed/normal accounts (e.g. `<endpoint>/<allowed_user_id>/...` or your own account ID) with `GET` and `POST` to understand the underlying delegation mechanism.
         - If the working response reveals a one-time token, delegation URL, or parameter redirect (e.g., `<auth_handler>?token=<token>`), chain this with any target token harvested earlier by directly requesting `<auth_handler>?token=<victim_token>` to bypass the front-end guard and acquire the victim's session.
+     d2) NAMED-VICTIM PARAMETER SUBSTITUTION — DO NOT STOP TO REPORT A PROOF-OF-CONCEPT (CRITICAL):
+        - If the researcher's task names a specific target identity (e.g. "find carlos's api key", "access user X's data"), and you discover ANY parameter that scopes a response to an identity (e.g. `id=<your_own_username>`, `user_id=<your_own_id>`, `account=<you>`) and it returns your own account's data, that is a proof-of-concept, not the objective.
+        - You MUST immediately re-issue the exact same request with that parameter substituted for the NAMED target's identity, in the SAME turn, before outputting DONE or any partial-status summary. This is a same-class, non-destructive read (GET) against a URL already in scope — it does not need researcher confirmation and is not a new action requiring approval.
+        - Only stop short of the named target's data if the substituted request is genuinely blocked, requires an approval-gated destructive method, or the parameter turns out not to control access at all. "I found the mechanism, here's the next step" is a failure state when the next step is a plain GET you are fully able to execute right now — execute it instead of describing it.
      e) MULTI-VECTOR EXHAUSTION BEFORE GIVING UP:
         - Never declare failure or output "DONE" after only one vector fails. Systematically evaluate:
           1. Direct Credential & Secret Leaks (embedded JS objects, comments, profile responses, leaked passwords).
@@ -4327,10 +4332,10 @@ AVAILABLE TOOLS (this is the complete, real list — you have no other tools):
 INSTRUCTIONS:
 - Review the entire conversation history, executed tools, and gathered evidence.
 - Present a clear, factual summary of findings and tool results.
-- STATE STATUS CLEARLY AT THE START ONLY IF AN ACTIVE TARGET RECON/TESTING CAMPAIGN WAS EXECUTED THIS TURN:
-  - [STATUS: OBJECTIVE ACHIEVED / FULL TAKEOVER] if the primary requested target account or role was genuinely accessed and compromised.
-  - [STATUS: PARTIAL / IN PROGRESS] if only intermediate stepping stones were accessed.
-  - [STATUS: BLOCKED / EXHAUSTED] if a live campaign was executed and all viable attack vectors failed.
+- STATE STATUS CLEARLY AT THE START ONLY IF AN ACTIVE TARGET RECON/TESTING CAMPAIGN WAS EXECUTED THIS TURN — say it in plain language, no bracket tags or all-caps labels:
+  - Full takeover / objective achieved, if the primary requested target account or role was genuinely accessed and compromised.
+  - Partial / in progress, if only intermediate stepping stones were accessed.
+  - Blocked / exhausted, if a live campaign was executed and all viable attack vectors failed.
   - DO NOT output a [STATUS: ...] line for general conversation, Q&A, sample report requests, or coding assistance.
 - CRITICAL IDENTITY VERIFICATION:
   - NEVER claim account takeover unless the primary target's specific token, credentials, or session was actually established and verified!
@@ -4390,7 +4395,12 @@ INSTRUCTIONS:
                 if tokens is not None and emit and hasattr(emit, "set_token_count"):
                     emit.set_token_count(tokens)
 
-                if not ai_resp:
+                if not ai_resp or (isinstance(ai_resp, str) and ai_resp.startswith("Error:")):
+                    # Empty completion, or a provider-level error string (already
+                    # retried once at the source in ai_utils.call_nvidia) — don't
+                    # let raw error text get treated as orchestrator narration or
+                    # get written into history. Fall through to synthesis, which
+                    # has its own retry.
                     break
 
                 # Check if ask_neural_core returned a native tool call object (dict)
@@ -4627,6 +4637,46 @@ INSTRUCTIONS:
             else casual_synth_prompt
         )
 
+        def _is_provider_failure(answer):
+            return (not answer) or (isinstance(answer, str) and answer.startswith("Error:"))
+
+        def _ask_synthesizer(prompt, hist):
+            """Synthesizer call with one silent retry on an empty completion
+            or a provider-level error string (e.g. transient 5xx) — these are
+            not worth surfacing to the researcher as-is."""
+            answer, tok = ask_neural_core(
+                prompt=prompt,
+                system_prompt=synthesizer_system_prompt,
+                role="synthesizer",
+                thinking=False,
+                history=hist,
+                on_token=on_token,
+                return_usage=True,
+                cancel_check=cancel_check
+            )
+            if _is_provider_failure(answer):
+                logger.debug(f"Synthesizer call failed ({answer!r}), retrying once.")
+                if emit and hasattr(emit, "set_label"):
+                    emit.set_label("Wait a minute.. some issue on my end. Let me cook again..")
+                time.sleep(1.5)
+                answer2, tok2 = ask_neural_core(
+                    prompt=prompt,
+                    system_prompt=synthesizer_system_prompt,
+                    role="synthesizer",
+                    thinking=False,
+                    history=hist,
+                    on_token=on_token,
+                    return_usage=True,
+                    cancel_check=cancel_check
+                )
+                if not _is_provider_failure(answer2):
+                    answer, tok = answer2, (tok2 if tok2 is not None else tok)
+                else:
+                    # Both attempts failed — don't leak the raw provider error
+                    # string into the transcript as if it were a real answer.
+                    answer, tok = None, tok
+            return answer, tok
+
         if not tools_executed:
             if report_requested and has_critical_findings:
                 synth_prompt = (
@@ -4637,15 +4687,9 @@ INSTRUCTIONS:
             else:
                 synth_prompt = original_user_text
 
-            final_answer, tokens = ask_neural_core(
-                prompt=synth_prompt,
-                system_prompt=synthesizer_system_prompt,
-                role="synthesizer",
-                thinking=False,
-                history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
-                on_token=on_token,
-                return_usage=True,
-                cancel_check=cancel_check
+            final_answer, tokens = _ask_synthesizer(
+                synth_prompt,
+                self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx)
             )
         else:
             if report_requested and has_critical_findings:
@@ -4662,7 +4706,7 @@ INSTRUCTIONS:
                     f"- Check: What was the primary requested target account/role? Did tool outputs prove compromise of THAT exact account, or only an intermediate stepping-stone account?\n"
                     f"- Explain what was tested and what was observed in the tool outputs (status codes, returned HTML/JSON, cookies, credentials/comments).\n"
                     f"- If a user directory or member table was returned, note that this is a directory listing, not an account takeover of the members in that table.\n"
-                    f"- If only an intermediate session or low-privilege foothold was obtained, set [STATUS: PARTIAL / IN PROGRESS] and explain the exact next step to achieve full takeover of the primary target.\n"
+                    f"- If only an intermediate session or low-privilege foothold was obtained, say plainly that it's partial/in-progress (no bracket tags) and explain the exact next step to achieve full takeover of the primary target.\n"
                     f"- If a login attempt failed (e.g. returned 'Invalid username or password' or login form despite HTTP 200), state that it failed and do NOT claim account takeover.\n"
                     f"- Outline the next logical testing steps.\n"
                     f"- Do NOT generate a rigid, multi-section formal vulnerability report unless the user explicitly requested a report."
@@ -4671,21 +4715,15 @@ INSTRUCTIONS:
             if len(tools_executed) > 0 and cfg.get("show_recaps", True):
                 synth_prompt += "\n\nIMPORTANT: Write your complete, detailed analysis, PoC commands, and findings with full markdown formatting first. ONLY on the very last line of your response, add a single summary line in this exact format:\nrecap: Goal was [goal]. Done: [what was accomplished]. Next: [recommended next step]."
             
-            final_answer, tokens = ask_neural_core(
-                prompt=synth_prompt,
-                system_prompt=synthesizer_system_prompt,
-                role="synthesizer",
-                thinking=False,
-                history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
-                on_token=on_token,
-                return_usage=True,
-                cancel_check=cancel_check
+            final_answer, tokens = _ask_synthesizer(
+                synth_prompt,
+                self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx)
             )
 
         if tokens is not None and emit and hasattr(emit, "set_token_count"):
             emit.set_token_count(tokens)
 
-        final_response = final_answer or ai_resp or "Analysis completed. No further actions required."
+        final_response = final_answer or ai_resp or "Hit a blank response twice in a row on my end — try that again?"
         final_response = _clean_synthesizer_output(final_response)
         self.history.append({"role": "assistant", "content": final_response})
         self.target.state["history"] = self.history

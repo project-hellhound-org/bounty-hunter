@@ -653,6 +653,22 @@ class StreamRenderer:
             self._live = None
         self._commit_up_to(len(self.buffer))
 
+        # Safety net: on_token streaming is the only thing that ever prints
+        # a turn — if the underlying API call streamed zero tokens (a
+        # dropped connection, a cold-start hiccup on the very first request
+        # of a session, a provider that returned its answer non-streamed),
+        # self.buffer stays empty and the caller sees a blank turn even
+        # though handle_message()/dispatch() successfully returned real
+        # text. final_text is that return value — only used here as a
+        # last-resort fallback when nothing actually reached the screen, so
+        # a normally-streamed response is never double-printed.
+        if final_text and not self.buffer.strip():
+            printable = _sanitize_h1(str(final_text)).rstrip("\n")
+            if printable.strip():
+                _print_with_status_color(printable)
+                self.buffer = str(final_text)
+                self._committed_len = len(self.buffer)
+
         if self._recap_line:
             print_formatted_text(HTML(f"<i><ansigray>{html.escape(self._recap_line)}</ansigray></i>"))
             print()
