@@ -104,6 +104,29 @@ class GuiEmit:
     def set_token_count(self, count: int):
         self.tokens += count
 
+    def request_approval(self, tool_name: str, method: str, url: str, reason: str) -> bool:
+        """
+        Blocks and shows a native confirm() dialog via PyWebView's synchronous
+        evaluate_js, so destructive-action approval actually works from the
+        GUI. Previously guard.check_request()'s 'require_approval' decision
+        only had a code path for sys.stdin.isatty() — GUI sessions always
+        fell through to the "non-interactive" branch, so any approval-gated
+        action was permanently blocked with zero way to ever authorize it
+        (no UI anywhere ever looked for the requires_approval flag).
+        """
+        if not self.window:
+            return False
+        msg = (
+            f"GUARD APPROVAL REQUIRED\\n\\nTool: {tool_name}\\nAction: {method} {url}\\n"
+            f"Reason: {reason}\\n\\nAuthorize this destructive action?"
+        )
+        try:
+            result = self.window.evaluate_js(f"confirm({json.dumps(msg)})")
+            return bool(result)
+        except Exception as e:
+            logger.warning(f"[GuiEmit] approval dialog failed: {e}")
+            return False
+
     def __call__(self, msg: Any):
         if isinstance(msg, str):
             self.info(msg)

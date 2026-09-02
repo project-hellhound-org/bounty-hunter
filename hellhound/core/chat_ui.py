@@ -14,6 +14,8 @@ import textwrap
 import html
 import re
 import time
+import signal
+import threading
 from typing import Optional, Dict, Any, List
 
 from colorama import Fore, Back, Style, init
@@ -537,6 +539,58 @@ def _print_with_status_color(text: str):
         rich_console.print(Markdown(remaining))
 
 
+class _InterruptGuard:
+    """
+    Turns Ctrl+C during an in-flight AI/tool turn into a soft cancel instead
+    of killing the whole REPL. Before this, SIGINT during handle_message()/
+    dispatch() propagated as a raw KeyboardInterrupt straight past the
+    prompt_toolkit input box's own c-c binding (which only covers typing)
+    up to the outer REPL loop's except clause, which unconditionally broke
+    out and exited the whole process mid-turn — one Ctrl+C during a running
+    action meant relaunching from scratch.
+
+    Now: first Ctrl+C sets a threading.Event that's threaded into the
+    agent/dispatch call as cancel_check — the orchestrator loop and the
+    streaming provider calls already check it between steps/tokens and
+    wind the turn down cleanly (see agent.py's cancel_check checks). A
+    second Ctrl+C within `grace_seconds` is treated as "no, I really mean
+    quit" and is allowed through as a real KeyboardInterrupt, which the
+    outer REPL loop still catches to exit — so a genuine double-tap still
+    works exactly like before.
+    """
+    def __init__(self, grace_seconds: float = 2.0):
+        self.grace_seconds = grace_seconds
+        self.event = threading.Event()
+        self._last_press = 0.0
+        self._orig_handler = None
+
+    def _handler(self, signum, frame):
+        now = time.monotonic()
+        if self.event.is_set() and (now - self._last_press) < self.grace_seconds:
+            # Second Ctrl+C in quick succession — let it through as a real interrupt.
+            if callable(self._orig_handler):
+                self._orig_handler(signum, frame)
+            raise KeyboardInterrupt
+        self._last_press = now
+        self.event.set()
+        try:
+            print_formatted_text(HTML(
+                "\n<ansiyellow>[!] Interrupting — wrapping up the current step. "
+                "Press Ctrl+C again to quit instead.</ansiyellow>"
+            ))
+        except Exception:
+            print("\n[!] Interrupting — wrapping up the current step. Press Ctrl+C again to quit instead.")
+
+    def __enter__(self) -> threading.Event:
+        self._orig_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, self._handler)
+        return self.event
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        signal.signal(signal.SIGINT, self._orig_handler)
+        return False
+
+
 class StreamRenderer:
     """
     Incremental-commit markdown streaming, matching how Claude Code does it.
@@ -902,7 +956,8 @@ def start_chat_session(initial_target: Optional[str] = None):
 
                     t0 = time.monotonic()
                     try:
-                        res = dispatch(cmd_line, session_ctx, emit, on_token=on_token_callback)
+                        with _InterruptGuard() as cancel_event:
+                            res = dispatch(cmd_line, session_ctx, emit, on_token=on_token_callback, cancel_check=cancel_event.is_set)
                     finally:
                         emit.stop_indicator()
                         final_text = None
@@ -946,12 +1001,14 @@ def start_chat_session(initial_target: Optional[str] = None):
             ai_response = None
             t0 = time.monotonic()
             try:
-                ai_response = agent.handle_message(
-                    user_input,
-                    session_context=session_ctx,
-                    emit=indicator,
-                    on_token=on_token_callback
-                )
+                with _InterruptGuard() as cancel_event:
+                    ai_response = agent.handle_message(
+                        user_input,
+                        session_context=session_ctx,
+                        emit=indicator,
+                        on_token=on_token_callback,
+                        cancel_check=cancel_event.is_set
+                    )
                 if session_ctx.get("target") and session_ctx["target"] != "default":
                     agent.set_target(session_ctx["target"])
             finally:

@@ -3836,8 +3836,29 @@ class Agent:
         if guard_result.get("decision") == "require_approval":
             reason = guard_result.get("reason", "Method requires human approval")
             approved = False
+
+            if emit and hasattr(emit, "request_approval"):
+                # GUI (or any other emit implementation) that can actually
+                # surface a blocking approve/deny prompt outside a TTY.
+                try:
+                    approved = bool(emit.request_approval(tool_name, method, url, reason))
+                except Exception:
+                    approved = False
+
+                if approved:
+                    if hasattr(emit, "success"):
+                        emit.success(f"Action authorized by user — executing {tool_name}")
+                else:
+                    if hasattr(emit, "warn"):
+                        emit.warn(f"Action rejected by user — blocked {tool_name}")
+                    return {
+                        "error": f"Action rejected by user: {reason}. The destructive request '{method} {url}' was NOT executed.",
+                        "blocked": True,
+                        "approval_denied": True
+                    }
+
             # Check if interactive session with stdin attached
-            if sys.stdin and sys.stdin.isatty():
+            elif sys.stdin and sys.stdin.isatty():
                 was_running = False
                 if emit:
                     if hasattr(emit, "stop_indicator"):
@@ -4000,9 +4021,12 @@ class Agent:
         # way to be answered correctly even after the researcher set a handle.
         researcher_handle = (cfg.get("researcher_handle") or "").strip()
         researcher_line = (
-            f"RESEARCHER: {researcher_handle}"
+            f"RESEARCHER: {researcher_handle} (set via /handle, saved to disk config — persists across sessions, not session-scoped)"
             if researcher_handle
-            else "RESEARCHER: not set — they haven't run /handle <name> yet, so you don't have a name for them."
+            else "RESEARCHER: not set — they haven't run /handle <name> yet, so you don't have a name for them. "
+                 "If asked, say plainly it's not set and that /handle <name> sets it. Once set it is saved to disk "
+                 "config and persists across every future session — do NOT say it only lasts for this session, "
+                 "and do NOT claim to remember something from a prior session you have no record of here."
         )
 
         # Iteration ceiling: explicit arg wins, else the configured value
@@ -4141,6 +4165,13 @@ RULES:
    - Inspect JavaScript bundle files (e.g. `main.js`, `app.js`, `/static/js/*`, Webpack chunks) with `curl` to extract real route tables, actual API endpoints (`/api/...`), and client-side form submission logic.
    - DO NOT run blind directory fuzzers or heavy spider crawls when surgical probing of HTML and JavaScript files directly reveals the endpoints, parameters, and routes.
    - Run `spider` ONLY as a fallback if low-noise probing yields no internal endpoints.
+
+3b. DEAD-TARGET FAIL-FAST (DO NOT GRIND THE FULL RECON TOOLKIT AGAINST A DOMAIN THAT DOESN'T RESOLVE):
+   - This is distinct from rule 4e (MULTI-VECTOR EXHAUSTION) — that rule is about not giving up on a LIVE target too early; this rule is about not wasting many tool calls proving a domain is dead one tool at a time.
+   - After your FIRST connectivity signal on a target (a DNS/`dig` lookup, or your first `curl`/`httpx` probe to the root domain), if it fails outright (NXDOMAIN, connection timeout, connection refused — not an HTTP error code, an actual failure to connect), immediately run ONE more independent check (e.g. `dig` if you led with `curl`, or vice versa) to rule out a one-off network blip.
+   - If that second, independent check ALSO fails to connect: STOP. Do not then also run subfinder, dns_bruteforce, httpx, a port scan, and repeated curl retries against the same dead root domain — every one of those will fail the same way and you already have your answer. Report that the domain does not appear to resolve/respond and ask the researcher to confirm the spelling/scope before spending further turns on it.
+   - Do NOT attempt to fix a missing local tool (e.g. `apt-get install dig`) via `RunTerminalCommand` in the middle of a recon run just to get a second opinion on a target that has already failed to connect twice by other means — that's solving the wrong problem and burns real time installing packages against a target that's already answered the question.
+   - This rule does not apply once you have ANY successful connection to the target (even a single 200/403/404) — from that point on, the target is confirmed live and rule 4e (exhaust vectors before giving up) governs instead.
 
 4. Evidence-Driven Multi-Vector Testing & Exploitation:
    - Base all attacks on real data structures and routes discovered from application responses and JavaScript analysis.
@@ -4303,7 +4334,7 @@ INSTRUCTIONS:
   question, or casual chat, not an active recon/attack campaign.
 - Respond naturally and directly, like a capable assistant talking to
   someone they know — not a pentest report generator reciting doctrine.
-- Do NOT open with a [STATUS: ...] tag, do NOT recite scope/baseline rules,
+- Do NOT open with a status tag, do NOT recite scope/baseline rules,
   and do NOT bring up the target/scope unless the researcher's message is
   actually about it.
 - When asked about your capabilities or tools, answer only from what you
@@ -4336,7 +4367,7 @@ INSTRUCTIONS:
   - Full takeover / objective achieved, if the primary requested target account or role was genuinely accessed and compromised.
   - Partial / in progress, if only intermediate stepping stones were accessed.
   - Blocked / exhausted, if a live campaign was executed and all viable attack vectors failed.
-  - DO NOT output a [STATUS: ...] line for general conversation, Q&A, sample report requests, or coding assistance.
+  - DO NOT open with a status line at all for general conversation, Q&A, sample report requests, or coding assistance.
 - CRITICAL IDENTITY VERIFICATION:
   - NEVER claim account takeover unless the primary target's specific token, credentials, or session was actually established and verified!
   - Holding a session cookie for an intermediate stepping-stone user is NOT takeover of the primary target.
@@ -4395,13 +4426,38 @@ INSTRUCTIONS:
                 if tokens is not None and emit and hasattr(emit, "set_token_count"):
                     emit.set_token_count(tokens)
 
-                if not ai_resp or (isinstance(ai_resp, str) and ai_resp.startswith("Error:")):
-                    # Empty completion, or a provider-level error string (already
-                    # retried once at the source in ai_utils.call_nvidia) — don't
-                    # let raw error text get treated as orchestrator narration or
-                    # get written into history. Fall through to synthesis, which
-                    # has its own retry.
-                    break
+                def _orch_failed(resp):
+                    return (not resp) or (isinstance(resp, str) and resp.startswith("Error:"))
+
+                if _orch_failed(ai_resp):
+                    # Provider-level error or empty completion. Already retried
+                    # once at the source in ai_utils.call_nvidia/call_ollama —
+                    # if it's still failing, give it one more visible attempt
+                    # here before giving up on this iteration, since a 500
+                    # streak can outlast a single 1.5s backoff.
+                    if emit and hasattr(emit, "set_label"):
+                        emit.set_label("Wait a minute.. some issue on my end. Let me cook again..")
+                    ai_resp, tokens = ask_neural_core(
+                        prompt=user_text if iteration == 0 else "Continue analysis based on tool results. Choose next tool or output 'DONE'.",
+                        system_prompt=_get_orchestrator_system_prompt(),
+                        role="orchestrator",
+                        thinking=False,
+                        history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
+                        return_usage=True,
+                        cancel_check=cancel_check,
+                        tools=Agent._build_native_tools()
+                    )
+                    if tokens is not None and emit and hasattr(emit, "set_token_count"):
+                        emit.set_token_count(tokens)
+                    if _orch_failed(ai_resp):
+                        # Still failing — do NOT let this raw error string ride
+                        # along as `ai_resp` into the final `final_answer or
+                        # ai_resp or fallback` chain below; that was leaking
+                        # "Error: NVIDIA NIM API returned 500 - ..." straight
+                        # to the researcher whenever synthesis also failed.
+                        # Clear it so only the friendly fallback can surface.
+                        ai_resp = None
+                        break
 
                 # Check if ask_neural_core returned a native tool call object (dict)
                 tool_call = None

@@ -849,6 +849,48 @@ def list_available_models() -> List[Dict[str, Any]]:
 
     return models_list
 
+class _RepetitionGuard:
+    """
+    Detects the classic small-local-model failure mode: the model gets
+    stuck regenerating the same sentence over and over instead of
+    progressing (e.g. "Let me check the baseline response..." x40).
+
+    This is NOT a planner/state-machine issue -- it's a token-generation
+    degeneracy in the underlying model, most visible on low-temperature
+    passes with small quantized models -- BUT it is not actually exclusive
+    to small local models: it was only ever wired into call_ollama's
+    streaming loop, so the exact same degeneracy running unchecked to
+    max_tokens on a cloud provider (e.g. NVIDIA) went completely
+    uncaught, burning tokens and flooding the terminal with a repeated
+    word/phrase until the response length cap kicked in. Now wired into
+    every streaming provider (nvidia, openai, anthropic, ollama).
+
+    The fix belongs at the streaming layer: watch the accumulating text
+    for an exact phrase repeating past a small threshold, and cut
+    generation off there instead of riding it out to max_tokens.
+    """
+
+    def __init__(self, min_phrase_len: int = 40, max_repeats: int = 2):
+        self.min_phrase_len = min_phrase_len
+        self.max_repeats = max_repeats
+        self._buffer = ""
+
+    def feed(self, chunk: str) -> bool:
+        """Returns True the moment a loop is detected -- caller should stop."""
+        self._buffer += chunk
+        # Only worth checking once we have enough text for a real phrase,
+        # and only re-check periodically (on sentence-ish boundaries) so
+        # this stays cheap on a hot streaming loop.
+        if len(self._buffer) < self.min_phrase_len * (self.max_repeats + 1):
+            return False
+        if chunk and chunk[-1] not in ".!?\n" and len(self._buffer) % 24 != 0:
+            return False
+
+        tail = self._buffer[-self.min_phrase_len:]
+        occurrences = self._buffer.count(tail)
+        return occurrences > self.max_repeats
+
+
 def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """Unified dispatcher for all supported AI providers. When `tools` is provided, providers attempt native tool calling."""
     provider = (provider or "ollama").lower().strip()
@@ -861,11 +903,11 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
     if provider in ("nvidia", "nim"):
         res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
     elif provider == "openai":
-        res = call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, tools=tools)
+        res = call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
     elif provider == "anthropic":
-        res = call_anthropic(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, tools=tools)
+        res = call_anthropic(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
     elif provider == "gemini":
-        res = ask_gemini(api_key, active_model, system_prompt, prompt, max_tokens=max_tokens, timeout=timeout, history=history, thinking=thinking, on_token=on_token, return_usage=return_usage, tools=tools)
+        res = ask_gemini(api_key, active_model, system_prompt, prompt, max_tokens=max_tokens, timeout=timeout, history=history, thinking=thinking, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
     else: # Ollama / Local
         res = call_ollama(prompt, model=active_model, system_prompt=system_prompt, timeout=timeout, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
 
@@ -989,6 +1031,7 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
         full_response = []
         token_count = 0
         usage_tokens = None
+        repeat_guard = _RepetitionGuard()
         for line in r.iter_lines():
             if cancel_check and cancel_check():
                 break
@@ -1015,6 +1058,8 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
                             token_count += 1
                             if on_token:
                                 on_token(token)
+                            if repeat_guard.feed(token):
+                                break
                 except json.JSONDecodeError:
                     continue
 
@@ -1028,7 +1073,7 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
         err = f"Error: NVIDIA NIM connection failed ({str(e)})"
         return (err, None) if return_usage else err
 
-def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """REST call to OpenAI Chat Completions API with SSE streaming. Supports native tool calling."""
     try:
         url = "https://api.openai.com/v1/chat/completions"
@@ -1055,6 +1100,9 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
             payload["tool_choice"] = "auto"
             payload["stream"] = False
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code >= 500:
+                time.sleep(1.5)
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code != 200:
                 err = f"Error: OpenAI API returned {r.status_code}"
                 return (err, None) if return_usage else err
@@ -1074,13 +1122,19 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
             text = strip_thinking_tags(msg.get("content", "")) or None
             return (text, usage_tokens) if return_usage else text
         r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
+        if r.status_code >= 500:
+            time.sleep(1.5)
+            r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:
             err = f"Error: OpenAI API returned {r.status_code}"
             return (err, None) if return_usage else err
 
         full_response = []
         token_count = 0
+        repeat_guard = _RepetitionGuard()
         for line in r.iter_lines():
+            if cancel_check and cancel_check():
+                break
             if not line:
                 continue
             decoded = line.decode("utf-8").strip()
@@ -1101,6 +1155,8 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
                             token_count += 1
                             if on_token:
                                 on_token(token)
+                            if repeat_guard.feed(token):
+                                break
                 except json.JSONDecodeError:
                     continue
 
@@ -1114,7 +1170,7 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
         err = f"Error: OpenAI connection failed ({str(e)})"
         return (err, None) if return_usage else err
 
-def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20240620", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20240620", timeout: int = 30, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """REST call to Anthropic Messages API with SSE streaming. Supports native tool calling."""
     try:
         url = "https://api.anthropic.com/v1/messages"
@@ -1155,6 +1211,9 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
             payload["tools"] = anthropic_tools
             payload["stream"] = False
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code >= 500:
+                time.sleep(1.5)
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code != 200:
                 err = f"Error: Anthropic API returned {r.status_code}"
                 return (err, None) if return_usage else err
@@ -1171,6 +1230,9 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
             return (text, usage_tokens) if return_usage else text
 
         r = requests.post(url, headers=headers, json=payload, stream=bool(on_token), timeout=timeout)
+        if r.status_code >= 500:
+            time.sleep(1.5)
+            r = requests.post(url, headers=headers, json=payload, stream=bool(on_token), timeout=timeout)
         if r.status_code != 200:
             err = f"Error: Anthropic API returned {r.status_code}"
             return (err, None) if return_usage else err
@@ -1179,7 +1241,10 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
         usage_tokens = None
         if on_token:
             full_response = []
+            repeat_guard = _RepetitionGuard()
             for line in r.iter_lines():
+                if cancel_check and cancel_check():
+                    break
                 if line:
                     decoded = line.decode("utf-8") if isinstance(line, bytes) else line
                     if decoded.startswith("data:"):
@@ -1203,6 +1268,8 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
                                         full_response.append(token)
                                         token_count += 1
                                         on_token(token)
+                                        if repeat_guard.feed(token):
+                                            break
                         except json.JSONDecodeError:
                             continue
             result = "".join(full_response).strip()
@@ -1224,7 +1291,7 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
         err = f"Error: Anthropic connection failed ({str(e)})"
         return (err, None) if return_usage else err
 
-def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = None, timeout: int = 20, history: list = None, thinking: bool = False, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, max_tokens: int = None, timeout: int = 20, history: list = None, thinking: bool = False, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """Gemini API caller with SSE streaming support. Supports native function calling."""
     try:
         contents = []
@@ -1264,6 +1331,9 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
             # Use non-streaming for tool calling
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
             r = requests.post(url, json=payload, timeout=timeout)
+            if r.status_code >= 500:
+                time.sleep(1.5)
+                r = requests.post(url, json=payload, timeout=timeout)
             if r.status_code != 200:
                 err = f"Error: Gemini API returned {r.status_code} - {r.text[:100]}"
                 return (err, None) if return_usage else err
@@ -1288,6 +1358,9 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:{endpoint}{sep}key={api_key}"
 
         r = requests.post(url, json=payload, stream=bool(on_token), timeout=timeout)
+        if r.status_code >= 500:
+            time.sleep(1.5)
+            r = requests.post(url, json=payload, stream=bool(on_token), timeout=timeout)
         if r.status_code != 200:
             err = f"Error: Gemini API returned {r.status_code} - {r.text[:100]}"
             return (err, None) if return_usage else err
@@ -1296,7 +1369,10 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
         usage_tokens = None
         if on_token:
             full_response = []
+            repeat_guard = _RepetitionGuard()
             for line in r.iter_lines():
+                if cancel_check and cancel_check():
+                    break
                 if line:
                     decoded = line.decode("utf-8") if isinstance(line, bytes) else line
                     if decoded.startswith("data:"):
@@ -1315,6 +1391,8 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
                                     full_response.append(token)
                                     token_count += 1
                                     on_token(token)
+                                    if repeat_guard.feed(token):
+                                        break
                         except json.JSONDecodeError:
                             continue
             result = "".join(full_response).strip()
@@ -1340,44 +1418,6 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
     except Exception as e:
         err = f"Error: Gemini connection failed ({str(e)})"
         return (err, None) if return_usage else err
-
-def call_gemini(prompt: str, api_key: str, model: str = "gemini-2.0-flash", timeout: int = 30) -> str:
-    res = ask_gemini(api_key, model, ASK_PERSONA, prompt, timeout=timeout)
-    return res if res else "Error: AI analysis failed."
-
-class _RepetitionGuard:
-    """
-    Detects the classic small-local-model failure mode: the model gets
-    stuck regenerating the same sentence over and over instead of
-    progressing (e.g. "Let me check the baseline response..." x40).
-
-    This is NOT a planner/state-machine issue -- it's a token-generation
-    degeneracy in the underlying model, most visible on low-temperature
-    passes with small quantized models. The fix belongs at the streaming
-    layer: watch the accumulating text for an exact phrase repeating past
-    a small threshold, and cut generation off there instead of riding it
-    out to max_tokens.
-    """
-
-    def __init__(self, min_phrase_len: int = 40, max_repeats: int = 2):
-        self.min_phrase_len = min_phrase_len
-        self.max_repeats = max_repeats
-        self._buffer = ""
-
-    def feed(self, chunk: str) -> bool:
-        """Returns True the moment a loop is detected -- caller should stop."""
-        self._buffer += chunk
-        # Only worth checking once we have enough text for a real phrase,
-        # and only re-check periodically (on sentence-ish boundaries) so
-        # this stays cheap on a hot streaming loop.
-        if len(self._buffer) < self.min_phrase_len * (self.max_repeats + 1):
-            return False
-        if chunk and chunk[-1] not in ".!?\n" and len(self._buffer) % 24 != 0:
-            return False
-
-        tail = self._buffer[-self.min_phrase_len:]
-        occurrences = self._buffer.count(tail)
-        return occurrences > self.max_repeats
 
 
 def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
