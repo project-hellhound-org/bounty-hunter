@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════
-#  HELLHOUND — Install Script (v12.7)
+#  HELLHOUND — Install Script (v12.7.0)
 #  Run once from the project root directory.
 #  After this, type `hellhound` from anywhere.
 # ══════════════════════════════════════════════════════
 
 set -e
+
+# Re-attach stdin to /dev/tty if piped (e.g. curl ... | bash)
+if [ ! -t 0 ] && [ -e /dev/tty ]; then
+    exec < /dev/tty 2>/dev/null || true
+fi
 
 RED='\033[91m'
 GRN='\033[92m'
@@ -104,7 +109,7 @@ fi
 
 # ── 2. Virtual Environment ────────────────────────────
 start_animation "ISOLATING CORE"
-python3 -m venv "$VENV_DIR" || error "Failed to create virtual environment."
+python3 -m venv --clear "$VENV_DIR" 2>/dev/null || { rm -rf "$VENV_DIR" && python3 -m venv "$VENV_DIR"; } || error "Failed to create virtual environment."
 stop_animation
 success "Virtual environment ready at $VENV_DIR"
 
