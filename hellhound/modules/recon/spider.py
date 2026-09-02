@@ -61,9 +61,6 @@ except Exception:
                                                                         
 
 VERSION      = "13.21"
-NAME         = "spider"
-CATEGORY     = "recon"
-DESCRIPTION  = "Headless Single Page Application (SPA) DOM spider, API route discovery, and secret extractor"
 __author__   = "Sree Danush S (L4ZZ3RJ0D)"
 __license__  = "GPLv3"
 __credits__  = ["L4ZZ3RJ0D"]
@@ -1593,6 +1590,14 @@ class Config:
         self.max_retries        = kw.get("max_retries",        3)
         self.retry_base_delay   = kw.get("retry_base_delay",   0.5)
         self.max_urls_per_depth = kw.get("max_urls_per_depth", 500)
+        # Global wall-clock cap for the *entire* run (recon + probes + crawl).
+        # Per-request timeout/retries are already bounded, but a large
+        # wordlist/probe-list against a genuinely unresponsive target can
+        # still stack up to hours of wall time. 0 disables the cap.
+        self.max_runtime        = kw.get("max_runtime",        3600)
+        # Skip the pre-flight "is the target even alive" check that aborts
+        # early instead of burning the whole run against a dead host.
+        self.no_liveness_check  = kw.get("no_liveness_check",  False)
         self.jitter_min         = kw.get("jitter_min",         0.05)
         self.jitter_max         = kw.get("jitter_max",         0.35)
         self.verbose            = kw.get("verbose",            False)
@@ -1645,6 +1650,8 @@ class Config:
             raise ValueError("max_depth must be 0–20")
         if not (1 <= self.concurrency <= 100):
             raise ValueError("concurrency must be 1–100")
+        if self.max_runtime is not None and self.max_runtime < 0:
+            raise ValueError("max_runtime must be >= 0 (0 disables the cap)")
 
                                                                         
                           
@@ -7901,7 +7908,7 @@ class Spider:
                 self.emit.info("[Body-Hints] %s <- %s" % (found, url))
 
     def _process_html(self, url, text, depth, source):
-        soup = BeautifulSoup(text, "html.parser")
+        soup = BeautifulSoup(text, "lxml")
         ctf_patterns = getattr(self.cfg, "ctf_flag_patterns", [])
         Extractor.html_comments(soup, url, self.store, self.emit,
                                 base_url=url, discover_url=self._discover_url, depth=depth)
@@ -8163,7 +8170,7 @@ class Spider:
                     for m in re.finditer(r'"(/[a-zA-Z0-9_\-\/]+)"', text):
                         path = m.group(1)
                         if len(path) > 3:
-                            self.store.add_endpoint(_resolve_app_path(url, path, self.app_root), source="SourceMap", score=Conf.HIGH)
+                            self.store.add_endpoint(urljoin(url, path), source="SourceMap", score=Conf.HIGH)
             except Exception:
                 pass
 
@@ -8364,7 +8371,7 @@ class Spider:
                 for m in re.finditer(r'"([/][a-zA-Z0-9_\-\/]+)"', body):
                     path = m.group(1)
                     if len(path) > 3:
-                        full = _resolve_app_path(url, path, self.app_root)
+                        full = urljoin(url, path)
                         if self.is_valid(full):
                             self.store.add_endpoint(full, source='JSON_Path', score=Conf.LOW)
                             if not self._over_budget(depth + 1):
@@ -8382,7 +8389,7 @@ class Spider:
                                                    "next","prev","previous","first","last"):
                                     _t = str(_v) if _v else ""
                                     if _t.startswith(("/","http")):
-                                        _f = _resolve_app_path(url, _t, self.app_root)
+                                        _f = urljoin(url, _t)
                                         if self.is_valid(_f):
                                             if self.store.add_endpoint(_f, source="JSON_HATEOAS", score=Conf.MEDIUM):
                                                 self.emit.info(f"[HATEOAS] {_k}: {_f}")
@@ -8490,6 +8497,7 @@ class Spider:
                 _t_recon = 0.0
                 _t_crawl = 0.0
                 _t_audit = 0.0
+                _hdr_s = None
                 try:
                     _hdr_s, _hdr_h, _ = await fetch(session, "GET", self.target, self.rl)
                     if _hdr_h:
@@ -8499,6 +8507,24 @@ class Spider:
                         }
                 except Exception:
                     pass
+
+                # ── Liveness gate ──────────────────────────────────────────
+                # fetch() already exhausted cfg.max_retries with backoff on
+                # the target root. If it *still* came back empty, the host is
+                # unresponsive/unreachable — bail out now instead of spending
+                # the next hour retrying every sensitive-file/admin/wordlist
+                # probe and crawl URL against a dead target. Partial (empty)
+                # results are still written normally by the caller.
+                if _hdr_s is None and not self.cfg.no_liveness_check:
+                    self.emit.warn(
+                        f"[Fatal] Target unreachable after "
+                        f"{self.cfg.max_retries + 1} attempt(s) "
+                        f"(timeout={self.cfg.timeout}s/attempt) — aborting scan early. "
+                        f"Use --no-liveness-check to force a full scan anyway "
+                        f"(e.g. if only the root path is blocked/WAF'd)."
+                    )
+                    return
+
                 self.emit.animator.start_anim("Recon Probing Base")
 
                 # ── Fire WhatWeb + TLS concurrently ───────────────────────────
@@ -8864,19 +8890,19 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
 
     class _W:
         def __init__(self, b, v): self._b = b; self._v = v
-        def info(self, m, *a, **k):
+        def info(self, m):
             if self._v: self._b.info(m)
-        def success(self, m, *a, **k):
+        def success(self, m):
             if self._v: self._b.success(m)
-        def warn(self, m, *a, **k):            self._b.warn(m)
-        def always_info(self, m, *a, **k):     self._b.info(m)
-        def always_success(self, m, *a, **k):  self._b.success(m)
-        def section(self, t, *a, **k):         self._b.info(f"── {t} ──")
-        def row(self, k, v, *a, **kw):         self._b.info(f"{k}: {_strip(str(v))}")
-        def finding(self, *a, **k):            self._b.warn(str(a))
-        def endpoint_row(self, ep, *a, **k):   self._b.info(ep.get("url",""))
-        def live_crawl(self, url, *a, **k):    pass
-        def print_always(self, m, *a, **k):    print(m)
+        def warn(self, m):            self._b.warn(m)
+        def always_info(self, m):     self._b.info(m)
+        def always_success(self, m):  self._b.success(m)
+        def section(self, t):         self._b.info(f"── {t} ──")
+        def row(self, k, v, **kw):    self._b.info(f"{k}: {_strip(str(v))}")
+        def finding(self, *a):        self._b.warn(str(a))
+        def endpoint_row(self, ep):   self._b.info(ep.get("url",""))
+        def live_crawl(self, url):    pass
+        def print_always(self, m):    print(m)
         def __getattr__(self, name):
             def _fallback(*args, **kwargs):
                 if hasattr(self._b, name):
@@ -8898,8 +8924,7 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
                 def start(self, *a, **k): pass
                 def stop(self, *a, **k): pass
                 def update(self, *a, **k): pass
-                def _clear(self, *a, **k): pass
-                def __getattr__(self, name): return lambda *a, **k: None
+                def _clear(self): pass
             return _S()
 
     emit = _W(emit_obj, cfg.verbose)
@@ -8928,9 +8953,17 @@ def _do_run(target: str, cfg: Config, emit,
                 HARImporter(cfg.har_file, spider.store, emit, spider.is_valid, target).run()
             else:
                 emit.warn(f"[HAR] File not found: {cfg.har_file}")
-        asyncio.run(spider.run())
+        if cfg.max_runtime and cfg.max_runtime > 0:
+            asyncio.run(asyncio.wait_for(spider.run(), timeout=cfg.max_runtime))
+        else:
+            asyncio.run(spider.run())
     except KeyboardInterrupt:
         emit.warn("Scan interrupted — partial results follow")
+    except asyncio.TimeoutError:
+        emit.warn(
+            f"[Timeout] Scan exceeded --max-runtime={cfg.max_runtime}s — "
+            f"stopping and saving partial results (use --max-runtime 0 to disable this cap)"
+        )
     except ValueError as e:
         emit.warn(f"Config error: {e}")
         return {"raw": str(e), "intel": {}}
@@ -9054,6 +9087,14 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Concurrent workers  (default: 12)")
     scan.add_argument("--timeout",     "-t", type=int, default=15, metavar="S",
                       help="Per-request timeout in seconds  (default: 15)")
+    scan.add_argument("--max-runtime", "-M", type=int, default=3600, metavar="S",
+                      help="Global wall-clock cap for the whole scan, in seconds. "
+                           "If exceeded, the scan stops and partial results are saved "
+                           "automatically — no Ctrl+C needed  (default: 3600; 0 = unlimited)")
+    scan.add_argument("--no-liveness-check", "-L", action="store_true",
+                      help="Skip the pre-flight check that aborts immediately if the "
+                           "target root is unreachable (use if only '/' is blocked/WAF'd "
+                           "but other paths are expected to respond)")
     scan.add_argument("--verbose",     "-v", action="store_true",
                       help="Show all discovery logs")
 
@@ -9196,6 +9237,10 @@ def main():
     _pf("Depth",       str(args.depth))
     _pf("Concurrency", str(args.concurrency))
     _pf("Timeout",     f"{args.timeout}s")
+    _pf("Max Runtime", f"{args.max_runtime}s" if args.max_runtime > 0 else "unlimited")
+    _pf("Liveness Check",
+        "disabled" if args.no_liveness_check else "enabled",
+        C.GR if args.no_liveness_check else C.G)
     if not args.no_playwright and PLAYWRIGHT_AVAILABLE:
         if PATCHRIGHT_AVAILABLE:
             pw_status = "playwright  (+patchright available as bot-bypass fallback)"
@@ -9268,6 +9313,8 @@ def main():
         max_depth       = args.depth,
         concurrency     = args.concurrency,
         timeout         = args.timeout,
+        max_runtime     = args.max_runtime,
+        no_liveness_check = args.no_liveness_check,
         verbose         = args.verbose,
         use_playwright  = not args.no_playwright,
         enable_spa_interact = args.spa_interact,
