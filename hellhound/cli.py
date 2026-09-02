@@ -20,7 +20,7 @@ import click
 @click.option("--print", "-p", "print_cmd", default=None, help="Execute a slash command in headless mode and print output")
 @click.option("--json", "-j", "json_output", is_flag=True, default=False, help="Force structured JSON output for automation")
 @click.option("--gui", is_flag=True, default=False, help="Launch PyWebView graphical user interface")
-@click.version_option("12.6.0", prog_name="HELLHOUND")
+@click.version_option("12.7.0", prog_name="HELLHOUND")
 @click.pass_context
 def cli(ctx, print_cmd, json_output, gui):
     """

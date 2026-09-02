@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════
-#  HELLHOUND — Install Script (Cinematic v12.6)
+#  HELLHOUND — Install Script (v12.7)
 #  Run once from the project root directory.
 #  After this, type `hellhound` from anywhere.
 # ══════════════════════════════════════════════════════

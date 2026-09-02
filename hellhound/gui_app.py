@@ -411,7 +411,7 @@ class HellhoundAPI:
             "synthesizer_model": cfg.get("synthesizer_model", "nvidia/nemotron-3-super-120b-a12b"),
             "researcher_handle": cfg.get("researcher_handle", ""),
             "tools": tools_status,
-            "version": "12.6.0",
+            "version": "12.7.0",
         }
 
     def get_settings(self) -> Dict[str, Any]:
@@ -428,7 +428,7 @@ class HellhoundAPI:
             "global_headers": cfg.get("global_headers", {}),
             "auto_install_missing_tools": cfg.get("auto_install_missing_tools", False),
             "tools": tools_status,
-            "version": "12.6.0",
+            "version": "12.7.0",
         }
 
     def save_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
