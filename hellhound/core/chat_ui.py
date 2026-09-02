@@ -8,7 +8,6 @@ and clean response bubbles.
 """
 
 import os
-import sys
 import shutil
 import textwrap
 import html
@@ -16,12 +15,12 @@ import re
 import time
 import signal
 import threading
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
-from colorama import Fore, Back, Style, init
+from colorama import Fore, Style, init
 init(autoreset=True)
 
-from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
@@ -40,7 +39,6 @@ from prompt_toolkit.key_binding.key_bindings import merge_key_bindings
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
-from rich.panel import Panel
 
 rich_console = Console()
 
@@ -92,7 +90,7 @@ def _auto_markdown_emphasis(text: str) -> str:
 
     return out
 
-from hellhound.core.tasks import list_targets, create_or_load_target, Target
+from hellhound.core.tasks import list_targets, create_or_load_target
 from hellhound.core.ai_utils import load_config
 from hellhound.core.agent import get_agent
 from hellhound.core.commands import dispatch, get_command, COMMAND_REGISTRY

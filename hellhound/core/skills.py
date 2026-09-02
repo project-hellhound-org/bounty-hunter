@@ -12,9 +12,8 @@ phase/triage-aware routing, model-adaptive context injection, and reference load
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, List, Optional, Tuple, Set
 import re
-import os
 import logging
 
 logger = logging.getLogger(__name__)

@@ -1,7 +1,6 @@
 import requests
 import json
 import logging
-import concurrent.futures
 import os
 import re
 import sys

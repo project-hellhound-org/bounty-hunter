@@ -109,6 +109,12 @@ def _match_pattern(host: str, path: str, pattern: str) -> bool:
         pass
 
     # 2. Host matching (Wildcards and Subdomains)
+    #    A bare pattern like "example.com" matches ONLY that exact host —
+    #    NOT its subdomains. Scope is a legal/authorization boundary, not
+    #    just a routing convenience: if a program lists the apex domain
+    #    without a wildcard, testing "staging.example.com" or
+    #    "admin.example.com" is out of scope unless the researcher (or the
+    #    program's own scope text) explicitly adds "*.example.com".
     host_match = False
     if pat_host.startswith("*."):
         suffix = pat_host[2:]
@@ -118,8 +124,6 @@ def _match_pattern(host: str, path: str, pattern: str) -> bool:
         host_match = fnmatch.fnmatch(host, pat_host)
     else:
         if host == pat_host:
-            host_match = True
-        elif pat_host and host.endswith("." + pat_host):
             host_match = True
 
     if not host_match:

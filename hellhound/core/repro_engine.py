@@ -1,4 +1,3 @@
-import json
 import time
 import requests
 from colorama import Fore, Style

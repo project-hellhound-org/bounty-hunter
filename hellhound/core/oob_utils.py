@@ -3,8 +3,6 @@ import threading
 import random
 import socket
 import time
-import urllib.parse
-from colorama import Fore, Style
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OOB HANDLER (HTTP)

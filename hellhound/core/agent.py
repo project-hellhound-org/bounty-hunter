@@ -6,7 +6,7 @@ Coordinates discovery tools, enforces code-level scope guardrails,
 manages target task context, and triages verified findings.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import base64
 import hashlib
@@ -17,25 +17,21 @@ import time
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
-from typing import Dict, Any, List, Optional, Callable, Tuple, Set
-from urllib.parse import urlparse
+from typing import Dict, Any, List, Optional, Callable, Set
+from urllib.parse import urlparse, urljoin, urlunparse
 
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-from hellhound.core.scope import ScopeRules, is_in_scope, check_module_against_rules
+from hellhound.core.scope import is_in_scope, check_module_against_rules
 from hellhound.core.tasks import Target, create_or_load_target, save_target, set_scope, sanitize_target_name
 from hellhound.core.guard import AutopilotGuard
 from hellhound.core.ai_utils import (
     load_config,
-    call_ai,
     ask_neural_core,
-    thinking_animation,
-    render_chat_bubble,
     SYNTHESIZER_PERSONA,
     CHAT_PERSONA_SLM,
 )
@@ -51,18 +47,14 @@ from hellhound.memory import (
     update_from_spider,
     update_from_subzy,
     update_from_bac,
-    update_from_gowitness,
-    record_evidence_card,
 )
 from hellhound.core.skills import (
     get_relevant_skills_prompt,
     discover_skills,
-    search_skills,
     load_skill_body,
-    is_ctf_lab_context,
     is_ctf_auto_scope_eligible,
 )
-from hellhound.core.toolcheck import ensure_tool, get_binary_path, is_available
+from hellhound.core.toolcheck import ensure_tool, get_binary_path
 
 
 def _load_baseline_rules() -> str:

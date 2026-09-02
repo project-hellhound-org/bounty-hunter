@@ -12,7 +12,7 @@ Two modes:
                           Also used as base by engine when no console attached.
 """
 
-from colorama import Fore, Style, init
+from colorama import init
 init(autoreset=True)
 
 

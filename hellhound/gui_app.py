@@ -17,13 +17,11 @@ import os
 from pathlib import Path
 import shutil
 import sys
-import threading
 import time
 from typing import Dict, Any, List, Optional
 
 from hellhound.core.agent import Agent
 from hellhound.core.tasks import (
-    Target,
     list_targets,
     create_or_load_target,
     save_target,

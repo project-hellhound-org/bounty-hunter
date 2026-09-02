@@ -6,7 +6,7 @@ Stores target context, scope rules, summaries, timestamps, notes, and findings
 in ~/.hellhound/targets/<target>/task.json.
 """
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import os

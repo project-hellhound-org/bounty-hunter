@@ -7,7 +7,7 @@ and GUI IPC command execution.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Any, Tuple
+from typing import Callable, Dict, List, Optional, Any
 import inspect
 import os
 import re
@@ -17,19 +17,18 @@ import shlex
 import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
-import requests
 
-from hellhound.core.scope import ScopeRules, is_in_scope, check_module_against_rules, parse_program_rules
-from hellhound.core.tasks import create_or_load_target, set_scope as task_set_scope, list_targets, Target, save_target
+from hellhound.core.scope import ScopeRules, is_in_scope, check_module_against_rules
+from hellhound.core.tasks import create_or_load_target, set_scope as task_set_scope, save_target
 from hellhound.core.ai_utils import (
     load_config, save_config, ask_neural_core,
-    ping_ollama, call_ollama, list_available_models, detect_ai_config
+    ping_ollama, list_available_models, detect_ai_config
 )
 from hellhound.core.agent import handle_message as agent_handle_message, get_agent
-from hellhound.core.emit import PlainEmit, ConsoleEmit
+from hellhound.core.emit import PlainEmit
 from hellhound.core.http_utils import merge_global_context
 from hellhound.core.nodes import build_graph
-from hellhound.core.toolcheck import check_all_tools, try_install, ensure_tool, install_hint, check_wordlists
+from hellhound.core.toolcheck import check_all_tools, try_install, check_wordlists
 from hellhound.core.skills import is_ctf_domain_pattern, is_ctf_auto_scope_eligible
 
 
@@ -1230,7 +1229,7 @@ def handle_skills(args: List[str], session_context: Dict[str, Any], emit: Any) -
     /skills [search_query] [--json]
     Lists discovered skills or searches skill repository.
     """
-    from hellhound.core.skills import discover_skills, search_skills, load_skill_body
+    from hellhound.core.skills import discover_skills, search_skills
     try:
         from rich.markup import escape
     except Exception:

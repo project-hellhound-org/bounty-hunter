@@ -3,10 +3,9 @@ Hellhound Loot Engine — Module-Aware Intelligence Renderer
 Knows what each module returns and displays it cleanly.
 """
 
-import json
 import shutil
 from collections import defaultdict
-from colorama import Fore, Style, init
+from colorama import Style, init
 init(autoreset=True)
 
 # ═══════════════════════════════════════════════════════════════════════
