@@ -215,7 +215,6 @@ def _tokenize(text: str) -> Set[str]:
 
 # Specificity weights for domain-specific skills over generic broad guides
 SPECIFICITY_KEYWORDS: Dict[str, List[str]] = {
-    "ctf-lab-recon": ["ctf", "lab", "htb", "thm", "hackthebox", "tryhackme", "vulnhub", "ctfio", "training range", "isolated target", "private target", "non-indexed"],
     "graphql-audit": ["graphql", "introspection", "query", "mutation", "schema", "gql", "apollo"],
     "cicd-security": ["cicd", "ci/cd", "github actions", "gitlab-ci", "workflow", "runner", "actions"],
     "client-reverse": ["reverse", "signing", "signature", "anti-bot", "sensor", "hmac", "token", "obfuscat", "webpack", "wasm", "jsvmp"],
@@ -240,130 +239,6 @@ SPECIFICITY_KEYWORDS: Dict[str, List[str]] = {
     "ssti": ["ssti", "template injection", "jinja2", "ejs", "twig", "freemarker", "velocity", "handlebars", "{{7*7}}"],
     "server-side-parameter-pollution": ["sspp", "parameter pollution", "http parameter pollution", "hpp", "query string pollution", "%23", "%26", "truncat", "server-side parameter pollution", "parameter injection", "internal api query"]
 }
-
-
-# Known CTF / Lab platform domain patterns & suffixes
-CTF_DOMAIN_PATTERNS = (
-    ".ctfio.com",
-    ".ctfio",
-    ".hackthebox.com",
-    ".hackthebox.eu",
-    ".htb",
-    ".tryhackme.com",
-    ".thm",
-    ".vulnhub.com",
-    ".root-me.org",
-    ".pwnable.kr",
-    ".pwnable.tw",
-    ".pwnable.xyz",
-    ".ctfd.io",
-    ".overthewire.org",
-    ".portswigger-labs.net",
-    ".pentesterlab.com",
-    ".challs.io",
-    ".chal.pw",
-    ".ctf.live",
-    ".local",
-    ".test",
-    ".internal",
-)
-
-
-def is_ctf_domain_pattern(domain: str) -> bool:
-    """
-    Checks if a domain/host matches known CTF or lab platform domain patterns.
-    """
-    if not domain or not domain.strip():
-        return False
-    d = domain.lower().strip().lstrip("*.")
-    if d in ("localhost", "127.0.0.1"):
-        return True
-    for suffix in CTF_DOMAIN_PATTERNS:
-        clean_suf = suffix.lstrip(".")
-        if d == clean_suf or d.endswith(suffix) or d.endswith("." + clean_suf):
-            return True
-    if re.search(r'(^|\.)ctf[\.-]', d):
-        return True
-    try:
-        import ipaddress
-        ip = ipaddress.ip_address(d)
-        if ip.is_private or ip.is_loopback:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def is_ctf_auto_scope_eligible(target_name: str, user_text: str = "") -> bool:
-    """
-    Determines whether a target is eligible for automatic scoping without manual /scope.
-    Requires:
-      1. Target domain matches verified CTF/lab platform infrastructure (e.g. .ctfio.com, .htb, .tryhackme.com, localhost)
-         AND context or domain confirms CTF/lab nature.
-      OR
-      2. User text contains explicit high-confidence multi-word authorization phrases
-         ('training range', 'isolated target', 'private target', 'non-indexed target', 'non-indexed lab').
-
-    A bare token like 'lab' or 'test' alone against a regular public domain (e.g. 'targetcorp.example')
-    will NEVER qualify for auto-scoping.
-    """
-    if not target_name:
-        return False
-
-    # 1. Target domain matches CTF domain patterns
-    if is_ctf_domain_pattern(target_name):
-        return True
-
-    # 2. Check for explicit multi-word isolation authorization phrases in user text
-    q_lower = user_text.lower() if user_text else ""
-    explicit_phrases = [
-        "training range",
-        "isolated target",
-        "private target",
-        "non-indexed target",
-        "non-indexed lab"
-    ]
-    if any(phrase in q_lower for phrase in explicit_phrases):
-        return True
-
-    return False
-
-
-def is_ctf_lab_context(user_text: str) -> bool:
-    """
-    Checks if the user's message indicates a CTF, lab environment, training range,
-    or isolated non-indexed target.
-    Reads triggers dynamically from the `ctf-lab-recon` skill's description and keywords.
-    """
-    if not user_text or not user_text.strip():
-        return False
-
-    q_lower = user_text.lower()
-    q_tokens = _tokenize(user_text)
-
-    # 1. Check against specificity keywords for ctf-lab-recon
-    for kw in SPECIFICITY_KEYWORDS.get("ctf-lab-recon", []):
-        if " " in kw:
-            if kw in q_lower:
-                return True
-        elif kw in q_tokens:
-            return True
-
-    # 2. Check against description tokens of ctf-lab-recon dynamically from registry
-    registry = discover_skills()
-    skill = registry.get("ctf-lab-recon")
-    if skill and skill.description:
-        desc_tokens = _tokenize(skill.description)
-        # Exclude common generic stopwords from triggering
-        stopwords = {"use", "when", "targeting", "or", "that", "are", "not", "a", "live", "bounty", "program", "guides", "and", "the", "for", "to", "in", "is"}
-        sig_tokens = {t for t in desc_tokens if len(t) > 2 and t not in stopwords}
-        overlap = q_tokens.intersection(sig_tokens)
-        # High confidence match if specific distinctive triggers overlap
-        ctf_triggers = {"ctf", "lab", "htb", "thm", "hackthebox", "tryhackme", "vulnhub", "ctfio"}
-        if overlap.intersection(ctf_triggers):
-            return True
-
-    return False
 
 
 def search_skills(query: str, max_results: int = 2, min_score: float = 0.12) -> List[SkillMeta]:
@@ -511,7 +386,7 @@ def is_directed_task(user_text: str) -> bool:
     with an action verb describing what to do to it — e.g. "bypass auth on
     https://example.com/login", "log in and reach the admin console at x.com".
     When True, the user has already told the agent exactly what to do, so
-    broad session-start methodology (bb-methodology / ctf-lab-recon) should
+    broad session-start methodology (e.g. bb-methodology) should
     NOT be injected — it would compete with, rather than inform, an
     instruction the user already made explicit. Technology-specific skills
     (Rule 3, e.g. graphql-audit) can still fire independently.

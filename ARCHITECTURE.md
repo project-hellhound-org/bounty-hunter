@@ -84,7 +84,6 @@ hellhound/skills/
 ├── authentication/                     # OAuth, JWT, 2FA/MFA, Password Recovery, Session Auditing
 ├── bb-methodology/                     # 5-Phase Bug Bounty Workflow & Session Discipline
 ├── bug-bounty/                         # Master Playbook & Bounty Lifecycle Orchestration
-├── ctf-lab-recon/                      # Active Range Recon, Flag Mining, Stepping-Stone Tactics
 ├── web2-recon/                         # Subdomain Discovery, Port Mapping, Tech Fingerprinting
 ├── web2-vuln-classes/                  # Core Web Flaws (IDOR, SSRF, SQLi, XSS, SSTI, CSRF)
 ├── security-arsenal/                   # Curated Payloads, Filter Bypasses, WAF Evasion

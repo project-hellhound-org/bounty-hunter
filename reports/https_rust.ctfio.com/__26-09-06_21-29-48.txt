@@ -1,0 +1,3 @@
+# Dirsearch started Sun Sep  6 21:30:52 2026 as: /usr/lib/python3/dist-packages/dirsearch/dirsearch.py -u https://rust.ctfio.com/
+
+200     0B   https://rust.ctfio.com/flag.txt

@@ -6,7 +6,7 @@
 <p align="center">
   <b>Autonomous AI Bug Bounty & Penetration Testing Framework by Project Hellhound</b>
   <br>
-  <i>Target enumeration, two-tier neural reasoning, 26 methodology skills, persistent artifact blackboard, live SPA crawling, visual evidence capture, and zero-bypass scope guardrails — from recon to submission-ready report.</i>
+  <i>Target enumeration, two-tier neural reasoning, 27 methodology skills, persistent artifact blackboard, live SPA crawling, visual evidence capture, and zero-bypass scope guardrails — from recon to submission-ready report.</i>
 </p>
 
 <p align="center">
@@ -221,7 +221,8 @@ Run one-off prompts and scripted pipeline jobs directly:
 # Scoped reconnaissance against a domain
 hellhound -p "recon targetcorp.example"
 
-# Automated CTF/lab active enumeration and takeover
+# Say what you actually want done — the agent picks the right skill and
+# recon depth (active vs. passive) itself, it isn't hardcoded off the domain name
 hellhound -p "target is https://lab.ctfio.com and creds user:pass, takeover admin account"
 
 # Direct slash command execution with JSON output
@@ -308,7 +309,7 @@ Bounty Hunter coordinates specialized security tooling into a unified, scope-gov
 
 ## Hunting Methodology Skills
 
-Bounty Hunter includes **26 specialized methodology skills** loaded dynamically into the agent reasoning context:
+Bounty Hunter includes **27 specialized methodology skills** loaded dynamically into the agent reasoning context:
 
 | Skill | Category | Description |
 | :--- | :--- | :--- |
@@ -317,7 +318,6 @@ Bounty Hunter includes **26 specialized methodology skills** loaded dynamically 
 | `authentication` | Authentication | OAuth, JWT, 2FA/MFA, password recovery, and session token auditing. |
 | `bb-methodology` | Core Mindset | Systematic 5-phase bug bounty workflow and session discipline. |
 | `bug-bounty` | Master Playbook | End-to-end bug bounty lifecycle orchestration and triage tracking. |
-| `ctf-lab-recon` | CTF & Labs | Active enumeration doctrine for HTB, THM, and isolated training ranges. |
 | `web2-recon` | Surface Mapping | Comprehensive subdomain enumeration, port scanning, and live service mapping. |
 | `web2-vuln-classes`| Vulnerability Rules | In-depth heuristics for IDOR, SSRF, SQLi, XSS, SSTI, and OAuth flaws. |
 | `security-arsenal` | Payloads & Bypasses | Curated payload lists, filter bypasses, and WAF evasion techniques. |

@@ -27,7 +27,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from hellhound.core.scope import is_in_scope, check_module_against_rules
-from hellhound.core.tasks import Target, create_or_load_target, save_target, set_scope, sanitize_target_name
+from hellhound.core.tasks import Target, create_or_load_target, save_target, sanitize_target_name
 from hellhound.core.guard import AutopilotGuard
 from hellhound.core.ai_utils import (
     load_config,
@@ -52,7 +52,6 @@ from hellhound.core.skills import (
     get_relevant_skills_prompt,
     discover_skills,
     load_skill_body,
-    is_ctf_auto_scope_eligible,
 )
 from hellhound.core.toolcheck import ensure_tool, get_binary_path
 
@@ -169,7 +168,7 @@ def _execute_shuffledns(args: Dict[str, Any], target: Target, emit: Any) -> Dict
         cmd.extend(["-m", massdns_bin])
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = _run_cmd_with_heartbeat(cmd, timeout=90, emit=emit, label="dns_bruteforce (active DNS enumeration)")
         subdomains = [l.strip().lower() for l in proc.stdout.splitlines() if l.strip() and "." in l]
     except Exception as e:
         return {"error": f"shuffledns execution failed: {e}", "domain": domain}
@@ -236,7 +235,7 @@ def _execute_ffuf_vhost(args: Dict[str, Any], target: Target, emit: Any) -> Dict
     ]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = _run_cmd_with_heartbeat(cmd, timeout=120, emit=emit, label="vhost_fuzz (Host header fuzzing)")
         results = []
         if proc.stdout.strip():
             data = json.loads(proc.stdout)
@@ -338,7 +337,7 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
 
     results = []
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        proc = _run_cmd_with_heartbeat(cmd, timeout=90, emit=emit, label="content_discovery (path fuzzing)")
         
         # Read structured JSON output from tempfile
         if temp_json and os.path.exists(temp_json) and os.path.getsize(temp_json) > 0:
@@ -434,24 +433,47 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
         }
 
 
+def _run_cmd_with_heartbeat(cmd: List[str], timeout: int, emit: Any, label: str,
+                              heartbeat_interval: int = 5) -> "subprocess.CompletedProcess":
+    """
+    Runs a subprocess without blocking silently for the full timeout window.
+    Long recon calls (passive OSINT lookups, DNS brute-force) previously used
+    a single `subprocess.run(..., timeout=N)` — the terminal showed nothing
+    between "tool started" and "tool finished," which for an unindexed
+    domain (nothing found until timeout) looked exactly like a hang.
+    Polls in `heartbeat_interval`-second slices and emits a progress line
+    each time so the CLI stays visibly alive, then hard-kills at `timeout`.
+    """
+    start = time.monotonic()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        while True:
+            elapsed = time.monotonic() - start
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                proc.kill()
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            try:
+                stdout, stderr = proc.communicate(timeout=min(heartbeat_interval, remaining))
+                return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                if emit and hasattr(emit, "info"):
+                    emit.info(f"[*] {label} still running ({int(time.monotonic() - start)}s)...")
+                continue
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
 def _execute_subfinder(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     domain = args.get("domain") or target.name
     domain = domain.strip().lower()
     if domain.startswith("http://") or domain.startswith("https://"):
         domain = urlparse(domain).netloc.split(":")[0]
-
-    # Fast skip for CTF / Lab targets (unindexed private environments)
-    from hellhound.core.skills import is_ctf_domain_pattern, is_ctf_auto_scope_eligible
-    if is_ctf_domain_pattern(domain) or is_ctf_auto_scope_eligible(target.name):
-        if emit and hasattr(emit, "info"):
-            emit.info(f"[*] Skipping passive subfinder for CTF/lab target '{domain}' (unindexed). Using active enumeration.")
-        return {
-            "domain": domain,
-            "count": 0,
-            "subdomains": [],
-            "total_discovered": 0,
-            "note": "Skipped passive OSINT (subfinder) on CTF/lab target. Subdomains in private labs are not in public CT logs. Active dns_bruteforce or httpx should be used instead."
-        }
 
     auto_install = bool(load_config().get("auto_install_missing_tools", False))
     check = ensure_tool("subfinder", emit=emit, auto_install=auto_install)
@@ -468,8 +490,8 @@ def _execute_subfinder(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     subdomains = set()
 
     try:
-        cmd = [subfinder_bin, "-d", domain, "-silent", "-all"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        cmd = [subfinder_bin, "-d", domain, "-silent", "-all", "-timeout", "10"]
+        proc = _run_cmd_with_heartbeat(cmd, timeout=45, emit=emit, label="subfinder (passive OSINT lookup)")
         if proc.returncode == 0:
             for line in proc.stdout.splitlines():
                 sub = line.strip().lower()
@@ -681,7 +703,7 @@ def _execute_resolve_candidates(args: Dict[str, Any], target: Target, emit: Any)
         if resolvers and os.path.exists(resolvers):
             cmd.extend(["-r", resolvers])
 
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = _run_cmd_with_heartbeat(cmd, timeout=120, emit=emit, label="resolve_candidates (DNS resolution)")
         if proc.stdout.strip():
             for line in proc.stdout.splitlines():
                 if line.strip():
@@ -2795,7 +2817,7 @@ def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
                         cmd.extend(["--javascript", f"() => {{ document.cookie = '{clean_cookie}; path=/'; }}"])
 
                     try:
-                        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                        _run_cmd_with_heartbeat(cmd, timeout=120, emit=emit, label="gowitness (screenshot capture)")
                     except Exception as e:
                         return {"error": f"gowitness execution failed: {e}", "url": target_url}
                 else:
@@ -2821,7 +2843,7 @@ def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
                         cmd.extend(["--javascript", f"() => {{ document.cookie = '{clean_cookie}; path=/'; }}"])
 
                     try:
-                        subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                        _run_cmd_with_heartbeat(cmd, timeout=300, emit=emit, label="gowitness (batch screenshot capture)", heartbeat_interval=10)
                     except Exception as e:
                         return {"error": f"gowitness batch execution failed: {e}", "urls": target_urls}
 
@@ -3071,7 +3093,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "subfinder": ToolSpec(
         name="subfinder",
-        description="Enumerate subdomains for a domain using passive sources and certificate transparency logs. (Do NOT use on CTF/lab/private targets like *.ctfio.com or *.htb — use dns_bruteforce or httpx directly).",
+        description="Enumerate subdomains for a domain using passive sources and certificate transparency logs. Relies on public indexing, so it will return nothing for domains that aren't publicly indexed — if that happens, consider dns_bruteforce or httpx instead.",
         parameters={
             "type": "object",
             "properties": {
@@ -3971,16 +3993,6 @@ class Agent:
         if session_context is not None:
             session_context["target"] = self.target.name
             session_context["scope_rules"] = self.target.scope_rules
-
-        # Auto-scope shortcut ONLY when CTF/lab target criteria are met
-        if (target_match or self.target.name != "default") and is_ctf_auto_scope_eligible(self.target.name, user_text):
-            if not self.target.scope_raw or not self.target.scope_rules.in_scope:
-                set_scope(self.target, "")  # empty raw_text auto-populates in_scope with [*.target, target]
-                if emit and hasattr(emit, "info"):
-                    emit.info(
-                        f"[*] CTF/lab context detected — auto-scoping to "
-                        f"{self.target.name} (no manual /scope needed for lab targets)"
-                    )
 
         # Hard safety gate: if target is "default" with no scope, the orchestrator
         # has no valid domain/IP to hit — skip the tool loop entirely and let the

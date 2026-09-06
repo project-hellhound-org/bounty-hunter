@@ -29,7 +29,6 @@ from hellhound.core.emit import PlainEmit
 from hellhound.core.http_utils import merge_global_context
 from hellhound.core.nodes import build_graph
 from hellhound.core.toolcheck import check_all_tools, try_install, check_wordlists
-from hellhound.core.skills import is_ctf_domain_pattern, is_ctf_auto_scope_eligible
 
 
 def _interactive_prompt(prompt_text: str) -> str:
@@ -220,12 +219,12 @@ def handle_recon(args: List[str], session_context: Dict[str, Any], emit: Any,
                 session_context["target"] = target
                 agent = get_agent(target)
 
-        # Auto-detect active/passive when not explicitly specified
+        # Default to passive when the user didn't specify a mode. If the
+        # target isn't publicly indexed, subfinder will simply come back
+        # empty and the fallback escalation to dns_bruteforce below picks
+        # up the slack — no need to pre-judge based on the domain's name.
         if sub_mode is None:
-            if is_ctf_domain_pattern(target) or is_ctf_auto_scope_eligible(target):
-                sub_mode = "active"
-            else:
-                sub_mode = "passive"
+            sub_mode = "passive"
 
         if cancel_check and cancel_check():
             return {"status": "cancelled", "message": "Execution stopped by user"}
@@ -323,22 +322,14 @@ def handle_recon(args: List[str], session_context: Dict[str, Any], emit: Any,
         )
         answer = advice
     else:
-        if is_ctf_domain_pattern(target) or is_ctf_auto_scope_eligible(target):
-            prompt = (
-                f"Perform active CTF/lab reconnaissance on {target}. "
-                f"This is an isolated/unindexed challenge target. Do NOT perform passive subdomain enumeration (no subfinder). "
-                f"Start with active DNS brute-force (dns_bruteforce) and live-host confirmation (httpx), "
-                f"then content/endpoint discovery and vhost fuzzing on live ports. Respect scope throughout."
-            )
-        else:
-            prompt = (
-                f"Perform reconnaissance on {target}. Follow proper methodology: "
-                f"asset discovery and live-host confirmation first (subfinder, escalate "
-                f"to dns_bruteforce if passive results are thin), then content/endpoint "
-                f"discovery (spider) only against confirmed live hosts, then deeper "
-                f"analysis (wafbuster, tech fingerprinting) as warranted. Respect scope "
-                f"throughout."
-            )
+        prompt = (
+            f"Perform reconnaissance on {target}. Follow proper methodology: "
+            f"asset discovery and live-host confirmation first (subfinder, escalate "
+            f"to dns_bruteforce if passive results are thin), then content/endpoint "
+            f"discovery (spider) only against confirmed live hosts, then deeper "
+            f"analysis (wafbuster, tech fingerprinting) as warranted. Respect scope "
+            f"throughout."
+        )
         answer = agent.handle_message(prompt, session_context=session_context, emit=emit, on_token=on_token, cancel_check=cancel_check)
 
     if not is_json and not on_token:
