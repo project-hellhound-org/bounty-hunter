@@ -1,6 +1,6 @@
 ---
 name: auth-bypass
-description: Universal methodology for authentication bypass, JWT manipulation (alg:none confusion, RSA public key misuse), password reset flaws, response-body token disclosure, host header injection, and post-authentication privilege escalation.
+description: Universal methodology for authentication bypass, JWT manipulation (alg:none confusion, HS256 secret cracking, RSA public key misuse, kid path traversal, embedded jwk injection), password reset flaws, response-body token disclosure, host header injection, and post-authentication privilege escalation.
 ---
 
 # AUTHENTICATION BYPASS METHODOLOGY
@@ -206,8 +206,33 @@ When an application uses RS256 (asymmetric signing where the server signs with a
    - `{"alg": "HS256", "typ": "JWT"}`
 3. **Sign Payload with Public Key as Secret:**
    - Sign the Base64url `<header>.<payload>` using HMAC-SHA256 with the server's public key text (or raw public key bytes) as the HMAC key.
+   - `jwt_forge` tries several byte-encodings of the supplied key automatically (as-is, whitespace-stripped, trailing-newline-appended, CRLF-normalized, and base64-decoded raw bytes) — exact PEM formatting varies between JWT libraries and a single wrong byte breaks the signature silently.
 4. **Submit and Test:**
    - Send the forged token to discovered authenticated API routes or web dashboards.
+
+### C2. Attack Vector 3: HS256 Secret Cracking (Weak/Default Secret) — LAST RESORT
+Many applications sign HS256 tokens with a weak, default, or leaked secret (`secret`, `changeme`, a framework's example value left unchanged, etc.). Unlike the confusion attacks above, recovering the real secret produces a **legitimately signed** token that passes even a correctly implemented verifier.
+
+> [!IMPORTANT]
+> **Try the free forgeries first.** `jwt_forge`'s default `algorithm: "all"` deliberately does NOT include secret cracking — it only runs alg:none, kid_injection, and jwk_injection (plus hs256 confusion if you already have a public key). Test those against the server first. Cracking is the fallback for when a structurally-sound verifier rejects all of them, not the opening move — it costs more calls and only pays off when the app is *also* misconfigured with a weak secret.
+
+1. Only after the free variants from Sections B–C4 have been sent to a protected endpoint and rejected (401/403, or the response shows the forgery didn't take), run `jwt_forge` with `algorithm: "hs_crack"` explicitly against the captured HS256-signed token — it brute-forces the real signature against a built-in common-secret wordlist (~70 entries covering framework defaults, lab/CTF conventions, and generic weak secrets). The tool result's `hs_crack_available` field confirms whether this applies to the current token before you bother.
+2. If you have app- or company-specific guesses (product name, subdomain, framework docs default), pass them via the `wordlist` argument alongside the built-in list.
+3. On a hit, `cracked_secret` in the tool result holds the real secret and the top `forged_tokens` entry is a properly HMAC-signed admin token — treat this as a genuine secret-management finding (`severity: critical`), not just an implementation bypass, since the actual signing key was recovered.
+4. If nothing matches the built-in list, note it and move on — do not attempt full dictionary/brute-force cracking outside the tool's built-in wordlist unless the engagement scope explicitly allows heavier offline cracking.
+
+### C3. Attack Vector 4: `kid` Header Path Traversal to `/dev/null`
+Some JWT verification implementations resolve the header's `kid` (Key ID) claim to a local file path to load the signing key. Pointing `kid` at a file that reads as empty (`/dev/null`) lets an attacker sign with a known, empty HMAC secret.
+
+1. `jwt_forge` with `algorithm: "kid_injection"` (or default `"all"`) automatically forges `kid: ../../../../../../../../../../dev/null` and `kid: /dev/null` variants, both HMAC-SHA256 signed with an empty secret.
+2. This only works if the backend actually treats `kid` as a filesystem path — if all variants are rejected, the app likely resolves `kid` against a fixed keystore instead, and this vector doesn't apply.
+3. Related manual technique (not auto-generated, since it requires blind exploitation feedback): if `kid` is concatenated into a SQL query to look up the signing key, a UNION-based SQLi payload in `kid` that returns an attacker-known value can achieve the same effect — check for this if path traversal fails and the app has a database-backed key store.
+
+### C4. Attack Vector 5: Embedded `jwk` Header Injection
+Some libraries validate a token against whatever public key is embedded in the token's own `jwk` header claim, instead of a separately trusted key store. An attacker can generate their own keypair, embed the public half in the header, and sign with the matching private key — since the server never had a chance to reject the unrecognized key.
+
+1. `jwt_forge` with `algorithm: "jwk_injection"` (or default `"all"`) generates a fresh RSA keypair, embeds the public JWK in the header, and self-signs with RS256. Requires the `cryptography` package (falls back gracefully with a note if unavailable).
+2. Related manual technique for hosted-key setups: if the app instead fetches the key from a URL in the header (`jku`/`x5u`), host a JWKS file with an attacker-controlled keypair on infrastructure you control and point `jku` at it — this isn't auto-generated since it needs external hosting, but the same self-signing approach applies once the file is reachable.
 
 ### D. Mandatory Verification & Evidence for JWT Flaws
 
@@ -344,7 +369,7 @@ When tasked with account takeover or high-bounty hunting, execute the full attac
   │     └─ Test account update routes with discovered nested roles and attributes
   │
   └── Vector 5: Session Architecture & JWT Manipulation
-        └─ If JWT: alg:none, RS256->HS256 public key confusion, claim tampering
+        └─ If JWT: alg:none, HS256 secret cracking, RS256->HS256 public key confusion, kid /dev/null traversal, embedded jwk injection, claim tampering
 ```
 
 **Rule of Exhaustion:** Never conclude that an account cannot be compromised or that no bug exists until all viable vectors above have been tested and verified against the live target.
@@ -473,4 +498,3 @@ bcrypt ignores input beyond 72 bytes.
 Username: admin%00 -> null byte string truncation in C/legacy engines
 Username: "ⓢcott" -> normalizes to "scott" -> impersonates "scott"
 ```
-
