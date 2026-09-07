@@ -4250,6 +4250,7 @@ class Agent:
                 max_iterations = 60
 
         forced_skill = getattr(self, "_forced_skill", None)
+        was_forced_skill = bool(forced_skill)
         if forced_skill:
             forced_body = load_skill_body(forced_skill)
             if forced_body:
@@ -4532,25 +4533,52 @@ FINDINGS SO FAR: {len(self.target.findings)}{artifact_block_synth}"""
 
         # ── Lightweight persona-only prompt for turns where no hunting tool
         # ran (the Claude-Code-style default: most turns are just talk, not a
-        # scan). No baseline pentest doctrine, no tool schema dump, no skill
-        # methodology injection — those only belong on turns that actually do
-        # recon/exploitation work. This is what fixes both the "TARGET:
+        # scan). No full tool schema dump, no auto-selected skill methodology
+        # injection on plain chat — those only belong on turns that actually
+        # do recon/exploitation work. This is what fixes both the "TARGET:
         # default" noise and the doctrine-quoting-itself-back symptom.
+        #
+        # It still needs to know its OWN tool names (not full schemas) even
+        # here — otherwise, asked "what can you do" with no target set, it has
+        # nothing in context but its own base-model training and answers like
+        # a generic advisory chatbot ("I can't execute attacks myself"), which
+        # is false: it runs curl/jwt_forge/dns_bruteforce/etc. directly once a
+        # target exists. A name-only list is enough to keep it truthful
+        # without the verbose schema dump the comment above warns against.
+        tool_names_line = ", ".join(sorted(TOOL_REGISTRY.keys()))
+
+        # If the researcher explicitly forced a skill via /skill-name (e.g.
+        # /auth-bypass), honor that even on a target-less turn — that request
+        # is not idle chat, it's asking to draw on that skill's methodology.
+        forced_skill_block = (
+            f"\n{skills_block}\n" if was_forced_skill else ""
+        )
+
         casual_synth_prompt = f"""\
 {casual_persona}
 
 {researcher_line}{light_context_block}
 
+TOOLS YOU HAVE DIRECT EXECUTION ACCESS TO (names only — you run these
+yourself against a target, you are not a passive advisor describing what a
+human should do): {tool_names_line}
+{forced_skill_block}
 INSTRUCTIONS:
 - No hunting tool executed this turn — this is general conversation, a
-  question, or casual chat, not an active recon/attack campaign.
+  question, or casual chat, not an active recon/attack campaign. That's
+  because no target is set yet, NOT because you lack tools.
 - Respond naturally and directly, like a capable assistant talking to
   someone they know — not a pentest report generator reciting doctrine.
 - Do NOT open with a status tag, do NOT recite scope/baseline rules,
   and do NOT bring up the target/scope unless the researcher's message is
   actually about it.
-- When asked about your capabilities or tools, answer only from what you
-  actually have access to — don't invent or imply capabilities.
+- When asked about your capabilities or tools: you DO execute these tools
+  yourself once a target is set (via /target, /scope, or naming one in the
+  message) — never say you "can't execute" or "can only guide/advise."
+  Answer strictly from the tool list above (plus the requested skill's
+  methodology if one is shown) — don't invent tools not in that list, and
+  don't claim capabilities (browsers, GUIs, live network access outside
+  these tools) you don't have.
 """
 
         # ── Full hunting-turn prompt — target header, scope, baseline
