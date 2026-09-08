@@ -8890,19 +8890,27 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
 
     class _W:
         def __init__(self, b, v): self._b = b; self._v = v
-        def info(self, m):
+        def info(self, m, *a, **k):
             if self._v: self._b.info(m)
-        def success(self, m):
+        def success(self, m, *a, **k):
             if self._v: self._b.success(m)
-        def warn(self, m):            self._b.warn(m)
-        def always_info(self, m):     self._b.info(m)
-        def always_success(self, m):  self._b.success(m)
-        def section(self, t):         self._b.info(f"── {t} ──")
-        def row(self, k, v, **kw):    self._b.info(f"{k}: {_strip(str(v))}")
-        def finding(self, *a):        self._b.warn(str(a))
-        def endpoint_row(self, ep):   self._b.info(ep.get("url",""))
-        def live_crawl(self, url):    pass
-        def print_always(self, m):    print(m)
+        def warn(self, m, *a, **k):            self._b.warn(m)
+        def warn_sev(self, m, severity="HIGH", *a, **k):
+            self._b.warn(f"[{severity.upper()}] {m}")
+        def always_info(self, m, *a, **k):     self._b.info(m)
+        def always_success(self, m, *a, **k):  self._b.success(m)
+        def section(self, t, *a, **k):         self._b.info(f"── {t} ──")
+        def row(self, k, v, *a, **kw):         self._b.info(f"{k}: {_strip(str(v))}")
+        def finding(self, *a, **k):            self._b.warn(str(a))
+        def endpoint_row(self, ep, *a, **k):   self._b.info(ep.get("url",""))
+        def live_crawl(self, url, *a, **k):    pass
+        def print_always(self, m, *a, **k):    print(m)
+        def _w(self, m, *a, **k):              self._b.info(_strip(str(m)))
+        def crawl_feed(self, *a, **kw):          pass
+        def leader_row(self, k, v="", *a, **kw):     self._b.info(f"{k}: {_strip(str(v))}" if v != "" else str(k))
+        def robots_comment_leak(self, m, *a, **kw):  self._b.warn(str(m))
+        def robots_entry(self, *a, **kw):        self._b.info(" ".join(str(x) for x in a))
+        def security_txt_field(self, k, v="", *a, **kw): self._b.info(f"{k}: {_strip(str(v))}")
         def __getattr__(self, name):
             def _fallback(*args, **kwargs):
                 if hasattr(self._b, name):
@@ -8921,10 +8929,14 @@ def run(target: str, emit_obj, options: dict = None, stop_check=None, pause_chec
         def animator(self):
             class _S:
                 active = False
+                _last_line = ""
                 def start(self, *a, **k): pass
                 def stop(self, *a, **k): pass
                 def update(self, *a, **k): pass
-                def _clear(self): pass
+                def _clear(self, *a, **k): pass
+                def start_anim(self, *a, **k): pass
+                def stop_anim(self, *a, **k): pass
+                def __getattr__(self, name): return lambda *a, **k: None
             return _S()
 
     emit = _W(emit_obj, cfg.verbose)
