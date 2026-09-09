@@ -73,6 +73,25 @@ def sanitize_target_name(target: str) -> str:
     return cleaned or "default"
 
 
+def extract_raw_host(target: str) -> str:
+    """
+    Same URL/scheme stripping as sanitize_target_name, but preserves the
+    exact host[:port] text instead of mangling it into a filesystem-safe
+    name. sanitize_target_name's colon->underscore substitution makes
+    "192.168.1.5:8080" into "192.168.1.5_8080" — correct for a folder name,
+    useless (and silently broken) as an actual hostname to connect to. This
+    is what Target.host stores for anything that needs to build a real
+    network request or show the researcher what's actually being hit.
+    """
+    if not target:
+        return ""
+    cleaned = target.strip()
+    if cleaned.lower().startswith("http://") or cleaned.lower().startswith("https://"):
+        parsed = urlparse(cleaned)
+        cleaned = parsed.netloc or parsed.path
+    return cleaned
+
+
 @dataclass
 class Target:
     name: str
@@ -84,6 +103,9 @@ class Target:
     notes: Optional[str] = ""
     findings: List[Dict[str, Any]] = field(default_factory=list)
     state: Dict[str, Any] = field(default_factory=dict)
+    host: str = ""  # real, connectable host[:port] — see extract_raw_host(). `name`
+                     # is the filesystem-safe folder name and must NEVER be used to
+                     # build an actual URL/hostname (colons get mangled to underscores).
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -96,6 +118,7 @@ class Target:
             "notes": self.notes,
             "findings": self.findings,
             "state": redact_sensitive_dict_keys(self.state),
+            "host": self.host,
         }
 
     @classmethod
@@ -126,6 +149,7 @@ class Target:
             notes=data.get("notes", ""),
             findings=findings,
             state=state,
+            host=str(data.get("host", "")),  # "" for targets saved before this field existed
         )
 
 
@@ -148,6 +172,7 @@ def save_target(target: Target) -> None:
 
 
 def create_or_load_target(name: str) -> Target:
+    raw_host = extract_raw_host(name)
     safe_name = sanitize_target_name(name)
     path = get_target_path(safe_name)
 
@@ -155,12 +180,18 @@ def create_or_load_target(name: str) -> Target:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return Target.from_dict(data)
+                loaded = Target.from_dict(data)
+                if not loaded.host and raw_host:
+                    # Backfill: target was saved before the `host` field
+                    # existed (or was created some other way without it).
+                    loaded.host = raw_host
+                    save_target(loaded)
+                return loaded
         except Exception as e:
             print(f"[!] Warning: Failed to load target {safe_name} from disk (corrupted JSON?): {e}")
 
     # Create new target with clean empty scope
-    target = Target(name=safe_name)
+    target = Target(name=safe_name, host=raw_host)
     save_target(target)
     return target
 

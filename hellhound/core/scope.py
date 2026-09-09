@@ -59,6 +59,11 @@ class ScopeRules:
         )
 
 
+def normalize_host(target: str) -> Tuple[str, str]:
+    """Public wrapper around _normalize_host for callers outside this module."""
+    return _normalize_host(target)
+
+
 def _normalize_host(target: str) -> Tuple[str, str]:
     """
     Extracts the normalized hostname/domain and path from a target string.

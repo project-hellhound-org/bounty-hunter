@@ -111,6 +111,25 @@ class OOBServer:
             return f"http://{self.host}:{self.port}"
         return None
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PER-TARGET SERVER REGISTRY
+# Keeps a single live OOBServer per target name for the lifetime of the
+# process, so "start" and later "poll" calls from separate tool invocations
+# reuse the same listening socket/thread instead of losing hits between
+# calls. Deliberately NOT stored on Target.state — that gets JSON-serialized
+# to disk on every turn (save_target), and a live socket/thread can't survive
+# that round-trip.
+# ─────────────────────────────────────────────────────────────────────────────
+_active_servers = {}
+
+def get_or_create_oob_server(target_name: str) -> "OOBServer":
+    srv = _active_servers.get(target_name)
+    if srv is None:
+        srv = OOBServer()
+        _active_servers[target_name] = srv
+    return srv
+
+
 def resolve_oob_url(options):
     """
     Helper to extract the OOB URL from module options.
