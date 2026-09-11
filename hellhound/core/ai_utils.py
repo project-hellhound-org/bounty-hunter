@@ -19,7 +19,6 @@ def strip_thinking_tags(text: str) -> str:
     """
     Strips chain-of-thought/reasoning blocks (<think>...</think>, <thinking>...</thinking>,
     <reasoning>...</reasoning>) from model output while preserving actual answers.
-    Falls back to original unstripped text if stripping leaves an empty string.
     """
     if not text or not isinstance(text, str):
         return text or ""
@@ -31,7 +30,66 @@ def strip_thinking_tags(text: str) -> str:
     if re.search(r'<(?:think|thinking|reasoning)>', cleaned, flags=re.IGNORECASE):
         cleaned = re.sub(r'<(?:think|thinking|reasoning)>[\s\S]*$', '', cleaned, flags=re.IGNORECASE).strip()
         
-    return cleaned if cleaned else text.strip()
+    return cleaned
+
+class _StreamingThinkFilter:
+    """
+    Wraps an on_token callback to suppress chain-of-thought tokens
+    enclosed in <think>...</think>, <thinking>...</thinking>, or
+    <reasoning>...</reasoning> blocks during live streaming.
+    """
+    def __init__(self, callback: Optional[Callable[[str], None]]):
+        self.callback = callback
+        self.in_think = False
+        self.buf = ""
+        self.tag_pattern = re.compile(r'<(?:think|thinking|reasoning)\b[^>]*>', re.IGNORECASE)
+        self.close_tag_pattern = re.compile(r'</(?:think|thinking|reasoning)>', re.IGNORECASE)
+
+    def feed(self, token: str):
+        if not self.callback or not token:
+            return
+        self.buf += token
+        while self.buf:
+            if not self.in_think:
+                m = self.tag_pattern.search(self.buf)
+                if m:
+                    prefix = self.buf[:m.start()]
+                    if prefix:
+                        self.callback(prefix)
+                    self.in_think = True
+                    self.buf = self.buf[m.end():]
+                elif "<" in self.buf:
+                    idx = self.buf.rfind("<")
+                    if len(self.buf) - idx < 15:
+                        prefix = self.buf[:idx]
+                        if prefix:
+                            self.callback(prefix)
+                        self.buf = self.buf[idx:]
+                        break
+                    else:
+                        self.callback(self.buf)
+                        self.buf = ""
+                else:
+                    self.callback(self.buf)
+                    self.buf = ""
+            else:
+                m = self.close_tag_pattern.search(self.buf)
+                if m:
+                    self.in_think = False
+                    self.buf = self.buf[m.end():].lstrip("\r\n")
+                else:
+                    if "</" in self.buf:
+                        idx = self.buf.rfind("</")
+                        if len(self.buf) - idx < 16:
+                            self.buf = self.buf[idx:]
+                            break
+                    self.buf = ""
+                    break
+
+    def flush(self):
+        if self.callback and self.buf and not self.in_think:
+            self.callback(self.buf)
+            self.buf = ""
 
 def load_config() -> Dict[str, Any]:
     """Loads persistent Hellhound configuration from ~/.hellhound/config.json."""
@@ -524,6 +582,13 @@ class ThinkingIndicator:
             return f"\033[38;5;220mBlocked:\033[0m {result.get('error', 'Scope refusal')}"
         if result.get("error"):
             return f"\033[38;5;196mError:\033[0m {result['error']}"
+        if tool_name == "jwt_forge" and result.get("status") in ("not_a_jwt", "skipped"):
+            # Not a failure — a correct "this isn't forgeable" classification.
+            # Falls through here (before the generic jwt_forge success-template
+            # branch below, which assumes forged_tokens exist) so it renders as
+            # a plain neutral line instead of a red error or a nonsense
+            # "Forged JWT (0 variants)" summary.
+            return result.get("note", "Not a JWT.")
 
         if tool_name == "port_scan":
             ports = result.get("open_ports", [])
@@ -975,6 +1040,21 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
         if not (messages and messages[-1].get("role") == "user" and messages[-1].get("content") == prompt):
             messages.append({"role": "user", "content": prompt})
 
+        if "/" not in model:
+            for prefix in ("nvidia/", "meta/", "mistralai/", "deepseek-ai/"):
+                if f"{prefix}{model}" in (
+                    "nvidia/nemotron-3-super-120b-a12b",
+                    "meta/llama-3.3-70b-instruct",
+                    "meta/llama-3.1-70b-instruct",
+                    "meta/llama-3.1-8b-instruct",
+                    "mistralai/mistral-large-2-instruct",
+                    "deepseek-ai/deepseek-r1"
+                ):
+                    model = f"{prefix}{model}"
+                    break
+            else:
+                model = f"nvidia/{model}"
+
         cfg = load_config()
         resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
 
@@ -984,8 +1064,10 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             "temperature": 0.5,
             "max_tokens": resolved_max_tokens,
             "stream": True,
-            "chat_template_kwargs": {"thinking": thinking}
         }
+        if thinking:
+            payload["chat_template_kwargs"] = {"thinking": True}
+
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -1031,6 +1113,8 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
         token_count = 0
         usage_tokens = None
         repeat_guard = _RepetitionGuard()
+        stream_filter = _StreamingThinkFilter(on_token) if on_token else None
+
         for line in r.iter_lines():
             if cancel_check and cancel_check():
                 break
@@ -1045,6 +1129,10 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
                     break
                 try:
                     chunk = json.loads(data_str)
+                    if chunk.get("error"):
+                        err_msg = chunk["error"].get("message") or str(chunk["error"])
+                        err = f"Error: NVIDIA NIM API error - {err_msg}"
+                        return (err, None) if return_usage else err
                     # Capture authoritative usage from final chunk if present
                     if chunk.get("usage"):
                         usage_tokens = chunk["usage"].get("completion_tokens")
@@ -1052,15 +1140,21 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
                     if choices:
                         delta = choices[0].get("delta", {})
                         token = delta.get("content", "")
+                        # Note: delta.get("reasoning_content") contains internal reasoning/CoT
+                        # (e.g. from nemotron or deepseek-r1). We never stream or return reasoning
+                        # tokens to preserve clean user-facing chat.
                         if token:
                             full_response.append(token)
                             token_count += 1
-                            if on_token:
-                                on_token(token)
+                            if stream_filter:
+                                stream_filter.feed(token)
                             if repeat_guard.feed(token):
                                 break
                 except json.JSONDecodeError:
                     continue
+
+        if stream_filter:
+            stream_filter.flush()
 
         result = "".join(full_response).strip()
         cleaned = strip_thinking_tags(result)

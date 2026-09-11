@@ -16,9 +16,15 @@ import json
 import logging
 import time
 import os
+import threading
 from pathlib import Path
 import re
 import subprocess
+
+# Generic CTF-style flag token (THM{...}, HTB{...}, flag{...}, CTF{...}, etc.)
+# used to dedup record_finding calls that report the same flag under a
+# reworded title instead of by exact-dict match.
+_FLAG_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]{2,20}\{[^{}]{3,150}\}")
 import sys
 from typing import Dict, Any, List, Optional, Callable, Set
 from urllib.parse import urlparse, urljoin, urlunparse
@@ -48,6 +54,9 @@ from hellhound.memory import (
     update_from_spider,
     update_from_subzy,
     update_from_bac,
+    add_lesson,
+    find_relevant_lessons,
+    format_lessons_block,
 )
 from hellhound.core.skills import (
     get_relevant_skills_prompt,
@@ -1850,6 +1859,23 @@ def format_artifact_inventory(target: Target) -> str:
     return "================== HARVESTED ARTIFACT INVENTORY ==================\n" + "\n".join(lines) + "\n=================================================================="
 
 
+def _singular_plural_variants(word: str) -> List[str]:
+    """Cheap singular/plural variants of a URL path segment, used to catch
+    the 'guessed /letters/<id>, real endpoint is /letter/<id>' class of
+    mistake generically — not specific to any one target's naming."""
+    variants = set()
+    if word.endswith("ies") and len(word) > 3:
+        variants.add(word[:-3] + "y")
+    if word.endswith("s") and not word.endswith("ss") and len(word) > 1:
+        variants.add(word[:-1])
+    if not word.endswith("s"):
+        variants.add(word + "s")
+        if len(word) > 1 and word[-1] == "y" and word[-2].lower() not in "aeiou":
+            variants.add(word[:-1] + "ies")
+    variants.discard(word)
+    return list(variants)
+
+
 def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     url = args.get("url") or target.name
     method = args.get("method", "GET").upper()
@@ -2221,6 +2247,34 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                     f"Any identifier you haven't personally observed in an actual tool result against this "
                     f"target is not real and must not be tested."
                 )
+
+        # 404 + this path's first segment has a singular/plural twin already
+        # in this target's discovered endpoints -> near-certain wrong-path
+        # guess, not a genuinely missing ID. This is real evidence from this
+        # target's own history, not a generic reminder — much harder to
+        # ignore than prompt wording, and it's what would have caught
+        # /letters/<id> vs /letter/<id> on the very first 404, not the
+        # eleventh.
+        if resp_dict.get("status_code") == 404 and hasattr(target, "state") and isinstance(target.state, dict):
+            try:
+                req_segments = [s for s in urlparse(url).path.split("/") if s]
+                if req_segments:
+                    variants = set(_singular_plural_variants(req_segments[0]))
+                    if variants:
+                        for ep in target.state.get("endpoints", []):
+                            ep_segments = [s for s in urlparse(ep).path.split("/") if s]
+                            if ep_segments and ep_segments[0] in variants:
+                                resp_dict["endpoint_mismatch_hint"] = (
+                                    f"404 on path segment '{req_segments[0]}' — but '{ep_segments[0]}' (singular/"
+                                    f"plural variant) already exists in THIS target's discovered endpoints, e.g. "
+                                    f"'{ep}'. Before trying more IDs against '{req_segments[0]}', try this same ID "
+                                    f"against '{ep_segments[0]}' instead. Several sequential 404s on the same path "
+                                    f"segment is a signal you have the wrong path, not that the IDs don't exist."
+                                )
+                                break
+            except Exception:
+                pass
+
         return resp_dict
     except Exception as e:
         return {
@@ -2361,20 +2415,30 @@ def _execute_jwt_forge(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     # every call look like a "new" attempt — and the model can burn several
     # calls re-testing a question that was already answered for good on the
     # first one. Cache the verdict per token and refuse instantly on repeats.
+    #
+    # Flask/itsdangerous session cookies also change on every request (the
+    # flash-message payload rotates), so a NEW cookie value from the same
+    # target still isn't caught by the per-token cache above — the model
+    # kept re-triggering a fresh decode-and-fail cycle on every new session
+    # cookie from the same target, printing a red error line in the CLI each
+    # time even though the target's cookie FORMAT was already established.
+    # Once we know a target uses non-JWT sessions at all, stop re-verifying
+    # per-token and answer quietly (no error, no red line) instead.
     non_jwt_cache = None
+    target_confirmed_non_jwt = False
     if hasattr(target, "state") and isinstance(target.state, dict):
         non_jwt_cache = target.state.setdefault("_confirmed_non_jwt_tokens", {})
-        if token in non_jwt_cache:
+        target_confirmed_non_jwt = bool(target.state.get("_target_uses_non_jwt_sessions"))
+
+        if token in non_jwt_cache or target_confirmed_non_jwt:
             return {
-                "status": "error",
-                "error": (
-                    "Bro, we already went through this — same token, same answer: not a JWT. "
-                    "That verdict happens before claims/algorithm are even read, so a different "
-                    "claims or algorithm value isn't going to change it, no matter how many times "
-                    "you ask. Pull whatever you need straight from decoded_session_content below "
-                    "instead of hitting me with this one again."
+                "status": "skipped",
+                "note": (
+                    "Already established this target's session cookies aren't JWTs — "
+                    "skipping the re-check. Use decoded_session_content from the earlier "
+                    "call, or work off the session directly."
                 ),
-                "decoded_session_content": non_jwt_cache[token],
+                "decoded_session_content": non_jwt_cache.get(token),
             }
 
     # Strict check: Reject obvious placeholder strings or opaque cookies
@@ -2476,16 +2540,18 @@ def _execute_jwt_forge(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
                 decoded_session_content = try_non_jwt_session_decode(seg)
 
         result = {
-            "status": "error",
-            "error": "Nah bro, this ain't a JWT — the segments don't even decode to valid JSON. Not going to sit here guessing claims out of thin air, so check raw_content_seen below for what's actually in there.",
+            "status": "not_a_jwt",
+            "note": "Nah bro, this ain't a JWT — the segments don't even decode to valid JSON. Not going to sit here guessing claims out of thin air, so check raw_content_seen below for what's actually in there.",
             "raw_content_seen": raw_previews if raw_previews else "Segments did not even base64-decode to bytes.",
             "hint": "Do not guess/forge claims (role, isAdmin, admin, etc.) here — check raw_content_seen (and decoded_session_content, if present) for what's actually inside before assuming anything about this token. A dot-separated-but-non-JWT shape is common for framework-signed session cookies (e.g. Flask's itsdangerous sessions) carrying plain session/flash data, not auth claims — forging claims against those does nothing. If that's what this is, look for IDOR, mass assignment, or business-logic flaws instead. This is settled for this exact token — do not call jwt_forge on it again with different claims/algorithm values, that will not change anything."
         }
         if decoded_session_content is not None:
             result["decoded_session_content"] = decoded_session_content
-            result["error"] = "Nah bro, it's not a JWT — just a plain signed session cookie (see decoded_session_content), no claims or role field in there for you to forge. This one's settled, don't call jwt_forge on it again."
+            result["note"] = "Nah bro, it's not a JWT — just a plain signed session cookie (see decoded_session_content), no claims or role field in there for you to forge. This one's settled, don't call jwt_forge on it again."
         if non_jwt_cache is not None:
             non_jwt_cache[token] = decoded_session_content
+        if hasattr(target, "state") and isinstance(target.state, dict):
+            target.state["_target_uses_non_jwt_sessions"] = True
         return result
 
     target_claims = args.get("claims") or {"role": "admin"}
@@ -3415,6 +3481,36 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     request_ref = str(args.get("request_ref", "")).strip()
     note = str(args.get("note", "")).strip()
 
+    # Dedup: the storage layer's own dedup keys on the WHOLE finding dict,
+    # which differs any time the title is reworded even slightly — this let
+    # the same flag get logged 5+ times under different titles ("Flag
+    # captured: X", "Flag confirmed: X", "Mission complete: X"...) in one
+    # session. Catch that here: if this finding contains the same flag-shaped
+    # token (WORD{...}) as an existing finding, or is an exact duplicate of
+    # an existing (kind, request_ref, title), it's already recorded — don't
+    # append another copy.
+    existing_findings = target.findings if isinstance(target.findings, list) else []
+    flag_match = _FLAG_TOKEN_PATTERN.search(f"{title} {note}")
+    for f in existing_findings:
+        if not isinstance(f, dict):
+            continue
+        f_text = f"{f.get('type', '')} {f.get('note', '')}"
+        if flag_match:
+            existing_flag = _FLAG_TOKEN_PATTERN.search(f_text)
+            if existing_flag and existing_flag.group(0) == flag_match.group(0):
+                return {
+                    "status": "already_recorded",
+                    "note": f"Already recorded — flag {flag_match.group(0)} is already in findings under '{f.get('type', '')}'. No need to log it again under a new title.",
+                }
+        elif (
+            f.get("target", "").strip().lower() == request_ref.strip().lower()
+            and f.get("type", "").strip().lower() == title.strip().lower()
+        ):
+            return {
+                "status": "already_recorded",
+                "note": "Already recorded — identical finding (same title and endpoint) already exists."
+            }
+
     finding = {"type": title, "target": request_ref, "severity": severity, "note": note}
     try:
         update_from_bac(target, findings=[finding])
@@ -4199,12 +4295,94 @@ def _extract_preserved_artifacts(content: str) -> str:
     return header + "\n".join(lines) + "\n\n"
 
 
+_CONVERSATIONAL_STARTERS = re.compile(
+    r'^\s*(why|what|who|how|when|where|explain|tell me|can you explain|damn|dam|wow|nice|'
+    r'good|great|awesome|thanks|thank you|lol|lmao|haha|nvm|never\s*mind|'
+    # Greetings — previously missing, so a plain "hi"/"hey" with a target
+    # already set (has_real_target) fell through to the full orchestrator
+    # loop (heavy TARGET/SCOPE/tools system prompt) instead of the fast
+    # casual-synthesis path, turning a one-word greeting into two full LLM
+    # round-trips. classify_intent() in ai_utils.py already special-cased
+    # these same words as "chat" but was never wired into this gate — it's
+    # dead code; this is the actual gate that matters.
+    r'hi|hey|hello|yo|sup|howdy|greetings|morning|evening|afternoon)\b',
+    re.I
+)
+_ACTION_VERBS = re.compile(
+    r'\b(try|test|attempt|access|exploit|register|log\s*in|login|find|get|hack|scan|curl|'
+    r'probe|crawl|enumerate|brute\s*force|inject|forge|bypass|escalate|dump|extract|steal|'
+    r'take\s*over|takeover|check\s+if|verify\s+if|confirm\s+if|continue|keep\s+going|resume|'
+    r'next\s+step|do\s+it|go\s+ahead|proceed|run\b)\b',
+    re.I
+)
+_RETROSPECTIVE_MARKERS = re.compile(
+    r'^\s*(why\s+did\s+you|why\s+(did|does|is|was)\s+(he|it|that)|what\s+made\s+you|'
+    r'did\s+you|have\s+you|what\s+did\s+you|how\s+did\s+you)\b',
+    re.I
+)
+_NEW_TARGET_SIGNAL = re.compile(
+    r'(https?://|your target is|\bthe target\b|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', re.I
+)
+
+
+def _confidently_conversational(text: str) -> bool:
+    """
+    A deterministic, code-level pre-gate — checked BEFORE the orchestrator
+    loop is entered at all, not inside its prompt. Deliberately asymmetric:
+    it can only confidently say "skip tools, this is pure conversation,"
+    never "force tools, this is definitely an instruction." The forcing
+    side always stays with the model's own judgment — this only closes the
+    specific, repeatedly-observed gap (explain/recap/praise turns still
+    running tools), it doesn't reduce flexibility for real instructions,
+    ambiguous phrasing, or creative task framing, which all still reach the
+    model's full reasoning exactly as before. If in doubt, this returns
+    False and the turn proceeds through the orchestrator as usual.
+    """
+    t = text.strip()
+    if not t:
+        return False
+    if _NEW_TARGET_SIGNAL.search(t):
+        return False
+    # A retrospective question ("why did you try X", "what made you do
+    # that") legitimately contains an action-verb WORD describing something
+    # already done, not a new instruction to do it — don't let that block
+    # the conversational classification the way a bare "register" or
+    # "try X" (an actual new imperative) correctly should.
+    is_retrospective = bool(_RETROSPECTIVE_MARKERS.match(t))
+    if _ACTION_VERBS.search(t) and not is_retrospective:
+        return False
+    return bool(_CONVERSATIONAL_STARTERS.match(t))
+
+
 class Agent:
+    # ── Rolling memory digest thresholds ────────────────────────────────
+    # Raw self.history entries carry full-fidelity content (tool results up
+    # to 25k chars each — see _get_trimmed_history). Left unbounded, that
+    # gets resent on every future turn, including a plain "hi", which is
+    # what actually made turns slow after a session ran real recon. Once
+    # the raw log passes _HISTORY_COMPACT_TRIGGER entries, everything
+    # older than the most recent _HISTORY_KEEP_RAW is folded into a terse
+    # narrative digest (session_digest) and dropped from self.history —
+    # the digest rides along in the system prompt instead, at a fraction
+    # of the size.
+    _HISTORY_COMPACT_TRIGGER = 14
+    _HISTORY_KEEP_RAW = 8
+    _DIGEST_CHAR_CAP = 4000
+
     def __init__(self, target: Optional[Target] = None):
         self.target = target or create_or_load_target("default")
         self.history: List[Dict[str, str]] = self.target.state.get("history") or []
         if not isinstance(self.history, list):
             self.history = []
+        # Condensed rolling memory of everything older than the raw window
+        # above — per-target (stored in target.state), so a brand-new
+        # target/session never inherits another investigation's digest or
+        # history. See _compact_history_if_needed().
+        self.session_digest: str = self.target.state.get("session_digest") or ""
+        # Guards background compaction (see _compact_history_if_needed) so
+        # a second trigger firing while one summarization pass is still in
+        # flight skips instead of stacking up concurrent LLM calls.
+        self._compaction_lock = threading.Lock()
         self.guard = AutopilotGuard(
             circuit_threshold=5,
             circuit_cooldown=60.0,
@@ -4214,6 +4392,249 @@ class Agent:
         )
         self._turn_path_scope: Optional[str] = None  # e.g. "/app" — set per-turn in handle_message
         self._forced_skill: Optional[str] = None  # set by /skill-name slash command — one-shot, consumed next turn
+
+    def _compact_history_if_needed(self) -> None:
+        """
+        Trims old raw turns out of self.history immediately — synchronous,
+        cheap, no I/O — which is what actually keeps future prompts small.
+        The folded-out turns are then handed to a BACKGROUND thread for
+        digest summarization + lesson mining, since those are LLM calls
+        and must never block the response the researcher is waiting on.
+
+        (An earlier version of this ran those two LLM calls inline, right
+        before returning the answer. Once history passed the trigger,
+        every turn paid for two sequential slow API calls before the
+        researcher saw anything — a multi-hundred-second hang on what
+        should've been an instant reply. That was the actual bug behind
+        "still responding late." Fixed by making enrichment strictly
+        best-effort and asynchronous — it can lag a turn or two behind
+        without costing the researcher anything.)
+        """
+        if len(self.history) <= self._HISTORY_COMPACT_TRIGGER:
+            return
+
+        cutoff = len(self.history) - self._HISTORY_KEEP_RAW
+        to_fold = self.history[:cutoff]
+        remaining = self.history[cutoff:]
+        if not to_fold:
+            return
+
+        # The size fix happens right here, synchronously — everything below
+        # is enrichment and must not gate it.
+        self.history = remaining
+
+        if not self._compaction_lock.acquire(blocking=False):
+            # A previous compaction pass is still running — skip this round
+            # rather than piling up concurrent LLM calls. The next trigger
+            # will pick up the newly-accumulated turns.
+            return
+
+        target = self.target  # snapshot — safe even if the target changes mid-flight
+
+        def _worker():
+            try:
+                fold_text = self._render_turns_for_summary(to_fold)
+                self._digest_from_text(fold_text, len(to_fold))
+                target.state["session_digest"] = self.session_digest
+                self._mine_lessons_from_text(fold_text, target=target)
+                save_target(target)
+            except Exception:
+                pass  # best-effort background enrichment, never surfaces to the researcher
+            finally:
+                self._compaction_lock.release()
+
+        threading.Thread(target=_worker, daemon=True, name="hellhound-compaction").start()
+
+    def _finalize_target_lessons(self) -> None:
+        """
+        Called right before switching off the current target (see
+        set_target) so a short session — one that never grows past
+        _HISTORY_COMPACT_TRIGGER — still gets its lessons mined instead of
+        losing them the moment the target changes. Runs in the background
+        against a snapshot of the outgoing target/history, same reasoning
+        as _compact_history_if_needed: switching targets must never wait
+        on an LLM call.
+        """
+        if not self.target or len(self.history) < 4:
+            return
+        target = self.target
+        history_snapshot = list(self.history)
+        signature_snapshot = self._current_tech_signature()
+
+        def _worker():
+            try:
+                fold_text = self._render_turns_for_summary(history_snapshot)
+                self._mine_lessons_from_text(fold_text, target=target, tech_signature=signature_snapshot)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True, name="hellhound-target-finalize").start()
+
+    @staticmethod
+    def _render_turns_for_summary(turns: List[Dict[str, str]]) -> str:
+        """Bounded, plain-text rendering of history turns for feeding to a summarizer call."""
+        FOLD_CHAR_BUDGET = 20000
+        lines = []
+        running = 0
+        for h in turns:
+            role = h.get("role", "user")
+            content = str(h.get("content", ""))[:2000]
+            line = f"[{role}] {content}"
+            running += len(line)
+            if running > FOLD_CHAR_BUDGET:
+                break
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _digest_from_text(self, fold_text: str, folded_count: int) -> None:
+        """Updates self.session_digest from a block of older turns being folded out of raw history."""
+        summarizer_prompt = f"""\
+Condense these older turns from an ongoing bug-bounty session into an \
+updated rolling memory digest. Merge with the EXISTING DIGEST below rather \
+than discarding it — this digest is the agent's only memory of anything \
+older than its last few turns.
+
+Keep, tersely (a few short bullet points, not a report):
+- What's actually been tried against this target (tools/approaches used).
+- Confirmed findings or successes.
+- Explicit failures / dead ends — approaches that did NOT work and should \
+NOT be retried.
+- Any outstanding leads not yet resolved.
+
+Drop small talk, greetings, and anything not useful to remember later.
+
+EXISTING DIGEST:
+{self.session_digest or "(none yet)"}
+
+OLDER TURNS TO FOLD IN:
+{fold_text}
+
+Return ONLY the updated digest text — no preamble, no headers."""
+
+        updated = None
+        try:
+            updated, _ = ask_neural_core(
+                prompt=summarizer_prompt,
+                system_prompt="You compress agent conversation history into terse rolling memory notes. Output only the digest text, nothing else.",
+                role="compactor",
+                thinking=False,
+                max_tokens=400,
+                return_usage=True,
+            )
+        except Exception:
+            updated = None
+
+        if updated and isinstance(updated, str) and not updated.startswith("Error:"):
+            self.session_digest = updated.strip()[: self._DIGEST_CHAR_CAP]
+        else:
+            fallback_note = f"[{folded_count} earlier turns condensed — summarization unavailable this pass, details not preserved]"
+            self.session_digest = ((self.session_digest or "").strip() + "\n" + fallback_note).strip()[: self._DIGEST_CHAR_CAP]
+
+    def _mine_lessons_from_text(self, turns_text: str, target: Optional[Target] = None, tech_signature: Optional[List[str]] = None) -> None:
+        """
+        Extracts generalizable (technique, tech_signature, outcome, note)
+        lessons from a block of turns and writes them to the global,
+        cross-target lessons store (hellhound/memory/lessons.py). This is
+        the closest thing to "self-learning" available without being able
+        to fine-tune the underlying cloud model — instead of retraining
+        weights, HELLHOUND keeps its own external notes and re-reads the
+        relevant ones next time a similar-looking target shows up (see
+        find_relevant_lessons, injected into the orchestrator prompt).
+
+        `target` and `tech_signature` are accepted explicitly (rather than
+        always reading self.target / self._current_tech_signature()) because
+        this runs on a background thread — by the time it executes, the
+        researcher may already have switched targets on the main thread, and
+        reading self.target here would silently attribute the outgoing
+        target's lessons to the new one. Callers snapshot both before
+        spawning the thread; only compaction (same target throughout) omits
+        them and gets the live values.
+
+        Best-effort and silent on failure: a target this generic prompt
+        can't extract anything meaningful from should not add noise to the
+        store, and a malformed/empty model response should never break the
+        turn that triggered this.
+        """
+        if not turns_text.strip():
+            return
+
+        target = target or self.target
+        current_sig = tech_signature if tech_signature is not None else self._current_tech_signature()
+        mining_prompt = f"""\
+From these bug-bounty session turns, extract any GENERALIZABLE lessons — \
+things worth remembering on a DIFFERENT target with a similar tech stack, \
+not facts specific only to this one target (skip this target's own \
+hostnames/IPs/tokens/credentials — those never apply elsewhere).
+
+A lesson is a (technique, outcome) pair, e.g.: a bypass technique that \
+worked against a particular WAF/framework, a payload class that got \
+blocked/rate-limited on a particular stack, an auth pattern that was a \
+dead end, a header trick that succeeded. Only extract things with a clear \
+worked/failed outcome — skip anything inconclusive.
+
+Tag each lesson with BOTH kinds of tags in tech_signature: the stack it was \
+tried against (framework/language/CMS/WAF, e.g. "laravel", "nodejs", \
+"cloudflare") AND the vulnerability/technique class it belongs to (e.g. \
+"idor", "sqli", "ssrf", "auth-bypass", "jwt", "xxe", "graphql", \
+"rate-limit-bypass", "parameter-pollution"). This lets a future target match \
+on either "same stack" or "same class of bug", even when the stack differs.
+
+CURRENT TARGET'S KNOWN TECH TAGS (attach relevant ones per lesson, add more \
+specific ones — including a vuln-class tag — if evident from the turns): \
+{", ".join(current_sig) or "(none known yet)"}
+
+TURNS:
+{turns_text}
+
+Return ONLY a JSON array (no other text), each item shaped exactly like:
+{{"technique": "short description of the approach", "outcome": "worked" or \
+"failed", "tech_signature": ["stack-tag", "vuln-class-tag"], "note": "one \
+short sentence of context, e.g. why it failed or what made it work"}}
+
+If there is nothing worth generalizing, return an empty array: []"""
+
+        try:
+            raw, _ = ask_neural_core(
+                prompt=mining_prompt,
+                system_prompt="You extract structured, reusable lessons from a pentest session. Output ONLY a raw JSON array, nothing else — no markdown fences, no commentary.",
+                role="compactor",
+                thinking=False,
+                max_tokens=600,
+                return_usage=True,
+            )
+        except Exception:
+            raw = None
+
+        if not raw or not isinstance(raw, str) or raw.startswith("Error:"):
+            return
+
+        candidate = raw.strip()
+        # Strip an accidental markdown fence — models do this even when told not to.
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate.strip(), flags=re.IGNORECASE)
+
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            return
+        if not isinstance(parsed, list):
+            return
+
+        for item in parsed[:15]:  # sane per-pass ceiling
+            if not isinstance(item, dict):
+                continue
+            technique = item.get("technique")
+            outcome = item.get("outcome")
+            if not technique or outcome not in ("worked", "failed"):
+                continue
+            sig = item.get("tech_signature") or current_sig
+            add_lesson(
+                technique=str(technique),
+                outcome=str(outcome),
+                tech_signature=sig,
+                note=str(item.get("note", "")),
+                target_name=target.name if target else "",
+            )
 
     @staticmethod
     def _build_native_tools() -> List[Dict[str, Any]]:
@@ -4231,10 +4652,15 @@ class Agent:
         return tools
 
     def set_target(self, target_name: str) -> Target:
+        self._finalize_target_lessons()  # mine lessons from the outgoing target before its history is replaced
         self.target = create_or_load_target(target_name)
         self.history = self.target.state.get("history") or []
         if not isinstance(self.history, list):
             self.history = []
+        # Digest is per-target too — a fresh target starts with none, a
+        # revisited target picks its own digest back up, never the
+        # previous target's.
+        self.session_digest = self.target.state.get("session_digest") or ""
         self._turn_path_scope = None  # Reset path scope to prevent bleeding from previous target
         self.guard = AutopilotGuard(  # Reset circuit breaker and rate limiters for the new target
             circuit_threshold=5,
@@ -4259,6 +4685,41 @@ class Agent:
         if not self.target:
             return "default"
         return self.target.host or self.target.name
+
+    def _current_tech_signature(self) -> List[str]:
+        """
+        Best-effort tags describing this target, for matching against the
+        cross-target lessons store — covers BOTH axes a lesson can match
+        on: the tech stack (fingerprinted technologies + hostname tokens)
+        and the vulnerability/technique classes already active on this
+        target (finding types + anything dismissed as a false positive, so
+        "we already ruled out IDOR here" also pulls IDOR-tagged lessons).
+        Never invented — on a completely fresh target this may return very
+        little or nothing, and find_relevant_lessons() falls back
+        gracefully to general lessons in that case.
+        """
+        tags = []
+        techs = self.target.state.get("technologies") or []
+        for t in techs:
+            tags.append(str(t))
+        host = self._display_host or ""
+        host_tokens = re.split(r"[.\-_/:]+", host.lower())
+        tags.extend(tok for tok in host_tokens if len(tok) > 2 and tok not in ("www", "com", "net", "org", "http", "https"))
+
+        # Vuln-class tags: what's already been found or actively ruled out
+        # on this target, so lessons tagged by technique class (idor, sqli,
+        # ssrf, auth-bypass, ...) surface even when the stack itself is new.
+        findings = self.target.findings if isinstance(self.target.findings, list) else []
+        for f in findings:
+            ftype = f.get("type") if isinstance(f, dict) else f
+            if ftype:
+                tags.append(str(ftype).strip().lower())
+        for d in (self.target.state.get("dismissed_false_positives") or []):
+            item = d.get("item") if isinstance(d, dict) else d
+            if item:
+                tags.append(str(item).strip().lower())
+
+        return tags
 
     def _get_trimmed_history(self, max_turns: int = 6, for_chat: bool = False, turn_start_idx: Optional[int] = None) -> List[Dict[str, str]]:
         """
@@ -4293,6 +4754,40 @@ class Agent:
             current_turn_history = self.history[turn_start_idx:]
             # Keep up to max_turns of prior conversational context
             recent_prior = prior_history[-max_turns:] if len(prior_history) > max_turns else prior_history
+
+            # Per-message truncation below (25k tool-result cap, 4k general cap)
+            # bounds each entry individually, but current_turn_history has no
+            # cap on *count* — a long recon/attack turn (max_agent_iterations
+            # up to 60) can rack up 15-20+ tool calls, each up to 25k chars,
+            # before synthesis. That can balloon the synthesizer request past
+            # 200-400k chars, which on a cloud model either takes minutes to
+            # get a first streamed token or effectively hangs the SSE read
+            # with zero visibility (looked like "AI not responding" — it was
+            # actually just buried under a request curl-sized tests never hit).
+            # Cap the current-turn window itself: keep the most recent entries
+            # that fit a total char budget, drop older ones with a note so the
+            # synthesizer still knows work happened before the window.
+            CURRENT_TURN_CHAR_BUDGET = 60000
+            if current_turn_history:
+                kept_rev = []
+                running_total = 0
+                dropped = 0
+                for h in reversed(current_turn_history):
+                    entry_len = len(str(h.get("content", "")))
+                    if kept_rev and running_total + entry_len > CURRENT_TURN_CHAR_BUDGET:
+                        dropped += 1
+                        continue
+                    kept_rev.append(h)
+                    running_total += entry_len
+                current_turn_history = list(reversed(kept_rev))
+                if dropped:
+                    current_turn_history.insert(0, {
+                        "role": "user",
+                        "content": f"[NOTE: {dropped} earlier tool call(s)/message(s) from this turn were omitted "
+                                    f"here to keep the request size sane. Full outputs remain saved under "
+                                    f"~/.hellhound/targets/<target>/raw/ if needed.]"
+                    })
+
             combined = recent_prior + current_turn_history
         else:
             combined = self.history[-max_turns:] if len(self.history) > max_turns else self.history
@@ -4694,6 +5189,15 @@ class Agent:
             or bool(self.target.scope_rules and self.target.scope_rules.in_scope)
         )
 
+        # Code-level pre-gate: with an active target and prior session state
+        # already loaded, a confidently-conversational message ("why did you
+        # do that", "explain this deeper", "nice work!") was still entering
+        # the full orchestrator loop and calling tools — the wall of
+        # TARGET/SCOPE/session context outweighed the model's own judgment
+        # more often than not. This is checked once, here, before the loop
+        # below ever runs — not just requested inside its prompt.
+        _skip_orchestrator_loop = has_real_target and _confidently_conversational(original_user_text)
+
         # Build System Prompt with registered tools and current target scope
         tools_summary = "\n".join([
             f"- {name}: {spec.description} | Params: {json.dumps(spec.parameters)}"
@@ -4812,6 +5316,19 @@ class Agent:
             except Exception:
                 pass  # memory module is best-effort context, never blocks the loop
 
+            if self.session_digest:
+                intel_block += (
+                    "\n\nCONDENSED MEMORY OF EARLIER TURNS (older raw history was "
+                    "folded into this to keep prompts small — includes failed "
+                    "approaches; do not retry something already marked as a dead "
+                    "end here):\n" + self.session_digest
+                )
+
+            lessons_here = find_relevant_lessons(self._current_tech_signature(), limit=6)
+            lessons_block_text = format_lessons_block(lessons_here)
+            if lessons_block_text:
+                intel_block += "\n\n" + lessons_block_text
+
             path_rule = ""
             if self._turn_path_scope:
                 path_rule = f"\n8. CRITICAL: The active application is scoped strictly to '{self._turn_path_scope}'. All tool URLs MUST start with 'https://{self._display_host}{self._turn_path_scope}/...' (e.g. 'https://{self._display_host}{self._turn_path_scope}/dashboard' or 'https://{self._display_host}{self._turn_path_scope}/api/auth/login'). Never query out-of-scope paths."
@@ -4836,11 +5353,16 @@ AVAILABLE TOOLS:
 ALREADY GATHERED THIS SESSION (do not re-run a tool to re-discover this):
 {intel_block}
 
+TARGET HOST (copy exactly, do not retype from memory): '{self._display_host}'
+Every tool call against this target — the very first one included, not just repeats in a loop — must use this exact string verbatim. Retyping/reconstructing it by hand, even once, is how a stray or transposed character slips into a URL and trips the scope guard on a host nobody actually meant to hit.
+
 RULES:
 1. DECISION & TOOL SELECTION (CRITICAL):
    - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network tools (curl, spider, subfinder, httpx, etc.). Output "DONE" immediately.
    - CONVERSATIONAL & EDUCATIONAL QUERIES — DECIDE BY THIS TEST, NOT BY MATCHING EXAMPLE PHRASES: Before considering any tool, ask yourself: "Can I fully and correctly answer THIS message using only what's already in ALREADY GATHERED THIS SESSION / conversation history, with zero new information from the target?" If yes — it's a question, a request to explain/recap something already done, an identity/capability/greeting question, a methodology question, anything answerable from existing context — output "DONE" immediately with a normal conversational reply. Only emit a tool call if answering genuinely requires NEW data or a NEW action against the target that isn't already sitting in front of you. Illustrative (not exhaustive) examples of the "no new data needed" case: "explain...", "how does...", "what is...", "why did...", "hi", "hello", "what can you do", "who are you", "who am i", "what's my name", "how does this work", "why did that fail", "what did you find". This test applies EVEN IF a target is already active and tools were run earlier in the session — an ongoing mission does not mean every subsequent message is part of it; judge THIS message on its own, by whether IT needs new data, not by session momentum. Being the first message in a session, or a target already being scoped, is NOT on its own a reason to start testing — the message itself has to actually require new information.
    - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a valid, in-scope target endpoint is required right now.
+   - DO NOT re-run `spider` (a full crawl) more than once per meaningfully-different session state. A fresh unauthenticated crawl, then ONE re-crawl after obtaining an authenticated session, is normal and enough — re-crawling again on a specific sub-path you already have covered (e.g. crawling `/letters/new` right after already crawling the whole site authenticated) adds nothing and burns time. If you already have the endpoints you need from an earlier crawl in ALREADY GATHERED THIS SESSION, use `curl`/`content_discovery` directly against known endpoints instead of re-crawling. If the researcher has told you to stop re-running a tool, that instruction holds for the rest of the session, not just the message it was given in.
+   - DO NOT call `record_finding` in response to a message that isn't reporting NEW evidence. Explaining a bug you already found, recapping what happened, or the researcher reacting/complimenting/joking about a result already in ALREADY GATHERED THIS SESSION are conversational — they need zero tool calls, `record_finding` included. Re-recording something already confirmed doesn't make it "more confirmed"; it's noise, not evidence.
 
 2. MISSION OBJECTIVE FIDELITY & AUTONOMOUS EXPLOIT PROGRESSION (CRITICAL):
    - TARGET ACCOUNT / ROLE: Focus strictly on the primary requested target (e.g. Administrator or specified high-privilege role/user).
@@ -5014,6 +5536,13 @@ The researcher explicitly requested a formal report. Provide a structured, profe
         # constraints nobody set.
         target_configured = has_real_target
 
+        digest_block = (
+            f"\nMEMORY FROM EARLIER THIS SESSION (condensed — includes things "
+            f"already tried, including approaches that failed; do not repeat "
+            f"a dead end listed here):\n{self.session_digest}\n"
+            if self.session_digest else ""
+        )
+
         light_context_block = ""
         if target_configured:
             light_context_block = f"""
@@ -5021,7 +5550,7 @@ CURRENT SESSION CONTEXT (background only — do not mention scope, targets, or
 status mechanics unless the researcher's message is actually about them):
 TARGET: {self._display_host}
 SCOPE: {scope_summary}
-FINDINGS SO FAR: {len(self.target.findings)}{artifact_block_synth}"""
+FINDINGS SO FAR: {len(self.target.findings)}{artifact_block_synth}{digest_block}"""
 
         # ── Lightweight persona-only prompt for turns where no hunting tool
         # ran (the Claude-Code-style default: most turns are just talk, not a
@@ -5057,8 +5586,10 @@ human should do): {tool_names_line}
 {forced_skill_block}
 INSTRUCTIONS:
 - No hunting tool executed this turn — this is general conversation, a
-  question, or casual chat, not an active recon/attack campaign. That's
-  because no target is set yet, NOT because you lack tools.
+  question, casual chat, or a reaction to something already done, not a new
+  active recon/attack step. That's either because no target is set yet, or
+  because this specific message doesn't need new tool work even though a
+  target is active — NOT because you lack tools.
 - Respond naturally and directly, like a capable assistant talking to
   someone they know — not a pentest report generator reciting doctrine.
 - Do NOT open with a status tag, do NOT recite scope/baseline rules,
@@ -5084,7 +5615,7 @@ INSTRUCTIONS:
 TARGET: {self._display_host}
 SCOPE CONSTRAINTS: {scope_summary}{path_scope_synth}
 CURRENT FINDINGS: {len(self.target.findings)} verified findings
-{artifact_block_synth}
+{artifact_block_synth}{digest_block}
 AVAILABLE TOOLS (this is the complete, real list — you have no other tools):
 {tools_summary}
 
@@ -5114,6 +5645,27 @@ INSTRUCTIONS:
         turn_start_idx = len(self.history)
         self.history.append({"role": "user", "content": user_text})
         tools_executed = []
+        # Separate from tools_executed above: only tool calls that actually
+        # DID something new (not a dedup/no-op skip like record_finding
+        # returning "already_recorded", or jwt_forge returning "skipped")
+        # count toward "this turn ran real tool work" for the purpose of
+        # picking the full doctrine-heavy synth prompt vs the light casual
+        # one below. Without this, a pure-chat follow-up ("explain that
+        # bug again", "nice work!") that only touches a no-op record_finding
+        # call still looked like a real hunting turn and got the full
+        # report-register prompt instead of a normal conversational reply.
+        _NO_OP_TOOL_STATUSES = {"skipped", "already_recorded"}
+        _productive_tools_executed = []
+        # Hard cap on record_finding per turn — enforced here, not just
+        # requested in the prompt. Prompt instructions are advisory; the
+        # model has repeatedly ignored "don't re-record" wording and kept
+        # calling record_finding 5-10+ times in a single turn (recap
+        # follow-ups, praise, even a meta-question about its own behavior).
+        # Once this cap is hit, further record_finding calls in THIS turn
+        # are refused before the executor even runs — deterministic, not
+        # dependent on the model choosing to listen.
+        _RECORD_FINDING_CAP_PER_TURN = 3
+        _record_finding_calls_this_turn = 0
         ai_resp = None  # stays None if has_real_target is False and the
                          # loop below never runs — without this, referencing
                          # it in the final-answer fallback chain crashes with
@@ -5133,10 +5685,13 @@ INSTRUCTIONS:
             self._turn_path_scope = _new_scope
 
         # ── 3. Orchestrator Iteration Loop ──
-        # Only enter the tool loop when there's a real target to hit.
-        # The model decides whether to use tools or just answer — Rule 1
-        # in the orchestrator prompt handles conversational queries with DONE.
-        if has_real_target:
+        # Only enter the tool loop when there's a real target AND this turn
+        # isn't confidently conversational (_skip_orchestrator_loop, checked
+        # above — a code-level gate, not just the prompt's own Rule 1). The
+        # model still makes the real judgment call for anything not caught
+        # by that gate; this only removes the loop entirely for the clear
+        # cases instead of trusting the prompt to self-regulate every time.
+        if has_real_target and not _skip_orchestrator_loop:
             for iteration in range(max_iterations):
                 self._current_turn = iteration + 1
                 if cancel_check and cancel_check():
@@ -5279,6 +5834,30 @@ INSTRUCTIONS:
                         continue
                     _executed_signatures.add(_sig)
 
+                    # Hard cap: record_finding specifically, enforced before
+                    # execution — see _RECORD_FINDING_CAP_PER_TURN comment above.
+                    if t_name == "record_finding":
+                        _record_finding_calls_this_turn += 1
+                        if _record_finding_calls_this_turn > _RECORD_FINDING_CAP_PER_TURN:
+                            blocked_result = {
+                                "status": "blocked",
+                                "note": (
+                                    f"Hard cap hit — that's {_record_finding_calls_this_turn} record_finding "
+                                    f"calls this turn, capped at {_RECORD_FINDING_CAP_PER_TURN}. Whatever you're "
+                                    f"trying to log, it's a variation of something already recorded — stop "
+                                    f"logging and move on to the next real step, or finish up."
+                                )
+                            }
+                            if emit and hasattr(emit, "tool_result"):
+                                emit.tool_result(t_name, blocked_result)
+                            self.history.append({"role": "assistant", "content": ai_resp})
+                            self.history.append({
+                                "role": "user",
+                                "content": f"[TOOL BLOCKED] {blocked_result['note']}"
+                            })
+                            user_text = "record_finding is capped for this turn. Do not call it again — move on to the next step or wrap up."
+                            continue
+
                     tools_executed.append(t_name)
                     
                     if emit and hasattr(emit, "set_label"):
@@ -5290,6 +5869,9 @@ INSTRUCTIONS:
                         emit.info(f"[*] Executing tool: {t_name} with args: {t_args}")
 
                     tool_result = self.execute_tool_call(t_name, t_args, emit)
+
+                    if not (isinstance(tool_result, dict) and tool_result.get("status") in _NO_OP_TOOL_STATUSES):
+                        _productive_tools_executed.append(t_name)
 
                     if emit and hasattr(emit, "tool_result"):
                         emit.tool_result(t_name, tool_result)
@@ -5429,6 +6011,7 @@ INSTRUCTIONS:
                         t_name = tool_call["tool"]
                         t_args = tool_call["args"]
                         tools_executed.append(t_name)
+                        _productive_tools_executed.append(t_name)
                         if emit and hasattr(emit, "set_label"):
                             emit.set_label(f"Let me cook — probing {self._display_host}")
                         if emit and hasattr(emit, "tool_start"):
@@ -5488,7 +6071,7 @@ INSTRUCTIONS:
         # quoting its own baseline doctrine back in casual replies.
         synthesizer_system_prompt = (
             full_synth_prompt
-            if (tools_executed or (report_requested and has_critical_findings))
+            if (_productive_tools_executed or (report_requested and has_critical_findings))
             else casual_synth_prompt
         )
 
@@ -5569,7 +6152,7 @@ INSTRUCTIONS:
                 synth_prompt,
                 self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx)
             )
-        elif not tools_executed:
+        elif not _productive_tools_executed:
             if report_requested and has_critical_findings:
                 synth_prompt = (
                     f"The researcher requested: \"{original_user_text}\"\n\n"
@@ -5618,7 +6201,9 @@ INSTRUCTIONS:
         final_response = final_answer or ai_resp or "Hit a blank response twice in a row on my end — try that again?"
         final_response = _clean_synthesizer_output(final_response)
         self.history.append({"role": "assistant", "content": final_response})
+        self._compact_history_if_needed()
         self.target.state["history"] = self.history
+        self.target.state["session_digest"] = self.session_digest
         save_target(self.target)
         return final_response
 

@@ -23,6 +23,12 @@ from hellhound.memory.investigation import (
     snapshot_briefing_state,
     answer_from_memory,
 )
+from hellhound.memory.lessons import (
+    load_lessons,
+    add_lesson,
+    find_relevant_lessons,
+    format_lessons_block,
+)
 
 __all__ = [
     "LIST_FIELDS",
@@ -44,4 +50,8 @@ __all__ = [
     "build_investigation_graph",
     "snapshot_briefing_state",
     "answer_from_memory",
+    "load_lessons",
+    "add_lesson",
+    "find_relevant_lessons",
+    "format_lessons_block",
 ]
