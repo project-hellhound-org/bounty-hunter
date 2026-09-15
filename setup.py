@@ -16,10 +16,6 @@ setup(
         "requests",
         "rich",
         "prompt_toolkit",
-        "pywebview",
-        "qtpy",
-        "PyQt6",
-        "PyQt6-WebEngine",
     ],
     entry_points={
         "console_scripts": [

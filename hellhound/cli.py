@@ -19,26 +19,20 @@ import click
 )
 @click.option("--print", "-p", "print_cmd", default=None, help="Execute a slash command in headless mode and print output")
 @click.option("--json", "-j", "json_output", is_flag=True, default=False, help="Force structured JSON output for automation")
-@click.option("--gui", is_flag=True, default=False, help="Launch PyWebView graphical user interface")
 @click.version_option("12.7.0", prog_name="HELLHOUND")
 @click.pass_context
-def cli(ctx, print_cmd, json_output, gui):
+def cli(ctx, print_cmd, json_output):
     """
     HELLHOUND — Autonomous bug bounty recon & triage assistant
 
     Run without arguments to launch the interactive chat console.
 
       hellhound                     → interactive console
-      hellhound gui                 → launch PyWebView GUI
       hellhound --print "/scope show --json"
       hellhound -p "/recon example.com"
     """
     if print_cmd:
         _execute_headless(print_cmd, json_output)
-        return
-
-    if gui:
-        _launch_gui()
         return
 
     if ctx.invoked_subcommand is None:
@@ -89,17 +83,6 @@ def console():
 
 
 # -------------------------------------------------
-# GUI subcommand (PyWebView chat-archive interface)
-# -------------------------------------------------
-@cli.command()
-@click.argument("target", required=False, default=None)
-@click.option("--debug", is_flag=True, default=False, help="Enable webview developer tools")
-def gui(target, debug):
-    """Launch the modern PyWebView GUI interface"""
-    _launch_gui(target=target, debug=debug)
-
-
-# -------------------------------------------------
 # Upgrade subcommand
 # -------------------------------------------------
 @cli.command()
@@ -129,6 +112,59 @@ def upgrade():
 
 
 # -------------------------------------------------
+# Terminal preference (used by packaging/hellhound-launch.sh, the desktop
+# launcher's entry point) — NOT read by the console itself. Stored as a
+# plain one-line file, not config.json, so the bash wrapper can read it
+# with `cat` before Python (and the venv) is even on the critical path.
+# -------------------------------------------------
+@cli.group()
+def terminal():
+    """Configure which terminal emulator the desktop launcher opens."""
+    pass
+
+
+@terminal.command("set")
+@click.argument("name")
+def terminal_set(name):
+    """Pin the desktop launcher to a specific terminal (e.g. ghostty, kitty, alacritty)."""
+    import os as _os
+    import shutil as _shutil
+    from pathlib import Path
+
+    if _shutil.which(name) is None:
+        click.echo(click.style(
+            f"[!] Warning: '{name}' was not found on PATH right now — saving the "
+            f"preference anyway in case it's installed later.", fg="yellow"
+        ))
+
+    pref_dir = Path.home() / ".hellhound"
+    pref_dir.mkdir(parents=True, exist_ok=True)
+    (pref_dir / "terminal_preference").write_text(name.strip() + "\n")
+    click.echo(f"[+] Desktop launcher will now open HELLHOUND in: {name}")
+
+
+@terminal.command("show")
+def terminal_show():
+    """Show the currently configured terminal preference."""
+    from pathlib import Path
+    pref_file = Path.home() / ".hellhound" / "terminal_preference"
+    if pref_file.exists() and pref_file.read_text().strip():
+        click.echo(pref_file.read_text().strip())
+    else:
+        click.echo("(none set — desktop launcher auto-detects an installed terminal)")
+
+
+@terminal.command("clear")
+def terminal_clear():
+    """Clear the saved terminal preference and go back to auto-detect."""
+    from pathlib import Path
+    pref_file = Path.home() / ".hellhound" / "terminal_preference"
+    if pref_file.exists():
+        pref_file.unlink()
+    click.echo("[+] Cleared — desktop launcher will auto-detect a terminal.")
+
+
+# -------------------------------------------------
 # Shared launcher
 # -------------------------------------------------
 def _launch_console():
@@ -140,18 +176,6 @@ def _launch_console():
         sys.exit(0)
     except Exception as e:
         click.echo(f"[!] Failed to start console: {e}")
-        sys.exit(1)
-
-
-def _launch_gui(target=None, debug: bool = False):
-    try:
-        from hellhound.gui_app import launch_gui
-        launch_gui(target=target, debug=debug)
-    except KeyboardInterrupt:
-        click.echo("\n[+] Exiting HELLHOUND GUI.")
-        sys.exit(0)
-    except Exception as e:
-        click.echo(f"[!] Failed to start GUI: {e}")
         sys.exit(1)
 
 

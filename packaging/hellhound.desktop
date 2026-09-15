@@ -1,9 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=HELLHOUND
-Comment=Autonomous bug bounty recon & triage assistant
-Exec=hellhound --gui
+GenericName=Bug Bounty Reconnaissance & Triage Framework
+Comment=Autonomous AI bug bounty recon & triage assistant — opens the interactive terminal console
+Exec=hellhound
 Icon=hellhound
-Terminal=false
-Categories=Security;Development;Utility;
+Terminal=true
+Categories=Security;Network;System;Utility;
+Keywords=bugbounty;recon;pentest;security;hacking;osint;
 StartupNotify=true

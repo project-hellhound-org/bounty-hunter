@@ -44,9 +44,9 @@ class _AnimatorShim:
     """
     Some modules (spider.py) were written against a local `Emit` class that
     exposes `self.emit.animator.{start_anim,update,stop_anim,active}` for a
-    background progress spinner. The GUI-facing PlainEmit/ConsoleEmit never
-    implemented that surface, so any such module crashed the moment it ran
-    outside its original standalone script with an AttributeError.
+    background progress spinner. PlainEmit/ConsoleEmit never implemented
+    that surface, so any such module crashed the moment it ran outside its
+    original standalone script with an AttributeError.
 
     This shim gives every Emit backend that same interface, routed onto
     whatever progress_start/progress_update/progress_stop this backend

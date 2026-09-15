@@ -234,23 +234,3 @@ def list_targets(exclude_default: bool = True) -> List[str]:
     # Sort most recently modified first
     targets_with_time.sort(key=lambda x: x[1], reverse=True)
     return [t[0] for t in targets_with_time]
-
-
-def migrate_legacy_history() -> int:
-    """Migrate legacy targets from gui/target_history.json into target tasks."""
-    history_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "gui", "target_history.json")
-    if not os.path.exists(history_file):
-        return 0
-    try:
-        with open(history_file, "r", encoding="utf-8") as f:
-            items = json.load(f)
-            if not isinstance(items, list):
-                return 0
-            migrated = 0
-            for item in items:
-                if isinstance(item, str) and item.strip():
-                    t = create_or_load_target(item.strip())
-                    migrated += 1
-            return migrated
-    except Exception:
-        return 0

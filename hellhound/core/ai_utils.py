@@ -510,11 +510,10 @@ class ThinkingIndicator:
     def progress_start(self, desc: str, total: int = 0):
         """engine.run_single()/run_external() call emit.progress_start(name)
         before running a module and emit.progress_stop() in a `finally`
-        afterward. On the CLI path a raw ThinkingIndicator is passed as
-        `emit` (the GUI path wraps it in GuiEmit, which already defines
-        these) — without this alias every module run raised
-        AttributeError immediately. Just relabels the already-running
-        spinner; does not touch the thread.
+        afterward, but a raw ThinkingIndicator didn't define either —
+        without this alias every module run raised AttributeError
+        immediately. Just relabels the already-running spinner; does not
+        touch the thread.
         """
         self.set_label(desc)
 

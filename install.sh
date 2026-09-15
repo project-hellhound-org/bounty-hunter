@@ -334,7 +334,7 @@ with open(p, 'w') as f:
     fi
 fi
 
-# ── 7. System GUI (PyWebView HUD) ──────────────────────
+# ── 7. Desktop Launcher (opens the CLI in a terminal) ──
 echo ""
 info "Registering HELLHOUND as a desktop application..."
 mkdir -p "$HOME/.local/share/applications" "$HOME/.local/share/hellhound" "$HOME/.local/share/icons/hicolor/512x512/apps" "$HOME/.local/share/pixmaps"
@@ -349,10 +349,15 @@ cp "$ICON_SRC" "$HOME/.local/share/hellhound/logo.png" 2>/dev/null || true
 cp "$ICON_SRC" "$HOME/.local/share/icons/hellhound.png" 2>/dev/null || true
 cp "$ICON_SRC" "$HOME/.local/share/pixmaps/hellhound.png" 2>/dev/null || true
 
-# Generate hicolor icon hierarchy for Linux application launchers
+# Generate hicolor icon hierarchy for Linux application launchers (best-effort
+# — only runs if Pillow happens to be available; a missing Pillow just means
+# a lower-resolution icon, never blocks the install)
 "$VENV_DIR/bin/python" -c "
 import os
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    raise SystemExit(0)
 src = '$ICON_SRC'
 if os.path.exists(src):
     try:
@@ -367,9 +372,23 @@ if os.path.exists(src):
     except Exception: pass
 " 2>/dev/null || true
 
-chmod +x "$PROJECT_ROOT/gui/hellhound-gui.sh"
+# Install the terminal-aware launcher wrapper alongside the `hellhound`
+# symlink so it's resolvable by bare name from Exec=. This wrapper picks an
+# explicit terminal emulator (user preference, via `hellhound terminal set`,
+# or auto-detected) instead of relying on Terminal=true's DE-default
+# handoff, which had no way to honor a user's own terminal choice (e.g.
+# ghostty) and no consistent starting window size.
+cp "$PROJECT_ROOT/packaging/hellhound-launch.sh" "$HOME/.local/bin/hellhound-launch.sh"
+chmod +x "$HOME/.local/bin/hellhound-launch.sh"
+if [ -w "/usr/local/bin" ] 2>/dev/null; then
+    ln -sf "$HOME/.local/bin/hellhound-launch.sh" "/usr/local/bin/hellhound-launch.sh" 2>/dev/null || true
+elif command -v sudo &>/dev/null; then
+    sudo ln -sf "$HOME/.local/bin/hellhound-launch.sh" "/usr/local/bin/hellhound-launch.sh" 2>/dev/null || true
+fi
 
-# Install .desktop file
+# Install .desktop file. Exec points at the wrapper above (Terminal=false —
+# the wrapper opens its own terminal window itself, so the desktop
+# environment doesn't need to supply one).
 cp "$PROJECT_ROOT/packaging/hellhound.desktop" "$HOME/.local/share/applications/hellhound.desktop"
 chmod +x "$HOME/.local/share/applications/hellhound.desktop"
 
@@ -382,22 +401,13 @@ if command -v update-desktop-database &>/dev/null; then
 fi
 touch "$HOME/.local/share/applications/hellhound.desktop"
 
-# Update system alias
-GUI_ALIAS="alias hellhound-gui='$VENV_DIR/bin/hellhound --gui'"
-if grep -qF "alias hellhound-gui=" "$SHELL_RC" 2>/dev/null; then
-    sed -i "s|alias hellhound-gui=.*|$GUI_ALIAS|" "$SHELL_RC"
-else
-    echo "$GUI_ALIAS" >> "$SHELL_RC"
-fi
-
-success "HELLHOUND registered — search for it in your application menu."
+success "HELLHOUND registered — search for it in your application menu (opens the CLI in a terminal)."
 
 # ── 8. Done ──────────────────────────────────────────
 echo ""
 echo -e "  ${GRN}${BLD}HELLHOUND installed successfully.${RST}"
 echo -e "  Venv    : ${CYN}$VENV_DIR${RST}"
 echo -e "  Command : ${CYN}hellhound${RST}"
-echo -e "  GUI HUD : ${CYN}hellhound-gui${RST}"
 if [ -n "$OLLAMA_MODEL" ] && command -v ollama &>/dev/null; then
     echo -e "  Local AI: ${CYN}Ollama ($OLLAMA_MODEL)${RST} — configured as orchestrator"
 elif command -v ollama &>/dev/null; then

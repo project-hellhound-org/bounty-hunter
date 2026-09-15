@@ -4,10 +4,6 @@ colorama
 aiohttp
 rich
 prompt_toolkit
-pywebview>=5.1
-qtpy
-PyQt6==6.6.1
-PyQt6-WebEngine==6.6.0
 cryptography
 beautifulsoup4
 lxml

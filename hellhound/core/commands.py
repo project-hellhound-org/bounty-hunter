@@ -2,8 +2,8 @@
 hellhound/core/commands.py
 
 Unified Slash-Command Architecture & Central Dispatcher.
-Provides a unified entrypoint for interactive console, headless CLI automation (--print),
-and GUI IPC command execution.
+Provides a unified entrypoint for interactive console and headless CLI
+automation (--print).
 """
 
 from dataclasses import dataclass, field
@@ -1357,8 +1357,7 @@ def handle_handle(args: List[str], session_context: Dict[str, Any], emit: Any) -
     """
     /handle [name]
     Sets (or shows) the researcher_handle used to personalize the
-    "Happy hacking" sign-off and the X-Bugbounty header. GUI Settings
-    already had a field for this; CLI had no way to set it at all.
+    "Happy hacking" sign-off and the X-Bugbounty header.
     """
     is_json = "--json" in args or getattr(emit, "json_mode", False)
     clean_args = [a for a in args if a not in ("--json", "-j")]

@@ -435,10 +435,18 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
 
     all_kb = merge_key_bindings([load_key_bindings(), kb])
 
+    # NOTE: width is intentionally NOT pinned with D.exact(w). `w` is only a
+    # snapshot of the terminal size at the moment this function was called;
+    # baking it into an exact Dimension meant the frame border stayed at that
+    # stale width even after prompt_toolkit's own SIGWINCH-driven re-render,
+    # so growing/maximizing the terminal made the border visibly detach from
+    # the real edge. Leaving width unset makes the Frame greedy (weight=1),
+    # so it fills whatever the *current* terminal width is on every redraw —
+    # including mid-session resizes — instead of only picking up a new size
+    # the next time this function happens to be called.
     frame = Frame(
         body=text_area,
         height=D.exact(3),
-        width=D.exact(w),
         style="class:frame",
     )
 
@@ -868,6 +876,25 @@ def start_chat_session(initial_target: Optional[str] = None):
 
     # Render Welcome Banner Card
     render_banner_card(target_name=agent.target.name)
+
+    # ── Auto-redraw on terminal resize ──
+    # render_banner_card() is a plain print(), computed once from whatever
+    # get_terminal_width() returned at call time — it is NOT a live layout,
+    # so it never reflows on its own. Without this, maximizing the terminal
+    # window after launch leaves the banner frozen at its old (often small,
+    # launcher-default) width, visibly misaligned against the new terminal
+    # edge, and the only way back was manually typing `clear`. SIGWINCH is
+    # raised by the terminal on every resize, so hook it to redo the same
+    # clear+redraw automatically. This only fires while we're between
+    # prompts — prompt_toolkit installs its own SIGWINCH handler for the
+    # duration of prompt_user_input()'s Application.run(), so the input
+    # frame there (now un-pinned, see prompt_user_input) keeps resizing
+    # itself live and this handler doesn't fight it.
+    if hasattr(signal, "SIGWINCH"):
+        def _on_resize(signum, frame):
+            os.system("clear")
+            render_banner_card(target_name=agent.target.name)
+        signal.signal(signal.SIGWINCH, _on_resize)
 
     while True:
         try:

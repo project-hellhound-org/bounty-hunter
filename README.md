@@ -17,7 +17,6 @@
   <a href="#the-recon--triage-arsenal">Arsenal</a> ·
   <a href="#what-it-finds">What It Finds</a> ·
   <a href="#hunting-methodology-skills">Skills</a> ·
-  <a href="#desktop-gui-app">Desktop GUI</a> ·
   <a href="#license">License</a>
 </p>
 
@@ -44,10 +43,9 @@
 
 It features **persistent target memory and an automated artifact blackboard**—harvested tokens, credentials, session cookies, open ports, crawl trees, visual screenshots, and triage notes are automatically retained in isolated per-target workspaces (`~/.hellhound/targets/<target>/`) so hunts seamlessly resume across sessions without token loss or "lost-in-the-middle" reasoning drops.
 
-Works across three flexible interfaces:
+Works across two flexible interfaces:
 - **Interactive Terminal**: An interactive terminal environment with real-time token streaming, live progress feedback, and inline command autocompletion (`hellhound`).
 - **Headless CLI Runner**: Direct one-line command execution for quick scripts and CI/CD pipelines (`hellhound -p "prompt"`).
-- **Desktop GUI Application**: A dedicated Electron/React desktop application with persistent target management, topology graphs, live findings drawers, and visual screenshot proof (`hellhound --gui`).
 
 ---
 
@@ -136,7 +134,7 @@ The automated installer will:
 - Set up an isolated Python virtual environment at `~/.hellhound-env`.
 - Mount the headless browser & Playwright SPA engine with all system dependencies.
 - Verify and install the offensive toolchain (`gowitness`, `subfinder`, `httpx`, `dnsx`, `naabu`, `ffuf`, `alterx`, `tlsx`, `shuffledns`, `subzy`).
-- Create global symlinks and desktop launcher integrations (`hellhound`, `hellhound --gui`).
+- Create a global `hellhound` command symlink.
 
 ---
 
@@ -227,12 +225,6 @@ hellhound -p "target is https://lab.ctfio.com and creds user:pass, takeover admi
 
 # Direct slash command execution with JSON output
 hellhound -p "/hunt target.com --json"
-```
-
-### 3. Native Desktop GUI App
-Launch the desktop application with target workspace switcher and live visual drawers:
-```bash
-hellhound --gui
 ```
 
 ---
@@ -345,21 +337,6 @@ Search skills anytime inside the console:
 > /skills ctf
 > /skills graphql
 ```
-
----
-
-## Desktop GUI App
-
-Bounty Hunter includes a native desktop interface:
-
-```bash
-hellhound --gui
-```
-
-- **Target-Archive Sidebar**: Switch between targets or spin up new target workspaces instantly.
-- **Live Thinking Drawer**: Real-time inspection of the AI co-pilot's tool-selection rationale and artifact ledger.
-- **Instant Slash Palette**: Execute `/recon`, `/hunt`, `/model`, and `/report` directly with UI feedback.
-- **Findings & Evidence Pane**: Tabbed view of discovered subdomains, live hosts, open ports, visual screenshots, and extracted loot.
 
 ---
 
