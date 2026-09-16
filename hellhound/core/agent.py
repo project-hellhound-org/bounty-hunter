@@ -1263,38 +1263,96 @@ def _clean_synthesizer_output(text: str) -> str:
     """
     Defensive net: if the synthesizer model ignored its plain-prose
     instruction and emitted a raw orchestrator-style JSON tool-call object
-    instead (seen with small local models echoing prior tool-call turns),
-    convert it into a readable sentence instead of dumping raw JSON to the
-    user's terminal.
+    instead of (or wrapped around) real prose, recover something readable
+    instead of dumping raw JSON to the user's terminal.
+
+    Seen in practice with small local models on plain advisory questions
+    (e.g. "how do I fix this as a developer") that need no tool at all:
+    the model reaches for run_terminal_command with an `echo` just to
+    "print" its answer rather than writing it directly as text. That case
+    gets unwrapped — the echoed string IS the real answer, so it's
+    returned as-is rather than just reformatted JSON. Any other stray
+    tool-call shape gets stripped down to whatever real prose surrounded
+    it; the raw JSON itself is never shown to the researcher.
     """
-    if not text:
-        return text
-    stripped = text.strip()
-    candidate = stripped
-    m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', stripped)
-    if m:
-        candidate = m.group(1)
-    elif not (stripped.startswith("{") and stripped.endswith("}")):
+    if not text or '"tool"' not in text:
         return text
 
+    start = text.find("{")
+    if start == -1:
+        return text
+
+    # Balanced-brace, string/escape-aware scan (mirrors
+    # _extract_first_balanced_json) so we know exactly where the JSON
+    # object ends and can preserve any real prose before/after it.
+    depth = 0
+    in_string = False
+    escape = False
+    end = -1
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end == -1:
+        return text
+
+    candidate = text[start:end]
     try:
         parsed = json.loads(candidate)
     except Exception:
         return text
-
-    if not isinstance(parsed, dict) or not ({"tool", "next_steps"} & set(parsed.keys())):
+    if not isinstance(parsed, dict) or "tool" not in parsed:
         return text
 
+    tool_name = parsed.get("tool")
+    args = parsed.get("args") or parsed.get("parameters") or parsed.get("arguments") or {}
+    before = text[:start].strip()
+    after = text[end:].strip()
+
+    # Most common failure mode: no tool was actually needed for a plain
+    # informational/advisory question, but the model reached for
+    # run_terminal_command + echo purely to "print" its answer instead of
+    # just writing it as prose. Unwrap the echoed string and use THAT as
+    # the answer instead of leaking the JSON wrapper around it.
+    if tool_name == "run_terminal_command" and isinstance(args, dict):
+        cmd = str(args.get("command", "")).strip()
+        m = re.match(r"^echo\s+(['\"])(.*)\1\s*$", cmd, re.DOTALL)
+        if m:
+            echoed = m.group(2).strip()
+            if echoed:
+                pieces = [p for p in (before, echoed, after) if p]
+                return "\n\n".join(pieces)
+
+    # Any other stray tool-call JSON: keep whatever real prose the model
+    # wrote around it, and drop the JSON itself rather than showing it raw.
     parts = []
+    if before:
+        parts.append(before)
     if parsed.get("analysis"):
         parts.append(str(parsed["analysis"]))
     if parsed.get("next_steps"):
         parts.append(f"Next: {parsed['next_steps']}")
-    if parsed.get("tool"):
-        args_str = json.dumps(parsed.get("args", {}))
-        parts.append(f"(Suggested next tool: {parsed['tool']} {args_str})")
-
-    return "\n\n".join(parts) if parts else text
+    if not parts:
+        args_str = json.dumps(args)
+        parts.append(f"(Suggested next tool: {tool_name} {args_str})")
+    if after:
+        parts.append(after)
+    return "\n\n".join(parts)
 
 
 def _execute_dig(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -6175,6 +6233,17 @@ INSTRUCTIONS:
   If a tool result already appears earlier in this conversation, report
   what it actually returned (e.g. the real output path) — don't restate
   the call, and don't invent a result that isn't there.
+- ADVICE / EXPLAIN / "HOW WOULD I FIX THIS" QUESTIONS NEED NO TOOL AT ALL.
+  If the researcher asks something like "how would I fix this as the
+  developer", "explain that vulnerability", or any other question you can
+  just answer from what you already know — answer directly, in plain
+  prose, right here. Do NOT reach for run_terminal_command (or any other
+  tool) with an `echo`/`cat`/print-style command as a way to "output" your
+  answer — a tool call is for taking a real action against a target or the
+  filesystem, not a formatting trick for delivering text you could have
+  just written. If you ever notice yourself building a {{"tool": ...}}
+  object whose only purpose is to print a string, stop and write that
+  string as your actual response instead.
 """
 
         # ── Full hunting-turn prompt — target header, scope, baseline
