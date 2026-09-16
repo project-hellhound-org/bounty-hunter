@@ -3177,7 +3177,12 @@ def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     screenshots_dir.mkdir(parents=True, exist_ok=True)
 
     delay = int(args.get("delay", 2))
-    fullpage = bool(args.get("fullpage", False))
+    # Default to full-page capture (see ToolSpec description) — omitting
+    # `fullpage` entirely used to silently fall back to viewport-only,
+    # which cuts off anything below the fold on a real page (a patient
+    # records table, admin secrets further down, etc.). Only an explicit
+    # `false` opts into a viewport-only shot now.
+    fullpage = bool(args.get("fullpage", True))
 
     # Resolve headers and session cookies for authenticated screenshots
     custom_headers = normalize_headers(args.get("headers"))
@@ -3520,7 +3525,477 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
 
     if emit and hasattr(emit, "success"):
         emit.success(f"[✓] Finding recorded: {title}")
-    return {"status": "recorded", "title": title, "kind": kind, "severity": severity}
+
+    result = {"status": "recorded", "title": title, "kind": kind, "severity": severity}
+
+    # Permanent feature, not conditional on the researcher (or the model)
+    # separately asking for a report: the moment a real vulnerability is
+    # confirmed and logged here, save a portable HTML artifact for it
+    # immediately. Best-effort — a failure here must never fail the
+    # underlying finding recording.
+    auto_report_path = _auto_save_finding_report(target, title, kind, severity, request_ref, note, emit)
+    if auto_report_path:
+        result["report_path"] = auto_report_path
+
+    return result
+
+
+_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+_SEVERITY_COLOR = {
+    "critical": "#ff3860", "high": "#ff7a45", "medium": "#ffc107",
+    "low": "#4da3ff", "info": "#8a8f98",
+}
+
+
+def _html_escape(s: Any) -> str:
+    import html as _html_mod
+    return _html_mod.escape(str(s if s is not None else ""), quote=True)
+
+
+# Findings at these severities count as "a vulnerability was found" for
+# the purposes of auto-saving a report. "low"/"info" are recon notes
+# (interesting endpoints, directory listings, etc.) rather than confirmed
+# vulnerabilities, so they don't trigger a report on their own — the
+# researcher can still get one for those via an explicit export_report.
+_AUTO_REPORT_SEVERITIES = {"critical", "high", "medium"}
+
+
+def _auto_save_finding_report(
+    target: Target, title: str, kind: str, severity: str, request_ref: str, note: str, emit: Any
+) -> Optional[str]:
+    """
+    Fires automatically every time record_finding logs a NEW confirmed
+    vulnerability (severity critical/high/medium) — permanent behavior,
+    not gated behind the researcher asking for "a report" or the model
+    separately deciding to call export_report. A confirmed finding is
+    worth a portable artifact the moment it's confirmed, not only if
+    someone remembers to ask for one at the end of the session.
+
+    Unlike export_report (which assembles a polished multi-finding report
+    from a model-authored narrative), this writes a small, self-contained
+    HTML file straight from the finding's own recorded fields — no extra
+    authoring step required. Best-effort: any failure here is logged and
+    swallowed, it must never fail the underlying record_finding call.
+    """
+    if severity not in _AUTO_REPORT_SEVERITIES:
+        return None
+    try:
+        target_name = target.name if (target and target.name) else "default"
+        reports_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}/reports"))
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        color = _SEVERITY_COLOR.get(severity, "#8a8f98")
+        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        note_html = (
+            f'<div class="section-label">Evidence / Notes</div><p>{_html_escape(note).replace(chr(10), "<br>")}</p>'
+            if note else ""
+        )
+        endpoint_html = f'<div class="meta">Endpoint: {_html_escape(request_ref)}</div>' if request_ref else ""
+
+        html_doc = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>{_html_escape(title)}</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ background:#0d0f14; color:#e6e8eb; font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 860px; margin: 0 auto; padding: 40px 24px 80px; line-height:1.55; }}
+  h1 {{ font-size: 1.6em; border-bottom: 2px solid {color}; padding-bottom: 12px; }}
+  .meta {{ color:#9aa0a8; font-size:.9em; margin-bottom: 10px; }}
+  .finding {{ background:#12151c; border:1px solid #262b36; border-radius:10px; padding:22px 24px; margin-top:20px; }}
+  .sev-badge {{ display:inline-block; color:#0d0f14; font-weight:700; font-size:.75em; padding:3px 10px; border-radius:999px; letter-spacing:.04em; background:{color}; margin-bottom:10px; }}
+  .section-label {{ text-transform:uppercase; letter-spacing:.06em; font-size:.72em; color:#7d8590; margin:14px 0 4px; font-weight:600; }}
+  .kind {{ color:#7d8590; font-size:.85em; }}
+  footer {{ margin-top:40px; color:#5c6370; font-size:.8em; text-align:center; }}
+</style></head>
+<body>
+<h1>{_html_escape(title)}</h1>
+<div class="meta">Target: {_html_escape(target.host or target.name)} &nbsp;·&nbsp; Generated {generated_at}</div>
+<div class="finding">
+  <span class="sev-badge">{_html_escape(severity.upper())}</span>
+  <div class="kind">Category: {_html_escape(kind)}</div>
+  {endpoint_html}
+  {note_html}
+</div>
+<footer>Auto-saved by HELLHOUND the moment this finding was confirmed — run export_report at the end of the session for a single combined write-up of every finding.</footer>
+</body></html>"""
+
+        safe_target = re.sub(r"[^A-Za-z0-9._-]+", "_", target_name).strip("_") or "default"
+        fname = f"finding_{safe_target}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
+        out_path = reports_dir / fname
+        out_path.write_text(html_doc, encoding="utf-8")
+
+        if emit and hasattr(emit, "success"):
+            emit.success(f"[✓] Finding report auto-saved: {out_path}")
+        return str(out_path)
+    except Exception as e:
+        logger.debug(f"Auto finding-report save failed (non-fatal): {e}")
+        return None
+
+
+def _resolve_report_evidence_path(target: Target, ref: str) -> Optional[Path]:
+    """
+    Resolves a screenshot_ref/request_ref/response_ref (as stored on a
+    finding or evidence card) to an actual file under this target's own
+    storage directory. Accepts a bare filename, a path relative to the
+    target dir, or an absolute path — but only ever returns a path that is
+    strictly inside ~/.hellhound/targets/<target>/, the same containment
+    rule read_artifact enforces, so a report can never be tricked into
+    embedding an arbitrary file off the target's own storage.
+    """
+    if not ref:
+        return None
+    target_name = target.name if (target and target.name) else "default"
+    base_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}")).resolve()
+    candidates = [
+        Path(os.path.expanduser(ref)),
+        base_dir / ref,
+        base_dir / "screenshots" / ref,
+        base_dir / "raw" / ref,
+    ]
+    for c in candidates:
+        try:
+            resolved = c.resolve()
+            if resolved.is_file() and str(resolved).startswith(str(base_dir)):
+                return resolved
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _render_steps_to_reproduce(raw: Any) -> str:
+    """
+    Renders a finding's steps_to_reproduce as a numbered HTML list, one
+    <li> per step, instead of dumping everything into a single <p> with
+    <br> substitutions (which collapses into an unreadable wall of text
+    whenever the writer doesn't happen to include a literal newline per
+    step).
+
+    Accepts either:
+      - a list of step strings (preferred — forces one step per item), or
+      - a single string, which is split heuristically on numbered-list
+        markers ("1.", "2)", etc.) or blank lines if the writer didn't
+        pass a list.
+
+    A run enclosed in ``` fences within a step is rendered as its own
+    <pre class="code-block"> so request/response blocks stay monospaced
+    and distinct from the surrounding prose.
+    """
+    if isinstance(raw, list):
+        steps = [str(s).strip() for s in raw if str(s).strip()]
+        # Each array entry is meant to be ONE step's content, but writers
+        # (models included) often prefix it with its own "1. "/"2)" marker
+        # out of habit — even though the <ol> below already numbers it.
+        # Strip a single leading marker per item so the report doesn't show
+        # "1. 1. Send POST request..." / "2. 2. Extract the token...".
+        steps = [re.sub(r"^(?:step\s*)?\d{1,2}[\.\)]\s+", "", s, flags=re.IGNORECASE) for s in steps]
+    else:
+        text = str(raw or "").strip()
+        if not text:
+            steps = []
+        else:
+            # Split on a numbered-list marker ("1. ", "2) ", "Step 3:") —
+            # this is how the report-writing skill teaches steps to be
+            # written even when the model emits them as one string instead
+            # of an array, and even if it wrote the whole thing without a
+            # single newline (start-of-string or any run of whitespace
+            # counts as a boundary, not just a line break).
+            parts = re.split(r"(?:(?<=^)|(?<=\s))(?:step\s*)?\d{1,2}[\.\)]\s+", text, flags=re.IGNORECASE)
+            parts = [p.strip() for p in parts if p.strip()]
+            steps = parts if len(parts) > 1 else [text]
+
+    if not steps:
+        return ""
+
+    def _render_step_body(step: str) -> str:
+        # Render fenced code blocks as <pre>, everything else as escaped
+        # text with real newlines preserved as <br>.
+        pieces = re.split(r"```(?:\w+\n)?(.*?)```", step, flags=re.DOTALL)
+        out = []
+        for i, piece in enumerate(pieces):
+            if i % 2 == 1:
+                out.append(f'<pre class="code-block">{_html_escape(piece.strip())}</pre>')
+            else:
+                escaped = _html_escape(piece.strip()).replace("\n", "<br>")
+                if escaped:
+                    out.append(f"<div>{escaped}</div>")
+        return "".join(out)
+
+    items = "".join(f"<li>{_render_step_body(s)}</li>" for s in steps)
+    return f'<ol class="steps-list">{items}</ol>'
+
+
+def _embed_image_base64(path: Path) -> Optional[str]:
+    try:
+        ext = path.suffix.lower().lstrip(".") or "png"
+        mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{data}"
+    except Exception:
+        return None
+
+
+def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Assembles a polished, self-contained HTML report from this target's
+    recorded findings and evidence — one portable .html file with every
+    screenshot embedded as base64 (no linked files that break the moment the
+    report leaves this machine — e.g. when it's attached to a HackerOne or
+    Bugcrowd submission).
+
+    IMPORTANT — division of labor: this tool does NOT write the narrative
+    for you. The title, executive summary, impact statements, and steps to
+    reproduce are YOUR writing — follow the report-writing skill's
+    methodology (impact-first, CVSS 3.1 scoring, never "could potentially" —
+    prove it or don't claim it) before calling this. This tool's only job is
+    to faithfully assemble and embed everything you give it, and to check
+    your work: every finding_ref you pass MUST match an actual recorded
+    finding or evidence card for this target (fabricated/unmatched refs are
+    rejected, not silently included), and any RECORDED finding you leave out
+    of the report gets flagged back to you rather than silently dropped —
+    the researcher asked for a report with nothing missing, not a partial one.
+    """
+    findings_arg = args.get("findings")
+    if not isinstance(findings_arg, list) or not findings_arg:
+        return {"error": "findings is required — a non-empty array of finding objects. See tool description for the expected shape."}
+
+    report_title = str(args.get("report_title") or f"Security Assessment Report — {target.host or target.name}").strip()
+    executive_summary = str(args.get("executive_summary") or "").strip()
+    include_timeline = bool(args.get("include_timeline", True))
+
+    # ── Cross-validate against what was actually recorded ──
+    # Build the set of known, actually-recorded finding identities so a
+    # fabricated or garbled finding_ref can't slip into the report.
+    recorded_titles = set()
+    for f in (target.findings or []):
+        if isinstance(f, dict) and f.get("type"):
+            recorded_titles.add(str(f["type"]).strip().lower())
+    evidence_cards = target.state.get("recent_evidence") or []
+    evidence_by_title = {}
+    for card in evidence_cards:
+        if isinstance(card, dict) and card.get("title"):
+            key = str(card["title"]).strip().lower()
+            recorded_titles.add(key)
+            evidence_by_title[key] = card
+
+    unmatched_refs = []
+    included_titles_lower = set()
+    resolved_findings = []
+    for item in findings_arg:
+        if not isinstance(item, dict):
+            continue
+        finding_ref = str(item.get("finding_ref", "")).strip()
+        ref_lower = finding_ref.lower()
+        # Fuzzy match: exact, or substring either direction — wording often
+        # differs slightly between the recorded title and how it's referenced
+        # here, and rejecting on that alone would block legitimate reports.
+        matched = ref_lower in recorded_titles or any(
+            ref_lower in t or t in ref_lower for t in recorded_titles
+        )
+        if not matched:
+            unmatched_refs.append(finding_ref)
+            continue
+        included_titles_lower.add(ref_lower)
+        resolved_findings.append(item)
+
+    if not resolved_findings:
+        return {
+            "error": "None of the provided finding_ref values matched a recorded finding or evidence card for this target.",
+            "unmatched_refs": unmatched_refs,
+            "hint": "finding_ref must match (or closely match) a title already logged via record_finding, or an evidence card title. Check target.findings first if unsure of exact wording.",
+        }
+
+    # What got recorded but left out of the report entirely?
+    all_recorded_display = set()
+    for f in (target.findings or []):
+        if isinstance(f, dict) and f.get("type"):
+            all_recorded_display.add(str(f["type"]).strip())
+    for card in evidence_cards:
+        if isinstance(card, dict) and card.get("title") and card.get("type") != "screenshot":
+            all_recorded_display.add(str(card["title"]).strip())
+    omitted = sorted(
+        t for t in all_recorded_display
+        if t.strip().lower() not in included_titles_lower
+        and not any(t.strip().lower() in inc or inc in t.strip().lower() for inc in included_titles_lower)
+    )
+
+    # ── Render ──
+    resolved_findings.sort(key=lambda it: _SEVERITY_ORDER.get(str(it.get("severity", "info")).lower(), 4))
+
+    findings_html_parts = []
+    total_screenshots_embedded = 0
+    for idx, item in enumerate(resolved_findings, 1):
+        title = _html_escape(item.get("finding_ref", "Untitled finding"))
+        severity = str(item.get("severity", "info")).lower()
+        if severity not in _SEVERITY_ORDER:
+            severity = "info"
+        color = _SEVERITY_COLOR[severity]
+        cvss = _html_escape(item.get("cvss_score", "")) if item.get("cvss_score") else ""
+        impact = _html_escape(item.get("impact_statement", "")).replace("\n", "<br>")
+        steps_html = _render_steps_to_reproduce(item.get("steps_to_reproduce", ""))
+        evidence_snippet = item.get("evidence_snippet", "")
+
+        shots_html = ""
+        refs = item.get("screenshot_refs") or []
+        if isinstance(refs, str):
+            refs = [refs]
+        for ref in refs:
+            p = _resolve_report_evidence_path(target, str(ref))
+            if p:
+                data_uri = _embed_image_base64(p)
+                if data_uri:
+                    shots_html += f'<div class="evidence-shot"><img src="{data_uri}" alt="Evidence screenshot"></div>'
+                    total_screenshots_embedded += 1
+
+        evidence_block = ""
+        if evidence_snippet:
+            evidence_block = f'<div class="section-label">Evidence</div><pre class="code-block">{_html_escape(evidence_snippet)}</pre>'
+
+        # Plain-text version of this finding for the copy button — hunters
+        # paste this straight into a HackerOne/Bugcrowd report field, so it
+        # needs to be plain text, not HTML.
+        finding_plain_parts = [item.get("finding_ref", "Untitled finding")]
+        if impact:
+            finding_plain_parts.append("\nImpact:\n" + str(item.get("impact_statement", "")))
+        raw_steps = item.get("steps_to_reproduce", "")
+        if raw_steps:
+            if isinstance(raw_steps, list):
+                steps_plain = "\n".join(f"{i}. {s}" for i, s in enumerate(raw_steps, 1))
+            else:
+                steps_plain = str(raw_steps)
+            finding_plain_parts.append("\nSteps to Reproduce:\n" + steps_plain)
+        finding_plain_text = "\n".join(finding_plain_parts)
+
+        findings_html_parts.append(f"""
+<div class="finding" id="finding-{idx}">
+  <div class="finding-header">
+    <span class="sev-badge" style="background:{color}">{severity.upper()}</span>
+    <h2>{idx}. {title}</h2>
+    {f'<span class="cvss">CVSS {cvss}</span>' if cvss else ''}
+    <button class="copy-btn" onclick="hhCopy('finding-src-{idx}', this)">Copy</button>
+  </div>
+  {f'<div class="section-label">Impact</div><p>{impact}</p>' if impact else ''}
+  {f'<div class="section-label">Steps to Reproduce</div>{steps_html}' if steps_html else ''}
+  {evidence_block}
+  {f'<div class="section-label">Screenshots</div><div class="evidence-shots">{shots_html}</div>' if shots_html else ''}
+  <template id="finding-src-{idx}">{_html_escape(finding_plain_text)}</template>
+</div>""")
+
+    timeline_html = ""
+    if include_timeline:
+        timeline = target.state.get("timeline") or []
+        if timeline:
+            rows = "".join(
+                f'<div class="tl-row"><span class="tl-ts">{_html_escape(e.get("ts", ""))}</span><span class="tl-event">{_html_escape(e.get("event", ""))}</span></div>'
+                for e in timeline if isinstance(e, dict)
+            )
+            timeline_html = f'<h2>Investigation Timeline</h2><div class="timeline">{rows}</div>'
+
+    warnings = []
+    if unmatched_refs:
+        warnings.append(f"{len(unmatched_refs)} finding_ref(s) did not match any recorded finding and were skipped: {', '.join(unmatched_refs)}")
+    if omitted:
+        warnings.append(f"{len(omitted)} recorded finding(s) were NOT included in this report: {', '.join(omitted)}")
+    warnings_html = ""
+    if warnings:
+        warnings_html = '<div class="warn-box"><strong>⚠ Report completeness warnings</strong><ul>' + "".join(f"<li>{_html_escape(w)}</li>" for w in warnings) + '</ul></div>'
+
+    researcher_handle = str(load_config().get("researcher_handle") or "").strip()
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    html_doc = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>{_html_escape(report_title)}</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ background:#0d0f14; color:#e6e8eb; font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 960px; margin: 0 auto; padding: 40px 24px 80px; line-height:1.55; }}
+  h1 {{ font-size: 1.9em; border-bottom: 2px solid #ff3860; padding-bottom: 12px; }}
+  h2 {{ font-size: 1.25em; margin: 0; }}
+  .meta {{ color:#9aa0a8; font-size:.9em; margin-bottom: 28px; }}
+  .summary {{ background:#161922; border:1px solid #262b36; border-radius:8px; padding:18px 20px; margin-bottom:32px; }}
+  .finding {{ background:#12151c; border:1px solid #262b36; border-radius:10px; padding:22px 24px; margin-bottom:22px; }}
+  .finding-header {{ display:flex; align-items:center; gap:12px; margin-bottom:14px; flex-wrap:wrap; }}
+  .sev-badge {{ color:#0d0f14; font-weight:700; font-size:.75em; padding:3px 10px; border-radius:999px; letter-spacing:.04em; }}
+  .cvss {{ margin-left:auto; color:#9aa0a8; font-size:.85em; }}
+  .section-label {{ text-transform:uppercase; letter-spacing:.06em; font-size:.72em; color:#7d8590; margin:14px 0 4px; font-weight:600; }}
+  .code-block {{ background:#0a0c10; border:1px solid #262b36; border-radius:6px; padding:12px 14px; overflow-x:auto; font-size:.85em; white-space:pre-wrap; word-break:break-all; }}
+  .steps-list {{ margin:6px 0 0; padding-left:22px; }}
+  .steps-list li {{ margin-bottom:10px; }}
+  .steps-list .code-block {{ margin-top:6px; }}
+  .copy-btn {{ background:#1c2029; border:1px solid #333a47; color:#c7ccd3; font-size:.72em; padding:3px 10px; border-radius:6px; cursor:pointer; margin-left:8px; }}
+  .copy-btn:hover {{ background:#262b36; }}
+  .copy-btn.copied {{ background:#1f3d2a; border-color:#2f6b41; color:#8fe0a6; }}
+  .evidence-shots {{ display:flex; flex-wrap:wrap; gap:12px; }}
+  .evidence-shot img {{ max-width:100%; border-radius:6px; border:1px solid #262b36; }}
+  .warn-box {{ background:#2a1a10; border:1px solid #6b3a12; border-radius:8px; padding:14px 18px; margin-bottom:28px; font-size:.9em; }}
+  .timeline {{ font-size:.85em; }}
+  .tl-row {{ display:flex; gap:14px; padding:5px 0; border-bottom:1px solid #1c2029; }}
+  .tl-ts {{ color:#7d8590; white-space:nowrap; }}
+  footer {{ margin-top:60px; color:#5c6370; font-size:.8em; text-align:center; }}
+</style></head>
+<body>
+<h1>{_html_escape(report_title)} <button class="copy-btn" onclick="hhCopy('title-src', this)">Copy</button></h1>
+<template id="title-src">{_html_escape(report_title)}</template>
+<div class="meta">Target: {_html_escape(target.host or target.name)} &nbsp;·&nbsp; Generated {generated_at}{f' &nbsp;·&nbsp; {_html_escape(researcher_handle)}' if researcher_handle else ''}</div>
+{f'<div class="summary">{_html_escape(executive_summary).replace(chr(10), "<br>")} <button class="copy-btn" onclick="hhCopy(&#39;summary-src&#39;, this)">Copy</button><template id="summary-src">{_html_escape(executive_summary)}</template></div>' if executive_summary else ''}
+{warnings_html}
+{"".join(findings_html_parts)}
+{timeline_html}
+<footer>Generated by HELLHOUND — {len(resolved_findings)} finding(s), {total_screenshots_embedded} screenshot(s) embedded.</footer>
+<script>
+function hhCopy(id, btn) {{
+  var el = document.getElementById(id);
+  if (!el) return;
+  var text = el.content ? el.content.textContent : el.textContent;
+  var done = function() {{
+    var orig = btn.textContent;
+    btn.textContent = 'Copied';
+    btn.classList.add('copied');
+    setTimeout(function() {{ btn.textContent = orig; btn.classList.remove('copied'); }}, 1400);
+  }};
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(text).then(done, function() {{
+      var ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try {{ document.execCommand('copy'); done(); }} catch (e) {{}}
+      document.body.removeChild(ta);
+    }});
+  }} else {{
+    var ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try {{ document.execCommand('copy'); done(); }} catch (e) {{}}
+    document.body.removeChild(ta);
+  }}
+}}
+</script>
+</body></html>"""
+
+    target_name = target.name if (target and target.name) else "default"
+    reports_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}/reports"))
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    # Filename carries the target name, not just a timestamp — a report
+    # pulled out of its target folder (attached to an email, dropped in a
+    # shared drive, etc.) should still be identifiable on sight.
+    safe_target_for_fname = re.sub(r"[^A-Za-z0-9._-]+", "_", target_name).strip("_") or "default"
+    fname = f"report_{safe_target_for_fname}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
+    out_path = reports_dir / fname
+    try:
+        out_path.write_text(html_doc, encoding="utf-8")
+    except Exception as e:
+        return {"error": f"Failed to write report file: {e}"}
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[✓] Report written: {out_path} ({len(resolved_findings)} finding(s), {total_screenshots_embedded} screenshot(s) embedded)")
+
+    result = {
+        "status": "success",
+        "path": str(out_path),
+        "findings_included": len(resolved_findings),
+        "screenshots_embedded": total_screenshots_embedded,
+    }
+    if unmatched_refs:
+        result["unmatched_refs"] = unmatched_refs
+    if omitted:
+        result["omitted_recorded_findings"] = omitted
+    return result
 
 
 def _execute_load_skill(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -3655,9 +4130,40 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_record_finding
     ),
+    "export_report": ToolSpec(
+        name="export_report",
+        description="Assemble every recorded finding and piece of evidence for this target into a single, self-contained, professional HTML report — headline, executive summary, per-finding impact statements and steps to reproduce, and every referenced screenshot embedded directly in the file (base64, no linked images that break once the file leaves this machine — e.g. attached to a HackerOne/Bugcrowd submission). Use this at the end of a hunting session when the researcher asks for a report, a writeup, or to export/save findings. YOU write the narrative (title, executive summary, impact statement, steps to reproduce per finding) — follow the report-writing skill's methodology first (impact-first tone, CVSS 3.1 scoring, never 'could potentially' — prove it or don't claim it). This tool assembles and embeds what you give it faithfully, and checks your work: every finding_ref must match something actually recorded via record_finding or logged as evidence during this session (fabricated/unmatched refs are rejected), and any recorded finding you leave out gets flagged back to you rather than silently dropped.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "report_title": {"type": "string", "description": "Report headline, e.g. 'IDOR in /api/v2/invoices/{id} allows any authenticated user to read any customer's invoice data'. Defaults to a generic title if omitted."},
+                "executive_summary": {"type": "string", "description": "A short, impact-first summary of the overall engagement and its most significant findings."},
+                "include_timeline": {"type": "boolean", "description": "Whether to append a full timestamped investigation timeline as an appendix. Default true.", "default": True},
+                "findings": {
+                    "type": "array",
+                    "description": "One object per finding to include, most severe first (order doesn't matter — sorted automatically).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "finding_ref": {"type": "string", "description": "Must match (or closely match) the title of an existing record_finding entry or evidence card for this target — this is how the tool verifies the finding is real, not invented."},
+                            "severity": {"type": "string", "description": "critical, high, medium, low, or info."},
+                            "cvss_score": {"type": "string", "description": "e.g. '8.6 (High)'. Optional."},
+                            "impact_statement": {"type": "string", "description": "Impact-first, proven (not speculative) description of what an attacker can actually do."},
+                            "steps_to_reproduce": {"type": "array", "items": {"type": "string"}, "description": "One array entry per step, in order — e.g. ['Request a password reset for a known staff email...', 'Extract the token from the JSON response...', 'POST the token to /api/auth/reset...']. Each entry is rendered as its own numbered list item — do NOT prefix an entry with your own '1.'/'2)' marker, the numbering is added automatically and a manual prefix will show up doubled ('1. 1. ...'). Wrap a raw request/response in ``` fences within an entry to render it as a code block."},
+                            "evidence_snippet": {"type": "string", "description": "Optional raw request/response excerpt to display in a code block."},
+                            "screenshot_refs": {"type": "array", "items": {"type": "string"}, "description": "Filenames or paths of screenshots to embed for this finding (from gowitness output already captured for this target)."}
+                        },
+                        "required": ["finding_ref", "severity"]
+                    }
+                }
+            },
+            "required": ["findings"]
+        },
+        executor=_execute_export_report
+    ),
     "gowitness": ToolSpec(
         name="gowitness",
-        description="Capture high-fidelity visual web screenshots of URLs or endpoints using gowitness. Automatically saves screenshots to target workspace (~/.hellhound/targets/<target>/screenshots/) and indexes them into target investigation memory & visual evidence cards. Supports session cookies & custom headers to screenshot authenticated member portals and admin dashboards for vulnerability PoC.",
+        description="Capture high-fidelity visual web screenshots of URLs or endpoints using gowitness. Captures the FULL scrollable page by default (not just the visible viewport) so evidence below the fold — a patient records table, admin secrets, anything further down the page — isn't cut off. Automatically saves screenshots to target workspace (~/.hellhound/targets/<target>/screenshots/) and indexes them into target investigation memory & visual evidence cards. Supports session cookies & custom headers to screenshot authenticated member portals and admin dashboards for vulnerability PoC.",
         parameters={
             "type": "object",
             "properties": {
@@ -3665,7 +4171,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "urls": {"type": "array", "items": {"type": "string"}, "description": "Optional list of multiple target URLs to screenshot in batch."},
                 "headers": {"type": "object", "description": "Optional custom HTTP headers (e.g. {'Cookie': 'session=abc123', 'Authorization': 'Bearer ...'})."},
                 "cookies": {"type": "object", "description": "Optional session cookies dictionary or cookie string to screenshot authenticated pages."},
-                "fullpage": {"type": "boolean", "description": "Capture full scrollable page instead of standard viewport (default: false).", "default": False},
+                "fullpage": {"type": "boolean", "description": "Capture the full scrollable page instead of just the visible viewport. Defaults to true — for evidence/PoC screenshots you almost always want everything on the page, not just what fits above the fold. Only set this to false if you specifically want a viewport-only shot (e.g. to show what a user sees without scrolling).", "default": True},
                 "delay": {"type": "integer", "description": "Delay in seconds before capturing to allow JavaScript rendering (default: 2).", "default": 2},
                 "output_dir": {"type": "string", "description": "Optional custom directory path to save screenshots (defaults to target workspace)."}
             },
@@ -3675,7 +4181,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "subfinder": ToolSpec(
         name="subfinder",
-        description="Enumerate subdomains for a domain using passive sources and certificate transparency logs. Relies on public indexing, so it will return nothing for domains that aren't publicly indexed — if that happens, consider dns_bruteforce or httpx instead.",
+        description="Enumerate subdomains for a domain using passive sources and certificate transparency logs. Relies on public indexing, so it will return nothing for domains that aren't publicly indexed — if that happens, consider dns_bruteforce or httpx instead. Subdomain enumeration only makes sense when the attack surface is actually unknown — do NOT call this when the researcher already gave a specific, fully-qualified target (a single host/URL, e.g. 'find an auth bypass on https://app.example.com/portal') and the goal doesn't call for discovering additional hosts; go straight at the given target instead.",
         parameters={
             "type": "object",
             "properties": {
@@ -5358,9 +5864,10 @@ Every tool call against this target — the very first one included, not just re
 
 RULES:
 1. DECISION & TOOL SELECTION (CRITICAL):
-   - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network tools (curl, spider, subfinder, httpx, etc.). Output "DONE" immediately.
+   - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network/recon tools (curl, spider, subfinder, httpx, etc.) — there is nothing to point them at. This does NOT apply to target-independent tools that touch no network and don't need a scoped host: export_report, record_finding, search_findings, dismiss_finding, view_evidence, get_investigation_graph, ask_memory, plan_next_steps. If the researcher asks for a sample/demo/example report or output from one of those, CALL the tool for real (with clearly-labeled sample/placeholder data if no real findings exist yet) — do not output "DONE" and describe what you would generate instead, and do not print a fake tool-call JSON object as prose. Only fall back to "DONE" with a plain-language answer when nothing in the tool list, local or network, actually applies.
    - CONVERSATIONAL & EDUCATIONAL QUERIES — DECIDE BY THIS TEST, NOT BY MATCHING EXAMPLE PHRASES: Before considering any tool, ask yourself: "Can I fully and correctly answer THIS message using only what's already in ALREADY GATHERED THIS SESSION / conversation history, with zero new information from the target?" If yes — it's a question, a request to explain/recap something already done, an identity/capability/greeting question, a methodology question, anything answerable from existing context — output "DONE" immediately with a normal conversational reply. Only emit a tool call if answering genuinely requires NEW data or a NEW action against the target that isn't already sitting in front of you. Illustrative (not exhaustive) examples of the "no new data needed" case: "explain...", "how does...", "what is...", "why did...", "hi", "hello", "what can you do", "who are you", "who am i", "what's my name", "how does this work", "why did that fail", "what did you find". This test applies EVEN IF a target is already active and tools were run earlier in the session — an ongoing mission does not mean every subsequent message is part of it; judge THIS message on its own, by whether IT needs new data, not by session momentum. Being the first message in a session, or a target already being scoped, is NOT on its own a reason to start testing — the message itself has to actually require new information.
    - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a valid, in-scope target endpoint is required right now.
+   - SCOPED TARGET & GOAL — SKIP UNNEEDED DISCOVERY: If the researcher already gave a specific, fully-qualified target (a single host/URL) AND a specific goal that doesn't call for discovering additional hosts/subdomains, do NOT run subfinder, dns_bruteforce, or other subdomain/asset-discovery tools before going at the given target — those are for when the attack surface itself is the unknown, not a habitual first step. Go straight at the given URL/endpoint with curl/spider/whatever the goal actually needs. Only reach for discovery tools if the goal explicitly requires finding more hosts, or the direct approach against the given target genuinely dead-ends and broadening scope is the only path left.
    - DO NOT re-run `spider` (a full crawl) more than once per meaningfully-different session state. A fresh unauthenticated crawl, then ONE re-crawl after obtaining an authenticated session, is normal and enough — re-crawling again on a specific sub-path you already have covered (e.g. crawling `/letters/new` right after already crawling the whole site authenticated) adds nothing and burns time. If you already have the endpoints you need from an earlier crawl in ALREADY GATHERED THIS SESSION, use `curl`/`content_discovery` directly against known endpoints instead of re-crawling. If the researcher has told you to stop re-running a tool, that instruction holds for the rest of the session, not just the message it was given in.
    - DO NOT call `record_finding` in response to a message that isn't reporting NEW evidence. Explaining a bug you already found, recapping what happened, or the researcher reacting/complimenting/joking about a result already in ALREADY GATHERED THIS SESSION are conversational — they need zero tool calls, `record_finding` included. Re-recording something already confirmed doesn't make it "more confirmed"; it's noise, not evidence.
 
@@ -5465,10 +5972,11 @@ RULES:
   "args": {{ ... }}
 }}
 ```
-7. When testing authentication or password recovery workflows, harvest real user identities/emails from application content or endpoints rather than inventing dummy emails.{path_rule}
+7. When testing authentication or password recovery workflows, harvest real user identities/emails from application content or endpoints rather than inventing dummy emails.{path_rule} If the endpoint that handed you that identity (an author byline, a public post/API response, a directory listing, etc.) was not itself meant to expose that data, that source endpoint is part of the attack chain, not incidental setup — cite it explicitly by its actual path and what it discloses (e.g. "the victim email was obtained from GET <actual endpoint you hit>, which discloses <what it exposed>") in the finding's narrative/steps, and record it as its own finding via `record_finding` if it constitutes a separate information-disclosure issue in its own right. Never silently use harvested data in a report without disclosing where it came from.
 8. Resetting credentials or obtaining a password reset token is NOT mission completion. You MUST execute the login request (e.g. POST /api/auth/login with the new credentials), store/send the resulting session cookie or token, and access the target's internal staff console/portal (e.g., /portal, /dashboard, /admin, staff charts) to verify true end-to-end access before outputting DONE. If all tools and end-to-end access steps are complete, respond with "DONE".
 8b. Modifying user role or metadata via PATCH/POST/PUT (e.g. PATCH /meridian/api/account) is NOT mission completion. You MUST immediately execute curl to verify access to the target restricted route (e.g., GET /meridian/api/account and GET /meridian/api/admin/overview with the session cookie), capture visual proof with gowitness on the unlocked dashboard/overview, and record the confirmed vulnerability via record_finding BEFORE outputting DONE or ending your response!
 9. Skill methodology is never provided automatically — check the SKILL MENU yourself and call `load_skill` with whatever name actually fits the task, before doing anything else. This applies to every message, including what looks like the start of a new session — there's no default "starting" skill loaded for you; if you judge that a session is beginning and methodology would help, that's your call to make by loading one, not something decided for you in advance.
+10. `load_skill` is a preparatory step, not mission progress — it fetches reference material, it doesn't touch the target. When the researcher already gave a specific target and a specific goal, do NOT stop the turn right after `load_skill` returns. Continue in the SAME turn straight into the actual recon/exploit tool calls (curl, spider, etc.) the skill just told you to make. Outputting "DONE" immediately after only `load_skill` has run — leaving a "Next: perform reconnaissance..." for the researcher to manually ask for with "continue" — is exactly the narrated-instead-of-executed failure mode rule 1's NON-NEGOTIABLE line already forbids; loading a skill does not exempt you from it.
 """
 
         # Build live investigation context summary
@@ -5559,14 +6067,59 @@ FINDINGS SO FAR: {len(self.target.findings)}{artifact_block_synth}{digest_block}
         # do recon/exploitation work. This is what fixes both the "TARGET:
         # default" noise and the doctrine-quoting-itself-back symptom.
         #
-        # It still needs to know its OWN tool names (not full schemas) even
-        # here — otherwise, asked "what can you do" with no target set, it has
-        # nothing in context but its own base-model training and answers like
-        # a generic advisory chatbot ("I can't execute attacks myself"), which
-        # is false: it runs curl/jwt_forge/dns_bruteforce/etc. directly once a
-        # target exists. A name-only list is enough to keep it truthful
-        # without the verbose schema dump the comment above warns against.
-        tool_names_line = ", ".join(sorted(TOOL_REGISTRY.keys()))
+        # It still needs real grounding on its OWN tools even here —
+        # bare names alone aren't enough. Asked a pointed capability
+        # question ("do you have the skills to write a report?"), a model
+        # given nothing but "export_report" as an unexplained word in a
+        # comma list has no way to know that tool actually produces a
+        # full report with severity, impact statements, reproduction
+        # steps, and embedded evidence — so it falls back to its own
+        # generic trained-in "I can't do that autonomously" disclaimer
+        # instead of checking what it actually has. This bit the exact
+        # same way for jwt_forge/curl earlier ("I don't execute attacks")
+        # before tool names were added at all — a bare name turned out to
+        # be the same class of gap one level down: enough to stop it
+        # inventing capabilities it doesn't have, not enough to stop it
+        # UNDERSELLING ones it does. One short line per tool (not the full
+        # schema dump the comment above warns against — no JSON params,
+        # just the lead sentence) is the minimum that actually grounds it.
+        #
+        # CAUGHT IN THE WILD (2026-09): the 20-word auto-slice above is a
+        # silent trap for any tool whose first sentence is long/em-dash-heavy
+        # — it doesn't fail loudly, it just quietly lops off the one clause
+        # that actually sells the tool. export_report was the first victim:
+        # its real first sentence runs ~52 words, so the auto-hint landed on
+        # "...into a single, self-contained, professional HTML report —
+        # headline,..." — cut off *before* ever saying "screenshots
+        # embedded" or "submission-ready". A researcher asked "are you good
+        # at reporting?" and the model, shown only that limp fragment,
+        # confidently denied being able to produce an HTML report or embed
+        # screenshots at all — even though that's exactly what the tool
+        # does — because the fragment wasn't strong enough evidence to beat
+        # its own trained-in "I can't produce polished deliverables" hedge.
+        # Fix: hand-curated hints for any tool description that doesn't
+        # collapse cleanly into 20 words, so the differentiating clause
+        # survives instead of being gambled on where a period lands.
+        _CURATED_TOOL_HINTS = {
+            "export_report": (
+                "Assembles a polished, self-contained HTML report from recorded "
+                "findings — executive summary, per-finding impact/CVSS/repro steps, "
+                "and every screenshot embedded directly in the file (submission-ready "
+                "for HackerOne/Bugcrowd)."
+            ),
+        }
+
+        def _short_tool_hint(spec) -> str:
+            if spec.name in _CURATED_TOOL_HINTS:
+                return _CURATED_TOOL_HINTS[spec.name]
+            lead = re.split(r'(?<=[.!?])\s+', spec.description.strip(), maxsplit=1)[0]
+            words = lead.split()
+            return " ".join(words[:20]) + ("..." if len(words) > 20 else "")
+
+        tool_names_line = "\n".join(
+            f"  - {name}: {_short_tool_hint(spec)}"
+            for name, spec in sorted(TOOL_REGISTRY.items())
+        )
 
         # If the researcher explicitly forced a skill via /skill-name (e.g.
         # /auth-bypass), honor that even on a target-less turn — that request
@@ -5580,9 +6133,9 @@ FINDINGS SO FAR: {len(self.target.findings)}{artifact_block_synth}{digest_block}
 
 {researcher_line}{light_context_block}
 
-TOOLS YOU HAVE DIRECT EXECUTION ACCESS TO (names only — you run these
-yourself against a target, you are not a passive advisor describing what a
-human should do): {tool_names_line}
+TOOLS YOU HAVE DIRECT EXECUTION ACCESS TO — you run these yourself against a
+target, you are not a passive advisor describing what a human should do:
+{tool_names_line}
 {forced_skill_block}
 INSTRUCTIONS:
 - No hunting tool executed this turn — this is general conversation, a
@@ -5595,13 +6148,33 @@ INSTRUCTIONS:
 - Do NOT open with a status tag, do NOT recite scope/baseline rules,
   and do NOT bring up the target/scope unless the researcher's message is
   actually about it.
-- When asked about your capabilities or tools: you DO execute these tools
+- When asked about your capabilities or tools — including specific ones
+  like report writing, JWT attacks, or anything else — check the actual
+  tool list above first and answer from what it says a tool does. Never
+  fall back to a generic "I can't do that autonomously" disclaimer for
+  something a tool above explicitly covers. You DO execute these tools
   yourself once a target is set (via /target, /scope, or naming one in the
   message) — never say you "can't execute" or "can only guide/advise."
-  Answer strictly from the tool list above (plus the requested skill's
-  methodology if one is shown) — don't invent tools not in that list, and
-  don't claim capabilities (browsers, GUIs, live network access outside
-  these tools) you don't have.
+  Don't invent tools not in the list above, and don't claim capabilities
+  (browsers, GUIs, live network access outside these tools) you don't have.
+- Concretely: if asked whether you can write up / export / produce a
+  report, a polished writeup, an HTML file, or something with screenshots
+  in it — export_report in the list above already does exactly that
+  (assembles a self-contained HTML report with every screenshot embedded).
+  Do not tell the researcher you "can't generate HTML" or "can't produce a
+  polished/submission-ready report" — you can, via that tool. The only
+  real caveat is division of labor: YOU write the narrative (title,
+  impact, repro steps), the tool assembles and embeds it.
+- If the researcher actually asks you to run/generate/export something a
+  local tool above covers (export_report for a report, record_finding for
+  a finding, etc.) — even with no target configured, tools like
+  export_report don't need one — CALL the tool, don't describe calling it.
+  NEVER print a tool-call-shaped JSON object ({{"tool": ..., "arguments":
+  ...}} or similar) as your answer text — that is not the same as actually
+  running the tool, produces nothing real, and just looks like it did.
+  If a tool result already appears earlier in this conversation, report
+  what it actually returned (e.g. the real output path) — don't restate
+  the call, and don't invent a result that isn't there.
 """
 
         # ── Full hunting-turn prompt — target header, scope, baseline
@@ -5635,10 +6208,10 @@ INSTRUCTIONS:
   - NEVER claim account takeover unless the primary target's specific token, credentials, or session was actually established and verified!
   - Holding a session cookie for an intermediate stepping-stone user is NOT takeover of the primary target.
 - NEVER fabricate credentials, tokens, or exploit results. If a login attempt failed or an exploit didn't work, state that fact clearly.
-- Only generate a formal HackerOne markdown vulnerability report if the researcher explicitly requested a report and high-impact findings were confirmed.
+- Only generate a formal HackerOne markdown vulnerability report if the researcher explicitly requested a report and high-impact findings were confirmed. This ban isn't just on the HackerOne template by name — it covers ANY rigid, formal write-up structure by default: a numbered "Investigation Summary" with one heading per tool call (e.g. "1. Skill Loading", "2. Initial Landing Page", "3. API Endpoint — Posts"), a step-by-step audit log mirroring the tool-call trace, or dumping full raw request/response JSON bodies for every step. That's report-doc structure wearing a different name, and it's just as much the wrong default as the HackerOne template. Unless a report was actually asked for, tell the researcher what happened the way you'd say it out loud: what you found, how you got there, what it means — conversationally, weaving in only the specific evidence (a token, a status code, a snippet) that actually matters to the story, not a full transcript of every tool call.
 - When asked about your capabilities, tools, or what you can do: answer ONLY from the AVAILABLE TOOLS list above. Never claim access to external tools not in that list.
 - EDUCATIONAL & TECHNIQUE QUERIES: When the researcher asks about offensive security techniques (e.g. 403 bypass, IDOR, SQLi, XSS, SSRF, JWT attacks, auth bypass, privilege escalation, parameter pollution), provide comprehensive, detailed technical explanations with concrete examples, payloads, headers, and methodology. This is educational content essential to bug bounty work — NEVER refuse to explain a technique. You are a bug bounty assistant, not a content filter.
-- OUTPUT FORMAT: Respond in plain natural-language prose with clean markdown structure (headings, bullet points, and code blocks for evidence/PoC). NEVER output a raw tool-call object.
+- OUTPUT FORMAT: Respond in plain natural-language prose with clean markdown structure (headings, bullet points, and code blocks for evidence/PoC). NEVER output a raw tool-call object. Default to a short, flowing explanation (a few paragraphs, not a numbered section per tool call) — reach for headings/sections only when the researcher actually asked for a report or the content genuinely needs that structure to stay readable (e.g. comparing several distinct findings).
 - VOICE: Talk directly TO the researcher, second person ("you asked me to...", "I tried...", "your session cookie..."). Never narrate about them in third person ("the researcher instructed...", "the researcher's goal was..." ) — that's report-doc phrasing, not how you'd actually talk to the person sitting across from you. Save strict third-person, formal phrasing for an actual generated HackerOne report artifact, not a normal reply.
 """
 
@@ -5674,6 +6247,7 @@ INSTRUCTIONS:
         _executed_signatures = set()  # every (tool, args) run this turn — not just the last one
         _dup_skip_count = 0
         _narration_retry_count = 0
+        _premature_done_retry_count = 0
 
         # A path scope set in an earlier turn (e.g. "...from this endpoint
         # https://host/app") persists across the session — most follow-up
@@ -5691,7 +6265,18 @@ INSTRUCTIONS:
         # model still makes the real judgment call for anything not caught
         # by that gate; this only removes the loop entirely for the clear
         # cases instead of trusting the prompt to self-regulate every time.
-        if has_real_target and not _skip_orchestrator_loop:
+        #
+        # CAUGHT IN THE WILD (2026-09): this gate was has_real_target-only,
+        # which meant a target-less "generate a sample report so I can see
+        # it" had NO path into this loop at all — export_report never
+        # requires a target (it's local/memory-only, already exempted from
+        # scope checks in execute_tool_call), but the model had zero actual
+        # mechanism to call it. Result: it fabricated a fake tool-call JSON
+        # blob as its final answer instead of ever touching the filesystem
+        # — nothing was generated, it just looked like something was.
+        # report_requested is added here so target-independent report/export
+        # requests can still reach real tool execution with no target set.
+        if (has_real_target or report_requested) and not _skip_orchestrator_loop:
             for iteration in range(max_iterations):
                 self._current_turn = iteration + 1
                 if cancel_check and cancel_check():
@@ -5950,6 +6535,40 @@ INSTRUCTIONS:
                 _has_explicit_completion = bool(re.search(r"^\s*done\b|^\s*\[status:\s*(objective achieved|full takeover|exhausted)\]", _resp_lower, re.MULTILINE))
                 _has_next_step = any(m in _resp_lower for m in _next_step_markers)
 
+                # Deterministic guard: `load_skill` is prep, not mission
+                # progress (see doctrine rule 10). Prompt instructions are
+                # advisory — the model has been observed calling
+                # load_skill, then immediately outputting a bare "DONE"
+                # with nothing actually run against the target, leaving the
+                # researcher to manually type "continue". Catch that here
+                # instead of trusting the prompt alone: if the only tool(s)
+                # executed this turn are load_skill and the model just
+                # tried to end the turn with an explicit DONE while a real
+                # target/mission is active, push back and force it to keep
+                # going. Bounded retries so a session that genuinely has
+                # nothing further to do (e.g. the skill itself was the ask)
+                # doesn't loop forever.
+                _only_load_skill_so_far = tools_executed and all(t == "load_skill" for t in tools_executed)
+                if (
+                    _has_explicit_completion
+                    and _only_load_skill_so_far
+                    and has_real_target
+                    and _premature_done_retry_count < 3
+                ):
+                    _premature_done_retry_count += 1
+                    self.history.append({"role": "assistant", "content": ai_resp})
+                    self.history.append({
+                        "role": "user",
+                        "content": (
+                            "SYSTEM: load_skill only loads reference methodology — it doesn't touch the "
+                            f"target and isn't mission progress by itself. The target is '{self._display_host}' "
+                            f"and the mission is still: '{original_user_text}'. Continue now with the actual "
+                            "recon/exploit tool calls the skill just told you to make — do not stop here."
+                        )
+                    })
+                    user_text = "Continue — emit the next real tool call now, do not output DONE yet."
+                    continue
+
                 _looks_like_narration = (
                     (_has_next_step or any(m in _resp_lower for m in _narration_markers))
                     and not _has_explicit_completion
@@ -6069,9 +6688,22 @@ INSTRUCTIONS:
         # Q&A, "no real target" turns — gets the lightweight persona prompt.
         # This is the fix for both the TARGET:-default leak and the model
         # quoting its own baseline doctrine back in casual replies.
+        #
+        # CAUGHT IN THE WILD (2026-09): now that the orchestrator loop above
+        # can run target-independent tools (export_report, record_finding,
+        # etc.) with no real target configured — see the report_requested
+        # addition to that gate — _productive_tools_executed can be
+        # non-empty on a target-less turn (e.g. a sample export_report run).
+        # Gating on _productive_tools_executed alone would then route that
+        # turn into full_synth_prompt, which unconditionally prints
+        # "TARGET: default" — exactly the leak this branch point was
+        # originally built to prevent. target_configured is now required
+        # alongside it, so a target-less local-tool run still gets the
+        # doctrine-free casual prompt (which has its own instruction, added
+        # below, against echoing raw tool-call JSON).
         synthesizer_system_prompt = (
             full_synth_prompt
-            if (_productive_tools_executed or (report_requested and has_critical_findings))
+            if (target_configured and (_productive_tools_executed or (report_requested and has_critical_findings)))
             else casual_synth_prompt
         )
 
@@ -6183,8 +6815,9 @@ INSTRUCTIONS:
                     f"- If a user directory or member table was returned, note that this is a directory listing, not an account takeover of the members in that table.\n"
                     f"- If only an intermediate session or low-privilege foothold was obtained, say plainly that it's partial/in-progress (no bracket tags) and explain the exact next step to achieve full takeover of the primary target.\n"
                     f"- If a login attempt failed (e.g. returned 'Invalid username or password' or login form despite HTTP 200), state that it failed and do NOT claim account takeover.\n"
+                    f"- Every tool that ran this turn gets at least one line, even if it returned nothing or wasn't the one that ended up mattering (e.g. 'subfinder found 0 subdomains via passive sources' or 'the X probe returned nothing useful here'). A zero/negative result is still worth recording for the researcher — never omit a tool from the summary just because it didn't lead anywhere.\n"
                     f"- Outline the next logical testing steps.\n"
-                    f"- Do NOT generate a rigid, multi-section formal vulnerability report unless the user explicitly requested a report."
+                    f"- Do NOT generate a rigid, multi-section formal vulnerability report unless the user explicitly requested a report. Concretely, that means: no 'Investigation Summary' / 'Outcome' / 'Next Steps' style section headers, no bulleted one-line-per-tool-call transcript ('curl X — did Y', 'gowitness — did Z'), and no restating the tool trace step by step. Write it as a colleague sitting next to the researcher would say it out loud after watching the run — a few natural paragraphs (short bullets are fine INSIDE a paragraph for something like a list of endpoints, but not as the whole response's skeleton), covering what you did, what you saw, and what it means, in that conversational order. If the researcher's own request already came formatted as steps/bullets, mirror that back to them — otherwise default to prose."
                 )
 
             if len(tools_executed) > 0 and cfg.get("show_recaps", True):
@@ -6198,7 +6831,29 @@ INSTRUCTIONS:
         if tokens is not None and emit and hasattr(emit, "set_token_count"):
             emit.set_token_count(tokens)
 
-        final_response = final_answer or ai_resp or "Hit a blank response twice in a row on my end — try that again?"
+        # NOTE: ai_resp here is the ORCHESTRATOR's raw control-flow text —
+        # e.g. the literal word "DONE" — not a real explanation. It used to
+        # be used as the fallback final answer whenever the synthesizer
+        # call failed (both attempts in _ask_synthesizer), which meant a
+        # session that ran real tools (curl, record_finding, ...) could
+        # end with the researcher seeing nothing but a bare "DONE" and no
+        # explanation of what was actually found. Fall back to a message
+        # that says the synthesis step failed instead of masquerading the
+        # orchestrator token as a real answer.
+        if final_answer:
+            final_response = final_answer
+        elif tools_executed:
+            logger.warning(
+                f"Synthesizer failed after tool execution (tools_executed={tools_executed}); "
+                f"raw orchestrator response was {ai_resp!r}."
+            )
+            final_response = (
+                "I ran " + ", ".join(tools_executed) + " and got results, but hit an error "
+                "generating the write-up just now. The raw tool output is still in this "
+                "session — ask me to summarize what was found, or try again."
+            )
+        else:
+            final_response = ai_resp or "Hit a blank response twice in a row on my end — try that again?"
         final_response = _clean_synthesizer_output(final_response)
         self.history.append({"role": "assistant", "content": final_response})
         self._compact_history_if_needed()

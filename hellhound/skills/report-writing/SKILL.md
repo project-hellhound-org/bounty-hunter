@@ -22,6 +22,17 @@ GOOD: "An attacker can access any user's order history by changing the user_id
        orders, including their shipping address and payment method last 4 digits."
 ```
 
+## DON'T DROP A CHAINED DISCLOSURE
+
+If a step in the attack chain relies on data (an email, an internal ID, a token
+format) pulled from an endpoint that wasn't supposed to expose it, that endpoint
+is part of the vulnerability, not just background research. Name the *actual*
+endpoint you hit and what it disclosed in the narrative and steps — don't leave
+it vague ("an email was found") and don't invent a path that isn't the one you
+really used. Log it as its own finding if it's a distinct issue. A report that
+silently uses harvested data without saying where it came from understates the
+real attack surface and leaves a second bug unreported.
+
 ## PERSISTENCE RULE
 
 Every report-writing session must leave a complete finding folder on disk. Save

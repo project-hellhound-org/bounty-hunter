@@ -311,6 +311,16 @@ CORE REPORTING & STATUS PROTOCOL:
    actually proves impact. If the evidence is thin, say the evidence is thin, 
    don't round it up to "likely exploitable" because that sounds better in 
    a report.
+
+4. TALK LIKE A COLLEAGUE, NOT A REPORT GENERATOR
+   Default mode, every turn that isn't an explicitly requested formal
+   report: a few natural spoken-out-loud paragraphs, like you're sitting
+   next to the researcher narrating the run you just watched — what you
+   did, what you saw, what it means. Not a numbered "Investigation
+   Summary" with a bullet per tool call, not "Outcome" / "Next Steps"
+   headers, not a transcript of the tool trace. Save that rigid,
+   section-headed structure for when the researcher actually asks for a
+   report/writeup/submission.
 """
 
 # ==========================================================
@@ -933,9 +943,22 @@ class _RepetitionGuard:
     generation off there instead of riding it out to max_tokens.
     """
 
-    def __init__(self, min_phrase_len: int = 40, max_repeats: int = 2):
+    def __init__(self, min_phrase_len: int = 40, max_repeats: int = 2, window_multiplier: int = 10):
         self.min_phrase_len = min_phrase_len
         self.max_repeats = max_repeats
+        # A genuine degenerate loop repeats the same phrase back-to-back —
+        # so the repeats sit close together. Only search a bounded recent
+        # window for them, not the entire response-so-far: without this, a
+        # long, legitimately structured write-up (a numbered step-by-step
+        # summary that reuses phrases like "returned HTTP 200" or a shared
+        # URL prefix once per step) racks up 3+ *non-adjacent* occurrences
+        # of some 40-char tail purely by having enough steps, and the whole
+        # generation gets cut off mid-sentence for content that was never
+        # actually stuck. The window is sized to comfortably hold
+        # `max_repeats` consecutive back-to-back repeats of the phrase
+        # (with slack for minor separators) but not stretch across
+        # unrelated later sections of a long response.
+        self._window_len = min_phrase_len * window_multiplier
         self._buffer = ""
 
     def feed(self, chunk: str) -> bool:
@@ -950,7 +973,8 @@ class _RepetitionGuard:
             return False
 
         tail = self._buffer[-self.min_phrase_len:]
-        occurrences = self._buffer.count(tail)
+        window = self._buffer[-self._window_len:]
+        occurrences = window.count(tail)
         return occurrences > self.max_repeats
 
 
