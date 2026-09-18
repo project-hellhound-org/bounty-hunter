@@ -4056,6 +4056,21 @@ function hhCopy(id, btn) {{
     return result
 
 
+def _execute_set_target_stub(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Placeholder to satisfy ToolSpec's executor signature (args, target, emit)
+    — that signature has no access to the Agent instance, but switching the
+    active target (Agent.set_target) is an Agent-level operation, not a
+    target-level one. The real implementation is Agent._execute_set_target,
+    special-cased at the top of Agent.execute_tool_call (same pattern as the
+    "internal memory tools operate locally" bypass just below it) so it runs
+    with `self` in scope. This stub should never actually be reached; it
+    exists only as a defensive fallback if some other code path ever calls
+    TOOL_REGISTRY['set_target'].executor directly.
+    """
+    return {"error": "set_target must be routed through Agent.execute_tool_call, not called directly."}
+
+
 def _execute_load_skill(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Loads a skill's full methodology content on demand, by name, from the skill menu."""
     name = str(args.get("name", "")).strip()
@@ -4641,6 +4656,19 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_fuzz_hunter
     ),
+    "set_target": ToolSpec(
+        name="set_target",
+        description="Declare the host/domain/IP the researcher wants you to actively hunt against, switching the active session to it. Call this ONLY when the researcher's message is actually directing you to test, scan, recon, or hunt a specific host — never when a domain merely appears in the message as an example, a quoted payload, part of an email address, something being asked ABOUT rather than asked to be tested, or unrelated conversation. When in doubt, don't call it — answer conversationally instead (you can always call it on a later turn once the researcher confirms). No network/recon tool can run until a real target is set this way (or via /target or /scope).",
+        parameters={
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "The exact domain, hostname, or IP (with optional :port) the researcher wants tested — copied verbatim from their message, not reconstructed from memory."},
+                "reason": {"type": "string", "description": "One short phrase: what in the researcher's message makes this an actual hunting target (e.g. 'researcher said \"start recon on acme.com\"'), for the audit trail."}
+            },
+            "required": ["host"]
+        },
+        executor=_execute_set_target_stub
+    ),
 }
 
 
@@ -4725,6 +4753,15 @@ def _strip_payload_context(text: str) -> str:
     last_gt = cleaned.rfind('>')
     if first_lt != -1 and last_gt != -1 and last_gt > first_lt:
         cleaned = cleaned[:first_lt] + ' ' + cleaned[last_gt + 1:]
+    # Email addresses — a user describing what a site returns/accepts
+    # ("returns a session for {\"email\":\"noob@gmail.com\"}") is quoting
+    # example data, not naming gmail.com as the target. Without this, the
+    # domain half of any email mentioned in chat gets picked up by the
+    # domain regex below (word-boundary matches right after '@') and set
+    # as the active target, which then silently launches the full recon/
+    # tool loop against a real third-party host the user never asked to
+    # scan and never confirmed via /scope.
+    cleaned = re.sub(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b', ' ', cleaned)
     return cleaned
 
 
@@ -4778,18 +4815,26 @@ def _extract_first_balanced_json(text: str) -> Optional[dict]:
 
 def extract_target_from_text(user_text: str) -> Optional[str]:
     """
-    Extracts a target domain, IP address, or host from user text — the RAW
-    match, not filesystem-sanitized (that split happens downstream in
-    create_or_load_target, which needs both the safe folder name AND the
-    real connectable host[:port]; sanitizing here would destroy the colon
-    before it ever reaches that split).
+    Finds a domain/IP/host-shaped candidate in user text — used ONLY as a
+    cheap pre-filter (see has_real_target in Agent.handle_message) to decide
+    whether a message is worth loading the full tool-calling orchestrator
+    prompt for. It does NOT set the active target anymore. Switching the
+    active target is now a decision the orchestrator model itself makes, via
+    the `set_target` tool, after actually reading the message for whether
+    the researcher is directing it to hunt that host — not from a regex
+    match. (This function used to double as the auto-target-setter; that
+    caused the domain half of any email address mentioned in chat, e.g.
+    'noob@gmail.com', to get silently promoted to THE active target and
+    launch live recon against it. A false positive here now just means an
+    extra turn loads the tool prompt for what turns out to be a
+    conversational message — cheap, and the model still answers "DONE".)
     Handles:
     - Full URLs: http://10.49.135.46/ -> 10.49.135.46
     - IPv4 addresses: 10.49.135.46, 192.168.1.1:8080
     - Standard domain names: example.com, sub.target.ctf.io
     - Local hostnames: localhost, htb.local
-    Payload/code content (quoted HTML/JS snippets, code blocks) is stripped
-    before matching — see _strip_payload_context.
+    Payload/code content (quoted HTML/JS snippets, code blocks, email
+    addresses) is stripped before matching — see _strip_payload_context.
     """
     if not user_text:
         return None
@@ -4816,7 +4861,11 @@ def extract_target_from_text(user_text: str) -> Optional[str]:
         "br", "it", "es", "cn", "kr", "id", "za", "mx", "ch", "se", "no",
         "fi", "dk", "pl", "be", "at", "nz", "ie", "sg", "hk", "tw", "il",
     )
-    dom_match = re.search(r'\b([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.([a-zA-Z0-9]{2,}))\b', scan_text)
+    # Negative lookbehind for '@' — belt-and-suspenders against email
+    # domains reaching this point (the primary fix strips whole email
+    # addresses in _strip_payload_context above; this catches any caller
+    # that hands raw, unstripped text straight to this function).
+    dom_match = re.search(r'(?<!@)\b([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.([a-zA-Z0-9]{2,}))\b', scan_text)
     if dom_match and dom_match.group(2).lower() in _COMMON_TLDS:
         return dom_match.group(1)
     local_match = re.search(r'\b(localhost|htb\.local)\b', scan_text, re.IGNORECASE)
@@ -5235,6 +5284,56 @@ If there is nothing worth generalizing, return an empty array: []"""
         )
         return self.target
 
+    def _execute_set_target(self, args: Dict[str, Any], emit: Any = None) -> Dict[str, Any]:
+        """
+        Model-driven replacement for the old regex auto-detection: the
+        orchestrator itself calls this — after reading and understanding
+        the researcher's actual message, not from a domain-shaped string
+        matching a pattern — when it judges the researcher is directing it
+        to hunt a specific host. See the "set_target" ToolSpec description
+        for the judgment call the model is expected to make before calling
+        this at all (this method does NOT re-derive that judgment from the
+        text; it trusts the model's call and only validates the host itself
+        and existing /scope constraints).
+        """
+        host = str(args.get("host", "")).strip()
+        if not host:
+            return {"error": "host is required — the exact domain/IP/hostname the researcher named."}
+
+        normalized, _scheme = normalize_host(host)
+        if not normalized:
+            return {"error": f"'{host}' does not look like a valid host, domain, or IP — double-check it against the researcher's message rather than retrying as-is."}
+
+        # Respect any /scope the researcher already configured for this
+        # session — a model judgment call doesn't override an explicit
+        # allow/deny list the researcher set up themselves.
+        if self.target and self.target.scope_rules and self.target.scope_rules.in_scope:
+            allowed, reason = is_in_scope(normalized, self.target.scope_rules)
+            if not allowed:
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(f"[!] set_target blocked — {reason}")
+                return {
+                    "error": f"SCOPE_VIOLATION: {reason}. Ask the researcher to confirm/add '{normalized}' via /scope before treating it as a target.",
+                    "blocked": True,
+                }
+
+        already_active = (
+            self.target and self.target.name != "default"
+            and sanitize_target_name(normalized) == self.target.name
+        )
+        if already_active:
+            return {"target": self.target.name, "host": self._display_host, "note": "already the active target — no change made."}
+
+        new_target = self.set_target(normalized)
+        msg = f"Target set to '{new_target.name}' ({args.get('reason', '').strip() or 'directed by researcher'})."
+        if emit and hasattr(emit, "info"):
+            emit.info(f"[*] {msg}")
+        return {
+            "target": new_target.name,
+            "host": self._display_host,
+            "message": msg + " Recon/testing tools may now be used against this host.",
+        }
+
     @property
     def _display_host(self) -> str:
         """
@@ -5456,6 +5555,14 @@ If there is nothing worth generalizing, return an empty array: []"""
         spec = TOOL_REGISTRY.get(tool_name)
         if not spec:
             return {"error": f"Tool '{tool_name}' not found in registry."}
+
+        # set_target switches the Agent's OWN active target (self.target),
+        # not something the current target object can do to itself — needs
+        # `self` in scope, so it's special-cased here rather than going
+        # through the generic (args, target, emit) executor signature every
+        # other tool uses.
+        if tool_name == "set_target":
+            return self._execute_set_target(args, emit)
 
         # Internal memory & finding recording tools operate locally on target state
         if tool_name in ("record_finding", "search_findings", "dismiss_finding", "export_report", "view_evidence", "get_investigation_graph", "ask_memory", "plan_next_steps"):
@@ -5720,21 +5827,30 @@ If there is nothing worth generalizing, return an empty array: []"""
             if session_context.get("scope_rules"):
                 self.target.scope_rules = session_context["scope_rules"]
 
-        # Check if there is a target defined in the prompt or active context
+        # extract_target_from_text is now ONLY a cheap pre-filter for whether
+        # this message is worth loading the full tool-calling orchestrator
+        # prompt for (see has_real_target below) — it no longer sets the
+        # active target itself. That used to happen here directly from the
+        # regex match, which meant any domain-shaped string anywhere in a
+        # message (including the domain half of an email address someone
+        # was quoting, e.g. "noob@gmail.com") got silently promoted to THE
+        # active hunting target and launched the tool loop against it,
+        # with no actual understanding of whether the researcher meant it
+        # as a target at all. Deciding that now belongs to the model: when
+        # the orchestrator loop below runs, it has a set_target tool and is
+        # instructed to call it only when the researcher's message is
+        # actually directing it to hunt a specific host — see the
+        # set_target ToolSpec description and rule 0 in the orchestrator
+        # system prompt. A false positive here just means the tool loop
+        # loads for a turn that turns out to be conversational (the model
+        # answers "DONE" without calling set_target) — cheap and reversible,
+        # unlike silently switching targets and running tools.
         target_match = extract_target_from_text(user_text)
-        domain_match = target_match
-        if target_match:
-            detected_target = target_match
-            # Compare sanitized forms — target_match is now the RAW host
-            # (needed downstream to populate Target.host correctly), but
-            # self.target.name is always the sanitized folder name. Comparing
-            # raw-to-sanitized directly would mismatch on every single turn
-            # even when the target hasn't changed, spuriously calling
-            # set_target() each time and wiping path-scope/rate-limiter state
-            # that should persist across the conversation.
-            if self.target.name == "default" or (self.target.name != sanitize_target_name(detected_target)):
-                self.set_target(detected_target)
-        elif self.target.name == "default" and self.target.scope_rules.in_scope:
+        if self.target.name == "default" and not target_match and self.target.scope_rules.in_scope:
+            # This branch is NOT regex-inferred from the message — it's the
+            # researcher's own explicit /scope configuration from earlier in
+            # the session, just applied lazily on first use. Safe to keep
+            # auto-setting from it.
             primary_target = self.target.scope_rules.in_scope[0].lstrip("*.")
             if primary_target:
                 self.set_target(primary_target)
@@ -5921,8 +6037,13 @@ TARGET HOST (copy exactly, do not retype from memory): '{self._display_host}'
 Every tool call against this target — the very first one included, not just repeats in a loop — must use this exact string verbatim. Retyping/reconstructing it by hand, even once, is how a stray or transposed character slips into a URL and trips the scope guard on a host nobody actually meant to hit.
 
 RULES:
+0. SETTING THE TARGET (CRITICAL — READ BEFORE ANYTHING ELSE IF TARGET IS "default"):
+   - If TARGET above is "default", you have no active hunting target yet. Before you may call ANY network/recon tool, decide: is the researcher's message actually DIRECTING you to test/scan/recon/hunt a specific host right now? If yes, call `set_target` with that exact host first — its result becomes the new TARGET for this and every later turn.
+   - Do NOT call `set_target` when a domain/host/URL/IP merely APPEARS in the message without being a hunting instruction — e.g. it's part of an email address someone is quoting, a code/payload example, a general question ("what does a CORS misconfig on X look like"), something the researcher is asking you ABOUT rather than asking you to test, or unrelated conversation. When genuinely unsure whether the researcher means it as a target, don't call it — ask them to confirm, or answer conversationally; you can still call `set_target` on a later turn once they clarify. A wrong guess here means running real tools against a host nobody authorized.
+   - Once TARGET is no longer "default", do not call `set_target` again for the same host on every subsequent turn — only when the researcher clearly shifts to a genuinely different host.
+
 1. DECISION & TOOL SELECTION (CRITICAL):
-   - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network/recon tools (curl, spider, subfinder, httpx, etc.) — there is nothing to point them at. This does NOT apply to target-independent tools that touch no network and don't need a scoped host: export_report, record_finding, search_findings, dismiss_finding, view_evidence, get_investigation_graph, ask_memory, plan_next_steps. If the researcher asks for a sample/demo/example report or output from one of those, CALL the tool for real (with clearly-labeled sample/placeholder data if no real findings exist yet) — do not output "DONE" and describe what you would generate instead, and do not print a fake tool-call JSON object as prose. Only fall back to "DONE" with a plain-language answer when nothing in the tool list, local or network, actually applies.
+   - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network/recon tools (curl, spider, subfinder, httpx, etc.) — call `set_target` per rule 0 first if the message actually warrants it, otherwise there is nothing to point them at. This does NOT apply to target-independent tools that touch no network and don't need a scoped host: export_report, record_finding, search_findings, dismiss_finding, view_evidence, get_investigation_graph, ask_memory, plan_next_steps. If the researcher asks for a sample/demo/example report or output from one of those, CALL the tool for real (with clearly-labeled sample/placeholder data if no real findings exist yet) — do not output "DONE" and describe what you would generate instead, and do not print a fake tool-call JSON object as prose. Only fall back to "DONE" with a plain-language answer when nothing in the tool list, local or network, actually applies.
    - CONVERSATIONAL & EDUCATIONAL QUERIES — DECIDE BY THIS TEST, NOT BY MATCHING EXAMPLE PHRASES: Before considering any tool, ask yourself: "Can I fully and correctly answer THIS message using only what's already in ALREADY GATHERED THIS SESSION / conversation history, with zero new information from the target?" If yes — it's a question, a request to explain/recap something already done, an identity/capability/greeting question, a methodology question, anything answerable from existing context — output "DONE" immediately with a normal conversational reply. Only emit a tool call if answering genuinely requires NEW data or a NEW action against the target that isn't already sitting in front of you. Illustrative (not exhaustive) examples of the "no new data needed" case: "explain...", "how does...", "what is...", "why did...", "hi", "hello", "what can you do", "who are you", "who am i", "what's my name", "how does this work", "why did that fail", "what did you find". This test applies EVEN IF a target is already active and tools were run earlier in the session — an ongoing mission does not mean every subsequent message is part of it; judge THIS message on its own, by whether IT needs new data, not by session momentum. Being the first message in a session, or a target already being scoped, is NOT on its own a reason to start testing — the message itself has to actually require new information.
    - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a valid, in-scope target endpoint is required right now.
    - SCOPED TARGET & GOAL — SKIP UNNEEDED DISCOVERY: If the researcher already gave a specific, fully-qualified target (a single host/URL) AND a specific goal that doesn't call for discovering additional hosts/subdomains, do NOT run subfinder, dns_bruteforce, or other subdomain/asset-discovery tools before going at the given target — those are for when the attack surface itself is the unknown, not a habitual first step. Go straight at the given URL/endpoint with curl/spider/whatever the goal actually needs. Only reach for discovery tools if the goal explicitly requires finding more hosts, or the direct approach against the given target genuinely dead-ends and broadening scope is the only path left.
