@@ -2027,6 +2027,57 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                 allow_redirects=False
             )
 
+        # ── Capture REAL, unedited proof of this exact request/response ──
+        # This is what record_finding/export_report pull from later instead
+        # of trusting the model to retype exact header/body values from
+        # memory when it writes up a finding — that retyping is exactly how
+        # a report ends up with a fabricated "session=abc123" / "example_value"
+        # placeholder that was never actually observed on the wire. Capped
+        # rolling log, newest-relevant-first when looked up.
+        try:
+            req_header_lines = "\n".join(f"{k}: {v}" for k, v in headers.items())
+            req_cookie_str = ""
+            if req_cookies:
+                req_cookie_str = "; ".join(f"{ck}={cv}" for ck, cv in req_cookies.items()) if isinstance(req_cookies, dict) else str(req_cookies)
+            req_body_preview = ""
+            if json_payload is not None:
+                req_body_preview = json.dumps(json_payload)
+            elif data_payload is not None:
+                req_body_preview = str(data_payload)[:1000]
+            resp_header_lines = "\n".join(f"{k}: {v}" for k, v in r.headers.items())
+            resp_body_preview = (r.text or "")[:2000]
+
+            curl_repro = f'curl -s -X {method} "{url}"'
+            for hk, hv in headers.items():
+                curl_repro += f' -H "{hk}: {hv}"'
+            if req_cookie_str:
+                curl_repro += f' -b "{req_cookie_str}"'
+            if req_body_preview:
+                curl_repro += f" --data '{req_body_preview}'"
+
+            raw_evidence = (
+                f"$ {curl_repro}\n\n"
+                f"HTTP/1.1 {r.status_code} {r.reason}\n{resp_header_lines}\n\n{resp_body_preview}"
+            )
+
+            if hasattr(target, "state") and isinstance(target.state, dict):
+                evidence_log = target.state.setdefault("curl_evidence_log", [])
+                evidence_log.append({
+                    "url": url,
+                    "method": method,
+                    "origin_sent": headers.get("Origin") or custom_headers.get("Origin"),
+                    "status": r.status_code,
+                    "raw": raw_evidence,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                })
+                # Rolling cap — keep the most recent 40 requests. A long
+                # recon session shouldn't grow this unboundedly in target
+                # state that gets persisted to disk every call.
+                if len(evidence_log) > 40:
+                    del evidence_log[: len(evidence_log) - 40]
+        except Exception:
+            pass  # evidence capture is best-effort and must never break the actual request
+
         # Store observed session cookies in target.state so subsequent tools (curl, gowitness, spider) can reuse them
         raw_set_cookie = r.headers.get("set-cookie") or r.headers.get("Set-Cookie")
         if (r.cookies or raw_set_cookie) and hasattr(target, "state") and isinstance(target.state, dict):
@@ -3528,6 +3579,34 @@ def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     return result_payload
 
 
+def _lookup_curl_evidence(target: Target, request_ref: str, limit: int = 2) -> List[str]:
+    """
+    Pulls REAL, previously-captured request/response text for a given
+    endpoint out of target.state['curl_evidence_log'] (populated by every
+    curl call — see _execute_curl). This is what makes record_finding and
+    export_report immune to the model retyping/inventing evidence from
+    memory when it writes a finding or a report: whatever's returned here
+    is exactly what the server actually sent, byte for byte, not a
+    remembered approximation.
+    Matches by URL containment (either direction) since request_ref is
+    often a bare path/endpoint label while the log stores full URLs, and
+    returns the most recent matches first — the last-run variant of a test
+    (e.g. the winning Origin value) is usually the one worth citing.
+    """
+    if not request_ref or not hasattr(target, "state") or not isinstance(target.state, dict):
+        return []
+    ref_lower = request_ref.strip().lower()
+    if not ref_lower:
+        return []
+    log = target.state.get("curl_evidence_log") or []
+    matches = [
+        e for e in reversed(log)
+        if isinstance(e, dict) and e.get("url")
+        and (ref_lower in e["url"].lower() or e["url"].lower() in ref_lower)
+    ]
+    return [m["raw"] for m in matches[:limit] if m.get("raw")]
+
+
 def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Logs a finding YOU have already confirmed (not a guess or a plan) into
@@ -3575,6 +3654,14 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
             }
 
     finding = {"type": title, "target": request_ref, "severity": severity, "note": note}
+    # Attach the REAL captured request/response for this endpoint, if any
+    # was seen during this session — not what the model typed from memory.
+    # This is what later feeds export_report's evidence block, so a report
+    # never has to fall back on invented placeholder values like
+    # "session=abc123" for something that was actually tested.
+    raw_evidence_matches = _lookup_curl_evidence(target, request_ref)
+    if raw_evidence_matches:
+        finding["raw_evidence"] = raw_evidence_matches
     try:
         update_from_bac(target, findings=[finding])
         save_target(target)
@@ -3585,13 +3672,15 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         emit.success(f"[✓] Finding recorded: {title}")
 
     result = {"status": "recorded", "title": title, "kind": kind, "severity": severity}
+    if raw_evidence_matches:
+        result["raw_evidence_attached"] = len(raw_evidence_matches)
 
     # Permanent feature, not conditional on the researcher (or the model)
     # separately asking for a report: the moment a real vulnerability is
     # confirmed and logged here, save a portable HTML artifact for it
     # immediately. Best-effort — a failure here must never fail the
     # underlying finding recording.
-    auto_report_path = _auto_save_finding_report(target, title, kind, severity, request_ref, note, emit)
+    auto_report_path = _auto_save_finding_report(target, title, kind, severity, request_ref, note, emit, raw_evidence_matches)
     if auto_report_path:
         result["report_path"] = auto_report_path
 
@@ -3619,7 +3708,8 @@ _AUTO_REPORT_SEVERITIES = {"critical", "high", "medium"}
 
 
 def _auto_save_finding_report(
-    target: Target, title: str, kind: str, severity: str, request_ref: str, note: str, emit: Any
+    target: Target, title: str, kind: str, severity: str, request_ref: str, note: str, emit: Any,
+    raw_evidence: Optional[List[str]] = None,
 ) -> Optional[str]:
     """
     Fires automatically every time record_finding logs a NEW confirmed
@@ -3649,6 +3739,13 @@ def _auto_save_finding_report(
             if note else ""
         )
         endpoint_html = f'<div class="meta">Endpoint: {_html_escape(request_ref)}</div>' if request_ref else ""
+        # Real, byte-for-byte captured request/response — separate from the
+        # narrative note above, and never model-authored: this is exactly
+        # what _execute_curl saw on the wire for this endpoint.
+        raw_evidence_html = ""
+        if raw_evidence:
+            blocks = "".join(f'<pre class="code-block">{_html_escape(r)}</pre>' for r in raw_evidence)
+            raw_evidence_html = f'<div class="section-label">Proof — Captured Request/Response</div>{blocks}'
 
         html_doc = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -3661,6 +3758,7 @@ def _auto_save_finding_report(
   .finding {{ background:#12151c; border:1px solid #262b36; border-radius:10px; padding:22px 24px; margin-top:20px; }}
   .sev-badge {{ display:inline-block; color:#0d0f14; font-weight:700; font-size:.75em; padding:3px 10px; border-radius:999px; letter-spacing:.04em; background:{color}; margin-bottom:10px; }}
   .section-label {{ text-transform:uppercase; letter-spacing:.06em; font-size:.72em; color:#7d8590; margin:14px 0 4px; font-weight:600; }}
+  .code-block {{ background:#0a0c10; border:1px solid #262b36; border-radius:6px; padding:12px 14px; overflow-x:auto; font-size:.82em; white-space:pre-wrap; word-break:break-all; margin-bottom:10px; }}
   .kind {{ color:#7d8590; font-size:.85em; }}
   footer {{ margin-top:40px; color:#5c6370; font-size:.8em; text-align:center; }}
 </style></head>
@@ -3672,6 +3770,7 @@ def _auto_save_finding_report(
   <div class="kind">Category: {_html_escape(kind)}</div>
   {endpoint_html}
   {note_html}
+  {raw_evidence_html}
 </div>
 <footer>Auto-saved by HELLHOUND the moment this finding was confirmed — run export_report at the end of the session for a single combined write-up of every finding.</footer>
 </body></html>"""
@@ -3813,7 +3912,15 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
     """
     findings_arg = args.get("findings")
     if not isinstance(findings_arg, list) or not findings_arg:
-        return {"error": "findings is required — a non-empty array of finding objects. See tool description for the expected shape."}
+        # This is a malformed CALL, not a broken tool — mirror the framing
+        # used elsewhere (e.g. jwt_forge's "no token found" case): say
+        # plainly what's missing from the arguments just supplied, and give
+        # a concrete next action, rather than a flat validation message
+        # that reads like the tool itself failed.
+        return {
+            "error": "This export_report call didn't include a findings array, so there's nothing to assemble into a report.",
+            "hint": "Pass findings as a non-empty array — one object per finding, each with at least finding_ref (must match an existing record_finding title) and severity. If nothing has been recorded yet, call record_finding for each confirmed result first, then retry export_report referencing those titles.",
+        }
 
     report_title = str(args.get("report_title") or f"Security Assessment Report — {target.host or target.name}").strip()
     executive_summary = str(args.get("executive_summary") or "").strip()
@@ -3823,9 +3930,16 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
     # Build the set of known, actually-recorded finding identities so a
     # fabricated or garbled finding_ref can't slip into the report.
     recorded_titles = set()
+    # type -> finding dict, so real curl-captured evidence (attached at
+    # record_finding time — see _lookup_curl_evidence) can be pulled in
+    # below regardless of whether the model remembers to pass
+    # evidence_snippet, or what it types there.
+    findings_by_type: Dict[str, Dict[str, Any]] = {}
     for f in (target.findings or []):
         if isinstance(f, dict) and f.get("type"):
-            recorded_titles.add(str(f["type"]).strip().lower())
+            key = str(f["type"]).strip().lower()
+            recorded_titles.add(key)
+            findings_by_type[key] = f
     evidence_cards = target.state.get("recent_evidence") or []
     evidence_by_title = {}
     for card in evidence_cards:
@@ -3856,9 +3970,9 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
 
     if not resolved_findings:
         return {
-            "error": "None of the provided finding_ref values matched a recorded finding or evidence card for this target.",
+            "status": "no_matching_findings",
+            "note": f"Nah bro, none of those finding_ref values matched anything actually recorded for this target — {', '.join(unmatched_refs) if unmatched_refs else 'nothing to go on'}. Not going to include a finding I can't verify was really logged. Call record_finding first for each confirmed result (or check target.findings for the exact title wording), then retry export_report with those as finding_ref.",
             "unmatched_refs": unmatched_refs,
-            "hint": "finding_ref must match (or closely match) a title already logged via record_finding, or an evidence card title. Check target.findings first if unsure of exact wording.",
         }
 
     # What got recorded but left out of the report entirely?
@@ -3881,7 +3995,8 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
     findings_html_parts = []
     total_screenshots_embedded = 0
     for idx, item in enumerate(resolved_findings, 1):
-        title = _html_escape(item.get("finding_ref", "Untitled finding"))
+        raw_finding_ref = str(item.get("finding_ref", "Untitled finding"))
+        title = _html_escape(raw_finding_ref)
         severity = str(item.get("severity", "info")).lower()
         if severity not in _SEVERITY_ORDER:
             severity = "info"
@@ -3890,6 +4005,21 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
         impact = _html_escape(item.get("impact_statement", "")).replace("\n", "<br>")
         steps_html = _render_steps_to_reproduce(item.get("steps_to_reproduce", ""))
         evidence_snippet = item.get("evidence_snippet", "")
+
+        # Pull the REAL captured request/response for this finding, keyed
+        # off the same fuzzy title match used to validate finding_ref above
+        # — independent of whatever the model passed (or didn't pass) as
+        # evidence_snippet. This is what actually fixes a report showing
+        # fabricated placeholder curl output: it's now backed by what the
+        # server literally returned during this session.
+        ref_lower_lookup = raw_finding_ref.strip().lower()
+        real_finding = findings_by_type.get(ref_lower_lookup)
+        if not real_finding:
+            for ftype_key, fdict in findings_by_type.items():
+                if ref_lower_lookup and (ref_lower_lookup in ftype_key or ftype_key in ref_lower_lookup):
+                    real_finding = fdict
+                    break
+        real_evidence_list = (real_finding.get("raw_evidence") if real_finding else None) or []
 
         shots_html = ""
         refs = item.get("screenshot_refs") or []
@@ -3905,7 +4035,12 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
 
         evidence_block = ""
         if evidence_snippet:
-            evidence_block = f'<div class="section-label">Evidence</div><pre class="code-block">{_html_escape(evidence_snippet)}</pre>'
+            evidence_block += f'<div class="section-label">Evidence</div><pre class="code-block">{_html_escape(evidence_snippet)}</pre>'
+        if real_evidence_list:
+            proof_label = "Proof — Captured Request/Response" if len(real_evidence_list) == 1 else "Proof — Captured Requests/Responses"
+            evidence_block += f'<div class="section-label">{proof_label}</div>' + "".join(
+                f'<pre class="code-block">{_html_escape(r)}</pre>' for r in real_evidence_list
+            )
 
         # Plain-text version of this finding for the copy button — hunters
         # paste this straight into a HackerOne/Bugcrowd report field, so it
@@ -3920,6 +4055,8 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
             else:
                 steps_plain = str(raw_steps)
             finding_plain_parts.append("\nSteps to Reproduce:\n" + steps_plain)
+        if real_evidence_list:
+            finding_plain_parts.append("\nProof — Captured Request/Response:\n" + "\n\n---\n\n".join(real_evidence_list))
         finding_plain_text = "\n".join(finding_plain_parts)
 
         findings_html_parts.append(f"""
@@ -4033,7 +4170,16 @@ function hhCopy(id, btn) {{
     # pulled out of its target folder (attached to an email, dropped in a
     # shared drive, etc.) should still be identifiable on sight.
     safe_target_for_fname = re.sub(r"[^A-Za-z0-9._-]+", "_", target_name).strip("_") or "default"
-    fname = f"report_{safe_target_for_fname}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
+    # Default is a STABLE filename that re-running export_report overwrites
+    # in place — the researcher asking to "update the report" with more
+    # evidence should update the file they already have open, not scatter a
+    # disconnected new timestamped copy next to it every time. Pass
+    # new_file=true explicitly to snapshot the current report under its own
+    # timestamp instead (e.g. for versioning before/after a fix is applied).
+    if bool(args.get("new_file", False)):
+        fname = f"report_{safe_target_for_fname}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
+    else:
+        fname = f"report_{safe_target_for_fname}.html"
     out_path = reports_dir / fname
     try:
         out_path.write_text(html_doc, encoding="utf-8")
@@ -4197,7 +4343,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "kind": {"type": "string", "description": "Category, e.g. 'idor', 'auth_bypass', 'mass_assignment', 'interesting_endpoint'. Free text.", "default": "interesting_endpoint"},
                 "severity": {"type": "string", "description": "Your assessed severity: critical, high, medium, or low.", "default": "medium"},
                 "request_ref": {"type": "string", "description": "The URL/endpoint the finding applies to."},
-                "note": {"type": "string", "description": "Optional extra detail — the specific request/response evidence that confirmed it."}
+                "note": {"type": "string", "description": "Your own short analysis of why this confirms the finding. You do NOT need to retype raw request/response data here — the real request/response for this exact request_ref is captured automatically from the curl calls already made this session and attached to the report; this field is for your interpretation, not for reconstructing evidence from memory."}
             },
             "required": ["title"]
         },
@@ -4205,13 +4351,14 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "export_report": ToolSpec(
         name="export_report",
-        description="Assemble every recorded finding and piece of evidence for this target into a single, self-contained, professional HTML report — headline, executive summary, per-finding impact statements and steps to reproduce, and every referenced screenshot embedded directly in the file (base64, no linked images that break once the file leaves this machine — e.g. attached to a HackerOne/Bugcrowd submission). Use this at the end of a hunting session when the researcher asks for a report, a writeup, or to export/save findings. YOU write the narrative (title, executive summary, impact statement, steps to reproduce per finding) — follow the report-writing skill's methodology first (impact-first tone, CVSS 3.1 scoring, never 'could potentially' — prove it or don't claim it). This tool assembles and embeds what you give it faithfully, and checks your work: every finding_ref must match something actually recorded via record_finding or logged as evidence during this session (fabricated/unmatched refs are rejected), and any recorded finding you leave out gets flagged back to you rather than silently dropped.",
+        description="Assemble every recorded finding and piece of evidence for this target into a single, self-contained, professional HTML report — headline, executive summary, per-finding impact statements and steps to reproduce, real captured request/response proof for each finding, and every referenced screenshot embedded directly in the file (base64, no linked images that break once the file leaves this machine — e.g. attached to a HackerOne/Bugcrowd submission). Use this at the end of a hunting session when the researcher asks for a report, a writeup, or to export/save findings — and call it again any time the researcher asks to update/add to the report; by default this OVERWRITES the target's one report file in place rather than creating a new one (see new_file). YOU write the narrative (title, executive summary, impact statement, steps to reproduce per finding) — follow the report-writing skill's methodology first (impact-first tone, CVSS 3.1 scoring, never 'could potentially' — prove it or don't claim it). Never fabricate example/placeholder evidence (made-up cookies, made-up response bodies, etc.) — this tool assembles and embeds what you give it faithfully, checks your work (every finding_ref must match something actually recorded via record_finding or logged as evidence during this session; fabricated/unmatched refs are rejected, any recorded finding you leave out gets flagged back to you), AND automatically attaches the real request/response captured during this session for each finding — you do not need to, and should not try to, retype that from memory.",
         parameters={
             "type": "object",
             "properties": {
                 "report_title": {"type": "string", "description": "Report headline, e.g. 'IDOR in /api/v2/invoices/{id} allows any authenticated user to read any customer's invoice data'. Defaults to a generic title if omitted."},
                 "executive_summary": {"type": "string", "description": "A short, impact-first summary of the overall engagement and its most significant findings."},
                 "include_timeline": {"type": "boolean", "description": "Whether to append a full timestamped investigation timeline as an appendix. Default true.", "default": True},
+                "new_file": {"type": "boolean", "description": "False (default): overwrite this target's single report file in place — re-running export_report after recording another finding or attaching more evidence updates the SAME file the researcher already has open, rather than producing a disconnected new one. Set true only when the researcher explicitly wants a separate timestamped snapshot (e.g. to keep a before/after-fix copy).", "default": False},
                 "findings": {
                     "type": "array",
                     "description": "One object per finding to include, most severe first (order doesn't matter — sorted automatically).",
@@ -4223,7 +4370,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                             "cvss_score": {"type": "string", "description": "e.g. '8.6 (High)'. Optional."},
                             "impact_statement": {"type": "string", "description": "Impact-first, proven (not speculative) description of what an attacker can actually do."},
                             "steps_to_reproduce": {"type": "array", "items": {"type": "string"}, "description": "One array entry per step, in order — e.g. ['Request a password reset for a known staff email...', 'Extract the token from the JSON response...', 'POST the token to /api/auth/reset...']. Each entry is rendered as its own numbered list item — do NOT prefix an entry with your own '1.'/'2)' marker, the numbering is added automatically and a manual prefix will show up doubled ('1. 1. ...'). Wrap a raw request/response in ``` fences within an entry to render it as a code block."},
-                            "evidence_snippet": {"type": "string", "description": "Optional raw request/response excerpt to display in a code block."},
+                            "evidence_snippet": {"type": "string", "description": "Optional — your own narrative annotation of the evidence, if it adds something the raw data doesn't say on its own. Do NOT use this to reconstruct/retype a request or response from memory — the real, byte-for-byte captured request/response for each finding's request_ref is attached automatically from the curl calls already made this session. Never invent example/placeholder values (e.g. a made-up session cookie or a made-up response body) here or anywhere else in this call — if you don't actually have real evidence for something, leave it out rather than fabricating it."},
                             "screenshot_refs": {"type": "array", "items": {"type": "string"}, "description": "Filenames or paths of screenshots to embed for this finding (from gowitness output already captured for this target)."}
                         },
                         "required": ["finding_ref", "severity"]
@@ -5005,6 +5152,7 @@ class Agent:
         )
         self._turn_path_scope: Optional[str] = None  # e.g. "/app" — set per-turn in handle_message
         self._forced_skill: Optional[str] = None  # set by /skill-name slash command — one-shot, consumed next turn
+        self._active_session_context: Optional[Dict[str, Any]] = None  # this turn's session_context, if any — see set_target()
 
     def _compact_history_if_needed(self) -> None:
         """
@@ -5282,6 +5430,21 @@ If there is nothing worth generalizing, return an empty array: []"""
             test_rps=1.0,
             safe_methods_only=True
         )
+        # Sync live into whatever session_context THIS turn is using, the
+        # instant the switch happens — not just once at turn-start. Without
+        # this, a target set mid-turn (e.g. via the set_target TOOL, called
+        # partway through the orchestrator loop) never reaches the CLI's
+        # session_ctx dict, which still holds the value captured at
+        # turn-start. The CLI then re-applies THAT stale value onto this
+        # same Agent instance right after the turn finishes (see
+        # chat_ui.py's post-dispatch "agent.set_target(session_ctx['target'])"
+        # sync-back), silently reverting the switch this method just made —
+        # which is exactly how a whole engagement's later turns end up
+        # filed under targets/default/ instead of the real target folder.
+        active_ctx = getattr(self, "_active_session_context", None)
+        if active_ctx is not None:
+            active_ctx["target"] = self.target.name
+            active_ctx["scope_rules"] = self.target.scope_rules
         return self.target
 
     def _execute_set_target(self, args: Dict[str, Any], emit: Any = None) -> Dict[str, Any]:
@@ -5820,6 +5983,12 @@ If there is nothing worth generalizing, return an empty array: []"""
         Main autonomous reasoning and conversational loop.
         """
         original_user_text = user_text
+        # Track this turn's session_context so set_target() can sync into it
+        # live, the instant a target switch happens — including mid-turn,
+        # from inside the tool loop below (see set_target()'s own comment).
+        # Overwritten fresh on every call; a stale reference from a prior
+        # call is never reused since this line always runs first.
+        self._active_session_context = session_context
         if session_context:
             t_name = session_context.get("target") or session_context.get("target_name")
             if t_name and t_name != "default" and t_name != self.target.name:

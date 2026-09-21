@@ -237,7 +237,8 @@ SPECIFICITY_KEYWORDS: Dict[str, List[str]] = {
     "race-condition": ["race condition", "toctou", "concurrency", "parallel requests", "rate limit bypass", "double spend", "coupon race"],
     "ssrf": ["ssrf", "server-side request forgery", "metadata", "169.254.169.254", "internal port", "webhook", "pdf converter", "headless browser"],
     "ssti": ["ssti", "template injection", "jinja2", "ejs", "twig", "freemarker", "velocity", "handlebars", "{{7*7}}"],
-    "server-side-parameter-pollution": ["sspp", "parameter pollution", "http parameter pollution", "hpp", "query string pollution", "%23", "%26", "truncat", "server-side parameter pollution", "parameter injection", "internal api query"]
+    "server-side-parameter-pollution": ["sspp", "parameter pollution", "http parameter pollution", "hpp", "query string pollution", "%23", "%26", "truncat", "server-side parameter pollution", "parameter injection", "internal api query"],
+    "cors-misconfig": ["cors", "cross-origin", "cross origin", "access-control-allow-origin", "access-control-allow-credentials", "origin reflection", "null origin", "preflight", "same origin policy", "sop bypass"]
 }
 
 
@@ -284,7 +285,7 @@ def search_skills(query: str, max_results: int = 2, min_score: float = 0.12) -> 
             "start of any bug bounty", "what should i do next", "7-question gate",
             "request-signing", "graphql", "smart contract", "anti-bot",
             "idor", "xss", "ssrf", "sqli", "race condition", "prototype pollution",
-            "oauth", "saml", "subdomain takeover"
+            "oauth", "saml", "subdomain takeover", "cors"
         ]:
             if phrase in q_lower and phrase in desc_lower:
                 score += 1.5
