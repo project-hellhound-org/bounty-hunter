@@ -461,8 +461,19 @@ def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any,
 
 def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
-    /scope [show | clear | <rules_text>]
-    Inspects, clears, or configures persistent program scope rules for current target.
+    /scope [show | clear | in <host...> | out <host...> | disallow <rule...> | <pasted program policy text>]
+
+    show                    — display the current scope for the active target
+    clear                   — wipe all scope rules for the active target
+    in <host...>            — ADD one or more hosts to in-scope (aliases: include, add-in)
+    out <host...>           — ADD one or more hosts to out-of-scope (aliases: exclude, add-out)
+    disallow <rule...>      — ADD one or more prohibited-action rules (alias: prohibit)
+    <pasted policy text>    — anything else REPLACES the entire scope, parsed from
+                              free-form/markdown program-policy text (e.g. pasting a
+                              HackerOne/Bugcrowd scope page). Use this for the initial
+                              scope setup; use in/out/disallow for incremental edits
+                              afterward — they add to what's already there instead of
+                              wiping it.
     """
     is_json = "--json" in args or getattr(emit, "json_mode", False)
     clean_args = [a for a in args if a not in ("--json", "-j")]
@@ -513,6 +524,62 @@ def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         if not is_json:
             emit.success(f"Scope cleared for target: {target_obj.name}")
         return {"status": "success", "action": "cleared"}
+
+    # Explicit shorthand verbs — /scope in <host...>, /scope out <host...>,
+    # /scope disallow <rule...> — ADD to the matching list on the existing
+    # scope_rules. This must run BEFORE the generic free-text branch below:
+    # that branch calls set_scope(), which re-derives the WHOLE ScopeRules
+    # object from parse_program_rules() using ONLY this call's raw text —
+    # not merged with what was already there. Two bugs that combined to
+    # bite here: (1) "out" was never actually a recognized keyword to that
+    # parser — it only recognizes full phrases like "out of scope:" or
+    # "exclusions:" as a line-starting section header, so a bare "out X"
+    # matched no header and silently fell through to the parser's DEFAULT
+    # section, which is in_scope; and (2) even if "out" had been
+    # recognized, calling set_scope() at all replaces the entire scope
+    # from scratch, so a previously-set "*.arc.io" in-scope wildcard would
+    # vanish the moment any other /scope command ran, "out" or not.
+    scope_verb_map = {
+        "in": "in_scope", "include": "in_scope", "add-in": "in_scope",
+        "out": "out_scope", "exclude": "out_scope", "add-out": "out_scope",
+        "disallow": "disallowed", "prohibit": "disallowed",
+    }
+    verb = clean_args[0].lower()
+    if verb in scope_verb_map and len(clean_args) > 1:
+        list_name = scope_verb_map[verb]
+        rules = target_obj.scope_rules
+        target_list = getattr(rules, list_name)
+        added = []
+        for raw_entry in clean_args[1:]:
+            entry = raw_entry.strip().strip(",")
+            if not entry:
+                continue
+            if entry not in target_list:
+                target_list.append(entry)
+                added.append(entry)
+            # A host can't be simultaneously in and out of scope — moving it
+            # to one list removes it from the others so the state can't end
+            # up self-contradictory.
+            for other_name in ("in_scope", "out_scope", "disallowed"):
+                if other_name == list_name:
+                    continue
+                other_list = getattr(rules, other_name)
+                if entry in other_list:
+                    other_list.remove(entry)
+
+        target_obj.scope_summary = f"{len(rules.in_scope)} in-scope domains, {len(rules.out_scope)} out-of-scope exclusions, {len(rules.disallowed)} prohibited rules"
+        save_target(target_obj)
+        session_context["scope_rules"] = rules
+
+        if not is_json:
+            if added:
+                emit.success(f"Scope updated for target '{target_obj.name}':")
+            else:
+                emit.info(f"Nothing new to add — {', '.join(e.strip().strip(',') for e in clean_args[1:])} already in {list_name} for '{target_obj.name}'.")
+            emit.info(f"  In-Scope: {rules.in_scope}")
+            emit.info(f"  Out-of-Scope: {rules.out_scope}")
+            emit.info(f"  Disallowed: {rules.disallowed}")
+        return {"status": "success", "action": "added", "list": list_name, "added": added, "target": target_obj.name, "scope": rules.to_dict()}
 
     raw_text = " ".join(clean_args)
     task_set_scope(target_obj, raw_text)
@@ -1294,7 +1361,7 @@ register_command(Command(
     name="/scope",
     aliases=["/rules"],
     description="Inspect, clear, or configure program scope rules for target",
-    usage="/scope [show | clear | <rules_text>]",
+    usage="/scope [show | clear | in <host...> | out <host...> | disallow <rule...> | <pasted program policy text>]",
     category="config",
     handler=handle_scope
 ))

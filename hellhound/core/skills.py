@@ -238,7 +238,8 @@ SPECIFICITY_KEYWORDS: Dict[str, List[str]] = {
     "ssrf": ["ssrf", "server-side request forgery", "metadata", "169.254.169.254", "internal port", "webhook", "pdf converter", "headless browser"],
     "ssti": ["ssti", "template injection", "jinja2", "ejs", "twig", "freemarker", "velocity", "handlebars", "{{7*7}}"],
     "server-side-parameter-pollution": ["sspp", "parameter pollution", "http parameter pollution", "hpp", "query string pollution", "%23", "%26", "truncat", "server-side parameter pollution", "parameter injection", "internal api query"],
-    "cors-misconfig": ["cors", "cross-origin", "cross origin", "access-control-allow-origin", "access-control-allow-credentials", "origin reflection", "null origin", "preflight", "same origin policy", "sop bypass"]
+    "cors-misconfig": ["cors", "cross-origin", "cross origin", "access-control-allow-origin", "access-control-allow-credentials", "origin reflection", "null origin", "preflight", "same origin policy", "sop bypass"],
+    "403-bypass": ["403", "401", "forbidden", "forbidden bypass", "access denied", "x-forwarded-for", "x-original-url", "x-rewrite-url", "waf bypass", "method override", "header spoofing"]
 }
 
 
