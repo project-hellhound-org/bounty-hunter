@@ -22,13 +22,38 @@ from hellhound.core.scope import ScopeRules, is_in_scope, check_module_against_r
 from hellhound.core.tasks import create_or_load_target, set_scope as task_set_scope, save_target
 from hellhound.core.ai_utils import (
     load_config, save_config, ask_neural_core,
-    ping_ollama, list_available_models, detect_ai_config
+    ping_ollama, list_available_models, detect_ai_config,
+    NVIDIA_DEFAULT_MODEL
 )
 from hellhound.core.agent import handle_message as agent_handle_message, get_agent
 from hellhound.core.emit import PlainEmit
 from hellhound.core.http_utils import merge_global_context
 from hellhound.core.nodes import build_graph
 from hellhound.core.toolcheck import check_all_tools, try_install, check_wordlists
+
+# Recon/OSINT tool API keys — separate namespace from the LLM provider
+# keys /model set-key handles (those are validated against a fixed
+# provider list tied to model selection; these are read directly by their
+# tool executors in agent.py via cfg["api_keys"][<name>]). Centralized
+# here so /setup can both display status and offer to collect them,
+# instead of a researcher having to discover each tool's env var by
+# reading source.
+RECON_API_KEY_INFO: Dict[str, Dict[str, str]] = {
+    "urlscan": {
+        "label": "urlscan.io",
+        "used_by": "urlscan_recon",
+        "signup_url": "https://urlscan.io/user/signup",
+        "env_var": "URLSCAN_API_KEY",
+        "where": "after signup: urlscan.io -> top-right profile menu -> API",
+    },
+    "virustotal": {
+        "label": "VirusTotal",
+        "used_by": "virustotal_lookup",
+        "signup_url": "https://www.virustotal.com/gui/join-us",
+        "env_var": "VT_API_KEY",
+        "where": "after signup: virustotal.com -> your profile icon -> API key",
+    },
+}
 
 
 def _interactive_prompt(prompt_text: str) -> str:
@@ -550,8 +575,16 @@ def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         rules = target_obj.scope_rules
         target_list = getattr(rules, list_name)
         added = []
+        # clean_args is whitespace-tokenized, so "a.com,b.com,c.com" typed
+        # with no spaces arrives as ONE token — split each on commas too,
+        # or a comma-separated list silently becomes a single malformed
+        # entry (confirmed: this is exactly what happened with
+        # "help.arc.io,explorer.arc.io,community.arc.io").
+        raw_hosts = []
         for raw_entry in clean_args[1:]:
-            entry = raw_entry.strip().strip(",")
+            raw_hosts.extend(raw_entry.split(","))
+        for host_piece in raw_hosts:
+            entry = host_piece.strip().strip(",")
             if not entry:
                 continue
             if entry not in target_list:
@@ -575,7 +608,7 @@ def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) ->
             if added:
                 emit.success(f"Scope updated for target '{target_obj.name}':")
             else:
-                emit.info(f"Nothing new to add — {', '.join(e.strip().strip(',') for e in clean_args[1:])} already in {list_name} for '{target_obj.name}'.")
+                emit.info(f"Nothing new to add — {', '.join(h.strip().strip(',') for h in raw_hosts if h.strip())} already in {list_name} for '{target_obj.name}'.")
             emit.info(f"  In-Scope: {rules.in_scope}")
             emit.info(f"  Out-of-Scope: {rules.out_scope}")
             emit.info(f"  Disallowed: {rules.disallowed}")
@@ -609,7 +642,7 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
     current_orch_prov = session_context.get("options", {}).get("orchestrator_provider") or cfg.get("orchestrator_provider", "ollama")
     current_orch_model = session_context.get("options", {}).get("orchestrator_model") or cfg.get("orchestrator_model", "")
     current_synth_prov = session_context.get("options", {}).get("synthesizer_provider") or cfg.get("synthesizer_provider", "nvidia")
-    current_synth_model = session_context.get("options", {}).get("synthesizer_model") or cfg.get("synthesizer_model", "nvidia/nemotron-3-super-120b-a12b")
+    current_synth_model = session_context.get("options", {}).get("synthesizer_model") or cfg.get("synthesizer_model", NVIDIA_DEFAULT_MODEL)
 
     # ── Subcommand: /model set-key <provider> <api_key> ──────────────
     if clean_args and clean_args[0] == "set-key":
@@ -1009,6 +1042,38 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
                 emit.success(f"Max tool-call iterations per turn set to {n}.")
             return {"status": "success", "max_agent_iterations": n}
 
+        # ── Subcommand: /setup set-key [<provider> <api_key>] ──────
+        # Recon/OSINT tool keys (urlscan, virustotal) — NOT the same list
+        # as /model set-key, which is for LLM providers only.
+        if first in ("set-key", "setkey", "keys"):
+            provider = clean_args[1].lower() if len(clean_args) >= 2 else ""
+            key = clean_args[2] if len(clean_args) >= 3 else ""
+
+            if not provider and not is_json and sys.stdin.isatty():
+                names = ", ".join(RECON_API_KEY_INFO.keys())
+                provider = _interactive_prompt(f"Which tool's key? ({names}):").lower()
+            if provider not in RECON_API_KEY_INFO:
+                if not is_json:
+                    emit.error(f"Unknown recon tool '{provider}'. Use: {', '.join(RECON_API_KEY_INFO.keys())}")
+                    emit.info("Usage: /setup set-key <tool> <api_key>")
+                return {"status": "error", "error": "unknown_provider", "provider": provider}
+
+            if not key and not is_json and sys.stdin.isatty():
+                info = RECON_API_KEY_INFO[provider]
+                emit.info(f"Don't have one? Get it at: {info['signup_url']}  ({info['where']})")
+                key = _interactive_prompt(f"Enter API key for {info['label']}:")
+            if not key:
+                if not is_json:
+                    emit.error("Usage: /setup set-key <tool> <api_key>")
+                return {"status": "error", "error": "usage"}
+
+            cfg.setdefault("api_keys", {})[provider] = key
+            save_config(cfg)
+            if not is_json:
+                masked = key[:6] + "..." + key[-4:] if len(key) > 14 else key[:3] + "..."
+                emit.success(f"API key saved for {RECON_API_KEY_INFO[provider]['label']} ({masked}). {RECON_API_KEY_INFO[provider]['used_by']} will pick it up automatically.")
+            return {"status": "success", "provider": provider}
+
         if first in ("install-all", "install") or (first == "tools" and len(clean_args) > 1 and clean_args[1].lower() in ("install-all", "install")):
             tool_status = check_all_tools()
             missing_pd = tool_status.get("missing_pd", [])
@@ -1021,7 +1086,12 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
             if not is_json:
                 emit.banner("INSTALLING MISSING TOOLS")
             for t in missing_pd + missing_other:
-                try_install(t, emit=emit)
+                ok = try_install(t, emit=emit)
+                if not is_json:
+                    if ok:
+                        emit.success(f"[✓] {t} installed.")
+                    else:
+                        emit.warn(f"[✗] {t} still missing — see the error above (or install it manually).")
             tool_status = check_all_tools()
             if not is_json:
                 emit.success(f"Installation complete. Installed {tool_status['installed_count']}/{tool_status['total_tools']} tools.")
@@ -1088,9 +1158,30 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
             emit(f"    [bold yellow][!][/bold yellow] SecLists Missing -> Install: `{wordlist_status['install_hint_apt']}`")
             emit(f"                           or: `{wordlist_status['install_hint_git']}`")
 
+        # ── Recon/OSINT tool API keys (urlscan, virustotal, etc.) ──────
+        # These aren't LLM provider keys — they belong to individual
+        # TOOL_REGISTRY executors (urlscan_recon, virustotal_lookup) that
+        # would otherwise fail with "no_api_key" the first time a
+        # researcher tries them, with no earlier warning anywhere that a
+        # key was ever needed. Surface it here, same spot as every other
+        # dependency check.
+        recon_api_keys = cfg.get("api_keys", {}) if isinstance(cfg.get("api_keys"), dict) else {}
+        emit("\n  Recon/OSINT Tool API Keys (optional — unlocks extra tools):")
+        missing_recon_keys = []
+        for key_name, info in RECON_API_KEY_INFO.items():
+            has_key = bool(recon_api_keys.get(key_name) or os.environ.get(info["env_var"], ""))
+            if has_key:
+                emit(f"    [bold green][✓][/bold green] {info['label']:<12} -> used by {info['used_by']}")
+            else:
+                emit(f"    [dim][ ][/dim] {info['label']:<12} -> used by {info['used_by']} (not set) — get one: {info['signup_url']}")
+                missing_recon_keys.append(key_name)
+        if missing_recon_keys:
+            emit(f"    [*] Set with: `/setup set-key <tool> <api_key>` (e.g. `/setup set-key urlscan <key>`)")
+        status["recon_api_keys"] = {k: bool(recon_api_keys.get(k) or os.environ.get(v["env_var"], "")) for k, v in RECON_API_KEY_INFO.items()}
+
         auto_state = "[bold green]ON[/bold green]" if auto_install_enabled else "[dim]OFF[/dim]"
         emit(f"\n  Auto-Install Missing Tools: {auto_state} (Toggle: `/setup tools auto-install on|off`)")
-        
+
         recap_state = "[bold green]ON[/bold green]" if cfg.get("show_recaps", True) else "[dim]OFF[/dim]"
         emit(f"  Multi-tool Recap Footers:   {recap_state} (Toggle: `/setup recaps on|off`)")
 
@@ -1098,10 +1189,30 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
             ans = _interactive_prompt("Some binary tools are missing. Would you like to install them now? (y/n)")
             if ans.lower() in ("y", "yes"):
                 emit.banner("INSTALLING MISSING TOOLS")
+                still_missing = []
                 for t in tool_status["missing_pd"] + tool_status["missing_other"]:
-                    try_install(t, emit=emit)
+                    ok = try_install(t, emit=emit)
+                    if ok:
+                        emit.success(f"[✓] {t} installed.")
+                    else:
+                        still_missing.append(t)
+                        emit.warn(f"[✗] {t} still missing — see the error above (or install it manually).")
                 tool_status = check_all_tools()
                 status["tools"] = tool_status
+                if still_missing:
+                    emit.warn(f"\n{len(still_missing)} tool(s) could not be auto-installed: {', '.join(still_missing)}. Run `/setup` again to recheck after installing manually.")
+
+        if missing_recon_keys and not is_json and sys.stdin.isatty():
+            ans = _interactive_prompt(f"Set up recon tool API key(s) now? ({', '.join(missing_recon_keys)}) (y/n)")
+            if ans.lower() in ("y", "yes"):
+                for key_name in missing_recon_keys:
+                    info = RECON_API_KEY_INFO[key_name]
+                    emit.info(f"Don't have one? Get it at: {info['signup_url']}  ({info['where']})")
+                    val = _interactive_prompt(f"API key for {info['label']} (blank to skip):")
+                    if val.strip():
+                        cfg.setdefault("api_keys", {})[key_name] = val.strip()
+                        save_config(cfg)
+                        emit.success(f"Saved key for {info['label']}.")
 
     return {"status": "success", "setup": status}
 
@@ -1370,7 +1481,7 @@ register_command(Command(
     name="/model",
     aliases=["/ai"],
     description="Inspect, switch active AI model for orchestrator/synthesizer, or configure API keys",
-    usage="/model [orchestrator|synthesizer] <provider/model-id>  e.g. /model orchestrator ollama qwen2.5:3b-instruct  /model synthesizer nvidia/nemotron-3-super-120b-a12b\n/model set-key <provider> <key>",
+    usage="/model [orchestrator|synthesizer] <provider/model-id>  e.g. /model orchestrator ollama qwen2.5:3b-instruct  /model synthesizer nvidia/nemotron-3-ultra-550b-a55b\n/model set-key <provider> <key>  (any NIM model ID works, not just the examples shown)",
     category="config",
     handler=handle_model
 ))

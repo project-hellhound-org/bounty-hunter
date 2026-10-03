@@ -212,7 +212,7 @@ class HellhoundCompleter(Completer):
             sub_suggestions = [
                 ("orchestrator", "Configure fast local tool-selection model"),
                 ("synthesizer", "Configure deep cloud-reasoning analysis model"),
-                ("nvidia/nemotron-3-super-120b-a12b", "Nvidia Nemotron 120B (Synthesizer Cloud)"),
+                ("nvidia/nemotron-3-ultra-550b-a55b", "Nvidia Nemotron Ultra 550B (Synthesizer Cloud)"),
                 ("anthropic/claude-3-5-sonnet", "Claude 3.5 Sonnet (Synthesizer Cloud)"),
                 ("openai/gpt-4o", "GPT-4o (Synthesizer Cloud)"),
                 ("deepseek/deepseek-chat", "DeepSeek V3 (Synthesizer Cloud)"),

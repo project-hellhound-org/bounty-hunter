@@ -51,6 +51,29 @@ def _escape_graphql_string(s: str) -> str:
             .replace("\t", "\\t"))
 
 
+def _normalize_handle(program: str) -> str:
+    """
+    HackerOne program handles are lowercase URL slugs (hackerone.com/eternal
+    -> handle "eternal") — the GraphQL `team(handle: ...)` lookup is an
+    exact, case-sensitive match against that slug. A program name typed or
+    inferred in prose ("the Eternal program") almost never comes pre-
+    lowercased, and a capitalized handle simply doesn't match anything,
+    surfacing as a generic "Team does not exist" — which reads exactly like
+    the program itself isn't on HackerOne, when actually the lookup was
+    just cased wrong. Also tolerates a full URL/mention being passed
+    instead of a bare handle (e.g. "https://hackerone.com/eternal?type=team"
+    or "@eternal"), pulling just the slug out of it.
+    """
+    program = (program or "").strip()
+    if not program:
+        return program
+    if "hackerone.com/" in program:
+        program = program.split("hackerone.com/", 1)[1]
+    program = program.split("?")[0].split("/")[0]
+    program = program.lstrip("@")
+    return program.strip().lower()
+
+
 class HackerOneAPIError(Exception):
     """Raised on API failures (rate limit, timeout, bad response)."""
     def __init__(self, message, status_code=None):
@@ -74,8 +97,17 @@ def _graphql_request(query: str, timeout: int = DEFAULT_TIMEOUT) -> dict:
             body = resp.read().decode("utf-8", errors="replace")
             data = json.loads(body)
             if "errors" in data:
+                # data["errors"] is GraphQL's list of {message, locations,
+                # path, extensions} error objects — dumping that whole
+                # structure with str() (as this used to do) is exactly what
+                # produces the unreadable raw-dict wall of text callers were
+                # seeing. Pull out just the human message(s).
+                messages = [
+                    str(err["message"]) for err in data["errors"]
+                    if isinstance(err, dict) and err.get("message")
+                ]
                 raise HackerOneAPIError(
-                    f"GraphQL errors: {data['errors']}",
+                    "; ".join(messages) if messages else str(data["errors"]),
                     status_code=200,
                 )
             return data
@@ -108,6 +140,7 @@ def search_disclosed_reports(
         List of disclosed report summaries.
     """
     limit = max(1, min(25, limit))
+    program = _normalize_handle(program)
 
     where_clauses = ['disclosed_at: { _is_null: false }']
     if keyword:
@@ -123,7 +156,19 @@ def search_disclosed_reports(
 
     where = ", ".join(where_clauses)
 
+    # NOTE on `me { id __typename }`: every independently-authored tool
+    # that still successfully queries hacktivity_items (h1grep, h1disc,
+    # several dated 2021-2024) pairs it with this sibling field. HackerOne's
+    # /graphql endpoint is public but undocumented and known to reject
+    # otherwise-reasonable query shapes without a real schema-based reason
+    # (h1grep's own docs call this out explicitly) — this looks like
+    # session/operation validation on their end rather than a real schema
+    # difference, so it's included defensively here even though it isn't
+    # used below. If this endpoint changes again, this is the first thing
+    # to re-verify against a fresh capture of hackerone.com/hacktivity's
+    # own network requests.
     query = f"""{{
+      me {{ id __typename }}
       hacktivity_items(
         first: {limit},
         order_by: {{ field: popular, direction: DESC }},
@@ -180,18 +225,27 @@ def get_program_stats(program: str) -> dict:
     Returns:
         Dict with bounty info, response times, resolved counts.
     """
+    program = _normalize_handle(program)
     safe_program = _escape_graphql_string(program)
+    # default_currency, average_time_to_bounty_awarded, and
+    # average_time_to_first_program_response used to be direct scalar
+    # fields on Team but no longer are (confirmed: HackerOne's endpoint
+    # rejects all three with an undefinedField error as of this writing —
+    # not a guess). The GraphQL schema now exposes SLA-style metrics under
+    # a separate AggregatedSlaSnapshot type rather than flat on Team, but
+    # the exact accessor field name to reach it wasn't confirmable without
+    # live schema access, so those three are dropped here rather than
+    # guessed at. Every other field below was NOT flagged as invalid by
+    # the same error response, so they're kept.
     query = f"""{{
+      me {{ id __typename }}
       team(handle: "{safe_program}") {{
         name
         handle
         url
         offers_bounties
-        default_currency
         base_bounty
         resolved_report_count
-        average_time_to_bounty_awarded
-        average_time_to_first_program_response
         launched_at
         state
       }}
@@ -207,13 +261,11 @@ def get_program_stats(program: str) -> dict:
         "name": team.get("name", ""),
         "url": team.get("url", ""),
         "offers_bounties": team.get("offers_bounties", False),
-        "currency": team.get("default_currency", "USD"),
         "base_bounty": team.get("base_bounty"),
         "resolved_reports": team.get("resolved_report_count"),
-        "avg_days_to_bounty": team.get("average_time_to_bounty_awarded"),
-        "avg_days_to_first_response": team.get("average_time_to_first_program_response"),
         "launched_at": (team.get("launched_at") or "")[:10],
         "state": team.get("state", ""),
+        "note": "Response-time SLA metrics and default currency are no longer exposed by HackerOne's public API — not available in this result.",
     }
 
 
@@ -228,8 +280,10 @@ def get_program_policy(program: str) -> dict:
     Returns:
         Dict with safe harbor status, response SLAs, excluded vuln classes.
     """
+    program = _normalize_handle(program)
     safe_program = _escape_graphql_string(program)
     query = f"""{{
+      me {{ id __typename }}
       team(handle: "{safe_program}") {{
         name
         handle

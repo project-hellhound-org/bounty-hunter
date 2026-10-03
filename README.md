@@ -81,7 +81,7 @@ Autonomous vulnerability exploitation and multi-step attack chaining require mod
 
 > [!TIP]
 > ### 💡 Recommended AI Providers (Free & Paid)
-> - **For Free Users (Strongly Recommended)**: Use **NVIDIA NIM** (`nvidia/nemotron-3-super-120b-a12b` or `meta/llama-3.3-70b-instruct`). NVIDIA provides **generous free API credits** with access to massive 70B–120B frontier models, delivering high-speed inference and exceptional reasoning at zero cost.
+> - **For Free Users (Strongly Recommended)**: Use **NVIDIA NIM** (one free API key works against ANY model NIM serves — e.g. `nvidia/nemotron-3-ultra-550b-a55b` or `meta/llama-3.3-70b-instruct`; browse current model IDs at [build.nvidia.com/models](https://build.nvidia.com/models), NVIDIA periodically retires old ones). NVIDIA provides **generous free API credits** with access to massive frontier models, delivering high-speed inference and exceptional reasoning at zero cost.
 > - **For Paid API Users**: Use **Anthropic Claude 3.5 Sonnet**, **Google Gemini 2.0 Flash / Pro**, or **OpenAI GPT-4o**.
 > - **Local Models (Ollama)**: While supported for fully offline environments, small local models (SLMs under 14B) may struggle with nuanced multi-stage IDOR chaining and complex JSON schema adherence. For local setups, 32B+ models (e.g. `qwen2.5:32b` or `deepseek-r1:32b`) are recommended if hardware permits.
 
@@ -90,8 +90,10 @@ Autonomous vulnerability exploitation and multi-step attack chaining require mod
 > /model
 
 # Configure NVIDIA NIM (Recommended Free Tier - Ultra Fast 120B Reasoning)
-> /model orchestrator nvidia nvidia/nemotron-3-super-120b-a12b
-> /model synthesizer nvidia nvidia/nemotron-3-super-120b-a12b
+> /model orchestrator nvidia nvidia/nemotron-3-ultra-550b-a55b
+> /model synthesizer nvidia nvidia/nemotron-3-ultra-550b-a55b
+> # Any other NIM model ID works too — the same API key covers all of them:
+> /model synthesizer nvidia <any-model-id-from-build.nvidia.com/models>
 
 # Or configure Claude / Gemini for advanced cloud reasoning
 > /model synthesizer anthropic claude-3-5-sonnet
@@ -150,8 +152,8 @@ export NVIDIA_API_KEY="nvapi-your-key-here"
 3. Inside Bounty Hunter, select Nemotron or Llama 3.3:
 ```bash
 hellhound
-> /model orchestrator nvidia nvidia/nemotron-3-super-120b-a12b
-> /model synthesizer nvidia nvidia/nemotron-3-super-120b-a12b
+> /model orchestrator nvidia nvidia/nemotron-3-ultra-550b-a55b
+> /model synthesizer nvidia nvidia/nemotron-3-ultra-550b-a55b
 ```
 
 #### B. Commercial Frontier Cloud Providers (Claude, Gemini, OpenAI)
@@ -202,6 +204,13 @@ To enable automatic on-demand installation of any missing tools during scans:
 ```bash
 > /setup tools auto-install on
 ```
+
+#### Third-party recon tool API keys
+A few recon tools call external services that need their own free API key (separate from your LLM provider key above) — `/setup` shows exactly which ones are set and which aren't, with a signup link for each. Set any of them with:
+```bash
+> /setup set-key <tool> <api_key>
+```
+Every tool in the arsenal that needs one is self-describing this way — run `/setup` any time to see current status rather than hunting through docs for which key goes where.
 
 ---
 

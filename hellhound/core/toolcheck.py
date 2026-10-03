@@ -7,7 +7,9 @@ Manages ProjectDiscovery tool suite (via pdtm) and standalone offensive Go binar
 
 import os
 import shutil
+import site
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional, Dict, Any, Set, List
 
@@ -23,18 +25,46 @@ OTHER_TOOLS: Dict[str, str] = {
     "ffuf": "go install github.com/ffuf/ffuf/v2@latest",
     "subzy": "go install -v github.com/PentestPad/subzy@latest",
     "gowitness": "go install github.com/sensepost/gowitness@latest",
+    "gau": "go install github.com/lc/gau/v2/cmd/gau@latest",
+    "nuclei": "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+    "uro": "pip install uro",
+    # Not a single runnable command (varies by distro/package manager) —
+    # try_install() below recognizes the parenthetical and skips
+    # auto-exec for this one rather than running it literally.
+    "nmap": "apt install nmap (or the equivalent for your OS — brew install nmap on macOS, pacman -S nmap on Arch)",
 }
 
 
 def _get_search_path() -> str:
-    """Constructs complete search path including standard Go binary locations."""
+    """
+    Constructs complete search path including standard Go binary locations
+    AND the directories pip actually installs console scripts into.
+
+    Why this matters: `pip install uro` installs a console-script entry
+    point named `uro` into the SAME bin/ directory as whichever Python
+    interpreter ran the install — e.g. ~/.hellhound-env/bin/uro for a venv
+    install, or the --user site's bin/ for a --break-system-packages/--user
+    install. If Hellhound itself is launched via a symlinked `hellhound`
+    command that execs the venv's python directly (see install.sh) rather
+    than through an activated shell, that bin/ dir is never on the
+    inherited PATH env var — so a package that installed successfully (pip
+    says "Requirement already satisfied") still reads as missing here,
+    with no error, because this function was never looking in the one
+    place pip actually put it.
+    """
     custom_paths = [
         str(Path.home() / ".pdtm" / "go" / "bin"),
         str(Path.home() / "go" / "bin"),
         "/usr/local/bin",
         "/usr/bin",
+        # The currently-running interpreter's own bin/ dir — where its
+        # pip installs console scripts (covers venvs like .hellhound-env).
+        str(Path(sys.executable).resolve().parent),
+        # The `pip install --user` target's bin/ dir, for installs made
+        # outside a venv with --user instead of --break-system-packages.
+        str(Path(site.USER_BASE) / "bin") if hasattr(site, "USER_BASE") and site.USER_BASE else "",
     ]
-    return os.environ.get("PATH", "") + ":" + ":".join(custom_paths)
+    return os.environ.get("PATH", "") + ":" + ":".join(p for p in custom_paths if p)
 
 
 def is_available(tool_name: str) -> bool:
@@ -55,17 +85,65 @@ def install_hint(tool_name: str) -> str:
 
 
 def try_install(tool_name: str, emit=None) -> bool:
-    """Attempt to install a missing tool. Returns True if it's available afterward."""
+    """
+    Attempt to install a missing tool. Returns True if it's available
+    afterward.
+
+    pip-based tools get special handling: on Debian/Ubuntu/Kali with
+    Python 3.11+, a plain `pip install X` fails with an
+    "externally-managed-environment" error (PEP 668) and the old version
+    of this function swallowed that failure completely — it printed
+    "Installing..." and then just silently stayed missing, with no error
+    ever shown. This now retries with --break-system-packages / --user,
+    and if every attempt fails, reports the REAL error back through emit
+    instead of failing silently.
+    """
     cmd = install_hint(tool_name)
-    if cmd.startswith("(no known"):
+    if cmd.startswith("(no known") or "(" in cmd:
+        # Either genuinely unknown, or (like nmap) a human-readable hint
+        # rather than a single runnable command — don't exec it literally.
+        if emit and hasattr(emit, "warn") and "(" in cmd and not cmd.startswith("(no known"):
+            emit.warn(f"[!] {tool_name} has no single auto-install command — install it yourself: {cmd}")
         return False
     if emit and hasattr(emit, "info"):
         emit.info(f"[*] Installing {tool_name} via `{cmd}`...")
-    try:
-        subprocess.run(cmd.split(), capture_output=True, text=True, timeout=180, check=False)
-    except Exception:
-        return False
-    return is_available(tool_name)
+
+    if cmd.startswith("pip install "):
+        package = cmd[len("pip install "):].strip()
+        attempts = [
+            [sys.executable, "-m", "pip", "install", "--break-system-packages", package],
+            [sys.executable, "-m", "pip", "install", "--user", package],
+            [sys.executable, "-m", "pip", "install", package],
+        ]
+    else:
+        attempts = [cmd.split()]
+
+    last_error = ""
+    for attempt_cmd in attempts:
+        try:
+            proc = subprocess.run(attempt_cmd, capture_output=True, text=True, timeout=180, check=False)
+        except Exception as e:
+            last_error = str(e)
+            continue
+        if is_available(tool_name):
+            return True
+        last_error = (proc.stderr or proc.stdout or "").strip().splitlines()[-1] if (proc.stderr or proc.stdout) else f"exit code {proc.returncode}"
+
+    if emit and hasattr(emit, "warn") and last_error:
+        if "already satisfied" in last_error.lower():
+            # pip succeeded — the package IS installed — but is_available()
+            # still can't find its console script on PATH. That used to
+            # mean _get_search_path() wasn't checking the running
+            # interpreter's own bin/ dir (fixed above); if this still
+            # shows up after that fix, the package genuinely has no
+            # console-script entry point, or something else put a
+            # same-named file in the way.
+            emit.warn(f"[!] pip says {tool_name} is already installed, but no '{tool_name}' executable was found on PATH.")
+            emit.info(f"    Check where pip put it: {sys.executable} -m pip show -f {cmd.split()[-1]}  (look for a 'bin/{tool_name}' or 'Scripts/{tool_name}' entry)")
+        else:
+            emit.warn(f"[!] Install of {tool_name} failed: {last_error}")
+            emit.info(f"    Try manually: {cmd}  (or: {sys.executable} -m pip install --break-system-packages {cmd.split()[-1]})" if cmd.startswith("pip install") else f"    Try manually: {cmd}")
+    return False
 
 
 def ensure_tool(tool_name: str, emit=None, auto_install: bool = False) -> Dict[str, Any]:
@@ -167,4 +245,3 @@ def check_wordlists() -> Dict[str, Any]:
         "install_hint_apt": "sudo apt update && sudo apt install -y seclists wordlists",
         "install_hint_git": "sudo git clone --depth 1 https://github.com/danielmiessler/SecLists.git /usr/share/wordlists/seclists"
     }
-

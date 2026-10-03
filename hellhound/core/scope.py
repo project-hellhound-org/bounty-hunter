@@ -31,6 +31,11 @@ MODULE_RISK_MAP = {
     "fuzzhunter": ["no-fuzzing", "no-dos", "no-automated-scanners"],
     "exmap": ["no-active-exploitation"],
     "bypass403": ["no-automated-scanners"],
+    # nuclei -dast sends real payloads against every live param-bearing URL
+    # it's handed — same risk class as fuzzhunter/hydra, not a passive lookup.
+    "gaunucleisweep": ["no-fuzzing", "no-dos", "no-automated-scanners"],
+    # nmap --script vuln,default is an active vulnerability-scanning sweep.
+    "nmapservicescan": ["no-dos", "no-automated-scanners"],
 }
 
 

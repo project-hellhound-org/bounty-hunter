@@ -20,6 +20,8 @@ import threading
 from pathlib import Path
 import re
 import subprocess
+import tempfile
+from xml.etree import ElementTree as ET
 
 # Generic CTF-style flag token (THM{...}, HTB{...}, flag{...}, CTF{...}, etc.)
 # used to dedup record_finding calls that report the same flag under a
@@ -1315,6 +1317,767 @@ def _execute_403_bypass(args: Dict[str, Any], target: Target, emit: Any) -> Dict
     return result
 
 
+
+# ==========================================================
+# EXTRA RECON TOOLS — passive URL/asset discovery, active
+# exposure sweeps, OSINT lookups. Added from the researcher's
+# personal script collection; ported to native Python/structured
+# JSON instead of shelling out to the original scripts so output
+# matches the rest of TOOL_REGISTRY (Nah-bro voice on self-made
+# mistakes, real errors as "error", no raw ANSI/banner noise).
+# ==========================================================
+
+def _execute_wayback_urls(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Pulls archived URLs for a domain from the Wayback Machine's CDX API —
+    free, no API key, often turns up old endpoints/params/backup files
+    that gau/katana never saw live. Supports subdomain inclusion, a
+    sensitive-extension filter, and status-code include/exclude filters.
+    """
+    domain = str(args.get("domain") or target.name).strip().lower()
+    if domain.startswith(("http://", "https://")):
+        domain = urlparse(domain).netloc.split(":")[0]
+    if not domain:
+        return {
+            "status": "no_domain_given",
+            "note": "Nah bro, wayback_urls needs a domain — nothing to query the CDX API for. Pass one and call this again.",
+        }
+
+    include_subdomains = bool(args.get("include_subdomains", True))
+    extensions_only = bool(args.get("extensions_only", False))
+    status_codes = str(args.get("status_codes", "")).strip()
+    exclude_status_codes = str(args.get("exclude_status_codes", "")).strip()
+
+    ext_regex = (
+        r"xls|xml|xlsx|json|pdf|sql|doc|docx|pptx|txt|git|zip|tar\.gz|tgz|bak|7z|rar|log|"
+        r"cache|secret|db|backup|yml|gz|config|csv|yaml|md|md5|exe|dll|bin|ini|bat|sh|tar|"
+        r"deb|rpm|iso|img|env|apk|msi|dmg|tmp|crt|pem|key|pub|asc"
+    )
+
+    url_pattern = f"*.{domain}/*" if include_subdomains else f"{domain}/*"
+    params = {
+        "url": url_pattern,
+        "collapse": "urlkey",
+        "output": "text",
+        "fl": "original,statuscode",
+    }
+    filters = []
+    if extensions_only:
+        filters.append(f"original:.*\\.({ext_regex})$")
+    if status_codes:
+        filters.append(f"statuscode:({status_codes.replace(',', '|')})")
+    if exclude_status_codes:
+        filters.append(f"!statuscode:({exclude_status_codes.replace(',', '|')})")
+
+    try:
+        resp = requests.get(
+            "https://web.archive.org/cdx/search/cdx",
+            params=[*params.items(), *[("filter", f) for f in filters]],
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        return {"error": f"Wayback CDX request failed: {e}"}
+
+    if resp.status_code != 200:
+        return {"error": f"Wayback CDX returned HTTP {resp.status_code}"}
+
+    urls = []
+    seen = set()
+    for line in resp.text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        u = line.split(" ", 1)[0]
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    if urls:
+        existing = target.state.setdefault("wayback_urls", [])
+        for u in urls:
+            if u not in existing:
+                existing.append(u)
+        try:
+            save_target(target)
+        except Exception:
+            pass
+
+    return {
+        "domain": domain,
+        "url_count": len(urls),
+        "urls": urls[:500],
+        "truncated": len(urls) > 500,
+        "note": (
+            f"{len(urls)} archived URL(s) from the Wayback Machine." if urls else
+            "No archived URLs found for this domain/filter combination — the CDX index may simply not have this host crawled."
+        ),
+    }
+
+
+def _execute_otx_urls(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Pulls passive URL intel for a domain from AlienVault OTX's public
+    hostname/url_list endpoint — free, no API key. Complements
+    wayback_urls/gau with a different crawl source (threat-intel
+    sandboxes, sinkholes, OSINT feeds that fed OTX).
+    """
+    domain = str(args.get("domain") or target.name).strip().lower()
+    if domain.startswith(("http://", "https://")):
+        domain = urlparse(domain).netloc.split(":")[0]
+    if not domain:
+        return {
+            "status": "no_domain_given",
+            "note": "Nah bro, otx_urls needs a domain — nothing to look up in OTX. Pass one and call this again.",
+        }
+
+    page = 1
+    limit = 500
+    max_pages = int(args.get("max_pages", 10))
+    urls: List[str] = []
+    seen = set()
+
+    try:
+        while page <= max_pages:
+            resp = requests.get(
+                f"https://otx.alienvault.com/api/v1/indicators/hostname/{domain}/url_list",
+                params={"limit": limit, "page": page},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                break
+            data = resp.json() if resp.content else {}
+            entries = data.get("url_list") or []
+            if not entries:
+                break
+            for e in entries:
+                u = e.get("url")
+                if u and u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+            if len(entries) < limit:
+                break
+            page += 1
+    except requests.RequestException as e:
+        return {"error": f"AlienVault OTX request failed: {e}"}
+    except ValueError:
+        return {"error": "AlienVault OTX returned a non-JSON response"}
+
+    if urls:
+        existing = target.state.setdefault("otx_urls", [])
+        for u in urls:
+            if u not in existing:
+                existing.append(u)
+        try:
+            save_target(target)
+        except Exception:
+            pass
+
+    return {
+        "domain": domain,
+        "pages_fetched": page,
+        "url_count": len(urls),
+        "urls": urls[:500],
+        "truncated": len(urls) > 500,
+        "note": (
+            f"{len(urls)} URL(s) from AlienVault OTX passive intel." if urls else
+            "No URLs on record in OTX for this domain — that's normal for a host with no threat-intel footprint, not a failure."
+        ),
+    }
+
+
+def _execute_urlscan_recon(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Queries urlscan.io's search API for pages it has crawled under this
+    domain, pulling out either discovered subdomains or discovered URLs.
+    Needs an urlscan.io API key — set with `/model set-key urlscan <key>`
+    (stored the same way LLM provider keys are) or the URLSCAN_API_KEY
+    env var.
+    """
+    cfg = load_config()
+    api_keys = cfg.get("api_keys", {}) if isinstance(cfg.get("api_keys"), dict) else {}
+    api_key = api_keys.get("urlscan") or os.environ.get("URLSCAN_API_KEY", "")
+    if not api_key:
+        return {
+            "status": "no_api_key",
+            "note": "Nah bro, urlscan_recon needs an urlscan.io API key — none is configured. Set one first: /model set-key urlscan <your_api_key> (or export URLSCAN_API_KEY), then retry.",
+        }
+
+    domain = str(args.get("domain") or target.name).strip().lower()
+    if domain.startswith(("http://", "https://")):
+        domain = urlparse(domain).netloc.split(":")[0]
+    if not domain:
+        return {
+            "status": "no_domain_given",
+            "note": "Nah bro, urlscan_recon needs a domain — nothing to search for. Pass one and call this again.",
+        }
+
+    mode = str(args.get("mode", "subdomains")).strip().lower()
+    if mode not in ("subdomains", "urls"):
+        return {
+            "status": "unknown_mode",
+            "note": f"Nah bro, '{mode}' isn't valid for urlscan_recon — use 'subdomains' or 'urls'.",
+        }
+
+    try:
+        resp = requests.get(
+            "https://urlscan.io/api/v1/search/",
+            params={"q": f"page.domain:{domain}", "size": 100},
+            headers={"API-Key": api_key},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        return {"error": f"urlscan.io request failed: {e}"}
+
+    if resp.status_code == 401:
+        return {"status": "bad_api_key", "note": "Nah bro, urlscan.io rejected that API key (401) — check it with /model set-key urlscan <key> and retry."}
+    if resp.status_code != 200:
+        return {"error": f"urlscan.io returned HTTP {resp.status_code}"}
+
+    text = resp.text
+    results: List[str]
+    if mode == "subdomains":
+        matched = re.findall(rf"https?://((?:[a-zA-Z0-9_-]+\.)+{re.escape(domain)})", text)
+        stripped = [re.sub(r"^https?://", "", u) for u in matched]
+        results = sorted({u.split("/")[0] for u in stripped if u.split("/")[0] != domain})
+    else:
+        matched = re.findall(rf"https?://(?:[a-zA-Z0-9_-]+\.)+{re.escape(domain)}/[^\s\"'>]+", text)
+        results = sorted(set(matched))
+
+    if results and mode == "subdomains":
+        try:
+            update_from_subfinder(target, results)
+            save_target(target)
+        except Exception:
+            existing = target.state.setdefault("subdomains", [])
+            for s in results:
+                if s not in existing:
+                    existing.append(s)
+
+    return {
+        "domain": domain,
+        "mode": mode,
+        "count": len(results),
+        "results": results,
+        "note": f"{len(results)} {mode} found via urlscan.io's search index." if results else "urlscan.io has no crawled pages under this domain yet.",
+    }
+
+
+def _execute_virustotal_lookup(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Looks up an IP or domain in VirusTotal's public v2 API: resolved
+    hostnames (for an IP) and previously-seen-but-undetected URLs — useful
+    for finding sibling hosts/forgotten subdomains sitting on shared
+    infrastructure. Needs a VirusTotal API key — set with
+    `/model set-key virustotal <key>` (comma-separate multiple keys there
+    to rotate across the free-tier rate limit) or VT_API_KEY env var.
+    """
+    cfg = load_config()
+    api_keys = cfg.get("api_keys", {}) if isinstance(cfg.get("api_keys"), dict) else {}
+    raw_keys = api_keys.get("virustotal") or os.environ.get("VT_API_KEY", "")
+    keys = [k.strip() for k in str(raw_keys).split(",") if k.strip()]
+    if not keys:
+        return {
+            "status": "no_api_key",
+            "note": "Nah bro, virustotal_lookup needs a VirusTotal API key — none is configured. Set one first: /model set-key virustotal <your_api_key> (or export VT_API_KEY), then retry.",
+        }
+
+    raw_input = str(args.get("input") or args.get("domain") or args.get("ip") or target.name).strip()
+    raw_input = re.sub(r"^https?://", "", raw_input).split("/")[0]
+    if not raw_input:
+        return {
+            "status": "no_input_given",
+            "note": "Nah bro, virustotal_lookup needs an IP or domain to look up. Pass one and call this again.",
+        }
+
+    is_ip = bool(re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", raw_input))
+    endpoint = "ip-address/report" if is_ip else "domain/report"
+    param_name = "ip" if is_ip else "domain"
+    api_key = keys[0]
+
+    try:
+        resp = requests.get(
+            f"https://www.virustotal.com/vtapi/v2/{endpoint}",
+            params={"apikey": api_key, param_name: raw_input},
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        return {"error": f"VirusTotal request failed: {e}"}
+
+    if resp.status_code == 403:
+        return {"status": "bad_api_key", "note": "Nah bro, VirusTotal rejected that API key (403) — check it with /model set-key virustotal <key> and retry."}
+    if resp.status_code == 204:
+        return {"status": "rate_limited", "note": "VirusTotal rate-limited this key (204) — the public API is 4 req/min. Wait a bit or add more keys (comma-separated) to /model set-key virustotal."}
+    if resp.status_code != 200:
+        return {"error": f"VirusTotal returned HTTP {resp.status_code}"}
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return {"error": "VirusTotal returned a non-JSON response"}
+
+    hostnames = []
+    if is_ip:
+        for r in data.get("resolutions", []) or []:
+            h = r.get("hostname")
+            if h:
+                hostnames.append(h)
+
+    undetected_urls = []
+    for entry in data.get("undetected_urls", []) or []:
+        if isinstance(entry, list) and entry:
+            undetected_urls.append(entry[0])
+
+    if hostnames:
+        try:
+            update_from_subfinder(target, hostnames)
+            save_target(target)
+        except Exception:
+            pass
+
+    return {
+        "input": raw_input,
+        "is_ip": is_ip,
+        "resolved_hostnames": sorted(set(hostnames)),
+        "undetected_url_count": len(undetected_urls),
+        "undetected_urls": undetected_urls[:200],
+        "note": (
+            "These are URLs VirusTotal scanned and did NOT flag as malicious — they're just historical sightings, not findings. "
+            "Hostnames resolved for this IP can reveal sibling hosts worth adding to subfinder/httpx sweeps."
+        ),
+    }
+
+
+def _execute_google_dork(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Runs a Google dork query and returns result URLs. Defaults to scoping
+    the query to the active target with `site:<domain>` unless the
+    researcher passed a fully custom query. Non-interactive port of the
+    researcher's dorking.py (which was written for a human typing into a
+    terminal prompt — this takes the same inputs as tool args instead).
+    """
+    try:
+        from googlesearch import search  # type: ignore
+    except ImportError:
+        return {
+            "status": "missing_dependency",
+            "note": "Nah bro, google_dork needs the googlesearch-python package and it's not installed. Run: pip install googlesearch-python, then retry.",
+        }
+
+    domain = str(args.get("domain") or target.name).strip().lower()
+    if domain.startswith(("http://", "https://")):
+        domain = urlparse(domain).netloc.split(":")[0]
+    query = str(args.get("query", "")).strip()
+    custom_query = str(args.get("custom_query", "")).strip()
+    num_results = int(args.get("num_results", 20))
+    num_results = max(1, min(num_results, 100))
+
+    if custom_query:
+        dork = custom_query
+    elif domain:
+        dork = f"site:{domain} {query}".strip()
+    elif query:
+        dork = query
+    else:
+        return {
+            "status": "no_query_given",
+            "note": "Nah bro, google_dork needs either a domain (to scope a site: search) or a custom_query. Pass one and call this again.",
+        }
+
+    results = []
+    try:
+        for r in search(dork, num_results=num_results):
+            results.append(r)
+            if len(results) >= num_results:
+                break
+    except Exception as e:
+        return {"error": f"Google dork search failed: {e}", "dork": dork}
+
+    return {
+        "dork": dork,
+        "result_count": len(results),
+        "results": results,
+        "note": (
+            f"{len(results)} result(s) for this dork." if results else
+            "No results — Google may be rate-limiting unauthenticated searches from this IP if you've run several of these in a row; space them out."
+        ),
+    }
+
+
+def _execute_gau_nuclei_sweep(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Composite exposure sweep: gau (passive URL fetch) -> filter to URLs
+    with params -> dedup with uro -> httpx live-check -> nuclei -dast
+    against the live set. This is an ACTIVE scan — nuclei's -dast mode
+    sends real payloads (not just a passive template match) — gated
+    against engagement rules the same way hydra/fuzzhunter are (see
+    check_module_against_rules). Needs gau, uro, httpx (or the
+    Kali-packaged httpx-toolkit binary), and nuclei on PATH.
+    """
+    domain = str(args.get("domain") or target.name).strip().lower()
+    if domain.startswith(("http://", "https://")):
+        domain = urlparse(domain).netloc.split(":")[0]
+    if not domain:
+        return {
+            "status": "no_domain_given",
+            "note": "Nah bro, gau_nuclei_sweep needs a domain — nothing to sweep. Pass one and call this again.",
+        }
+
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+
+    gau_bin = get_binary_path("gau")
+    if not gau_bin:
+        return {
+            "error": "gau not installed",
+            "hint": "go install github.com/lc/gau/v2/cmd/gau@latest",
+        }
+    uro_bin = get_binary_path("uro")
+    httpx_bin = get_binary_path("httpx-toolkit") or get_binary_path("httpx")
+    if not httpx_bin:
+        check = ensure_tool("httpx", emit=emit, auto_install=auto_install)
+        if check["available"]:
+            httpx_bin = get_binary_path("httpx")
+    if not httpx_bin:
+        return {
+            "error": "httpx (or httpx-toolkit) not installed",
+            "hint": "pdtm -i httpx",
+        }
+    nuclei_bin = get_binary_path("nuclei")
+    if not nuclei_bin:
+        return {
+            "error": "nuclei not installed",
+            "hint": "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+        }
+
+    try:
+        gau_proc = _run_cmd_with_heartbeat([gau_bin, domain], timeout=90, emit=emit, label="gau (passive URL fetch)")
+    except subprocess.TimeoutExpired:
+        return {"error": "gau timed out after 90s"}
+    raw_urls = [u.strip() for u in (gau_proc.stdout or "").splitlines() if u.strip()]
+    if not raw_urls:
+        return {"domain": domain, "note": "gau returned no URLs for this domain — nothing to filter/sweep."}
+
+    param_urls = [u for u in raw_urls if re.search(r"\?[^=]+=.+", u)]
+    seen = set()
+    deduped = []
+    if uro_bin:
+        try:
+            uro_proc = subprocess.run([uro_bin], input="\n".join(param_urls), capture_output=True, text=True, timeout=60)
+            deduped = [u.strip() for u in (uro_proc.stdout or "").splitlines() if u.strip()]
+        except Exception:
+            deduped = []
+    if not deduped:
+        for u in param_urls:
+            if u not in seen:
+                seen.add(u)
+                deduped.append(u)
+
+    if not deduped:
+        return {
+            "domain": domain,
+            "urls_fetched": len(raw_urls),
+            "urls_with_params": 0,
+            "note": "gau found URLs but none carried query parameters — nothing for nuclei's DAST templates to fuzz here.",
+        }
+
+    if emit and hasattr(emit, "info"):
+        emit.info(f"[*] httpx (live check) on {len(deduped)} param-bearing URL(s)...")
+    try:
+        httpx_proc = subprocess.run(
+            [httpx_bin, "-silent", "-t", "300", "-rl", "200"],
+            input="\n".join(deduped), capture_output=True, text=True, timeout=120,
+        )
+        live_urls = [u.strip() for u in (httpx_proc.stdout or "").splitlines() if u.strip()]
+    except subprocess.TimeoutExpired:
+        return {"error": "httpx live-check timed out after 120s", "urls_with_params": len(deduped)}
+
+    if not live_urls:
+        return {
+            "domain": domain,
+            "urls_fetched": len(raw_urls),
+            "urls_with_params": len(deduped),
+            "live_urls": 0,
+            "note": "None of the param-bearing URLs are still live — they're all dead/archived endpoints now.",
+        }
+
+    try:
+        nuclei_proc = subprocess.run(
+            [nuclei_bin, "-dast", "-retries", "2", "-silent", "-jsonl"],
+            input="\n".join(live_urls), capture_output=True, text=True, timeout=240,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "error": "nuclei -dast timed out after 240s",
+            "domain": domain, "urls_fetched": len(raw_urls),
+            "urls_with_params": len(deduped), "live_urls": len(live_urls),
+        }
+
+    findings = []
+    for line in (nuclei_proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            findings.append(json.loads(line))
+        except ValueError:
+            continue
+
+    return {
+        "domain": domain,
+        "urls_fetched": len(raw_urls),
+        "urls_with_params": len(deduped),
+        "live_urls": len(live_urls),
+        "nuclei_findings": findings,
+        "finding_count": len(findings),
+        "note": (
+            f"nuclei -dast flagged {len(findings)} candidate(s) — these are template matches, NOT confirmed findings. "
+            "Manually reproduce each one (re-send the exact request nuclei used, read the real response) before record_finding, "
+            "same False-Positive Discipline as every other automated scanner output here."
+            if findings else
+            "nuclei -dast ran clean against the live param-bearing URLs — no template matched."
+        ),
+    }
+
+
+def _execute_nmap_service_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Deep service/vuln enumeration via nmap (-sV -sC --script vuln,default)
+    against a host's already-discovered open ports (run port_scan/naabu
+    first, or pass explicit ports). This is heavier and noisier than
+    naabu's plain port discovery — gated against engagement rules
+    (no-automated-scanners / no-dos) via check_module_against_rules.
+    Needs nmap on PATH and usually root/CAP_NET_RAW for the SYN scan
+    (falls back to a TCP connect scan if that's unavailable).
+    """
+    host = str(args.get("host") or args.get("hosts") or target.name).strip().lower()
+    if host.startswith(("http://", "https://")):
+        host = urlparse(host).netloc.split(":")[0]
+    if not host:
+        return {
+            "status": "no_host_given",
+            "note": "Nah bro, nmap_service_scan needs a host — nothing to scan. Pass one and call this again.",
+        }
+
+    nmap_bin = get_binary_path("nmap")
+    if not nmap_bin:
+        return {"error": "nmap not installed", "hint": "apt install nmap  (or the equivalent for your OS)"}
+
+    ports = args.get("ports")
+    if not ports:
+        state_ports = target.state.get("open_ports", {}).get(host) if isinstance(target.state.get("open_ports"), dict) else None
+        if state_ports:
+            ports = ",".join(str(p) for p in state_ports)
+    if not ports:
+        return {
+            "status": "no_ports_given",
+            "note": "Nah bro, nmap_service_scan needs ports to target — run port_scan first to discover open ports, then pass them here explicitly (e.g. ports='80,443,8080').",
+        }
+
+    scan_flag = "-sS"
+    try:
+        probe = subprocess.run([nmap_bin, "-sS", "-p", "1", "127.0.0.1"], capture_output=True, text=True, timeout=10)
+        if probe.returncode != 0 and "requires root" in (probe.stderr or "").lower():
+            scan_flag = "-sT"
+    except Exception:
+        scan_flag = "-sT"
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as tmp:
+        out_path = tmp.name
+
+    cmd = [
+        nmap_bin, scan_flag, "-sV", "-sC", "--script", "vuln,default",
+        "--open", "--reason", "-T4", "-Pn",
+        "-p", str(ports), "-oX", out_path, host,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return {"error": "nmap timed out after 180s — try a narrower port list."}
+    except Exception as e:
+        return {"error": f"nmap execution failed: {e}"}
+
+    try:
+        root = ET.parse(out_path).getroot()
+    except Exception:
+        return {"error": "nmap produced no parseable XML output", "stderr": (proc.stderr or "")[-500:]}
+    finally:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
+
+    open_services = []
+    script_findings = []
+    for host_el in root.findall("host"):
+        addr_el = host_el.find("address")
+        addr = addr_el.get("addr") if addr_el is not None else host
+        ports_el = host_el.find("ports")
+        if ports_el is None:
+            continue
+        for port_el in ports_el.findall("port"):
+            state_el = port_el.find("state")
+            if state_el is None or state_el.get("state") != "open":
+                continue
+            service_el = port_el.find("service")
+            svc = {
+                "host": addr,
+                "port": port_el.get("portid"),
+                "protocol": port_el.get("protocol"),
+                "service": service_el.get("name") if service_el is not None else "",
+                "product": service_el.get("product") if service_el is not None else "",
+                "version": service_el.get("version") if service_el is not None else "",
+            }
+            open_services.append(svc)
+            for script_el in port_el.findall("script"):
+                script_findings.append({
+                    "host": addr, "port": port_el.get("portid"),
+                    "script_id": script_el.get("id"),
+                    "output": (script_el.get("output") or "")[:2000],
+                })
+
+    return {
+        "host": host,
+        "scan_type": "SYN" if scan_flag == "-sS" else "TCP connect (no raw-socket privileges)",
+        "open_services": open_services,
+        "script_findings": script_findings,
+        "note": (
+            f"{len(open_services)} open service(s), {len(script_findings)} NSE script hit(s) (vuln+default scripts). "
+            "NSE 'vuln' script hits are leads, not confirmed vulnerabilities — verify each one manually before record_finding."
+        ),
+    }
+
+
+def _execute_punycode_homoglyphs(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Generates homoglyph/Unicode confusable variants of a single letter and
+    their punycode (xn--...) encodings — useful for IDN-homograph /
+    typosquat-detection work (checking whether a lookalike of the target's
+    brand domain has been registered) and for building confusable-domain
+    test cases for input-validation findings. Pure local computation, no
+    network calls.
+    """
+    letter = str(args.get("letter", "")).strip().lower()
+    if len(letter) != 1 or not letter.isalpha():
+        return {
+            "status": "invalid_letter",
+            "note": "Nah bro, punycode_homoglyphs takes exactly one a-z letter. Pass a single letter and call this again.",
+        }
+
+    glyphs = _HOMOGLYPH_MAP.get(letter, [])
+    variants = []
+    for g in glyphs:
+        try:
+            pc = g.encode("idna").decode("ascii")
+        except Exception:
+            try:
+                pc = "xn--" + g.encode("punycode").decode("ascii")
+            except Exception:
+                pc = None
+        if pc:
+            variants.append({"glyph": g, "punycode": pc})
+
+    return {
+        "letter": letter,
+        "variant_count": len(variants),
+        "variants": variants,
+        "note": (
+            f"{len(variants)} homoglyph variant(s) for '{letter}'. Swap these into the target brand's domain label and check "
+            "registration (WHOIS/DNS) to spot phishing/typosquat registrations, or use them as confusable-input test cases."
+            if variants else f"No homoglyphs on file for '{letter}'."
+        ),
+    }
+
+
+_HOMOGLYPH_MAP: Dict[str, List[str]] = {
+    'a': ['à','á','â','ã','ä','å','ɑ','А','Α'], 'b': ['Ь','Ꮟ','Ƅ','ᖯ'],
+    'c': ['ϲ','с','ƈ','ȼ','ḉ'], 'd': ['ԁ','ժ','Ꮷ'],
+    'e': ['е','ҽ','℮','ḛ','ḝ','ẹ','é','è','ê','ë'], 'f': ['ғ'],
+    'g': ['ɡ','ց'], 'h': ['һ','հ','Ꮒ'],
+    'i': ['і','ɩ','Ꭵ','ı','í','ì','î','ï'], 'j': ['ј','ʝ','ϳ'],
+    'k': ['κ'], 'l': ['ⅼ','ӏ','Ɩ','ʟ'],
+    'm': ['м','ṃ','ᴍ'], 'n': ['ո','п','ռ','ṅ','ṇ'],
+    'o': ['ο','օ','ӧ','ö','ó','ò','ô','õ'], 'p': ['р','ρ','⍴'],
+    'q': ['զ','ԛ','գ'], 'r': ['ᴦ','г','ř','ȓ','ṛ'],
+    's': ['ѕ','ʂ','ṡ','ṣ'], 't': ['т','τ','ṭ','ț'],
+    'u': ['υ','ս','ü','ú','ù','û'], 'v': ['ν','ѵ'],
+    'w': ['ԝ','ա','ѡ'], 'x': ['х','ҳ','ӿ'],
+    'y': ['у','ү','ӯ','ý','ÿ'], 'z': ['ᴢ','ż','ź','ž'],
+}
+
+
+def _execute_generate_cors_poc(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Writes a ready-to-open CORS PoC HTML page (credentialed XHR against a
+    confirmed-misconfigured endpoint, raw/JSON-formatted response toggle)
+    into this target's reports dir, pre-filled with the vulnerable URL.
+    Pair with the cors_checker tool's findings — this does NOT test
+    anything itself, it just produces the browser-side demo artifact for
+    a CORS misconfig you've already confirmed, to attach as evidence.
+    """
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return {
+            "status": "no_url_given",
+            "note": "Nah bro, generate_cors_poc needs the confirmed-vulnerable URL to pre-fill — pass that (from a cors_checker finding) and call this again.",
+        }
+
+    template_path = Path(__file__).resolve().parent.parent / "tools" / "pocs" / "CorsPoC.html"
+    if not template_path.exists():
+        return {"error": f"CorsPoC.html template not found at {template_path}"}
+
+    html = template_path.read_text(encoding="utf-8")
+    # Pre-fill the target input's value attribute so the PoC opens ready to
+    # fire. Single-line match on the placeholder attribute only — robust to
+    # the template's CRLF line endings and exact indentation.
+    needle = 'placeholder="https://target.com/api/endpoint"'
+    if needle in html:
+        html = html.replace(needle, f'{needle} value="{_html_escape(url)}"', 1)
+    else:
+        return {"error": "CorsPoC.html template has changed shape — couldn't locate the target-URL input to pre-fill."}
+
+    target_name = sanitize_target_name(target.name)
+    out_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}/reports"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_host = re.sub(r"[^a-zA-Z0-9._-]", "_", urlparse(url).netloc or url)[:80]
+    out_path = out_dir / f"cors_poc_{safe_host}_{int(time.time())}.html"
+    out_path.write_text(html, encoding="utf-8")
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[✓] CORS PoC written: {out_path}")
+
+    return {
+        "url": url,
+        "poc_path": str(out_path),
+        "note": "Open this file in a browser (served from any origin OTHER than the target's own, e.g. file:// or a throwaway localhost page) and hit Fetch — if the response renders, the CORS misconfig is live. Attach this file as evidence on record_finding/export_report.",
+    }
+
+
+def _humanize_hackerone_error(action: str, program: str, e: Exception) -> Dict[str, Any]:
+    """
+    Turns a HackerOneAPIError (or any other exception from the hackerone_mcp
+    calls) into the same status+note, self-talk voice used elsewhere for
+    "this went wrong in a way you should understand and not just retry
+    blindly" tool results (see jwt_forge's not_a_jwt case, set_target's
+    validation errors) — instead of dumping the raw GraphQL error structure
+    or a generic Python exception string straight to the researcher.
+    """
+    msg = str(e)
+    low = msg.lower()
+    if "does not exist" in low or "not found" in low:
+        return {
+            "status": "program_not_found",
+            "note": f"Nah bro, HackerOne doesn't have a program under the handle '{program}' — {action} needs the exact URL slug from the program's HackerOne page (hackerone.com/<handle>), not the display name. Double-check the handle there and retry; if it's genuinely not on HackerOne, it may be listed on Bugcrowd/Intigriti/another platform instead.",
+        }
+    if "timeout" in low or "timed out" in low:
+        return {
+            "status": "timeout",
+            "note": f"Nah bro, the {action} call to HackerOne timed out — their API was slow or unreachable just now, not a problem with the program handle. Worth one retry; if it keeps timing out, move on and come back to it later.",
+        }
+    return {
+        "status": "api_error",
+        "note": f"Nah bro, the {action} call to HackerOne's API came back with an error, not real data: {msg}. Don't treat this as 'program has no policy/stats' — it's an API-level failure, so don't record anything based on it.",
+    }
+
+
 def _execute_hackerone_search(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Search HackerOne Hacktivity for disclosed vulnerability reports."""
     keyword = args.get("keyword", "")
@@ -1326,7 +2089,7 @@ def _execute_hackerone_search(args: Dict[str, Any], target: Target, emit: Any) -
         results = search_disclosed_reports(keyword=keyword, program=program, limit=limit)
         return {"status": "success", "results": results, "count": len(results)}
     except Exception as e:
-        return {"error": f"HackerOne search failed: {e}"}
+        return _humanize_hackerone_error("hackerone_search", program, e)
 
 
 def _execute_hackerone_policy(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -1337,10 +2100,13 @@ def _execute_hackerone_policy(args: Dict[str, Any], target: Target, emit: Any) -
         from hellhound.mcp.hackerone_mcp.server import get_program_policy
         result = get_program_policy(program)
         if "error" in result:
-            return result
+            return {
+                "status": "program_not_found",
+                "note": f"Nah bro, HackerOne doesn't have a program under the handle '{program}' — hackerone_policy needs the exact URL slug from the program's HackerOne page (hackerone.com/<handle>), not the display name. Double-check the handle there and retry.",
+            }
         return {"status": "success", "policy": result}
     except Exception as e:
-        return {"error": f"Failed to retrieve HackerOne policy: {e}"}
+        return _humanize_hackerone_error("hackerone_policy", program, e)
 
 
 def _execute_hackerone_stats(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -1351,10 +2117,13 @@ def _execute_hackerone_stats(args: Dict[str, Any], target: Target, emit: Any) ->
         from hellhound.mcp.hackerone_mcp.server import get_program_stats
         result = get_program_stats(program)
         if "error" in result:
-            return result
+            return {
+                "status": "program_not_found",
+                "note": f"Nah bro, HackerOne doesn't have a program under the handle '{program}' — hackerone_stats needs the exact URL slug from the program's HackerOne page (hackerone.com/<handle>), not the display name. Double-check the handle there and retry.",
+            }
         return {"status": "success", "stats": result}
     except Exception as e:
-        return {"error": f"Failed to retrieve HackerOne stats: {e}"}
+        return _humanize_hackerone_error("hackerone_stats", program, e)
 
 
 def _clean_synthesizer_output(text: str) -> str:
@@ -1366,39 +2135,57 @@ def _clean_synthesizer_output(text: str) -> str:
 
     Seen in practice with small local models on plain advisory questions
     (e.g. "how do I fix this as a developer") that need no tool at all:
-    the model reaches for run_terminal_command with an `echo` just to
-    "print" its answer rather than writing it directly as text. That case
-    gets unwrapped — the echoed string IS the real answer, so it's
-    returned as-is rather than just reformatted JSON. Any other stray
-    tool-call shape gets stripped down to whatever real prose surrounded
-    it; the raw JSON itself is never shown to the researcher.
+    the model reaches for a fake "print my answer" tool call instead of
+    just writing the answer as text — most often run_terminal_command with
+    an `echo`, but sometimes an entirely made-up tool name (answer/respond/
+    say/print) with the real text tucked into an args field like
+    "text"/"message"/"answer". Either shape gets unwrapped and returned as
+    the real prose it actually is, rather than the JSON wrapper around it.
+
+    Also tolerates the JSON not being strict JSON: small local models
+    frequently emit Python-dict-style single-quoted pseudo-JSON
+    (`{'tool': 'x', ...}`) rather than double-quoted JSON — json.loads
+    rejects that outright, so a Python-literal fallback parse is tried
+    before giving up. Markdown code fences wrapped around the blob are
+    stripped first for the same reason.
     """
-    if not text or '"tool"' not in text:
+    if not text or "{" not in text or "tool" not in text:
         return text
 
-    start = text.find("{")
+    # Strip a wrapping ```json ... ``` or ``` ... ``` fence, if present —
+    # the brace-scan below doesn't care about fence markers, but leaving
+    # them in would end up included in `before`/`after` and shown to the
+    # researcher as stray backticks.
+    fence_stripped = re.sub(r'```(?:json)?\s*\n?', '', text)
+    fence_stripped = fence_stripped.replace('```', '')
+
+    start = fence_stripped.find("{")
     if start == -1:
         return text
 
     # Balanced-brace, string/escape-aware scan (mirrors
     # _extract_first_balanced_json) so we know exactly where the JSON
-    # object ends and can preserve any real prose before/after it.
+    # object ends and can preserve any real prose before/after it. Tracks
+    # both quote styles since the blob may turn out to be single-quoted
+    # Python-dict-style pseudo-JSON rather than strict JSON.
     depth = 0
     in_string = False
+    string_quote = ""
     escape = False
     end = -1
-    for i in range(start, len(text)):
-        ch = text[i]
+    for i in range(start, len(fence_stripped)):
+        ch = fence_stripped[i]
         if in_string:
             if escape:
                 escape = False
             elif ch == "\\":
                 escape = True
-            elif ch == '"':
+            elif ch == string_quote:
                 in_string = False
             continue
-        if ch == '"':
+        if ch in ("'", '"'):
             in_string = True
+            string_quote = ch
         elif ch == "{":
             depth += 1
         elif ch == "}":
@@ -1409,35 +2196,77 @@ def _clean_synthesizer_output(text: str) -> str:
     if end == -1:
         return text
 
-    candidate = text[start:end]
+    candidate = fence_stripped[start:end]
+    parsed = None
     try:
         parsed = json.loads(candidate)
     except Exception:
-        return text
+        try:
+            import ast
+            parsed = ast.literal_eval(candidate)
+        except Exception:
+            return text
     if not isinstance(parsed, dict) or "tool" not in parsed:
         return text
 
     tool_name = parsed.get("tool")
     args = parsed.get("args") or parsed.get("parameters") or parsed.get("arguments") or {}
-    before = text[:start].strip()
-    after = text[end:].strip()
+    # Slice from fence_stripped, not the original text — start/end were
+    # computed against it, and its length can differ from the original
+    # whenever a code fence actually got stripped above.
+    before = fence_stripped[:start].strip()
+    after = fence_stripped[end:].strip()
 
     # Most common failure mode: no tool was actually needed for a plain
-    # informational/advisory question, but the model reached for
-    # run_terminal_command + echo purely to "print" its answer instead of
-    # just writing it as prose. Unwrap the echoed string and use THAT as
-    # the answer instead of leaking the JSON wrapper around it.
-    if tool_name == "run_terminal_command" and isinstance(args, dict):
-        cmd = str(args.get("command", "")).strip()
-        m = re.match(r"^echo\s+(['\"])(.*)\1\s*$", cmd, re.DOTALL)
-        if m:
-            echoed = m.group(2).strip()
-            if echoed:
-                pieces = [p for p in (before, echoed, after) if p]
+    # informational/advisory question, but the model reached for a fake
+    # "print my answer" tool call instead of just writing prose. Two
+    # shapes of this get unwrapped rather than falling through to anything
+    # below — this takes priority even when the tool name happens to be a
+    # real registered one (run_terminal_command is both real AND the most
+    # common vehicle for this exact fake-print pattern):
+    if isinstance(args, dict):
+        # Shape 1: run_terminal_command + echo — the echoed string IS the
+        # real answer.
+        if tool_name == "run_terminal_command":
+            cmd = str(args.get("command", "")).strip()
+            m = re.match(r"^echo\s+(['\"])(.*)\1\s*$", cmd, re.DOTALL)
+            if m:
+                echoed = m.group(2).strip()
+                if echoed:
+                    pieces = [p for p in (before, echoed, after) if p]
+                    return "\n\n".join(pieces)
+        # Shape 2: an entirely made-up tool name (answer/respond/say/
+        # print/reply/output/message — whatever the model invented) with
+        # the real text sitting in a plausibly-named args field. Same
+        # underlying mistake as shape 1, just a different fake verb.
+        for key in ("text", "message", "answer", "response", "reply", "content", "output"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                pieces = [p for p in (before, val.strip(), after) if p]
                 return "\n\n".join(pieces)
 
-    # Any other stray tool-call JSON: keep whatever real prose the model
-    # wrote around it, and drop the JSON itself rather than showing it raw.
+    # Neither fake-print shape matched. A REAL, registered tool name here
+    # (dns_bruteforce, curl, subfinder...) is a different situation from a
+    # model inventing a fake tool: it means a real action was genuinely
+    # intended, and somewhere between deciding that and it actually
+    # reaching execute_tool_call, the turn ended without dispatching it.
+    # Falling through to the vague "(Suggested next tool: ...)" line below
+    # would hide that a real, intended action never happened — worse than
+    # saying nothing, since the researcher has no way to know whether it
+    # actually ran. Say so plainly instead.
+    if tool_name in TOOL_REGISTRY:
+        pieces = [p for p in (before, after) if p]
+        extra = (" " + " ".join(pieces)) if pieces else ""
+        return (
+            f"Started to run {tool_name} but the turn ended before it actually fired — nothing ran, "
+            f"this isn't a result.{extra} Just ask again (e.g. \"run it\" / \"go ahead\") and it should "
+            f"actually execute this time."
+        )
+
+    # Any other stray tool-call JSON (an unregistered/hallucinated tool
+    # name — nothing real to run, nothing real to report): keep whatever
+    # real prose the model wrote around it, and drop the JSON itself
+    # rather than showing it raw.
     parts = []
     if before:
         parts.append(before)
@@ -1500,6 +2329,11 @@ DISCOVERY_TOOLS: Set[str] = {
     "resolve_candidates",
     "port_scan",
     "tls_cert_scan",
+    "wayback_urls",
+    "otx_urls",
+    "urlscan_recon",
+    "gau_nuclei_sweep",
+    "nmap_service_scan",
 }
 
 ACTIONABLE_ARTIFACT_PATTERNS = [
@@ -4568,6 +5402,124 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_403_bypass
     ),
+    "wayback_urls": ToolSpec(
+        name="wayback_urls",
+        description="Pulls archived URLs for a domain from the Wayback Machine's CDX API (web.archive.org) — free, no API key. Often surfaces old endpoints, params, and backup/config files that live crawlers (gau/katana) never see. Supports subdomain inclusion and filtering by sensitive file extensions or HTTP status codes.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Domain to query archived URLs for."},
+                "include_subdomains": {"type": "boolean", "description": "Include *.domain archived URLs, not just the apex.", "default": True},
+                "extensions_only": {"type": "boolean", "description": "Only return URLs ending in a sensitive extension (sql, env, bak, config, pem, key, etc.).", "default": False},
+                "status_codes": {"type": "string", "description": "Comma-separated HTTP status codes to include only (e.g. '200,301')."},
+                "exclude_status_codes": {"type": "string", "description": "Comma-separated HTTP status codes to exclude (e.g. '404,500')."}
+            },
+            "required": ["domain"]
+        },
+        executor=_execute_wayback_urls
+    ),
+    "otx_urls": ToolSpec(
+        name="otx_urls",
+        description="Pulls passive URL intel for a domain from AlienVault OTX's free, no-API-key hostname/url_list endpoint. A different crawl/threat-intel source than wayback_urls/gau — worth running alongside them, not instead of.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Domain to query OTX for."},
+                "max_pages": {"type": "integer", "description": "Max pages of 500 results each to fetch.", "default": 10}
+            },
+            "required": ["domain"]
+        },
+        executor=_execute_otx_urls
+    ),
+    "urlscan_recon": ToolSpec(
+        name="urlscan_recon",
+        description="Searches urlscan.io's crawl index for a domain and extracts either discovered subdomains or discovered URLs from pages it has already scanned. Needs an urlscan.io API key configured via /model set-key urlscan <key> or the URLSCAN_API_KEY env var.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Domain to search urlscan.io for."},
+                "mode": {"type": "string", "enum": ["subdomains", "urls"], "description": "Extract subdomains or full URLs from matching scans.", "default": "subdomains"}
+            },
+            "required": ["domain"]
+        },
+        executor=_execute_urlscan_recon
+    ),
+    "virustotal_lookup": ToolSpec(
+        name="virustotal_lookup",
+        description="Looks up a domain or IP in VirusTotal's v2 API: resolved hostnames (for an IP, revealing sibling hosts on shared infra) and previously-seen undetected URLs. Needs a VirusTotal API key via /model set-key virustotal <key> (comma-separate several keys there to rotate across the free-tier rate limit) or VT_API_KEY env var.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "input": {"type": "string", "description": "Domain or IP address to look up."}
+            },
+            "required": ["input"]
+        },
+        executor=_execute_virustotal_lookup
+    ),
+    "google_dork": ToolSpec(
+        name="google_dork",
+        description="Runs a Google dork search, by default scoped to the active target with 'site:<domain> <query>'. Pass custom_query to run a fully custom dork instead (e.g. cross-target intext: searches). Google may rate-limit unauthenticated searches if called repeatedly in a short window.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Domain to scope the dork to via site: — omit if custom_query is fully self-contained."},
+                "query": {"type": "string", "description": "Dork terms appended after site:<domain> (e.g. 'filetype:env \"DB_PASSWORD\"')."},
+                "custom_query": {"type": "string", "description": "A complete, self-contained dork query — overrides domain+query."},
+                "num_results": {"type": "integer", "description": "Max results to return (1-100).", "default": 20}
+            },
+            "required": []
+        },
+        executor=_execute_google_dork
+    ),
+    "gau_nuclei_sweep": ToolSpec(
+        name="gau_nuclei_sweep",
+        description="Composite ACTIVE exposure sweep: gau passive URL fetch -> filter to param-bearing URLs -> dedup -> httpx live-check -> nuclei -dast against the live set. Sends real payloads (not just template matching) — subject to engagement no-automated-scanners/no-fuzzing/no-dos rules. Needs gau, httpx (or httpx-toolkit), and nuclei on PATH; uro is used if present but optional.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Domain to sweep."}
+            },
+            "required": ["domain"]
+        },
+        executor=_execute_gau_nuclei_sweep
+    ),
+    "nmap_service_scan": ToolSpec(
+        name="nmap_service_scan",
+        description="Deep service/vuln enumeration (nmap -sV -sC --script vuln,default) against a host's already-discovered open ports. Heavier and noisier than naabu's plain port_scan — run port_scan first, then pass its open ports here (or they're read automatically from target state if port_scan already ran). Subject to engagement no-automated-scanners/no-dos rules. NSE 'vuln' script hits are leads requiring manual verification, not confirmed findings.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Host or IP to scan."},
+                "ports": {"type": "string", "description": "Comma-separated ports to scan (e.g. '80,443,8080'). If omitted, uses ports already discovered by port_scan for this host."}
+            },
+            "required": ["host"]
+        },
+        executor=_execute_nmap_service_scan
+    ),
+    "punycode_homoglyphs": ToolSpec(
+        name="punycode_homoglyphs",
+        description="Generates Unicode homoglyph/confusable variants of a single letter and their punycode (xn--) encodings — for IDN-homograph / typosquat-domain detection (brand-protection recon) and confusable-input test case generation. Pure local computation, no network calls, no scope restriction.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "letter": {"type": "string", "description": "A single a-z letter to generate homoglyph variants for."}
+            },
+            "required": ["letter"]
+        },
+        executor=_execute_punycode_homoglyphs
+    ),
+    "generate_cors_poc": ToolSpec(
+        name="generate_cors_poc",
+        description="Writes a ready-to-open, credentialed-XHR CORS PoC HTML page pre-filled with a CONFIRMED-vulnerable URL (from a cors_checker finding) into this target's reports directory, for use as evidence attached to record_finding/export_report. Does not test anything itself.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The confirmed CORS-misconfigured URL to pre-fill into the PoC."}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_generate_cors_poc
+    ),
     "hackerone_search": ToolSpec(
         name="hackerone_search",
         description="Search HackerOne Hacktivity for disclosed reports to learn about past vulnerability classes on the target or industry.",
@@ -6732,6 +7684,20 @@ INSTRUCTIONS:
         _narration_retry_count = 0
         _premature_done_retry_count = 0
 
+        # Wall-clock ceiling alongside the iteration-COUNT ceiling
+        # (max_iterations). Observed in practice: a slow local orchestrator
+        # model producing slightly-different-each-time tool-call text that
+        # never quite parses cleanly AND never quite repeats identically
+        # (defeating the _prev_ai_resp dedup check a few lines below) can
+        # burn through a large chunk of a 60-iteration budget on pure
+        # inference latency alone, with zero tools ever actually
+        # dispatched — one real case ran ~19 minutes this way. 60 iterations
+        # is a reasonable count-based ceiling when each one is fast; it's
+        # not a reasonable TIME budget when each one isn't. This caps the
+        # worst case regardless of which exact retry path is looping.
+        _loop_deadline = time.time() + 240  # 4 minutes
+        _timed_out = False
+
         # A path scope set in an earlier turn (e.g. "...from this endpoint
         # https://host/app") persists across the session — most follow-up
         # messages ("go for it", "try exploiting that flaw") won't repeat the
@@ -6763,6 +7729,13 @@ INSTRUCTIONS:
             for iteration in range(max_iterations):
                 self._current_turn = iteration + 1
                 if cancel_check and cancel_check():
+                    break
+                if time.time() > _loop_deadline:
+                    # Stop BEFORE starting another slow inference call, not
+                    # after — the goal is capping wall-clock time actually
+                    # spent, not just adding one more check at the end of
+                    # an iteration that already ran long.
+                    _timed_out = True
                     break
 
                 if emit and hasattr(emit, "set_label"):
@@ -7263,6 +8236,31 @@ INSTRUCTIONS:
                     "invent findings or a summary, since nothing was actually run."
                 )
 
+            final_answer, tokens = _ask_synthesizer(
+                synth_prompt,
+                self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx)
+            )
+        elif _timed_out:
+            # Hit the wall-clock ceiling above with no tool ever
+            # successfully dispatched this turn. The generic
+            # not-_productive_tools_executed branch below just hands the
+            # synthesizer the bare original_user_text plus full history —
+            # and that history is full of the orchestrator's own failed
+            # raw tool-call-JSON attempts from this same stuck turn, with
+            # nothing telling the synthesizer not to echo one back as its
+            # answer. Be explicit instead: say plainly that repeated
+            # attempts didn't get a tool to actually run, and forbid
+            # reproducing any JSON/tool-call syntax from that history.
+            synth_prompt = (
+                f"The researcher asked: \"{original_user_text}\"\n\n"
+                f"Repeated attempts to act on this were made, but no tool actually "
+                f"finished running before this turn's time budget ran out — nothing "
+                f"was dispatched, nothing was gathered. State that plainly in one or "
+                f"two sentences and suggest the researcher just ask again. Do NOT "
+                f"reproduce, paraphrase-as-code, or describe-in-JSON any tool-call "
+                f"syntax that may appear in the conversation history above — those "
+                f"were failed internal attempts, not something to show the researcher."
+            )
             final_answer, tokens = _ask_synthesizer(
                 synth_prompt,
                 self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx)

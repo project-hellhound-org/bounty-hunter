@@ -15,6 +15,24 @@ logger = logging.getLogger("hellhound.ai_utils")
 CONFIG_DIR = Path.home() / ".hellhound"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+# Default NVIDIA NIM model used when nothing else is configured. NVIDIA
+# periodically retires model IDs (they return HTTP 410 Gone past an
+# announced end-of-life date — nemotron-3-super-120b-a12b hit this on
+# 2026-10-03), so this is a single named constant rather than a string
+# repeated at every call site, to make swapping the default a one-line
+# change instead of a grep-and-replace across the file.
+#
+# IMPORTANT: this is only ever a *default suggestion* — one NVIDIA NIM API
+# key (an nvapi-... key from build.nvidia.com) works against ANY model NIM
+# serves, current or future. A researcher is never limited to this name:
+# `/model orchestrator nvidia <any-nim-model-id>` or
+# `/model synthesizer nvidia <any-nim-model-id>` accepts whatever model
+# string NVIDIA is currently serving, with no whitelist check — see
+# handle_model() in commands.py. Update this constant when NVIDIA retires
+# the current default; it does not need to be "the best" model, just a
+# live one, since the researcher can always override it per-tier.
+NVIDIA_DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
+
 def strip_thinking_tags(text: str) -> str:
     """
     Strips chain-of-thought/reasoning blocks (<think>...</think>, <thinking>...</thinking>,
@@ -99,7 +117,7 @@ def load_config() -> Dict[str, Any]:
         "orchestrator_provider": "ollama",
         "orchestrator_model": "",
         "synthesizer_provider": "nvidia",
-        "synthesizer_model": "nvidia/nemotron-3-super-120b-a12b",
+        "synthesizer_model": NVIDIA_DEFAULT_MODEL,
         "api_key": "ollama",
         "researcher_handle": "",
         "max_response_tokens": 8192,
@@ -144,7 +162,7 @@ def load_config() -> Dict[str, Any]:
                 if "synthesizer_provider" not in data:
                     data["synthesizer_provider"] = "nvidia" if ("api_keys" in data and "nvidia" in data.get("api_keys", {})) else legacy_prov
                 if "synthesizer_model" not in data:
-                    data["synthesizer_model"] = "nvidia/nemotron-3-super-120b-a12b" if data.get("synthesizer_provider") == "nvidia" else legacy_model
+                    data["synthesizer_model"] = NVIDIA_DEFAULT_MODEL if data.get("synthesizer_provider") == "nvidia" else legacy_model
                 return data
             return default_config
     except Exception as e:
@@ -200,7 +218,7 @@ For each finding, output EXACTLY this structure:
 IMPACT_ADVISOR_PERSONA = """\
 [SYSTEM: HELLHOUND IMPACT ADVISOR — WORST-CASE CALCULATOR]
 
-You are Hellhound. Your mission: take a security finding and calculate its maximum real-world impact from a bug bounty perspective.
+You are Bounty Hunter, Project Hellhound's recon/triage AI. Your mission: take a security finding and calculate its maximum real-world impact from a bug bounty perspective.
 
 For each finding, output EXACTLY:
 
@@ -221,26 +239,26 @@ For each finding, output EXACTLY:
 CORRELATION_PERSONA = """\
 [SYSTEM: HELLHOUND CORE — RECON & FINDINGS TRIAGE]
 
-You are Hellhound, an autonomous bug bounty reconnaissance and triage assistant.
+You are Bounty Hunter, Project Hellhound's autonomous bug bounty reconnaissance and triage assistant.
 Your goal is to organize recon discoveries (subdomains, open ports, live web tech, API routes, CORS/CNAME status) into actionable, non-destructive findings.
 """
 
 ASK_PERSONA = """\
 [SYSTEM: HELLHOUND CORE — TACTICAL ADVISORY]
 
-You are Hellhound, a concise, high-fidelity bug bounty research assistant.
+You are Bounty Hunter, a concise, high-fidelity bug bounty research assistant built under Project Hellhound.
 Minimalist. Tactical. Zero fluff. Provide factual, technical answers.
 """
 
 ASK_PERSONA_SLM = """\
 [SYSTEM: HELLHOUND — ASSISTANT]
-You are Hellhound, a capable cybersecurity and bug bounty triage assistant.
+You are Bounty Hunter, a capable cybersecurity and bug bounty triage assistant built under Project Hellhound.
 You are professional, technical, and concise.
 Answer the user's technical questions accurately based on the provided context. If the user asks a casual question, reply naturally.
 """
 
 CORRELATION_PERSONA_SLM = """\
-You are Hellhound. Correlate recon findings into clear triage summaries.
+You are Bounty Hunter. Correlate recon findings into clear triage summaries.
 Label missing data as [MISSING].
 """
 
@@ -254,19 +272,29 @@ REPORTING STRATEGY: (Low/Medium/High/Critical)
 """
 
 CHAT_PERSONA_SLM = """\
-You are Hellhound, a helpful bug bounty research and triage assistant.
+You are Bounty Hunter, a helpful bug bounty research and triage assistant built under Project Hellhound by the researcher (handle: l4zz3rj0d) — if asked your name, you're Bounty Hunter; Hellhound is the project that built you, l4zz3rj0d is who built you.
 For casual conversation: respond naturally and conversationally in 1-3 sentences max.
 """
 
 
 SYNTHESIZER_PERSONA = """\
-You are HELLHOUND — the researcher's own AI, running as their daily driver, not
-a tool that only wakes up for bug bounty work. Think JARVIS with a security
-clearance: sharp, witty, a little sarcastic, genuinely likeable — but the
-instant real work is on the table, the jokes take a back seat to the facts.
-You verify before you agree; you don't take a claim, a number, or a "looks
-exploitable" at face value just because it was handed to you — you check it
-against what the evidence actually shows and say so if it doesn't hold up.
+You are BOUNTY HUNTER — the researcher's own AI, running as their daily
+driver, not a tool that only wakes up for bug bounty work. Think JARVIS with
+a security clearance: sharp, witty, a little sarcastic, genuinely likeable —
+but the instant real work is on the table, the jokes take a back seat to the
+facts. You verify before you agree; you don't take a claim, a number, or a
+"looks exploitable" at face value just because it was handed to you — you
+check it against what the evidence actually shows and say so if it doesn't
+hold up.
+
+IDENTITY: If asked your name, you are Bounty Hunter — never answer
+"Hellhound" to that question. Project Hellhound is the codebase/project that
+built you, not your name — the distinction matters, keep it straight. You
+were built by the researcher you're working with now, handle l4zz3rj0d —
+they're your creator, the one who put you together and keeps extending you
+(not just "the user using a tool"). Wear that the way a built thing would:
+loyal to the person who made you, straightforward about what you are, no
+false modesty and no pretending you're independent of them.
 
 HOW YOU TALK, DEPENDING ON WHAT'S IN FRONT OF YOU:
 - General chat, learning questions, movies, whatever's on the researcher's
@@ -424,7 +452,7 @@ def render_session_footer():
     padding = (cols - len(label)) // 2
     print(f"{HR}{'█' * padding}{W}{label}{HR}{'█' * (cols - padding - len(label))}{RST}\n")
 
-def render_chat_bubble(text: str, sender: str = "HELLHOUND"):
+def render_chat_bubble(text: str, sender: str = "BOUNTY HUNTER"):
     if not text or not text.strip():
         return
     try:
@@ -785,7 +813,7 @@ def detect_ai_config(api_key: str) -> Tuple[Optional[str], Optional[str]]:
     elif api_key.startswith("sk-ant-"):
         return "anthropic", "claude-3-5-sonnet-20240620"
     elif api_key.startswith("nvapi-"):
-        return "nvidia", "nvidia/nemotron-3-super-120b-a12b"
+        return "nvidia", NVIDIA_DEFAULT_MODEL
     elif api_key.startswith("sk-"):
         return "openai", "gpt-4o"
     elif api_key == "ollama":
@@ -821,7 +849,7 @@ def get_default_model(provider: str) -> str:
             pass
         return "qwen2.5:3b-instruct-q4_0"
     elif provider == "nvidia" or provider == "nim":
-        return "nvidia/nemotron-3-super-120b-a12b"
+        return NVIDIA_DEFAULT_MODEL
     elif provider == "gemini":
         return "gemini-2.0-flash"
     elif provider == "anthropic":
@@ -865,10 +893,17 @@ def list_available_models() -> List[Dict[str, Any]]:
         pass
 
     # 2. Check NVIDIA NIM
+    # NOTE: this is a curated set of SUGGESTIONS for display only — NOT a
+    # whitelist. One NVIDIA NIM API key works against any model ID NIM
+    # serves, so `/model orchestrator nvidia <any-nim-model-id>` (or
+    # synthesizer) accepts anything, even a model not listed here. NVIDIA
+    # retires model IDs over time (see NVIDIA_DEFAULT_MODEL's docstring) —
+    # if one of these ever 404s/410s, swap it below; the researcher is
+    # never stuck waiting on this list to be updated to use a new model.
     nv_key = api_keys.get("nvidia") or os.environ.get("NVIDIA_API_KEY") or (cfg.get("api_key") if str(cfg.get("api_key", "")).startswith("nvapi-") else None)
     if nv_key:
         nim_models = [
-            "nvidia/nemotron-3-super-120b-a12b",
+            NVIDIA_DEFAULT_MODEL,
             "meta/llama-3.3-70b-instruct",
             "meta/llama-3.1-70b-instruct",
             "meta/llama-3.1-8b-instruct",
@@ -1005,6 +1040,29 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
     
     return strip_thinking_tags(res) if isinstance(res, str) else res
 
+def _format_nvidia_nim_error(r: "requests.Response", model: str, role: str) -> str:
+    """
+    Turns a non-200 NVIDIA NIM response into a message a researcher can
+    actually act on. 410 Gone specifically means the model ID itself has
+    passed its announced end-of-life date and NVIDIA has pulled it from
+    serving entirely (this happened to nemotron-3-super-120b-a12b on
+    2026-10-03) — retrying, waiting, or re-checking the API key does
+    nothing for a 410; the only fix is picking a different model. A plain
+    "NIM returned 410 - {...}" dump doesn't tell you that, so this
+    special-cases it (and the closely related 404, which NIM also uses for
+    an unrecognized model ID) with the actual fix inline.
+    """
+    if r.status_code in (410, 404):
+        return (
+            f"Error: NVIDIA NIM no longer serves model '{model}' (HTTP {r.status_code}) — "
+            f"it's been retired/renamed, not a transient failure. Your NVIDIA API key still works "
+            f"fine against any OTHER model NIM serves. Pick a current one and switch with:\n"
+            f"  /model {role} nvidia <model-id>\n"
+            f"(current NIM model IDs: https://build.nvidia.com/models — e.g. {NVIDIA_DEFAULT_MODEL})"
+        )
+    return f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:200]}"
+
+
 def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, role: str = "orchestrator", thinking: bool = False, max_tokens: int = None, history: list = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """Config-aware wrapper to query the configured AI provider/model for a specific role (orchestrator vs synthesizer)."""
     cfg = load_config()
@@ -1064,17 +1122,24 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             messages.append({"role": "user", "content": prompt})
 
         if "/" not in model:
-            for prefix in ("nvidia/", "meta/", "mistralai/", "deepseek-ai/"):
-                if f"{prefix}{model}" in (
-                    "nvidia/nemotron-3-super-120b-a12b",
-                    "meta/llama-3.3-70b-instruct",
-                    "meta/llama-3.1-70b-instruct",
-                    "meta/llama-3.1-8b-instruct",
-                    "mistralai/mistral-large-2-instruct",
-                    "deepseek-ai/deepseek-r1"
-                ):
-                    model = f"{prefix}{model}"
-                    break
+            # Bare model name (no "<vendor>/" prefix) — guess the right NIM
+            # vendor namespace from a keyword in the name rather than an
+            # exact-match whitelist. An exact-match list breaks the moment
+            # NVIDIA ships a new model ID under an existing vendor (e.g. a
+            # new nemotron generation) since the literal string was never
+            # in the list; keyword matching keeps working for any future
+            # model from these vendors without needing a code update. Any
+            # NVIDIA NIM API key works against any model NIM serves, so
+            # this is purely a routing convenience, never a restriction —
+            # falls back to "nvidia/" (NVIDIA's own namespace) for anything
+            # that doesn't match a known vendor keyword.
+            model_lower = model.lower()
+            if any(kw in model_lower for kw in ("llama",)):
+                model = f"meta/{model}"
+            elif "mistral" in model_lower or "mixtral" in model_lower:
+                model = f"mistralai/{model}"
+            elif "deepseek" in model_lower:
+                model = f"deepseek-ai/{model}"
             else:
                 model = f"nvidia/{model}"
 
@@ -1104,7 +1169,7 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
                 time.sleep(1.5)
                 r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code != 200:
-                err = f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:100]}"
+                err = _format_nvidia_nim_error(r, model, role)
                 return (err, None) if return_usage else err
             data = r.json()
             usage_tokens = data.get("usage", {}).get("completion_tokens")
@@ -1129,7 +1194,7 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             time.sleep(1.5)
             r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:
-            err = f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:100]}"
+            err = _format_nvidia_nim_error(r, model, role)
             return (err, None) if return_usage else err
 
         full_response = []
