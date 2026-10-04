@@ -903,17 +903,41 @@ def handle_headers(args: List[str], session_context: Dict[str, Any], emit: Any) 
 
 def handle_target(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
-    /target [domain_or_name]
+    /target [domain_or_name] [--clear-history]
     Switch or display the current active target for the session.
     """
     is_json = "--json" in args or getattr(emit, "json_mode", False)
-    clean_args = [a for a in args if a not in ("--json", "-j")]
+    clear_history = "--clear-history" in args or "--reset" in args
+    clean_args = [a for a in args if a not in ("--json", "-j", "--clear-history", "--reset")]
+
+    # ── --clear-history: wipe this target's saved conversation turns ──
+    # self.history is loaded straight from target.state["history"] on
+    # every Agent init (see agent.py) — it's NOT reset by restarting the
+    # process, switching models, or editing any persona/system-prompt
+    # file. A stale turn sitting in there (e.g. the model having already
+    # answered a question a prior persona build got wrong) keeps getting
+    # fed back as conversation context forever, silently outweighing a
+    # freshly corrected system prompt. This is the way to actually clear
+    # that out for one target without renaming/abandoning it.
+    if clear_history:
+        target_name_for_clear = (clean_args[0].strip().lower() if clean_args else session_context.get("target", "default"))
+        if target_name_for_clear.startswith(("http://", "https://")):
+            target_name_for_clear = urlparse(target_name_for_clear).netloc.split(":")[0]
+        target_obj = create_or_load_target(target_name_for_clear)
+        prior_len = len(target_obj.state.get("history") or [])
+        target_obj.state["history"] = []
+        save_target(target_obj)
+        if not is_json:
+            emit.success(f"Cleared {prior_len} saved conversation turn(s) for target '{target_name_for_clear}'. Next message starts with a clean slate.")
+        if not clean_args:
+            return {"status": "success", "target": target_name_for_clear, "history_cleared": prior_len}
 
     if not clean_args:
         current_target = session_context.get("target", "default")
         if not is_json:
             emit.info(f"Active session target: [bold cyan]{current_target}[/bold cyan]")
             emit.info("To switch target: /target <domain_or_name>")
+            emit.info("To wipe saved chat history for this target: /target --clear-history")
         return {"status": "success", "target": current_target}
 
     new_target_name = clean_args[0].strip().lower()
@@ -1508,7 +1532,7 @@ register_command(Command(
     name="/target",
     aliases=["/tgt", "/set-target"],
     description="Inspect or switch the active engagement target",
-    usage="/target [domain_or_name]",
+    usage="/target [domain_or_name] [--clear-history]",
     category="session",
     handler=handle_target
 ))

@@ -59,7 +59,14 @@ def _get_search_path() -> str:
         "/usr/bin",
         # The currently-running interpreter's own bin/ dir — where its
         # pip installs console scripts (covers venvs like .hellhound-env).
-        str(Path(sys.executable).resolve().parent),
+        # Deliberately NOT .resolve()'d: a venv's bin/python3 is almost
+        # always a symlink to the base system interpreter, so resolving it
+        # walks straight past the venv's own bin/ to e.g. /usr/bin — which
+        # is already on PATH and does NOT contain the venv's installed
+        # console scripts (uro, etc.). sys.executable itself already
+        # reports the venv path verbatim; resolving it threw away the one
+        # directory this was added to find.
+        str(Path(sys.executable).parent),
         # The `pip install --user` target's bin/ dir, for installs made
         # outside a venv with --user instead of --break-system-packages.
         str(Path(site.USER_BASE) / "bin") if hasattr(site, "USER_BASE") and site.USER_BASE else "",
@@ -119,6 +126,7 @@ def try_install(tool_name: str, emit=None) -> bool:
         attempts = [cmd.split()]
 
     last_error = ""
+    saw_already_satisfied = False
     for attempt_cmd in attempts:
         try:
             proc = subprocess.run(attempt_cmd, capture_output=True, text=True, timeout=180, check=False)
@@ -127,19 +135,44 @@ def try_install(tool_name: str, emit=None) -> bool:
             continue
         if is_available(tool_name):
             return True
-        last_error = (proc.stderr or proc.stdout or "").strip().splitlines()[-1] if (proc.stderr or proc.stdout) else f"exit code {proc.returncode}"
+        out = (proc.stderr or "") + (proc.stdout or "")
+        if "already satisfied" in out.lower():
+            saw_already_satisfied = True
+        last_error = out.strip().splitlines()[-1] if out.strip() else f"exit code {proc.returncode}"
+
+    # Every normal attempt reported "already satisfied" — pip sees valid
+    # package metadata in site-packages and skips re-installing entirely,
+    # which ALSO skips regenerating the console-script wrapper in bin/.
+    # That leaves a state where the package is genuinely present but the
+    # command was never written (a prior install that got interrupted
+    # after writing metadata but before writing scripts, a venv rebuilt
+    # from a stale lib/ copy, etc.) — "already satisfied" looks like
+    # success but the binary still doesn't exist. --force-reinstall
+    # --no-deps re-extracts the package unconditionally and regenerates
+    # its entry-point scripts, which fixes exactly this state without
+    # needing to know anything about this specific package's internals.
+    if cmd.startswith("pip install ") and saw_already_satisfied:
+        package = cmd[len("pip install "):].strip()
+        if emit and hasattr(emit, "info"):
+            emit.info(f"[*] {tool_name} looks installed but its command is missing — forcing a reinstall to regenerate it...")
+        for flag_set in (["--break-system-packages"], ["--user"], []):
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", *flag_set, package],
+                    capture_output=True, text=True, timeout=180, check=False,
+                )
+            except Exception as e:
+                last_error = str(e)
+                continue
+            if is_available(tool_name):
+                return True
+            out = (proc.stderr or "") + (proc.stdout or "")
+            last_error = out.strip().splitlines()[-1] if out.strip() else f"exit code {proc.returncode}"
 
     if emit and hasattr(emit, "warn") and last_error:
-        if "already satisfied" in last_error.lower():
-            # pip succeeded — the package IS installed — but is_available()
-            # still can't find its console script on PATH. That used to
-            # mean _get_search_path() wasn't checking the running
-            # interpreter's own bin/ dir (fixed above); if this still
-            # shows up after that fix, the package genuinely has no
-            # console-script entry point, or something else put a
-            # same-named file in the way.
-            emit.warn(f"[!] pip says {tool_name} is already installed, but no '{tool_name}' executable was found on PATH.")
-            emit.info(f"    Check where pip put it: {sys.executable} -m pip show -f {cmd.split()[-1]}  (look for a 'bin/{tool_name}' or 'Scripts/{tool_name}' entry)")
+        if saw_already_satisfied:
+            emit.warn(f"[!] {tool_name} is installed (pip confirms it) but no '{tool_name}' executable exists anywhere on PATH, even after a forced reinstall.")
+            emit.info(f"    Check what pip actually wrote: {sys.executable} -m pip show -f {cmd.split()[-1]}  (look for a 'bin/{tool_name}' or 'Scripts/{tool_name}' entry — if there genuinely isn't one, this package has no CLI command and must be used as a Python module instead)")
         else:
             emit.warn(f"[!] Install of {tool_name} failed: {last_error}")
             emit.info(f"    Try manually: {cmd}  (or: {sys.executable} -m pip install --break-system-packages {cmd.split()[-1]})" if cmd.startswith("pip install") else f"    Try manually: {cmd}")
