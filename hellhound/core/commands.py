@@ -486,19 +486,22 @@ def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any,
 
 def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
-    /scope [show | clear | in <host...> | out <host...> | disallow <rule...> | <pasted program policy text>]
+    /scope [show | clear | in <host...> | out <host...> | disallow <rule...> | remove <host...> | <pasted program policy text>]
 
     show                    — display the current scope for the active target
     clear                   — wipe all scope rules for the active target
     in <host...>            — ADD one or more hosts to in-scope (aliases: include, add-in)
     out <host...>           — ADD one or more hosts to out-of-scope (aliases: exclude, add-out)
     disallow <rule...>      — ADD one or more prohibited-action rules (alias: prohibit)
+    remove <host...>        — REMOVE one or more entries, wherever they currently sit
+                              (in-scope, out-of-scope, or disallowed) — use this to undo
+                              a wrongly-added host (aliases: rm, delete, del, drop)
     <pasted policy text>    — anything else REPLACES the entire scope, parsed from
                               free-form/markdown program-policy text (e.g. pasting a
                               HackerOne/Bugcrowd scope page). Use this for the initial
-                              scope setup; use in/out/disallow for incremental edits
-                              afterward — they add to what's already there instead of
-                              wiping it.
+                              scope setup; use in/out/disallow/remove for incremental
+                              edits afterward — they add to or remove from what's
+                              already there instead of wiping it.
     """
     is_json = "--json" in args or getattr(emit, "json_mode", False)
     clean_args = [a for a in args if a not in ("--json", "-j")]
@@ -613,6 +616,55 @@ def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) ->
             emit.info(f"  Out-of-Scope: {rules.out_scope}")
             emit.info(f"  Disallowed: {rules.disallowed}")
         return {"status": "success", "action": "added", "list": list_name, "added": added, "target": target_obj.name, "scope": rules.to_dict()}
+
+    # /scope remove <host...> — undo a wrongly-added entry, wherever it
+    # currently sits. Unlike in/out/disallow above, this doesn't target one
+    # specific list: the researcher asking to remove something usually
+    # doesn't know (or care) which list it landed in, especially right
+    # after a typo'd /scope out that put it somewhere unexpected. Search
+    # all three and strip it from whichever one(s) actually contain it.
+    remove_verbs = ("remove", "rm", "delete", "del", "drop")
+    if verb in remove_verbs and len(clean_args) > 1:
+        rules = target_obj.scope_rules
+        raw_hosts = []
+        for raw_entry in clean_args[1:]:
+            raw_hosts.extend(raw_entry.split(","))
+        removed: Dict[str, List[str]] = {"in_scope": [], "out_scope": [], "disallowed": []}
+        not_found = []
+        for host_piece in raw_hosts:
+            entry = host_piece.strip().strip(",")
+            if not entry:
+                continue
+            hit = False
+            for list_name in ("in_scope", "out_scope", "disallowed"):
+                target_list = getattr(rules, list_name)
+                if entry in target_list:
+                    target_list.remove(entry)
+                    removed[list_name].append(entry)
+                    hit = True
+            if not hit:
+                not_found.append(entry)
+
+        target_obj.scope_summary = f"{len(rules.in_scope)} in-scope domains, {len(rules.out_scope)} out-of-scope exclusions, {len(rules.disallowed)} prohibited rules"
+        save_target(target_obj)
+        session_context["scope_rules"] = rules
+
+        total_removed = sum(len(v) for v in removed.values())
+        if not is_json:
+            if total_removed:
+                emit.success(f"Removed from scope for target '{target_obj.name}':")
+                for list_name, entries in removed.items():
+                    if entries:
+                        emit.info(f"  {list_name}: -{', '.join(entries)}")
+            if not_found:
+                emit.warn(f"Not found in any scope list — nothing to remove: {', '.join(not_found)}")
+            emit.info(f"  In-Scope: {rules.in_scope}")
+            emit.info(f"  Out-of-Scope: {rules.out_scope}")
+            emit.info(f"  Disallowed: {rules.disallowed}")
+        return {
+            "status": "success", "action": "removed", "removed": removed,
+            "not_found": not_found, "target": target_obj.name, "scope": rules.to_dict()
+        }
 
     raw_text = " ".join(clean_args)
     task_set_scope(target_obj, raw_text)

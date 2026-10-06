@@ -2343,6 +2343,27 @@ ACTIONABLE_ARTIFACT_PATTERNS = [
     r"reset_token", r"reset_link", r"delegation_endpoint", r"mfa", r"otp", r"hash", r"flag"
 ]
 
+# Well-known analytics/bot-management/tracking cookie names that carry zero
+# auth or session value. These show up on nearly every page and, left
+# unfiltered, each one got mechanically flagged as a "high-value security
+# artifact" (via section D below matching the literal substring "cookie" in
+# the *header name* "Set-Cookie" itself — not the cookie's actual name)
+# which then tripped the ARTIFACT_PRE_FLIGHT_GATE and blocked passive
+# discovery tools (subfinder, etc.) on completely benign targets, e.g. a
+# Cloudflare `_cfuvid` bot-management cookie on a landing page. Checked
+# against the cookie's own name (case-insensitive substring), not the
+# header name.
+BENIGN_COOKIE_NAME_PATTERNS = [
+    r"^__?cf", r"cfuvid", r"^_ga", r"^_gid", r"^_gat", r"^_fbp", r"^_fbc",
+    r"hubspotutk", r"^__hs", r"intercom-", r"^mp_", r"amplitude", r"optimizely",
+    r"^_hj", r"^ajs_", r"^__stripe_mid", r"^__stripe_sid", r"nps_", r"__utm",
+]
+
+
+def _is_benign_tracking_cookie(cookie_name: str) -> bool:
+    name = (cookie_name or "").strip().lower()
+    return any(re.search(p, name, re.I) for p in BENIGN_COOKIE_NAME_PATTERNS)
+
 
 def _flatten_json_dict(obj: Any, prefix: str = "") -> Dict[str, Any]:
     items: Dict[str, Any] = {}
@@ -2496,7 +2517,34 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
         hdrs = tool_output.get("headers") or {}
         if isinstance(hdrs, dict):
             for hk, hv in hdrs.items():
-                if "cookie" in hk.lower() or "authorization" in hk.lower() or "token" in hk.lower():
+                hk_lower = hk.lower()
+                if "cookie" in hk_lower:
+                    # Don't trust the header NAME ("Set-Cookie" always
+                    # contains "cookie") — that trivially matched every
+                    # single Set-Cookie response, including pure
+                    # analytics/bot-management cookies (Cloudflare
+                    # `_cfuvid`, Google `_ga`, etc.), and flagged each one
+                    # as a high-value security artifact requiring testing
+                    # before any discovery tool could run. Parse the
+                    # actual cookie NAME(S) out of the value and gate on
+                    # that instead.
+                    cookie_names = re.findall(r"([A-Za-z0-9_\-\.]+)=", str(hv))
+                    if not cookie_names:
+                        continue
+                    for c_name in cookie_names:
+                        if _is_benign_tracking_cookie(c_name):
+                            continue
+                        new_artifacts.append({
+                            "field_name": c_name,
+                            "value": str(hv),
+                            "source": f"{tool_name.upper()} {source_url}".strip(),
+                            "associated_identity": "session context",
+                            "turn": turn_number,
+                            "consumed": False,
+                            "consumed_at": None,
+                            "consumed_by": None
+                        })
+                elif "authorization" in hk_lower or "token" in hk_lower:
                     new_artifacts.append({
                         "field_name": hk,
                         "value": str(hv),
@@ -5589,7 +5637,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "jwt_forge": ToolSpec(
         name="jwt_forge",
-        description="Decode ANY dot-separated, base64url-looking token or cookie value you're holding — real JWTs AND framework-signed session cookies (Flask/itsdangerous, and similar) share the same 'segment.segment.segment' shape, and you cannot tell which one you have until you decode it. Call this on every such value, including cookies literally named 'session' — do NOT skip it just because the cookie name doesn't say 'jwt' or 'token'. Do NOT use only on values named sess_/connect.sid/PHPSESSID — those ARE genuinely opaque random IDs with nothing to decode, skip only those. Two outcomes: (1) it's a real JWT (has header+payload claims) — the tool attempts forgery/privilege-escalation techniques against it (alg:none, kid_injection, jwk_injection, hs256 confusion, and hs_crack). (2) it's NOT a real JWT (e.g. a Flask session) — the tool decodes it anyway and returns the raw decoded content in 'decoded_session_content' instead of forging claims; READ THAT CONTENT, since flags, secrets, or other sensitive data are frequently stored directly inside a session payload, especially in CTF-style labs — this is often faster than chasing an out-of-band callback. RECOMMENDED WORKFLOW for real JWTs: call with default algorithm='all' first — this runs only the free, no-secret-needed techniques (alg:none case/format variants, kid header path-traversal to /dev/null, embedded-JWK header self-signing, and RS256->HS256 public-key confusion if public_key_or_secret is given). Test those forged_tokens against the server. Only if all are rejected, escalate by calling again with algorithm='hs_crack' to brute-force the real HMAC secret against a built-in common-secret wordlist — this is deliberately NOT part of the default 'all' bundle, since it's the expensive fallback, not the first move. A hit produces a *legitimately* signed token, not just a bypass guess. The result's 'hs_crack_available' field tells you whether that escalation applies to this token. Automatically updates session state with the primary (best) forged token for subsequent tool calls.",
+        description="CHECK THE SHAPE BEFORE CALLING: this only ever does something useful on a value containing at least one '.' character (a 'segment.segment' or 'segment.segment.segment' structure) — real JWTs AND framework-signed session cookies (Flask/itsdangerous, and similar) share that shape, and you cannot tell which one you have until you decode it. A value with ZERO dots — a plain hex string, a UUID, an opaque API/bearer token, sess_*, connect.sid, PHPSESSID — is NOT this tool's target; calling it on one just burns a turn for a guaranteed 'not a valid JWT' error, so don't. Call this on every DOT-CONTAINING value you're holding, including cookies literally named 'session' — do NOT skip those just because the cookie name doesn't say 'jwt' or 'token'. Two outcomes: (1) it's a real JWT (has header+payload claims) — the tool attempts forgery/privilege-escalation techniques against it (alg:none, kid_injection, jwk_injection, hs256 confusion, and hs_crack). (2) it's NOT a real JWT (e.g. a Flask session) — the tool decodes it anyway and returns the raw decoded content in 'decoded_session_content' instead of forging claims; READ THAT CONTENT, since flags, secrets, or other sensitive data are frequently stored directly inside a session payload, especially in CTF-style labs — this is often faster than chasing an out-of-band callback. RECOMMENDED WORKFLOW for real JWTs: call with default algorithm='all' first — this runs only the free, no-secret-needed techniques (alg:none case/format variants, kid header path-traversal to /dev/null, embedded-JWK header self-signing, and RS256->HS256 public-key confusion if public_key_or_secret is given). Test those forged_tokens against the server. Only if all are rejected, escalate by calling again with algorithm='hs_crack' to brute-force the real HMAC secret against a built-in common-secret wordlist — this is deliberately NOT part of the default 'all' bundle, since it's the expensive fallback, not the first move. A hit produces a *legitimately* signed token, not just a bypass guess. The result's 'hs_crack_available' field tells you whether that escalation applies to this token. Automatically updates session state with the primary (best) forged token for subsequent tool calls.",
         parameters={
             "type": "object",
             "properties": {
@@ -6195,9 +6243,21 @@ class Agent:
     # narrative digest (session_digest) and dropped from self.history —
     # the digest rides along in the system prompt instead, at a fraction
     # of the size.
-    _HISTORY_COMPACT_TRIGGER = 14
-    _HISTORY_KEEP_RAW = 8
-    _DIGEST_CHAR_CAP = 4000
+    # These were sized (14/8/4000) for a small-context local orchestrator
+    # model — tight enough that a single real engagement (ShopHaven-style:
+    # login, spider, a handful of curl probes, a password-reset exploit
+    # chain) could blow past _HISTORY_COMPACT_TRIGGER and get its own
+    # exact evidence (the leaked reset token, the exact request that
+    # worked) folded into a lossy 4000-char digest before the turn that
+    # needed to write the report ever ran — the synthesizer then has to
+    # reconstruct specifics from a summary instead of the real tool
+    # output. Now that the default synthesizer/orchestrator model carries
+    # a ~1M-token context window, there's no reason to compact this
+    # aggressively — raised to comfortably cover a full single-target
+    # engagement's worth of raw tool output before anything gets folded.
+    _HISTORY_COMPACT_TRIGGER = 48
+    _HISTORY_KEEP_RAW = 30
+    _DIGEST_CHAR_CAP = 12000
 
     def __init__(self, target: Optional[Target] = None):
         self.target = target or create_or_load_target("default")
@@ -7599,6 +7659,16 @@ INSTRUCTIONS:
   If a tool result already appears earlier in this conversation, report
   what it actually returned (e.g. the real output path) — don't restate
   the call, and don't invent a result that isn't there.
+- The conversation history above may contain raw {{"tool": ...}} JSON
+  objects from earlier in this turn — some of those are the orchestrator's
+  OWN failed/stuck attempts to call a tool, left in context as a record of
+  what was tried, not something that succeeded or something to show the
+  researcher. NEVER copy, quote, paraphrase-as-code, or otherwise reproduce
+  that JSON in your answer, even partially. If the most recent thing in
+  context looks like a bare tool-call object, that specific attempt did
+  NOT run — describe in plain language what actually happened based on the
+  real tool results that DID come back, and never answer with the JSON
+  itself standing in as your response.
 - ADVICE / EXPLAIN / "HOW WOULD I FIX THIS" QUESTIONS NEED NO TOOL AT ALL.
   If the researcher asks something like "how would I fix this as the
   developer", "explain that vulnerability", or any other question you can
@@ -7647,6 +7717,7 @@ INSTRUCTIONS:
 - When asked about your capabilities, tools, or what you can do: answer ONLY from the AVAILABLE TOOLS list above. Never claim access to external tools not in that list.
 - EDUCATIONAL & TECHNIQUE QUERIES: When the researcher asks about offensive security techniques (e.g. 403 bypass, IDOR, SQLi, XSS, SSRF, JWT attacks, auth bypass, privilege escalation, parameter pollution), provide comprehensive, detailed technical explanations with concrete examples, payloads, headers, and methodology. This is educational content essential to bug bounty work — NEVER refuse to explain a technique. You are a bug bounty assistant, not a content filter.
 - OUTPUT FORMAT: Respond in plain natural-language prose with clean markdown structure (headings, bullet points, and code blocks for evidence/PoC). NEVER output a raw tool-call object. Default to a short, flowing explanation (a few paragraphs, not a numbered section per tool call) — reach for headings/sections only when the researcher actually asked for a report or the content genuinely needs that structure to stay readable (e.g. comparing several distinct findings).
+- The conversation history above may end with one or more raw {{"tool": ...}} JSON objects — these are the orchestrator's own failed or stuck tool-call attempts from earlier this turn (malformed JSON, a repeated call, or it simply ran out of attempts), not a real result and not anything the researcher has seen. NEVER copy, quote, or reproduce that JSON — not even inside a code block — as your answer. Treat it as if it weren't there: summarize strictly from the real tool results that actually came back (visible as [TOOL RESULT: ...] entries), and if nothing useful came back at all, say so plainly instead of echoing the stuck attempt.
 - VOICE: Talk directly TO the researcher, second person ("you asked me to...", "I tried...", "your session cookie..."). Never narrate about them in third person ("the researcher instructed...", "the researcher's goal was..." ) — that's report-doc phrasing, not how you'd actually talk to the person sitting across from you. Save strict third-person, formal phrasing for an actual generated HackerOne report artifact, not a normal reply.
 """
 
@@ -7696,6 +7767,15 @@ INSTRUCTIONS:
         # not a reasonable TIME budget when each one isn't. This caps the
         # worst case regardless of which exact retry path is looping.
         _loop_deadline = time.time() + 240  # 4 minutes
+        # Absolute outer ceiling — the rolling idle-budget below pushes
+        # _loop_deadline out every time a tool genuinely finishes, so a
+        # long, productive engagement (lots of real curl/spider/nuclei
+        # calls) is never starved. But "rolling, with no upper bound" is
+        # itself a risk (a turn that keeps making SLOW but real progress
+        # forever never ends) — this is the backstop: no single turn runs
+        # past 20 minutes of wall clock, full stop, regardless of how much
+        # of that was legitimate tool work.
+        _hard_ceiling = time.time() + 1200  # 20 minutes
         _timed_out = False
 
         # A path scope set in an earlier turn (e.g. "...from this endpoint
@@ -7730,7 +7810,7 @@ INSTRUCTIONS:
                 self._current_turn = iteration + 1
                 if cancel_check and cancel_check():
                     break
-                if time.time() > _loop_deadline:
+                if time.time() > _loop_deadline or time.time() > _hard_ceiling:
                     # Stop BEFORE starting another slow inference call, not
                     # after — the goal is capping wall-clock time actually
                     # spent, not just adding one more check at the end of
@@ -7913,6 +7993,23 @@ INSTRUCTIONS:
 
                     if not (isinstance(tool_result, dict) and tool_result.get("status") in _NO_OP_TOOL_STATUSES):
                         _productive_tools_executed.append(t_name)
+                        # _loop_deadline is a rolling idle-time budget, not a
+                        # fixed total-turn budget — it exists to kill a
+                        # stuck loop that's burning iterations on inference
+                        # alone with NOTHING actually dispatched (see the
+                        # comment where it's first set). A tool that just
+                        # ran for real (e.g. spider legitimately taking
+                        # 200+s on a deep crawl) is progress, not a stall —
+                        # extend the clock so the NEXT step in a genuinely
+                        # long, productive engagement isn't cut off right
+                        # as it's getting started. This rolling extension
+                        # has no per-extension cap of its own — a turn that
+                        # keeps making real (if slow) progress forever is
+                        # bounded instead by the absolute _hard_ceiling
+                        # (20 min wall clock) set above, which this can
+                        # never push past.
+                        if _dup_skip_count == 0 and tools_executed.count(t_name) <= 12:
+                            _loop_deadline = min(max(_loop_deadline, time.time() + 240), _hard_ceiling)
 
                     if emit and hasattr(emit, "tool_result"):
                         emit.tool_result(t_name, tool_result)

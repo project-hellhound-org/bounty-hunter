@@ -1013,17 +1013,17 @@ class _RepetitionGuard:
         return occurrences > self.max_repeats
 
 
-def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None, role: str = "orchestrator") -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """Unified dispatcher for all supported AI providers. When `tools` is provided, providers attempt native tool calling."""
     provider = (provider or "ollama").lower().strip()
-    
+
     if system_prompt is None:
         system_prompt = ASK_PERSONA_SLM
 
     active_model = model or get_default_model(provider)
 
     if provider in ("nvidia", "nim"):
-        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
+        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools, role=role)
     elif provider == "openai":
         res = call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
     elif provider == "anthropic":
@@ -1059,6 +1059,13 @@ def _format_nvidia_nim_error(r: "requests.Response", model: str, role: str) -> s
             f"fine against any OTHER model NIM serves. Pick a current one and switch with:\n"
             f"  /model {role} nvidia <model-id>\n"
             f"(current NIM model IDs: https://build.nvidia.com/models — e.g. {NVIDIA_DEFAULT_MODEL})"
+        )
+    if r.status_code == 429:
+        return (
+            f"Error: NVIDIA NIM rate-limited the {role} model '{model}' (HTTP 429) after a retry — "
+            f"you're sending requests faster than your key's current rate limit allows. This clears "
+            f"on its own; if it keeps happening on long engagements, slow down or check your usage "
+            f"tier at https://build.nvidia.com."
         )
     return f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:200]}"
 
@@ -1098,9 +1105,9 @@ def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, t
             active_model = cfg.get("orchestrator_model") or cfg.get("ai_model") or get_default_model(provider)
             api_key = api_keys.get(provider) or os.environ.get(env_map.get(provider, ""), "") or "ollama"
 
-    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
+    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools, role=role)
 
-def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None, role: str = "orchestrator") -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """REST call to NVIDIA NIM OpenAI-compatible API with SSE streaming. Supports native tool calling."""
     try:
         url = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -1168,6 +1175,24 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
                 # a moment later.
                 time.sleep(1.5)
                 r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            elif r.status_code == 429:
+                # Rate-limited. The orchestrator loop fires one of these
+                # calls per tool call — a long engagement (lots of curl/
+                # spider/nuclei calls back to back) can realistically hit
+                # NVIDIA's per-key rate limit well before anything else goes
+                # wrong. Previously treated exactly like a hard failure with
+                # zero retry, which meant hitting your rate limit mid-run
+                # could tank the whole turn. Honor Retry-After if NVIDIA
+                # sends one (capped so a huge value doesn't hang the turn),
+                # otherwise back off a bit longer than the 5xx case since a
+                # rate limit won't clear in 1.5s.
+                _retry_after = r.headers.get("Retry-After") or r.headers.get("retry-after")
+                try:
+                    _wait = min(float(_retry_after), 10.0) if _retry_after else 3.0
+                except (TypeError, ValueError):
+                    _wait = 3.0
+                time.sleep(_wait)
+                r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code != 200:
                 err = _format_nvidia_nim_error(r, model, role)
                 return (err, None) if return_usage else err
@@ -1192,6 +1217,16 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
         r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
         if r.status_code >= 500:
             time.sleep(1.5)
+            r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
+        elif r.status_code == 429:
+            # See the matching 429 handling in the tool-calling branch above
+            # for why this needs a real retry rather than failing outright.
+            _retry_after = r.headers.get("Retry-After") or r.headers.get("retry-after")
+            try:
+                _wait = min(float(_retry_after), 10.0) if _retry_after else 3.0
+            except (TypeError, ValueError):
+                _wait = 3.0
+            time.sleep(_wait)
             r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
         if r.status_code != 200:
             err = _format_nvidia_nim_error(r, model, role)
