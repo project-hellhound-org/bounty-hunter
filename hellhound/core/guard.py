@@ -12,6 +12,7 @@ Defensive Guardrails & Pre-Request Verification:
 """
 
 from typing import Dict, Any, Optional, Set
+import re
 import time
 
 
@@ -123,6 +124,18 @@ class SafeMethodPolicy:
         "delete", "destroy", "remove", "purge", "wipe", "drop",
         "truncate", "format", "deprovision", "terminate", "reset-all",
     )
+    # Word-boundary match, not raw substring: a naive `kw in url` check
+    # false-positives constantly during real bug-hunting traffic — e.g.
+    # "format" matches inside "information_schema" (in-FORMAT-ion), so
+    # every blind-SQLi probe against information_schema.tables (a
+    # read-only SELECT) was getting flagged as a "destructive action" and
+    # forced through human approval. `\b` anchors each keyword to actual
+    # word boundaries, so it still matches "drop" in "/api/drop-table" or
+    # "?action=delete" (hyphens/= aren't word chars) but not "drop"/
+    # "format"/etc. embedded inside an unrelated longer word.
+    _DESTRUCTIVE_PATH_RE = re.compile(
+        r"\b(?:" + "|".join(re.escape(kw) for kw in DESTRUCTIVE_PATH_KEYWORDS) + r")\b"
+    )
 
     def __init__(
         self,
@@ -134,7 +147,7 @@ class SafeMethodPolicy:
 
     def _is_destructive_path(self, url: str) -> bool:
         u = (url or "").lower()
-        return any(kw in u for kw in self.DESTRUCTIVE_PATH_KEYWORDS)
+        return bool(self._DESTRUCTIVE_PATH_RE.search(u))
 
     def is_safe(self, method: str, url: str = "") -> bool:
         """Return True if the request is safe to send without approval."""

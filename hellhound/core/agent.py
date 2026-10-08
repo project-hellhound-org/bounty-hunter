@@ -2255,18 +2255,51 @@ def _clean_synthesizer_output(text: str) -> str:
     # saying nothing, since the researcher has no way to know whether it
     # actually ran. Say so plainly instead.
     if tool_name in TOOL_REGISTRY:
-        pieces = [p for p in (before, after) if p]
-        extra = (" " + " ".join(pieces)) if pieces else ""
+        # `before`/`after` can themselves be more raw tool-call JSON (a
+        # whole batch, not just this one object) — never splice that
+        # straight into `extra` as if it were prose. Count the real
+        # batch size (this object plus whatever's hiding in before/after)
+        # so the message is honest about how much got dropped, without
+        # ever showing the JSON itself.
+        _total_calls = 1
+        for _chunk in (before, after):
+            if _chunk and "{" in _chunk and '"tool"' in _chunk:
+                try:
+                    _total_calls += len(_extract_all_tool_calls(_chunk))
+                except Exception:
+                    pass
+        _plural = f", plus {_total_calls - 1} more queued right after it," if _total_calls > 1 else ""
         return (
-            f"Started to run {tool_name} but the turn ended before it actually fired — nothing ran, "
-            f"this isn't a result.{extra} Just ask again (e.g. \"run it\" / \"go ahead\") and it should "
-            f"actually execute this time."
+            f"Started to run {tool_name}{_plural} but the turn ended before any of it actually fired — "
+            f"nothing ran, no results to show. Just say \"continue\" or \"go ahead\" and it'll run properly."
         )
 
     # Any other stray tool-call JSON (an unregistered/hallucinated tool
     # name — nothing real to run, nothing real to report): keep whatever
     # real prose the model wrote around it, and drop the JSON itself
     # rather than showing it raw.
+    #
+    # `after` can itself hold MORE concatenated tool-call JSON objects
+    # (the model batched several calls, the synthesizer parroted the
+    # whole batch back instead of just the first) — strip every one of
+    # those too rather than leaving them in the returned text, or the
+    # researcher just sees the raw JSON shifted one object to the right.
+    if after and "{" in after and '"tool"' in after:
+        try:
+            trailing_calls = _extract_all_tool_calls(after)
+        except Exception:
+            trailing_calls = []
+        if trailing_calls:
+            # Nothing meaningful survives in `after` besides these blobs —
+            # the whole point is they were never executed, so say that
+            # once rather than per-object.
+            after = (
+                f"(plus {len(trailing_calls)} more queued tool call(s) that "
+                f"didn't run — ask me to continue and I'll execute them)"
+                if len(trailing_calls) > 1 else
+                "(plus another queued tool call that didn't run — ask me to continue and I'll execute it)"
+            )
+
     parts = []
     if before:
         parts.append(before)
@@ -6078,6 +6111,73 @@ def _extract_first_balanced_json(text: str) -> Optional[dict]:
     return None
 
 
+def _extract_all_tool_calls(text: str) -> List[dict]:
+    """
+    Like _extract_first_balanced_json, but keeps scanning past the first
+    match and returns EVERY top-level balanced {...} object in the text
+    that parses as a dict with a "tool" key — in encounter order.
+
+    Small/local orchestrator models frequently batch several tool calls
+    into one response instead of emitting exactly one, e.g.:
+
+        {"tool": "curl", "args": {...}} {"tool": "curl", "args": {...}} {"tool": "curl", "args": {...}}
+
+    Before this, only the FIRST object was ever extracted and executed;
+    everything after it was silently discarded mid-turn. Worse, once the
+    narration-retry budget was spent re-asking for "just one clean JSON
+    object" (which the model kept failing to produce, since it was never
+    wrong about wanting multiple calls — just about the framing), the
+    turn gave up and handed the synthesizer a history full of these raw
+    unexecuted blobs, which it then echoed back verbatim as the "final
+    answer" — the exact "nothing ran, say continue" loop this exists to
+    break.
+    """
+    results: List[dict] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        start = text.find("{", i)
+        if start == -1:
+            break
+        depth = 0
+        in_string = False
+        escape = False
+        end = -1
+        j = start
+        while j < n:
+            ch = text[j]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = j + 1
+                        break
+            j += 1
+        if end == -1:
+            # Unbalanced from here on — nothing more to find.
+            break
+        candidate = text[start:end]
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict) and "tool" in parsed:
+                results.append(parsed)
+        except Exception:
+            pass
+        i = end
+    return results
+
+
 def extract_target_from_text(user_text: str) -> Optional[str]:
     """
     Finds a domain/IP/host-shaped candidate in user text — used ONLY as a
@@ -7709,6 +7809,7 @@ INSTRUCTIONS:
   - Partial / in progress, if only intermediate stepping stones were accessed.
   - Blocked / exhausted, if a live campaign was executed and all viable attack vectors failed.
   - DO NOT open with a status line at all for general conversation, Q&A, sample report requests, or coding assistance.
+- WHEN BLOCKED/EXHAUSTED/STUCK: don't just label it — say it the way a competent human tester would hand off a blocker. Name the SPECIFIC thing that stopped you (e.g. "login never returns a session cookie, so I have no authenticated context to test BOLA from", "every destructive write needed to confirm this was denied approval", "the target stopped responding after request N"), not a vague "testing was inconclusive." Then name at least one concrete next move the researcher could take or authorize — a different account/credential to try, a specific manual check worth doing by hand, approving the gated action, or confirming scope/spelling — rather than leaving it as a dead end. If a destructive action was denied approval mid-run, say exactly which one and that it's still available if they want to authorize it now.
 - CRITICAL IDENTITY VERIFICATION:
   - NEVER claim account takeover unless the primary target's specific token, credentials, or session was actually established and verified!
   - Holding a session cookie for an intermediate stepping-stone user is NOT takeover of the primary target.
@@ -7933,97 +8034,151 @@ INSTRUCTIONS:
                                 pass
 
                 if tool_call and tool_call.get("tool") in TOOL_REGISTRY:
-                    t_name = tool_call["tool"]
-                    t_args = tool_call.get("args") or tool_call.get("parameters") or tool_call.get("arguments") or {}
+                    # The response may contain MORE than one tool-call JSON
+                    # object batched back to back (small/local orchestrator
+                    # models do this constantly — see _extract_all_tool_calls).
+                    # Run every registered one found here, in order, within
+                    # THIS iteration, instead of executing only `tool_call`
+                    # (the first) and silently dropping the rest. This is
+                    # what used to force a narration-retry/timeout spiral:
+                    # the model wasn't wrong to want 5 curls, it just never
+                    # got credit for more than one of them before the turn
+                    # ran out of budget.
+                    _batch = _extract_all_tool_calls(ai_resp) if isinstance(ai_resp, str) else [tool_call]
+                    if not _batch or tool_call not in _batch:
+                        _batch = [tool_call]
+                    # Safety cap, independent of the destructive-action
+                    # approval gate below: one model response batching an
+                    # unreasonable number of calls (runaway generation, a
+                    # degenerate repeat pattern) shouldn't be able to fire
+                    # them all blind. Anything past the cap is left for the
+                    # model to re-request next iteration, after it's had a
+                    # chance to see these results first — same as it would
+                    # for a single call that needed a follow-up.
+                    _MAX_BATCH_PER_RESPONSE = 15
+                    if len(_batch) > _MAX_BATCH_PER_RESPONSE:
+                        _batch = _batch[:_MAX_BATCH_PER_RESPONSE]
 
-                    # Already ran this exact tool+args earlier THIS turn (not just
-                    # last iteration) -> the orchestrator is repeating itself, not
-                    # progressing. Stop calling and move to synthesis with what's
-                    # already gathered, instead of re-crawling and re-saving.
-                    _sig = (t_name, json.dumps(t_args, sort_keys=True, default=str))
-                    if _sig in _executed_signatures:
-                        _dup_skip_count += 1
-                        if _dup_skip_count >= 2:
-                            # Repeating itself even after being told not to — stop
-                            # burning iterations and move straight to synthesis.
+                    self.history.append({"role": "assistant", "content": ai_resp})
+                    _last_t_name = None
+                    _last_tool_result = None
+                    _batch_ran_anything = False
+
+                    for _bt_call in _batch:
+                        if cancel_check and cancel_check():
                             break
-                        self.history.append({
-                            "role": "user",
-                            "content": f"[TOOL SKIPPED] '{t_name}' with these exact args already ran earlier this turn — reuse those results instead of repeating it."
-                        })
-                        user_text = f"You already ran '{t_name}' with identical args. Do not repeat it — synthesize from the results you already have, or choose a different tool/target."
-                        continue
-                    _executed_signatures.add(_sig)
+                        if time.time() > _hard_ceiling:
+                            _timed_out = True
+                            break
 
-                    # Hard cap: record_finding specifically, enforced before
-                    # execution — see _RECORD_FINDING_CAP_PER_TURN comment above.
-                    if t_name == "record_finding":
-                        _record_finding_calls_this_turn += 1
-                        if _record_finding_calls_this_turn > _RECORD_FINDING_CAP_PER_TURN:
-                            blocked_result = {
-                                "status": "blocked",
-                                "note": (
-                                    f"Hard cap hit — that's {_record_finding_calls_this_turn} record_finding "
-                                    f"calls this turn, capped at {_RECORD_FINDING_CAP_PER_TURN}. Whatever you're "
-                                    f"trying to log, it's a variation of something already recorded — stop "
-                                    f"logging and move on to the next real step, or finish up."
-                                )
-                            }
-                            if emit and hasattr(emit, "tool_result"):
-                                emit.tool_result(t_name, blocked_result)
-                            self.history.append({"role": "assistant", "content": ai_resp})
+                        t_name = _bt_call.get("tool")
+                        if t_name not in TOOL_REGISTRY:
+                            # Mixed batch — skip the invalid one, keep going
+                            # on the rest rather than aborting the whole batch.
                             self.history.append({
                                 "role": "user",
-                                "content": f"[TOOL BLOCKED] {blocked_result['note']}"
+                                "content": f"[TOOL ERROR] '{t_name}' is not a valid tool. Available tools: {', '.join(TOOL_REGISTRY.keys())}"
                             })
-                            user_text = "record_finding is capped for this turn. Do not call it again — move on to the next step or wrap up."
                             continue
+                        t_args = _bt_call.get("args") or _bt_call.get("parameters") or _bt_call.get("arguments") or {}
 
-                    tools_executed.append(t_name)
-                    
-                    if emit and hasattr(emit, "set_label"):
-                        emit.set_label(f"Yep, here we go — running {t_name}")
+                        # Already ran this exact tool+args earlier THIS turn (not
+                        # just last iteration) -> skip it, don't re-dispatch.
+                        _sig = (t_name, json.dumps(t_args, sort_keys=True, default=str))
+                        if _sig in _executed_signatures:
+                            _dup_skip_count += 1
+                            self.history.append({
+                                "role": "user",
+                                "content": f"[TOOL SKIPPED] '{t_name}' with these exact args already ran earlier this turn — reuse those results instead of repeating it."
+                            })
+                            continue
+                        _executed_signatures.add(_sig)
 
-                    if emit and hasattr(emit, "tool_start"):
-                        emit.tool_start(t_name, t_args)
-                    elif emit and hasattr(emit, "info"):
-                        emit.info(f"[*] Executing tool: {t_name} with args: {t_args}")
+                        # Hard cap: record_finding specifically, enforced before
+                        # execution — see _RECORD_FINDING_CAP_PER_TURN comment above.
+                        if t_name == "record_finding":
+                            _record_finding_calls_this_turn += 1
+                            if _record_finding_calls_this_turn > _RECORD_FINDING_CAP_PER_TURN:
+                                blocked_result = {
+                                    "status": "blocked",
+                                    "note": (
+                                        f"Hard cap hit — that's {_record_finding_calls_this_turn} record_finding "
+                                        f"calls this turn, capped at {_RECORD_FINDING_CAP_PER_TURN}. Whatever you're "
+                                        f"trying to log, it's a variation of something already recorded — stop "
+                                        f"logging and move on to the next real step, or finish up."
+                                    )
+                                }
+                                if emit and hasattr(emit, "tool_result"):
+                                    emit.tool_result(t_name, blocked_result)
+                                self.history.append({
+                                    "role": "user",
+                                    "content": f"[TOOL BLOCKED] {blocked_result['note']}"
+                                })
+                                continue
 
-                    tool_result = self.execute_tool_call(t_name, t_args, emit)
+                        tools_executed.append(t_name)
+                        _batch_ran_anything = True
 
-                    if not (isinstance(tool_result, dict) and tool_result.get("status") in _NO_OP_TOOL_STATUSES):
-                        _productive_tools_executed.append(t_name)
-                        # _loop_deadline is a rolling idle-time budget, not a
-                        # fixed total-turn budget — it exists to kill a
-                        # stuck loop that's burning iterations on inference
-                        # alone with NOTHING actually dispatched (see the
-                        # comment where it's first set). A tool that just
-                        # ran for real (e.g. spider legitimately taking
-                        # 200+s on a deep crawl) is progress, not a stall —
-                        # extend the clock so the NEXT step in a genuinely
-                        # long, productive engagement isn't cut off right
-                        # as it's getting started. This rolling extension
-                        # has no per-extension cap of its own — a turn that
-                        # keeps making real (if slow) progress forever is
-                        # bounded instead by the absolute _hard_ceiling
-                        # (20 min wall clock) set above, which this can
-                        # never push past.
-                        if _dup_skip_count == 0 and tools_executed.count(t_name) <= 12:
-                            _loop_deadline = min(max(_loop_deadline, time.time() + 240), _hard_ceiling)
+                        if emit and hasattr(emit, "set_label"):
+                            emit.set_label(f"Yep, here we go — running {t_name}")
 
-                    if emit and hasattr(emit, "tool_result"):
-                        emit.tool_result(t_name, tool_result)
+                        if emit and hasattr(emit, "tool_start"):
+                            emit.tool_start(t_name, t_args)
+                        elif emit and hasattr(emit, "info"):
+                            emit.info(f"[*] Executing tool: {t_name} with args: {t_args}")
+
+                        tool_result = self.execute_tool_call(t_name, t_args, emit)
+
+                        if not (isinstance(tool_result, dict) and tool_result.get("status") in _NO_OP_TOOL_STATUSES):
+                            _productive_tools_executed.append(t_name)
+                            # _loop_deadline is a rolling idle-time budget, not a
+                            # fixed total-turn budget — it exists to kill a
+                            # stuck loop that's burning iterations on inference
+                            # alone with NOTHING actually dispatched (see the
+                            # comment where it's first set). A tool that just
+                            # ran for real (e.g. spider legitimately taking
+                            # 200+s on a deep crawl) is progress, not a stall —
+                            # extend the clock so the NEXT step in a genuinely
+                            # long, productive engagement isn't cut off right
+                            # as it's getting started. This rolling extension
+                            # has no per-extension cap of its own — a turn that
+                            # keeps making real (if slow) progress forever is
+                            # bounded instead by the absolute _hard_ceiling
+                            # (20 min wall clock) set above, which this can
+                            # never push past.
+                            if _dup_skip_count == 0 and tools_executed.count(t_name) <= 12:
+                                _loop_deadline = min(max(_loop_deadline, time.time() + 240), _hard_ceiling)
+
+                        if emit and hasattr(emit, "tool_result"):
+                            emit.tool_result(t_name, tool_result)
+
+                        self.history.append({
+                            "role": "user",
+                            "content": f"[TOOL RESULT: {t_name}]\n{json.dumps(tool_result, indent=2)}"
+                        })
+                        _last_t_name = t_name
+                        _last_tool_result = tool_result
 
                     if emit and hasattr(emit, "set_label"):
                         emit.set_label("Got there — checking results")
 
-                    # Feed result back to conversation
-                    self.history.append({"role": "assistant", "content": ai_resp})
-                    self.history.append({
-                        "role": "user",
-                        "content": f"[TOOL RESULT: {t_name}]\n{json.dumps(tool_result, indent=2)}"
-                    })
-                    user_text = f"Tool '{t_name}' returned:\n{json.dumps(tool_result, indent=2)}\nEvaluate these findings."
+                    if _timed_out:
+                        break
+
+                    if not _batch_ran_anything:
+                        # Everything in the batch was a dup/invalid/capped —
+                        # nudge forward instead of re-asking for the exact
+                        # same batch again.
+                        user_text = "Those were already handled above. Choose a different next tool, or output 'DONE' if the investigation is complete."
+                        continue
+
+                    if len(_batch) > 1:
+                        user_text = (
+                            f"Ran {len([c for c in _batch if c.get('tool') in TOOL_REGISTRY])} tool call(s) from your last response "
+                            f"(results for each are above). Evaluate these findings and choose the next tool, or output 'DONE'."
+                        )
+                    else:
+                        user_text = f"Tool '{_last_t_name}' returned:\n{json.dumps(_last_tool_result, indent=2)}\nEvaluate these findings."
                     continue
 
                 elif tool_call:
@@ -8395,7 +8550,8 @@ INSTRUCTIONS:
                     f"- If a login attempt failed (e.g. returned 'Invalid username or password' or login form despite HTTP 200), state that it failed and do NOT claim account takeover.\n"
                     f"- Every tool that ran this turn gets at least one line, even if it returned nothing or wasn't the one that ended up mattering (e.g. 'subfinder found 0 subdomains via passive sources' or 'the X probe returned nothing useful here'). A zero/negative result is still worth recording for the researcher — never omit a tool from the summary just because it didn't lead anywhere.\n"
                     f"- Outline the next logical testing steps.\n"
-                    f"- Do NOT generate a rigid, multi-section formal vulnerability report unless the user explicitly requested a report. Concretely, that means: no 'Investigation Summary' / 'Outcome' / 'Next Steps' style section headers, no bulleted one-line-per-tool-call transcript ('curl X — did Y', 'gowitness — did Z'), and no restating the tool trace step by step. Write it as a colleague sitting next to the researcher would say it out loud after watching the run — a few natural paragraphs (short bullets are fine INSIDE a paragraph for something like a list of endpoints, but not as the whole response's skeleton), covering what you did, what you saw, and what it means, in that conversational order. If the researcher's own request already came formatted as steps/bullets, mirror that back to them — otherwise default to prose."
+                    f"- Do NOT generate a rigid, multi-section formal vulnerability report unless the user explicitly requested a report. Concretely, that means: no 'Investigation Summary' / 'Outcome' / 'Next Steps' style section headers, no bulleted one-line-per-tool-call transcript ('curl X — did Y', 'gowitness — did Z'), and no restating the tool trace step by step. Write it as a colleague sitting next to the researcher would say it out loud after watching the run — a few natural paragraphs (short bullets are fine INSIDE a paragraph for something like a list of endpoints, but not as the whole response's skeleton), covering what you did, what you saw, and what it means, in that conversational order. If the researcher's own request already came formatted as steps/bullets, mirror that back to them — otherwise default to prose.\n"
+                    f"- The conversation history above may contain raw internal tool-call JSON objects (lines like {{\"tool\": \"curl\", \"args\": {{...}}}}), possibly several concatenated together. Those are the orchestrator's own internal dispatch records, NOT something to show the researcher. Never reproduce, quote, paraphrase-as-code, or describe-in-JSON any of that syntax — translate it into plain prose about what was actually tried and found, same as every other tool result."
                 )
 
             if len(tools_executed) > 0 and cfg.get("show_recaps", True):

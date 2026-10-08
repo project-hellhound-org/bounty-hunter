@@ -622,6 +622,33 @@ class StreamRenderer:
         self._recap_line = None
         self._live = None
         self._token_count = 0
+        # None = undecided, True = this stream is shaping up to be a raw
+        # internal `{"tool": ...}` tool-call object (not prose meant for
+        # the researcher), False = normal prose. See _looks_like_raw_tool_call.
+        self._raw_tool_json = None
+
+    def _looks_like_raw_tool_call(self) -> Optional[bool]:
+        """Peek at the buffer so far to decide whether the synthesizer is
+        emitting a raw tool-call JSON object instead of prose.
+
+        This is the failure mode agent.py's _clean_synthesizer_output()
+        already defends against — but that cleanup only ever sees the
+        COMPLETE response, after on_token has already streamed and
+        permanently committed the raw text to the terminal. Catching it
+        here, early and incrementally, is what lets us withhold the live
+        print entirely and fall back to the cleaned text in finish().
+
+        Returns True/False once there's enough of the buffer to decide,
+        or None if it's still too early to tell either way.
+        """
+        stripped = self.buffer.lstrip()
+        if not stripped:
+            return None
+        if stripped[0] != "{":
+            return False
+        if len(stripped) < 60:
+            return None  # the "tool" key may not have arrived yet
+        return ('"tool"' in stripped[:200]) or ("'tool'" in stripped[:200])
 
     def _find_safe_commit_point(self) -> int:
         """Furthest index into self.buffer that ends on a completed
@@ -662,6 +689,16 @@ class StreamRenderer:
             return
         self.buffer += token
         self._token_count += 1
+
+        if self._raw_tool_json is None:
+            self._raw_tool_json = self._looks_like_raw_tool_call()
+        if self._raw_tool_json:
+            # Withhold live display entirely for this turn — nothing gets
+            # committed to scrollback. agent.py's _clean_synthesizer_output()
+            # will turn the complete response into a proper message or a
+            # plain "that didn't run" note; finish() prints that instead of
+            # letting the raw tool-call JSON reach the terminal.
+            return
 
         # Commit any newly-completed, fence-safe paragraph(s) permanently.
         # Stop the live tail first so the commit print doesn't visually
@@ -711,23 +748,38 @@ class StreamRenderer:
             except Exception:
                 pass
             self._live = None
-        self._commit_up_to(len(self.buffer))
 
-        # Safety net: on_token streaming is the only thing that ever prints
-        # a turn — if the underlying API call streamed zero tokens (a
-        # dropped connection, a cold-start hiccup on the very first request
-        # of a session, a provider that returned its answer non-streamed),
-        # self.buffer stays empty and the caller sees a blank turn even
-        # though handle_message()/dispatch() successfully returned real
-        # text. final_text is that return value — only used here as a
-        # last-resort fallback when nothing actually reached the screen, so
-        # a normally-streamed response is never double-printed.
-        if final_text and not self.buffer.strip():
-            printable = _sanitize_h1(str(final_text)).rstrip("\n")
-            if printable.strip():
-                _print_with_status_color(printable)
-                self.buffer = str(final_text)
-                self._committed_len = len(self.buffer)
+        if self._raw_tool_json:
+            # Nothing was ever streamed to the screen for this turn (see
+            # on_token) — the raw buffer may still be bare tool-call JSON
+            # that was never meant for the researcher. final_text is
+            # agent.py's _clean_synthesizer_output()-cleaned return value;
+            # use that instead of the raw buffer.
+            if final_text:
+                printable = _sanitize_h1(str(final_text)).rstrip("\n")
+                if printable.strip():
+                    _print_with_status_color(printable)
+            self.buffer = str(final_text or "")
+            self._committed_len = len(self.buffer)
+        else:
+            self._commit_up_to(len(self.buffer))
+
+            # Safety net: on_token streaming is the only thing that ever
+            # prints a turn — if the underlying API call streamed zero
+            # tokens (a dropped connection, a cold-start hiccup on the very
+            # first request of a session, a provider that returned its
+            # answer non-streamed), self.buffer stays empty and the caller
+            # sees a blank turn even though handle_message()/dispatch()
+            # successfully returned real text. final_text is that return
+            # value — only used here as a last-resort fallback when nothing
+            # actually reached the screen, so a normally-streamed response
+            # is never double-printed.
+            if final_text and not self.buffer.strip():
+                printable = _sanitize_h1(str(final_text)).rstrip("\n")
+                if printable.strip():
+                    _print_with_status_color(printable)
+                    self.buffer = str(final_text)
+                    self._committed_len = len(self.buffer)
 
         if self._recap_line:
             print_formatted_text(HTML(f"<i><ansigray>{html.escape(self._recap_line)}</ansigray></i>"))
