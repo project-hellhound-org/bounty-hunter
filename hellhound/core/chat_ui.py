@@ -136,6 +136,22 @@ def re_strip_ansi(text: str) -> str:
 # -------------------------------------------------------------
 # Slash Command Palette Completer
 # -------------------------------------------------------------
+def _humanize_age(mtime: float) -> str:
+    """Render a unix mtime as a short relative-age string for completion
+    dropdowns, e.g. '2h ago', '3d ago', 'just now'."""
+    delta = max(0.0, time.time() - mtime)
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    days = int(delta // 86400)
+    if days < 30:
+        return f"{days}d ago"
+    return f"{days // 30}mo ago"
+
+
 class HellhoundCompleter(Completer):
     """
     Dynamic prompt_toolkit completer reading directly from COMMAND_REGISTRY.
@@ -282,6 +298,42 @@ class HellhoundCompleter(Completer):
                     ("endpoints", "Content and endpoint discovery only (spider)"),
                     ("tech", "Live-host and technology fingerprinting only (httpx)"),
                 ]
+
+            for val, meta in sub_suggestions:
+                if val.lower().startswith(word_before.lower()):
+                    yield Completion(val, start_position=-len(word_before), display=val, display_meta=meta)
+
+        elif cmd_name in ("/target", "/targets"):
+            # Every other argument-taking command above suggests its valid
+            # values from a hardcoded list — targets are the one case where
+            # the valid values are dynamic (whatever's actually saved under
+            # ~/.hellhound/targets/), so this reads that directory live
+            # instead of requiring the researcher to remember/retype a
+            # domain they already engaged. exclude_default=False on purpose:
+            # unlike the banner's "recent engagements" strip, the completer
+            # should also surface default/localhost since those are
+            # legitimate, commonly-reused switch targets (practice/lab
+            # targets in particular).
+            try:
+                from hellhound.core.tasks import _get_targets_dir
+                names = list_targets(exclude_default=False)
+            except Exception:
+                names = []
+                _get_targets_dir = None
+
+            sub_suggestions = []
+            for name in names:
+                meta = "saved target"
+                if _get_targets_dir:
+                    try:
+                        task_file = os.path.join(_get_targets_dir(), name, "task.json")
+                        meta = f"last active {_humanize_age(os.path.getmtime(task_file))}"
+                    except Exception:
+                        pass
+                sub_suggestions.append((name, meta))
+
+            if not arg_text.strip():
+                sub_suggestions.append(("--clear-history", "Wipe saved chat history for the CURRENT target"))
 
             for val, meta in sub_suggestions:
                 if val.lower().startswith(word_before.lower()):

@@ -52,7 +52,7 @@ Works across two flexible interfaces:
 ## How It Works
 
 ```
-You ──> /recon target.com ──> Orchestrator (Fast SLM) ──> Scope Security Gate
+You ──> /recon target.com ──> Orchestrator (Tool Selection) ──> Scope Security Gate
                                      │                            │ (Blocks out-of-scope)
                                      ▼                            ▼
                           Active Reconnaissance        Binary Toolchain Verification
@@ -62,11 +62,13 @@ You ──> /recon target.com ──> Orchestrator (Fast SLM) ──> Scope Secu
                           └─ Headless SPA Spider      
                                      │
                                      ▼ (Populates Non-Prunable Artifact Ledger)
-                          Synthesizer (Reasoning LLM) <── 26 Methodology Skills
+                          Synthesizer (Report Write-up) <── 26 Methodology Skills
                                      │                     (Access Control, Auth Bypass,
                                      ▼                      Web2, Web3, Mobile, CTF)
                                 /report (Submission-ready markdown/JSON/HTML)
 ```
+
+> **Orchestrator vs Synthesizer are ROLES, not model tiers.** Orchestrator calls select/run tools (native function-calling); Synthesizer calls write the researcher-facing prose at the end of a turn. Both can point at the SAME model — e.g. the recommended NVIDIA Nemotron 550B config below runs both roles on one model — or at two different ones if you want a cheap/fast model for tool selection and a stronger one for write-ups. Either way, the synthesizer call is always made with the same tool schema attached (just set to "don't call anything"), so it stays in a consistent tool-aware frame of reference for the whole turn rather than being dropped into a schema-free completion right after a history full of the orchestrator's own tool-call JSON.
 
 - **Scope Security Gate**: Unscoped targets are unconditionally blocked before any active network traffic leaves your system.
 - **Harvested Artifact Ledger**: Harvested credentials, tokens, session cookies, and delegation endpoints are automatically captured into a structured, non-prunable blackboard and pinned to every turn.

@@ -2126,6 +2126,82 @@ def _execute_hackerone_stats(args: Dict[str, Any], target: Target, emit: Any) ->
         return _humanize_hackerone_error("hackerone_stats", program, e)
 
 
+_DIAG_QUESTION_RE = re.compile(
+    r"\bwhy\b[^.?!]{0,80}\b("
+    r"continue|json|stuck|stopp?(ed|ing)?|timed?\s?out|timeout|didn'?t\s(run|work|finish)|"
+    r"keep(s)?\sasking|repeat(ed|ing)?|blank|empty|guard|approval"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _format_last_turn_diagnostics(diag: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Render the previous turn's control-flow telemetry as plain, factual
+    bullet points.
+
+    Why this exists: the researcher repeatedly needs to ask "why did you
+    just dump raw JSON" / "why do I have to say continue so much" /
+    "why'd that time out" — and the model answering those from its own
+    recollection means answering from the same conversation text that
+    already confused it, i.e. guessing. This instead reports the actual
+    recorded control-flow facts (set as they happen in handle_message /
+    execute_tool_call, see _diag_* locals and self._approvals_*_this_turn)
+    so an explanation is grounded in what really happened, not a plausible
+    story. Returns None if nothing was recorded yet (e.g. very first turn
+    of a fresh session).
+    """
+    if not diag:
+        return None
+    lines = []
+    ended = diag.get("ended_reason")
+    if ended == "timed_out":
+        lines.append(
+            f"That turn hit its wall-clock time budget after {diag.get('elapsed_s', '?')}s "
+            f"({diag.get('iterations', '?')} orchestrator iteration(s) run) — it was cut off before "
+            f"finishing, not because it chose to stop."
+        )
+    elif ended == "cancelled":
+        lines.append("That turn was interrupted (Ctrl+C) before it reached a conclusion.")
+    elif ended == "done":
+        lines.append("That turn ended with the orchestrator explicitly deciding it was done.")
+    if diag.get("narration_retry_count"):
+        lines.append(
+            f"{diag['narration_retry_count']} response(s) that turn looked like a tool call but "
+            f"failed to parse as valid JSON (mismatched braces/quotes), forcing a resend each time."
+        )
+    if diag.get("batches_truncated"):
+        lines.append(
+            f"At least one response planned more tool calls than the per-response cap "
+            f"({diag.get('truncated_calls', 0)} call(s)) allows in one go — the rest were deferred "
+            f"to a follow-up iteration/turn instead of all firing immediately."
+        )
+    if diag.get("approvals_denied"):
+        lines.append(
+            f"{diag['approvals_denied']} destructive-action approval prompt(s) were answered 'no' "
+            f"this turn, which blocked exactly those requests (nothing else)."
+        )
+    if diag.get("approvals_granted"):
+        lines.append(f"{diag['approvals_granted']} destructive-action approval prompt(s) were approved and ran normally.")
+    if diag.get("dup_skip_count"):
+        lines.append(f"{diag['dup_skip_count']} tool call(s) were skipped as exact duplicates already run earlier that turn.")
+    if diag.get("provider_gaveup"):
+        lines.append(
+            f"The model provider itself failed repeatedly ({diag.get('provider_retries', '?')} retr(y/ies) "
+            f"attempted, all unsuccessful) — a real outage/connection problem on the API side, not something "
+            f"the agent chose to do."
+        )
+    elif diag.get("provider_retries"):
+        lines.append(
+            f"The model provider failed transiently {diag['provider_retries']} time(s) this turn but a later "
+            f"retry succeeded, so the turn continued normally."
+        )
+    if diag.get("tools_executed"):
+        lines.append(f"Tools that actually executed: {', '.join(diag['tools_executed'])}.")
+    else:
+        lines.append("No tool actually executed that turn.")
+    return "\n".join(f"- {l}" for l in lines) if lines else None
+
+
 def _clean_synthesizer_output(text: str) -> str:
     """
     Defensive net: if the synthesizer model ignored its plain-prose
@@ -4639,16 +4715,21 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     request_ref = str(args.get("request_ref", "")).strip()
     note = str(args.get("note", "")).strip()
 
+    raw_evidence_matches = _lookup_curl_evidence(target, request_ref)
+
     # Dedup: the storage layer's own dedup keys on the WHOLE finding dict,
     # which differs any time the title is reworded even slightly — this let
     # the same flag get logged 5+ times under different titles ("Flag
     # captured: X", "Flag confirmed: X", "Mission complete: X"...) in one
-    # session. Catch that here: if this finding contains the same flag-shaped
-    # token (WORD{...}) as an existing finding, or is an exact duplicate of
-    # an existing (kind, request_ref, title), it's already recorded — don't
-    # append another copy.
+    # session, AND let the same endpoint get logged as two "different"
+    # IDOR findings just because the researcher asked "is this really a
+    # vuln?" and the model re-verified + re-recorded it under slightly
+    # different wording. Three ways an incoming finding can turn out to be
+    # the SAME finding, not a new one — checked in this order:
     existing_findings = target.findings if isinstance(target.findings, list) else []
     flag_match = _FLAG_TOKEN_PATTERN.search(f"{title} {note}")
+    norm_request_ref = _normalize_endpoint(request_ref)
+    matched_existing = None
     for f in existing_findings:
         if not isinstance(f, dict):
             continue
@@ -4660,24 +4741,49 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
                     "status": "already_recorded",
                     "note": f"Already recorded — flag {flag_match.group(0)} is already in findings under '{f.get('type', '')}'. No need to log it again under a new title.",
                 }
-        elif (
+            continue
+        # 1. Exact duplicate — same title, same endpoint.
+        if (
             f.get("target", "").strip().lower() == request_ref.strip().lower()
             and f.get("type", "").strip().lower() == title.strip().lower()
         ):
-            return {
-                "status": "already_recorded",
-                "note": "Already recorded — identical finding (same title and endpoint) already exists."
-            }
+            matched_existing = f
+            break
+        # 2. Same endpoint path (ignoring query string/value) + same vuln
+        # category — almost certainly a re-confirmation of the SAME finding
+        # under reworded title (e.g. re-verifying after the researcher asked
+        # "is this really a vuln?"), not a genuinely new one. This is the
+        # case the exact-match check above misses entirely.
+        if (
+            kind
+            and f.get("kind", "").strip().lower() == kind
+            and norm_request_ref
+            and _normalize_endpoint(f.get("target", "")) == norm_request_ref
+        ):
+            matched_existing = f
+            break
 
-    finding = {"type": title, "target": request_ref, "severity": severity, "note": note}
+    if matched_existing is not None:
+        return _merge_into_existing_finding(target, matched_existing, title, note, request_ref, raw_evidence_matches, emit)
+
+    finding = {"type": title, "kind": kind, "target": request_ref, "severity": severity, "note": note}
     # Attach the REAL captured request/response for this endpoint, if any
     # was seen during this session — not what the model typed from memory.
     # This is what later feeds export_report's evidence block, so a report
     # never has to fall back on invented placeholder values like
     # "session=abc123" for something that was actually tested.
-    raw_evidence_matches = _lookup_curl_evidence(target, request_ref)
     if raw_evidence_matches:
         finding["raw_evidence"] = raw_evidence_matches
+
+    # Save the auto-report BEFORE persisting the finding, so the path can
+    # be stored ON the finding — that's what lets a later re-confirmation
+    # of this same finding (see _merge_into_existing_finding above) update
+    # this exact file in place instead of guessing a filename or always
+    # creating a new one.
+    auto_report_path = _auto_save_finding_report(target, title, kind, severity, request_ref, note, emit, raw_evidence_matches)
+    if auto_report_path:
+        finding["report_path"] = auto_report_path
+
     try:
         update_from_bac(target, findings=[finding])
         save_target(target)
@@ -4690,17 +4796,84 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     result = {"status": "recorded", "title": title, "kind": kind, "severity": severity}
     if raw_evidence_matches:
         result["raw_evidence_attached"] = len(raw_evidence_matches)
-
-    # Permanent feature, not conditional on the researcher (or the model)
-    # separately asking for a report: the moment a real vulnerability is
-    # confirmed and logged here, save a portable HTML artifact for it
-    # immediately. Best-effort — a failure here must never fail the
-    # underlying finding recording.
-    auto_report_path = _auto_save_finding_report(target, title, kind, severity, request_ref, note, emit, raw_evidence_matches)
     if auto_report_path:
         result["report_path"] = auto_report_path
 
     return result
+
+
+def _normalize_endpoint(u: str) -> str:
+    """Strip query string + trailing slash + case, for comparing whether
+    two request_ref values point at the SAME endpoint regardless of which
+    parameter value was used to test it (e.g. ?user_id=1 vs ?user_id=10
+    are the same IDOR surface, not two different findings)."""
+    u = (u or "").strip().lower()
+    u = u.split("?", 1)[0]
+    return u.rstrip("/")
+
+
+def _merge_into_existing_finding(
+    target: Target, existing: Dict[str, Any], new_title: str, new_note: str,
+    new_request_ref: str, new_raw_evidence: Optional[List[str]], emit: Any,
+) -> Dict[str, Any]:
+    """A record_finding call matched something already recorded for this
+    SAME endpoint+category (see the dedup checks above) — merge the new
+    evidence into the existing finding and rewrite its existing HTML file
+    in place, rather than silently no-op'ing (the old behavior) or
+    scattering another near-duplicate finding_<target>_<timestamp>.html
+    next to it under slightly different wording (the bug this fixes)."""
+    existing_title = str(existing.get("type", new_title))
+    existing_note = str(existing.get("note", "")).strip()
+    existing_kind = str(existing.get("kind", "")).strip().lower() or "interesting_endpoint"
+    existing_severity = str(existing.get("severity", "medium")).strip().lower()
+
+    # Only add an "Update" section if there's genuinely new information —
+    # an identical re-verification shouldn't pad the file with a copy of
+    # the same sentence.
+    updated_note = None
+    if new_note and new_note.strip().lower() != existing_note.strip().lower():
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        updated_note = f"[{stamp}] {new_note.strip()}"
+
+    merged_evidence = list(existing.get("raw_evidence") or [])
+    for r in (new_raw_evidence or []):
+        if r not in merged_evidence:
+            merged_evidence.append(r)
+    # Cap growth — re-verifying the same IDOR 10 times shouldn't turn the
+    # file into an unbounded wall of near-identical curl transcripts; keep
+    # the earliest (original proof) and the most recent (latest proof).
+    if len(merged_evidence) > 8:
+        merged_evidence = merged_evidence[:2] + merged_evidence[-6:]
+    if merged_evidence:
+        existing["raw_evidence"] = merged_evidence
+
+    try:
+        save_target(target)
+    except Exception as e:
+        return {"error": f"Failed to update existing finding: {e}"}
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[✓] Finding re-confirmed (merged into existing): {existing_title}")
+
+    report_path = existing.get("report_path")
+    new_path = _auto_save_finding_report(
+        target, existing_title, existing_kind, existing_severity,
+        new_request_ref or existing.get("target", ""), existing_note, emit,
+        merged_evidence, existing_path=report_path, updated_note=updated_note,
+    )
+    if new_path and not report_path:
+        existing["report_path"] = new_path
+        try:
+            save_target(target)
+        except Exception:
+            pass
+
+    return {
+        "status": "updated_existing",
+        "title": existing_title,
+        "note": f"This endpoint/category was already recorded as '{existing_title}' — merged the new evidence into that existing finding instead of logging a near-duplicate.",
+        "report_path": new_path or report_path,
+    }
 
 
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -4723,9 +4896,34 @@ def _html_escape(s: Any) -> str:
 _AUTO_REPORT_SEVERITIES = {"critical", "high", "medium"}
 
 
+def _finding_markdown(title: str, kind: str, severity: str, request_ref: str, note: str,
+                       raw_evidence: Optional[List[str]] = None, updated_note: Optional[str] = None) -> str:
+    """Render a single finding as clean, portable Markdown — the format
+    HackerOne/Bugcrowd report fields actually render well (unlike the
+    plain-text copy this used to produce), so it can be pasted straight
+    into a submission with headers, bold labels and fenced code blocks
+    intact instead of landing as one flat paragraph."""
+    parts = [f"## {title}", "", f"**Severity:** {severity.upper()}  ", f"**Category:** {kind}"]
+    if request_ref:
+        parts.append(f"**Endpoint:** `{request_ref}`")
+    parts.append("")
+    if note:
+        parts += ["### Evidence / Notes", "", note, ""]
+    if updated_note:
+        parts += ["### Update", "", updated_note, ""]
+    if raw_evidence:
+        label = "### Proof — Captured Request/Response" if len(raw_evidence) == 1 else "### Proof — Captured Requests/Responses"
+        parts.append(label)
+        parts.append("")
+        for r in raw_evidence:
+            parts += ["```", r, "```", ""]
+    return "\n".join(parts).rstrip() + "\n"
+
+
 def _auto_save_finding_report(
     target: Target, title: str, kind: str, severity: str, request_ref: str, note: str, emit: Any,
     raw_evidence: Optional[List[str]] = None,
+    existing_path: Optional[str] = None, updated_note: Optional[str] = None,
 ) -> Optional[str]:
     """
     Fires automatically every time record_finding logs a NEW confirmed
@@ -4740,6 +4938,13 @@ def _auto_save_finding_report(
     HTML file straight from the finding's own recorded fields — no extra
     authoring step required. Best-effort: any failure here is logged and
     swallowed, it must never fail the underlying record_finding call.
+
+    existing_path: when the SAME finding (same endpoint + category) gets
+    re-confirmed later in the session — e.g. the researcher asked "is this
+    really a vuln?" and the model re-verified it — this rewrites that
+    existing file in place with the merged evidence instead of scattering
+    another near-duplicate finding_<target>_<timestamp>.html next to it.
+    Only a genuinely different finding gets a brand-new file.
     """
     if severity not in _AUTO_REPORT_SEVERITIES:
         return None
@@ -4754,6 +4959,10 @@ def _auto_save_finding_report(
             f'<div class="section-label">Evidence / Notes</div><p>{_html_escape(note).replace(chr(10), "<br>")}</p>'
             if note else ""
         )
+        updated_html = (
+            f'<div class="section-label">Update</div><p>{_html_escape(updated_note).replace(chr(10), "<br>")}</p>'
+            if updated_note else ""
+        )
         endpoint_html = f'<div class="meta">Endpoint: {_html_escape(request_ref)}</div>' if request_ref else ""
         # Real, byte-for-byte captured request/response — separate from the
         # narrative note above, and never model-authored: this is exactly
@@ -4762,6 +4971,8 @@ def _auto_save_finding_report(
         if raw_evidence:
             blocks = "".join(f'<pre class="code-block">{_html_escape(r)}</pre>' for r in raw_evidence)
             raw_evidence_html = f'<div class="section-label">Proof — Captured Request/Response</div>{blocks}'
+
+        md_text = _finding_markdown(title, kind, severity, request_ref, note, raw_evidence, updated_note)
 
         html_doc = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -4776,28 +4987,64 @@ def _auto_save_finding_report(
   .section-label {{ text-transform:uppercase; letter-spacing:.06em; font-size:.72em; color:#7d8590; margin:14px 0 4px; font-weight:600; }}
   .code-block {{ background:#0a0c10; border:1px solid #262b36; border-radius:6px; padding:12px 14px; overflow-x:auto; font-size:.82em; white-space:pre-wrap; word-break:break-all; margin-bottom:10px; }}
   .kind {{ color:#7d8590; font-size:.85em; }}
+  .copy-btn {{ background:#1c2029; border:1px solid #333a47; color:#c7ccd3; font-size:.72em; padding:3px 10px; border-radius:6px; cursor:pointer; margin-left:8px; }}
+  .copy-btn:hover {{ background:#262b36; }}
+  .copy-btn.copied {{ background:#1f3d2a; border-color:#2f6b41; color:#8fe0a6; }}
   footer {{ margin-top:40px; color:#5c6370; font-size:.8em; text-align:center; }}
 </style></head>
 <body>
-<h1>{_html_escape(title)}</h1>
+<h1>{_html_escape(title)} <button class="copy-btn" onclick="hhCopy('finding-src', this)">Copy as Markdown</button></h1>
+<template id="finding-src">{_html_escape(md_text)}</template>
 <div class="meta">Target: {_html_escape(target.host or target.name)} &nbsp;·&nbsp; Generated {generated_at}</div>
 <div class="finding">
   <span class="sev-badge">{_html_escape(severity.upper())}</span>
   <div class="kind">Category: {_html_escape(kind)}</div>
   {endpoint_html}
   {note_html}
+  {updated_html}
   {raw_evidence_html}
 </div>
 <footer>Auto-saved by HELLHOUND the moment this finding was confirmed — run export_report at the end of the session for a single combined write-up of every finding.</footer>
+<script>
+function hhCopy(id, btn) {{
+  var el = document.getElementById(id);
+  if (!el) return;
+  var text = el.content ? el.content.textContent : el.textContent;
+  var done = function() {{
+    var orig = btn.textContent;
+    btn.textContent = 'Copied';
+    btn.classList.add('copied');
+    setTimeout(function() {{ btn.textContent = orig; btn.classList.remove('copied'); }}, 1400);
+  }};
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(text).then(done, function() {{
+      var ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try {{ document.execCommand('copy'); done(); }} catch (e) {{}}
+      document.body.removeChild(ta);
+    }});
+  }} else {{
+    var ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try {{ document.execCommand('copy'); done(); }} catch (e) {{}}
+    document.body.removeChild(ta);
+  }}
+}}
+</script>
 </body></html>"""
 
-        safe_target = re.sub(r"[^A-Za-z0-9._-]+", "_", target_name).strip("_") or "default"
-        fname = f"finding_{safe_target}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
-        out_path = reports_dir / fname
+        if existing_path:
+            out_path = Path(existing_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            safe_target = re.sub(r"[^A-Za-z0-9._-]+", "_", target_name).strip("_") or "default"
+            fname = f"finding_{safe_target}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
+            out_path = reports_dir / fname
         out_path.write_text(html_doc, encoding="utf-8")
 
         if emit and hasattr(emit, "success"):
-            emit.success(f"[✓] Finding report auto-saved: {out_path}")
+            verb = "updated" if existing_path else "auto-saved"
+            emit.success(f"[✓] Finding report {verb}: {out_path}")
         return str(out_path)
     except Exception as e:
         logger.debug(f"Auto finding-report save failed (non-fatal): {e}")
@@ -5008,6 +5255,7 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
     resolved_findings.sort(key=lambda it: _SEVERITY_ORDER.get(str(it.get("severity", "info")).lower(), 4))
 
     findings_html_parts = []
+    findings_markdown_parts = []
     total_screenshots_embedded = 0
     for idx, item in enumerate(resolved_findings, 1):
         raw_finding_ref = str(item.get("finding_ref", "Untitled finding"))
@@ -5057,22 +5305,39 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
                 f'<pre class="code-block">{_html_escape(r)}</pre>' for r in real_evidence_list
             )
 
-        # Plain-text version of this finding for the copy button — hunters
-        # paste this straight into a HackerOne/Bugcrowd report field, so it
-        # needs to be plain text, not HTML.
-        finding_plain_parts = [item.get("finding_ref", "Untitled finding")]
+        # Markdown version of this finding, for both its own per-finding
+        # copy button AND as a section of the overall report-wide Markdown
+        # built below — real Markdown (headers/bold/fenced code), not flat
+        # plain text, since that's what HackerOne/Bugcrowd report fields
+        # actually render properly: a pasted fenced code block stays a
+        # code block, a numbered list stays numbered, instead of
+        # collapsing into one run-on paragraph.
+        finding_md_parts = [f"## {idx}. {item.get('finding_ref', 'Untitled finding')}", ""]
+        sev_cvss_line = f"**Severity:** {severity.upper()}"
+        if cvss:
+            sev_cvss_line += f"  \n**CVSS:** {item.get('cvss_score', '')}"
+        finding_md_parts += [sev_cvss_line, ""]
         if impact:
-            finding_plain_parts.append("\nImpact:\n" + str(item.get("impact_statement", "")))
+            finding_md_parts += ["### Impact", "", str(item.get("impact_statement", "")), ""]
         raw_steps = item.get("steps_to_reproduce", "")
         if raw_steps:
             if isinstance(raw_steps, list):
-                steps_plain = "\n".join(f"{i}. {s}" for i, s in enumerate(raw_steps, 1))
+                steps_md = "\n".join(f"{i}. {s}" for i, s in enumerate(raw_steps, 1))
             else:
-                steps_plain = str(raw_steps)
-            finding_plain_parts.append("\nSteps to Reproduce:\n" + steps_plain)
+                # Already free-form text from the model — pass through as-is
+                # rather than re-numbering lines that may not be a clean list.
+                steps_md = str(raw_steps)
+            finding_md_parts += ["### Steps to Reproduce", "", steps_md, ""]
+        if evidence_snippet:
+            finding_md_parts += ["### Evidence", "", "```", str(evidence_snippet), "```", ""]
         if real_evidence_list:
-            finding_plain_parts.append("\nProof — Captured Request/Response:\n" + "\n\n---\n\n".join(real_evidence_list))
-        finding_plain_text = "\n".join(finding_plain_parts)
+            proof_label_md = "### Proof — Captured Request/Response" if len(real_evidence_list) == 1 else "### Proof — Captured Requests/Responses"
+            finding_md_parts.append(proof_label_md)
+            finding_md_parts.append("")
+            for r in real_evidence_list:
+                finding_md_parts += ["```", r, "```", ""]
+        finding_md_text = "\n".join(finding_md_parts).rstrip() + "\n"
+        findings_markdown_parts.append(finding_md_text)
 
         findings_html_parts.append(f"""
 <div class="finding" id="finding-{idx}">
@@ -5080,13 +5345,13 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
     <span class="sev-badge" style="background:{color}">{severity.upper()}</span>
     <h2>{idx}. {title}</h2>
     {f'<span class="cvss">CVSS {cvss}</span>' if cvss else ''}
-    <button class="copy-btn" onclick="hhCopy('finding-src-{idx}', this)">Copy</button>
+    <button class="copy-btn" onclick="hhCopy('finding-src-{idx}', this)">Copy as Markdown</button>
   </div>
   {f'<div class="section-label">Impact</div><p>{impact}</p>' if impact else ''}
   {f'<div class="section-label">Steps to Reproduce</div>{steps_html}' if steps_html else ''}
   {evidence_block}
   {f'<div class="section-label">Screenshots</div><div class="evidence-shots">{shots_html}</div>' if shots_html else ''}
-  <template id="finding-src-{idx}">{_html_escape(finding_plain_text)}</template>
+  <template id="finding-src-{idx}">{_html_escape(finding_md_text)}</template>
 </div>""")
 
     timeline_html = ""
@@ -5111,6 +5376,21 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
     researcher_handle = str(load_config().get("researcher_handle") or "").strip()
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    # Single, whole-report Markdown — this is the actual point of the copy
+    # buttons existing at all: HackerOne/Bugcrowd submission fields render
+    # Markdown properly (headers, bold, fenced code), so pasting this one
+    # block directly into "Report details" should need little to no manual
+    # reformatting, instead of copying each finding separately and
+    # stitching them together by hand.
+    report_md_parts = [f"# {report_title}", ""]
+    report_md_parts.append(f"**Target:** {target.host or target.name}  ")
+    report_md_parts.append(f"**Generated:** {generated_at}" + (f"  \n**Researcher:** {researcher_handle}" if researcher_handle else ""))
+    report_md_parts.append("")
+    if executive_summary:
+        report_md_parts += ["## Summary", "", executive_summary, ""]
+    report_md_parts.append("".join(findings_markdown_parts).rstrip())
+    report_md_text = "\n".join(report_md_parts).rstrip() + "\n"
+
     html_doc = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <title>{_html_escape(report_title)}</title>
@@ -5133,6 +5413,8 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
   .copy-btn {{ background:#1c2029; border:1px solid #333a47; color:#c7ccd3; font-size:.72em; padding:3px 10px; border-radius:6px; cursor:pointer; margin-left:8px; }}
   .copy-btn:hover {{ background:#262b36; }}
   .copy-btn.copied {{ background:#1f3d2a; border-color:#2f6b41; color:#8fe0a6; }}
+  .copy-btn-primary {{ background:#3a1f12; border-color:#ff7a45; color:#ffb088; font-weight:600; margin-left:0; }}
+  .copy-btn-primary:hover {{ background:#4a2817; }}
   .evidence-shots {{ display:flex; flex-wrap:wrap; gap:12px; }}
   .evidence-shot img {{ max-width:100%; border-radius:6px; border:1px solid #262b36; }}
   .warn-box {{ background:#2a1a10; border:1px solid #6b3a12; border-radius:8px; padding:14px 18px; margin-bottom:28px; font-size:.9em; }}
@@ -5144,7 +5426,10 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
 <body>
 <h1>{_html_escape(report_title)} <button class="copy-btn" onclick="hhCopy('title-src', this)">Copy</button></h1>
 <template id="title-src">{_html_escape(report_title)}</template>
-<div class="meta">Target: {_html_escape(target.host or target.name)} &nbsp;·&nbsp; Generated {generated_at}{f' &nbsp;·&nbsp; {_html_escape(researcher_handle)}' if researcher_handle else ''}</div>
+<div class="meta">Target: {_html_escape(target.host or target.name)} &nbsp;·&nbsp; Generated {generated_at}{f' &nbsp;·&nbsp; {_html_escape(researcher_handle)}' if researcher_handle else ''}
+  &nbsp;·&nbsp; <button class="copy-btn copy-btn-primary" onclick="hhCopy('report-md-src', this)">Copy Full Report as Markdown</button>
+</div>
+<template id="report-md-src">{_html_escape(report_md_text)}</template>
 {f'<div class="summary">{_html_escape(executive_summary).replace(chr(10), "<br>")} <button class="copy-btn" onclick="hhCopy(&#39;summary-src&#39;, this)">Copy</button><template id="summary-src">{_html_escape(executive_summary)}</template></div>' if executive_summary else ''}
 {warnings_html}
 {"".join(findings_html_parts)}
@@ -7108,9 +7393,11 @@ If there is nothing worth generalizing, return an empty array: []"""
                     approved = False
 
                 if approved:
+                    self._approvals_granted_this_turn = getattr(self, "_approvals_granted_this_turn", 0) + 1
                     if hasattr(emit, "success"):
                         emit.success(f"Action authorized by user — executing {tool_name}")
                 else:
+                    self._approvals_denied_this_turn = getattr(self, "_approvals_denied_this_turn", 0) + 1
                     if hasattr(emit, "warn"):
                         emit.warn(f"Action rejected by user — blocked {tool_name}")
                     return {
@@ -7160,9 +7447,11 @@ If there is nothing worth generalizing, return an empty array: []"""
                         emit.start()
 
                 if approved:
+                    self._approvals_granted_this_turn = getattr(self, "_approvals_granted_this_turn", 0) + 1
                     if emit and hasattr(emit, "success"):
                         emit.success(f"Action authorized by user — executing {tool_name}")
                 else:
+                    self._approvals_denied_this_turn = getattr(self, "_approvals_denied_this_turn", 0) + 1
                     if emit and hasattr(emit, "warn"):
                         emit.warn(f"Action rejected by user — blocked {tool_name}")
                     return {
@@ -7231,6 +7520,54 @@ If there is nothing worth generalizing, return an empty array: []"""
                 self.set_target(t_name)
             if session_context.get("scope_rules"):
                 self.target.scope_rules = session_context["scope_rules"]
+
+        # ── Self-diagnostic short-circuit ──
+        # The researcher asking "why did you just dump JSON" / "why do I
+        # have to say continue so much" / "why'd that time out" is a
+        # meta-question about THIS agent's own prior control flow, not a
+        # hunting instruction — routing it through the normal orchestrator
+        # loop means the model answers from the same confusing transcript
+        # that prompted the question in the first place, i.e. guessing at
+        # its own internals. Answer it directly from the real recorded
+        # facts instead (see _format_last_turn_diagnostics) and skip the
+        # tool loop entirely. Falls through to normal handling if there's
+        # no recorded turn yet, or the explain call itself fails.
+        if _DIAG_QUESTION_RE.search(user_text or ""):
+            _diag = (self.target.state or {}).get("last_turn_diagnostics")
+            _diag_text = _format_last_turn_diagnostics(_diag)
+            if _diag_text:
+                explain_prompt = (
+                    f"The researcher is asking about the AGENT'S OWN behavior on the "
+                    f"PREVIOUS turn: \"{user_text}\"\n\n"
+                    f"Here is exactly what was recorded for that turn — these are real "
+                    f"logged facts, not something to guess at:\n{_diag_text}\n\n"
+                    f"Explain plainly, in 2-4 sentences, why that happened, using ONLY the "
+                    f"facts listed above. Do not invent a cause that isn't listed. If none "
+                    f"of the facts above plausibly explain what the researcher is actually "
+                    f"asking about, say so plainly instead of guessing at one."
+                )
+                answer, _tok = ask_neural_core(
+                    prompt=explain_prompt,
+                    system_prompt=(
+                        "You are explaining your own prior tool-use control flow to the "
+                        "researcher operating you — factually, concisely, second person. "
+                        "Never fabricate internals that weren't given to you as facts."
+                    ),
+                    role="synthesizer",
+                    thinking=False,
+                    history=[],
+                    on_token=on_token,
+                    return_usage=True,
+                    cancel_check=cancel_check,
+                    tools=Agent._build_native_tools(),
+                    tool_choice="none",
+                )
+                if answer and not (isinstance(answer, str) and answer.startswith("Error:")):
+                    answer = _clean_synthesizer_output(answer)
+                    self.history.append({"role": "user", "content": user_text})
+                    self.history.append({"role": "assistant", "content": answer})
+                    save_target(self.target)
+                    return answer
 
         # extract_target_from_text is now ONLY a cheap pre-filter for whether
         # this message is worth loading the full tool-calling orchestrator
@@ -7855,6 +8192,28 @@ INSTRUCTIONS:
         _dup_skip_count = 0
         _narration_retry_count = 0
         _premature_done_retry_count = 0
+        # ── Turn-diagnostics telemetry ──
+        # Ground truth for *why* a turn behaved the way it did (timed out,
+        # needed "continue", truncated a batch, got an approval denied),
+        # captured as it actually happens rather than reconstructed/guessed
+        # after the fact. Stored on target.state at the end of this turn so
+        # a later "why did you do that?" from the researcher can be
+        # answered from real recorded facts — see _DIAG_QUESTION_RE /
+        # _format_last_turn_diagnostics and the short-circuit at the top of
+        # this method.
+        _diag_batches_truncated = 0
+        _diag_truncated_calls = 0
+        _diag_provider_retries = 0
+        _diag_provider_gaveup = False
+        self._approvals_granted_this_turn = 0
+        self._approvals_denied_this_turn = 0
+        _turn_t0 = time.time()
+        # Extra full-call retries at the orchestrator level, on top of
+        # ai_utils.call_nvidia's own internal retry-with-backoff — this is
+        # the backstop for a provider outage that outlasts even that (or
+        # for a provider path, e.g. call_ollama, that doesn't have the
+        # same internal retry coverage).
+        _PROVIDER_RETRY_ATTEMPTS = 3
 
         # Wall-clock ceiling alongside the iteration-COUNT ceiling
         # (max_iterations). Observed in practice: a slow local orchestrator
@@ -7922,32 +8281,8 @@ INSTRUCTIONS:
                 if emit and hasattr(emit, "set_label"):
                     emit.set_label("Let me think")
 
-                ai_resp, tokens = ask_neural_core(
-                    prompt=user_text if iteration == 0 else "Continue analysis based on tool results. Choose next tool or output 'DONE'.",
-                    system_prompt=_get_orchestrator_system_prompt(),
-                    role="orchestrator",
-                    thinking=False,
-                    history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
-                    return_usage=True,
-                    cancel_check=cancel_check,
-                    tools=Agent._build_native_tools()
-                )
-                
-                if tokens is not None and emit and hasattr(emit, "set_token_count"):
-                    emit.set_token_count(tokens)
-
-                def _orch_failed(resp):
-                    return (not resp) or (isinstance(resp, str) and resp.startswith("Error:"))
-
-                if _orch_failed(ai_resp):
-                    # Provider-level error or empty completion. Already retried
-                    # once at the source in ai_utils.call_nvidia/call_ollama —
-                    # if it's still failing, give it one more visible attempt
-                    # here before giving up on this iteration, since a 500
-                    # streak can outlast a single 1.5s backoff.
-                    if emit and hasattr(emit, "set_label"):
-                        emit.set_label("Wait a minute.. some issue on my end. Let me cook again..")
-                    ai_resp, tokens = ask_neural_core(
+                def _call_orchestrator():
+                    return ask_neural_core(
                         prompt=user_text if iteration == 0 else "Continue analysis based on tool results. Choose next tool or output 'DONE'.",
                         system_prompt=_get_orchestrator_system_prompt(),
                         role="orchestrator",
@@ -7957,15 +8292,53 @@ INSTRUCTIONS:
                         cancel_check=cancel_check,
                         tools=Agent._build_native_tools()
                     )
-                    if tokens is not None and emit and hasattr(emit, "set_token_count"):
-                        emit.set_token_count(tokens)
+
+                ai_resp, tokens = _call_orchestrator()
+
+                if tokens is not None and emit and hasattr(emit, "set_token_count"):
+                    emit.set_token_count(tokens)
+
+                def _orch_failed(resp):
+                    return (not resp) or (isinstance(resp, str) and resp.startswith("Error:"))
+
+                if _orch_failed(ai_resp):
+                    # Provider-level error or empty completion. call_nvidia
+                    # already retries internally with real exponential
+                    # backoff (see ai_utils._post_with_retry) across both
+                    # 5xx/429 AND connection-level exceptions — so landing
+                    # here at all means that already failed several times.
+                    # This used to be exactly ONE extra attempt and then an
+                    # unconditional give-up for the whole iteration, which is
+                    # exactly what forced the researcher to type "continue"
+                    # on anything longer than a single bad moment. Give it a
+                    # few more full attempts, each with its own growing
+                    # backoff, before actually giving up.
+                    _provider_backoff = 2.0
+                    for _provider_attempt in range(_PROVIDER_RETRY_ATTEMPTS):
+                        _diag_provider_retries += 1
+                        if emit and hasattr(emit, "set_label"):
+                            emit.set_label(
+                                f"Wait a minute.. some issue on my end. Let me cook again "
+                                f"({_provider_attempt + 1}/{_PROVIDER_RETRY_ATTEMPTS})..."
+                            )
+                        time.sleep(_provider_backoff)
+                        _provider_backoff = min(_provider_backoff * 2, 15.0)
+                        ai_resp, tokens = _call_orchestrator()
+                        if tokens is not None and emit and hasattr(emit, "set_token_count"):
+                            emit.set_token_count(tokens)
+                        if not _orch_failed(ai_resp):
+                            break
                     if _orch_failed(ai_resp):
-                        # Still failing — do NOT let this raw error string ride
-                        # along as `ai_resp` into the final `final_answer or
-                        # ai_resp or fallback` chain below; that was leaking
-                        # "Error: NVIDIA NIM API returned 500 - ..." straight
-                        # to the researcher whenever synthesis also failed.
-                        # Clear it so only the friendly fallback can surface.
+                        # Still failing after every retry — do NOT let this raw
+                        # error string ride along as `ai_resp` into the final
+                        # `final_answer or ai_resp or fallback` chain below;
+                        # that was leaking "Error: NVIDIA NIM API returned
+                        # 500 - ..." straight to the researcher whenever
+                        # synthesis also failed. Clear it so only the
+                        # friendly fallback can surface. Record it for
+                        # diagnostics so a later "why did you stop?" gets a
+                        # real answer instead of a guess.
+                        _diag_provider_gaveup = True
                         ai_resp = None
                         break
 
@@ -8057,6 +8430,8 @@ INSTRUCTIONS:
                     # for a single call that needed a follow-up.
                     _MAX_BATCH_PER_RESPONSE = 15
                     if len(_batch) > _MAX_BATCH_PER_RESPONSE:
+                        _diag_batches_truncated += 1
+                        _diag_truncated_calls += len(_batch) - _MAX_BATCH_PER_RESPONSE
                         _batch = _batch[:_MAX_BATCH_PER_RESPONSE]
 
                     self.history.append({"role": "assistant", "content": ai_resp})
@@ -8419,9 +8794,27 @@ INSTRUCTIONS:
             return (not answer) or (isinstance(answer, str) and answer.startswith("Error:"))
 
         def _ask_synthesizer(prompt, hist):
-            """Synthesizer call with one silent retry on an empty completion
-            or a provider-level error string (e.g. transient 5xx) — these are
-            not worth surfacing to the researcher as-is."""
+            """Synthesizer call with retries (with backoff) on an empty
+            completion or a provider-level error string (e.g. transient
+            5xx/connection blip) — these are not worth surfacing to the
+            researcher as-is, and a single bad moment in the cloud
+            shouldn't kill the whole write-up.
+
+            tools + tool_choice="none": the synthesizer is given the SAME
+            tool schema as the orchestrator but is explicitly forbidden
+            from calling one. This keeps the model in a consistently
+            tool-aware frame of reference for the entire turn instead of
+            being dropped into a schema-free completion right after a
+            history full of the orchestrator's own raw tool-call JSON —
+            that mismatch (tool-aware call → tool-naive call, same
+            conversation) was the actual root cause of the model
+            sometimes echoing raw `{"tool": ...}` text back as its
+            "final answer" instead of writing prose. _clean_synthesizer_
+            output() and chat_ui's raw-JSON stream guard remain as
+            further defense-in-depth if a provider ever doesn't honor
+            tool_choice="none".
+            """
+            _synth_tools = Agent._build_native_tools()
             answer, tok = ask_neural_core(
                 prompt=prompt,
                 system_prompt=synthesizer_system_prompt,
@@ -8430,27 +8823,38 @@ INSTRUCTIONS:
                 history=hist,
                 on_token=on_token,
                 return_usage=True,
-                cancel_check=cancel_check
+                cancel_check=cancel_check,
+                tools=_synth_tools,
+                tool_choice="none",
             )
             if _is_provider_failure(answer):
-                logger.debug(f"Synthesizer call failed ({answer!r}), retrying once.")
-                if emit and hasattr(emit, "set_label"):
-                    emit.set_label("Wait a minute.. some issue on my end. Let me cook again..")
-                time.sleep(1.5)
-                answer2, tok2 = ask_neural_core(
-                    prompt=prompt,
-                    system_prompt=synthesizer_system_prompt,
-                    role="synthesizer",
-                    thinking=False,
-                    history=hist,
-                    on_token=on_token,
-                    return_usage=True,
-                    cancel_check=cancel_check
-                )
-                if not _is_provider_failure(answer2):
-                    answer, tok = answer2, (tok2 if tok2 is not None else tok)
+                logger.debug(f"Synthesizer call failed ({answer!r}), retrying.")
+                _synth_backoff = 1.5
+                for _synth_attempt in range(_PROVIDER_RETRY_ATTEMPTS):
+                    if emit and hasattr(emit, "set_label"):
+                        emit.set_label(
+                            f"Wait a minute.. some issue on my end. Let me cook again "
+                            f"({_synth_attempt + 1}/{_PROVIDER_RETRY_ATTEMPTS})..."
+                        )
+                    time.sleep(_synth_backoff)
+                    _synth_backoff = min(_synth_backoff * 2, 15.0)
+                    answer2, tok2 = ask_neural_core(
+                        prompt=prompt,
+                        system_prompt=synthesizer_system_prompt,
+                        role="synthesizer",
+                        thinking=False,
+                        history=hist,
+                        on_token=on_token,
+                        return_usage=True,
+                        cancel_check=cancel_check,
+                        tools=_synth_tools,
+                        tool_choice="none",
+                    )
+                    if not _is_provider_failure(answer2):
+                        answer, tok = answer2, (tok2 if tok2 is not None else tok)
+                        break
                 else:
-                    # Both attempts failed — don't leak the raw provider error
+                    # Every attempt failed — don't leak the raw provider error
                     # string into the transcript as if it were a real answer.
                     answer, tok = None, tok
             return answer, tok
@@ -8593,6 +8997,24 @@ INSTRUCTIONS:
         self._compact_history_if_needed()
         self.target.state["history"] = self.history
         self.target.state["session_digest"] = self.session_digest
+        # Record why this turn ended the way it did — ground truth for the
+        # _DIAG_QUESTION_RE short-circuit above on the researcher's NEXT
+        # message. Overwrites whatever was recorded last turn; only the
+        # most recent turn's telemetry is kept.
+        self.target.state["last_turn_diagnostics"] = {
+            "ended_reason": "cancelled" if _was_cancelled else ("timed_out" if _timed_out else "done"),
+            "iterations": getattr(self, "_current_turn", None),
+            "elapsed_s": round(time.time() - _turn_t0, 1),
+            "narration_retry_count": _narration_retry_count,
+            "batches_truncated": _diag_batches_truncated,
+            "truncated_calls": _diag_truncated_calls,
+            "approvals_granted": getattr(self, "_approvals_granted_this_turn", 0),
+            "approvals_denied": getattr(self, "_approvals_denied_this_turn", 0),
+            "dup_skip_count": _dup_skip_count,
+            "tools_executed": list(tools_executed),
+            "provider_retries": _diag_provider_retries,
+            "provider_gaveup": _diag_provider_gaveup,
+        }
         save_target(self.target)
         return final_response
 

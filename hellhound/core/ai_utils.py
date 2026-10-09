@@ -1013,8 +1013,14 @@ class _RepetitionGuard:
         return occurrences > self.max_repeats
 
 
-def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None, role: str = "orchestrator") -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
-    """Unified dispatcher for all supported AI providers. When `tools` is provided, providers attempt native tool calling."""
+def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None, role: str = "orchestrator", tool_choice: str = "auto") -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+    """Unified dispatcher for all supported AI providers. When `tools` is provided, providers attempt native tool calling.
+
+    tool_choice is currently only honored by the nvidia/nim provider (see
+    call_nvidia) — other providers keep their existing hardcoded "auto"
+    behavior for now, since nvidia/nim is the only one actually in active
+    use for the synthesizer role this was built for.
+    """
     provider = (provider or "ollama").lower().strip()
 
     if system_prompt is None:
@@ -1023,7 +1029,7 @@ def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout
     active_model = model or get_default_model(provider)
 
     if provider in ("nvidia", "nim"):
-        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools, role=role)
+        res = call_nvidia(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools, role=role, tool_choice=tool_choice)
     elif provider == "openai":
         res = call_openai(prompt, api_key, model=active_model, timeout=timeout, history=history, system_prompt=system_prompt, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools)
     elif provider == "anthropic":
@@ -1070,7 +1076,7 @@ def _format_nvidia_nim_error(r: "requests.Response", model: str, role: str) -> s
     return f"Error: NVIDIA NIM API returned {r.status_code} - {r.text[:200]}"
 
 
-def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, role: str = "orchestrator", thinking: bool = False, max_tokens: int = None, history: list = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, timeout: int = 300, role: str = "orchestrator", thinking: bool = False, max_tokens: int = None, history: list = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None, tool_choice: str = "auto") -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """Config-aware wrapper to query the configured AI provider/model for a specific role (orchestrator vs synthesizer)."""
     cfg = load_config()
     provider = cfg.get(f"{role}_provider") or cfg.get("ai_provider", "ollama")
@@ -1105,10 +1111,102 @@ def ask_neural_core(prompt: str, model: str = None, system_prompt: str = None, t
             active_model = cfg.get("orchestrator_model") or cfg.get("ai_model") or get_default_model(provider)
             api_key = api_keys.get(provider) or os.environ.get(env_map.get(provider, ""), "") or "ollama"
 
-    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools, role=role)
+    return call_ai(prompt, provider=provider, api_key=api_key, model=active_model, timeout=timeout, system_prompt=system_prompt, history=history, thinking=thinking, max_tokens=max_tokens, on_token=on_token, return_usage=return_usage, cancel_check=cancel_check, tools=tools, role=role, tool_choice=tool_choice)
 
-def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None, role: str = "orchestrator") -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
-    """REST call to NVIDIA NIM OpenAI-compatible API with SSE streaming. Supports native tool calling."""
+def _post_with_retry(
+    url: str,
+    headers: dict,
+    payload: dict,
+    timeout: int,
+    stream: bool = False,
+    max_attempts: int = 4,
+) -> Tuple[Optional[requests.Response], Optional[BaseException]]:
+    """POST with real retry + exponential backoff, covering both HTTP-level
+    failures (5xx, 429) AND network-level exceptions.
+
+    Before this existed, a bad status code (5xx/429) got exactly ONE retry
+    with a short fixed sleep, but a connection drop, read timeout, DNS
+    blip, or any other `requests` exception mid-call got ZERO retries —
+    it fell straight through to the generic `except Exception` at the
+    bottom of call_nvidia and the whole turn died immediately. In
+    practice "the model failed" and "the cloud connection hiccuped" are
+    both common and both transient, and conflating them with a hard,
+    single-shot give-up is why one bad network moment could kill an
+    entire orchestrator turn and force the researcher to type "continue".
+
+    4xx errors OTHER than 429 (bad request, bad auth, unknown model) are
+    NOT retried — retrying those just burns time on something that will
+    never succeed without the request itself changing.
+
+    Returns (response, None) on eventual success (incl. a final non-2xx
+    response the caller still needs to format into an error — e.g. a
+    persistent 4xx), or (last_response_or_None, last_exception) once
+    every attempt is exhausted on a retryable failure.
+    """
+    backoff = 1.5
+    last_exc: Optional[BaseException] = None
+    last_resp: Optional[requests.Response] = None
+
+    for attempt in range(max_attempts):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=stream)
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.RequestException,
+        ) as e:
+            last_exc = e
+            if attempt == max_attempts - 1:
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 12.0)
+            continue
+
+        if r.status_code == 429:
+            last_resp, last_exc = r, None
+            if attempt == max_attempts - 1:
+                break
+            retry_after = r.headers.get("Retry-After") or r.headers.get("retry-after")
+            try:
+                wait = min(float(retry_after), 12.0) if retry_after else backoff
+            except (TypeError, ValueError):
+                wait = backoff
+            time.sleep(wait)
+            backoff = min(backoff * 2, 12.0)
+            continue
+
+        if r.status_code >= 500:
+            last_resp, last_exc = r, None
+            if attempt == max_attempts - 1:
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 12.0)
+            continue
+
+        # Success, or a non-retryable 4xx — either way the caller decides
+        # what to do with the status code.
+        return r, None
+
+    return last_resp, last_exc
+
+
+def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None, role: str = "orchestrator", tool_choice: str = "auto") -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
+    """REST call to NVIDIA NIM OpenAI-compatible API with SSE streaming. Supports native tool calling.
+
+    tool_choice: "auto" (default) lets the model decide whether to call a
+    tool — used for the orchestrator, which parses the returned
+    `tool_calls` object. "none" attaches the same `tools` schema (so the
+    model stays in the same tool-aware frame of reference — it knows
+    calling is a thing it *could* do, it's just off right now) but
+    forbids it from actually calling one, which is what the synthesizer
+    uses: it keeps the model from treating "write the final answer" as a
+    schema-free completion where raw tool-call-shaped JSON sitting in its
+    own recent history can get echoed back as if it were prose. With
+    tool_choice="none" the response is guaranteed plain `content`, so
+    this stays on the normal streaming path rather than the
+    tool_calls-parsing one below.
+    """
     try:
         url = "https://integrate.api.nvidia.com/v1/chat/completions"
         headers = {
@@ -1165,34 +1263,20 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
 
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = tool_choice
+
+        if tools and tool_choice != "none":
             # Disable streaming for tool calling — simpler to parse non-streamed tool_calls
             payload["stream"] = False
-            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            if r.status_code >= 500:
-                # Transient upstream fault (NVIDIA NIM 500s under load) — one
-                # quick retry before giving up, since these routinely succeed
-                # a moment later.
-                time.sleep(1.5)
-                r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            elif r.status_code == 429:
-                # Rate-limited. The orchestrator loop fires one of these
-                # calls per tool call — a long engagement (lots of curl/
-                # spider/nuclei calls back to back) can realistically hit
-                # NVIDIA's per-key rate limit well before anything else goes
-                # wrong. Previously treated exactly like a hard failure with
-                # zero retry, which meant hitting your rate limit mid-run
-                # could tank the whole turn. Honor Retry-After if NVIDIA
-                # sends one (capped so a huge value doesn't hang the turn),
-                # otherwise back off a bit longer than the 5xx case since a
-                # rate limit won't clear in 1.5s.
-                _retry_after = r.headers.get("Retry-After") or r.headers.get("retry-after")
-                try:
-                    _wait = min(float(_retry_after), 10.0) if _retry_after else 3.0
-                except (TypeError, ValueError):
-                    _wait = 3.0
-                time.sleep(_wait)
-                r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            r, net_err = _post_with_retry(url, headers, payload, timeout, stream=False)
+            if r is None:
+                # Every attempt failed on a connection-level exception (no
+                # HTTP response ever came back to format a status-code
+                # error from) — this used to be an instant, zero-retry
+                # failure; _post_with_retry already retried it with
+                # backoff before giving up.
+                err = f"Error: NVIDIA NIM connection failed after retries ({net_err})"
+                return (err, None) if return_usage else err
             if r.status_code != 200:
                 err = _format_nvidia_nim_error(r, model, role)
                 return (err, None) if return_usage else err
@@ -1214,20 +1298,10 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             text = strip_thinking_tags(msg.get("content", "")) or None
             return (text, usage_tokens) if return_usage else text
 
-        r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
-        if r.status_code >= 500:
-            time.sleep(1.5)
-            r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
-        elif r.status_code == 429:
-            # See the matching 429 handling in the tool-calling branch above
-            # for why this needs a real retry rather than failing outright.
-            _retry_after = r.headers.get("Retry-After") or r.headers.get("retry-after")
-            try:
-                _wait = min(float(_retry_after), 10.0) if _retry_after else 3.0
-            except (TypeError, ValueError):
-                _wait = 3.0
-            time.sleep(_wait)
-            r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
+        r, net_err = _post_with_retry(url, headers, payload, timeout, stream=True)
+        if r is None:
+            err = f"Error: NVIDIA NIM connection failed after retries ({net_err})"
+            return (err, None) if return_usage else err
         if r.status_code != 200:
             err = _format_nvidia_nim_error(r, model, role)
             return (err, None) if return_usage else err
@@ -1262,6 +1336,22 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
                     choices = chunk.get("choices", [])
                     if choices:
                         delta = choices[0].get("delta", {})
+                        # Defensive: tool_choice="none" (synthesizer calls)
+                        # should make tool_calls impossible per the OpenAI-
+                        # compatible spec, but don't trust that blindly — if
+                        # a provider ever ignores it and streams a
+                        # tool_calls delta here anyway, log it and skip the
+                        # delta rather than silently mishandling it. The
+                        # caller still gets whatever real content streamed
+                        # alongside/before it; _clean_synthesizer_output and
+                        # the chat_ui raw-JSON stream guard are the next
+                        # layers of defense if a cloud provider genuinely
+                        # misbehaves here.
+                        if delta.get("tool_calls") and tool_choice == "none":
+                            logger.warning(
+                                f"NVIDIA NIM streamed tool_calls despite tool_choice='none' (role={role}) — ignoring that delta."
+                            )
+                            continue
                         token = delta.get("content", "")
                         # Note: delta.get("reasoning_content") contains internal reasoning/CoT
                         # (e.g. from nemotron or deepseek-r1). We never stream or return reasoning
