@@ -59,13 +59,15 @@ from hellhound.memory import (
     add_lesson,
     find_relevant_lessons,
     format_lessons_block,
+    dismiss_false_positive,
+    is_dismissed_as_false_positive,
 )
 from hellhound.core.skills import (
     get_relevant_skills_prompt,
     discover_skills,
     load_skill_body,
 )
-from hellhound.core.toolcheck import ensure_tool, get_binary_path
+from hellhound.core.toolcheck import ensure_tool, get_binary_path, install_hint
 
 
 def _load_baseline_rules() -> str:
@@ -546,8 +548,143 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
     }
 
 
+def _execute_feroxbuster_content(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Content & directory fuzzing via feroxbuster — purpose-built for
+    recursive content discovery (auto-recurses into discovered directories
+    without a separate re-fuzz pass, and has smarter default response
+    filtering than a bare ffuf invocation). Same calling convention and
+    return shape as _execute_ffuf_content so callers (fuzz_hunter's
+    auto-detect dispatch, or a direct call) can treat the two
+    interchangeably."""
+    import tempfile
+    url = args.get("url") or target.name
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    binary = get_binary_path("feroxbuster")
+    if not binary:
+        return {"error": "feroxbuster not installed", "hint": install_hint("feroxbuster")}
+
+    repo_root = Path(__file__).resolve().parent.parent
+    wordlist_candidates = [
+        repo_root / "wordlists" / "web" / "directories-fast.txt",
+        Path("/usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"),
+        Path("/usr/share/seclists/Discovery/Web-Content/common.txt"),
+        Path("/usr/share/wordlists/dirb/common.txt"),
+        Path("/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt")
+    ]
+    wordlist = None
+    for wc in wordlist_candidates:
+        if wc.exists() and wc.stat().st_size > 0:
+            wordlist = str(wc)
+            break
+    if not wordlist:
+        return {"error": "No directory wordlist found."}
+
+    depth = int(args.get("max_depth", 4) or 4)
+    threads = int(args.get("threads", 40) or 40)
+
+    temp_json = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as tf:
+            temp_json = tf.name
+    except Exception:
+        temp_json = None
+
+    cmd = [
+        binary,
+        "-u", url.rstrip("/"),
+        "-w", wordlist,
+        "-t", str(threads),
+        "-d", str(depth),
+        "-s", "200,204,301,302,307,308,401,403,405",
+        "-k",   # don't choke on self-signed certs on lab/internal targets
+        "-q",   # suppress banner/progress bar — only the JSON events matter
+        "--json",
+    ]
+    if temp_json:
+        cmd.extend(["-o", temp_json])
+
+    req_headers = normalize_headers(args.get("headers"))
+    if not req_headers and hasattr(target, "state") and isinstance(target.state, dict):
+        req_headers = normalize_headers(target.state.get("headers"))
+    for hk, hv in req_headers.items():
+        if isinstance(hv, str) and hv.strip():
+            cmd.extend(["-H", f"{hk}: {hv.strip()}"])
+
+    req_cookies = normalize_cookies(args.get("cookies") or args.get("cookie"))
+    if not req_cookies and hasattr(target, "state") and isinstance(target.state, dict):
+        req_cookies = normalize_cookies(target.state.get("cookies") or target.state.get("session_cookie"))
+    if req_cookies:
+        cookie_str = "; ".join(f"{k}={v}" for k, v in req_cookies.items())
+        cmd.extend(["-H", f"Cookie: {cookie_str}"])
+
+    results = []
+    try:
+        _run_cmd_with_heartbeat(cmd, timeout=120, emit=emit, label="fuzz_hunter (feroxbuster, recursive)")
+        # feroxbuster writes one JSON object per line to -o when --json is
+        # set — NOT a single JSON document like ffuf's -of json, so this
+        # is parsed line-by-line rather than with one json.load().
+        if temp_json and os.path.exists(temp_json) and os.path.getsize(temp_json) > 0:
+            with open(temp_json, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if obj.get("type") != "response":
+                        continue
+                    hit_url = obj.get("url", "")
+                    status = obj.get("status", 0)
+                    length = obj.get("content_length", 0)
+                    path = hit_url[len(url.rstrip("/")):] if hit_url.startswith(url.rstrip("/")) else hit_url
+                    results.append({
+                        "url": hit_url,
+                        "path": path,
+                        "status": status,
+                        "length": length,
+                        "redirect": obj.get("headers", {}).get("location", "") if isinstance(obj.get("headers"), dict) else ""
+                    })
+    except Exception:
+        results = []
+    finally:
+        if temp_json and os.path.exists(temp_json):
+            try:
+                os.remove(temp_json)
+            except Exception:
+                pass
+
+    paths = [r["path"] for r in results]
+
+    if hasattr(target, "state") and isinstance(target.state, dict):
+        if "endpoints" not in target.state or not isinstance(target.state["endpoints"], list):
+            target.state["endpoints"] = []
+        for r in results:
+            hit_url = r.get("url")
+            if hit_url and hit_url not in target.state["endpoints"]:
+                target.state["endpoints"].append(hit_url)
+        save_target(target)
+
+    return {
+        "target_url": url,
+        "paths": paths,
+        "discovered_endpoints": results[:100],
+        "count": len(results)
+    }
+
+
 def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
-    """Execute a custom terminal command/Kali tool targeting a specified host/IP."""
+    """
+    Execute a custom terminal command/Kali tool targeting a specified host/IP.
+    This is the general-purpose fallback: arbitrary shell (pipes, heredocs,
+    multi-stage `cmd1 | cmd2 > file` chains) for whatever the registered,
+    purpose-built tools don't cover — e.g. the model assembling its own
+    subfinder|httpx-style one-off pipeline instead of being limited to a
+    fixed tool catalog.
+    """
     command = args.get("command", "").strip()
     target_host = args.get("target", "").strip()
 
@@ -555,14 +692,18 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
         return {"error": "No command specified."}
 
     try:
-        import subprocess
-        # 180s timeout to prevent locking execution loops
-        proc = subprocess.run(
-            command,
+        # Was a flat `subprocess.run(..., timeout=180)` — for a multi-stage
+        # pipeline (subfinder | httpx, a heredoc writing a file then piping
+        # it onward) that legitimately takes 30-90s, the CLI showed nothing
+        # at all between "tool started" and "tool finished," indistinguishable
+        # from a genuine hang. Routed through the same heartbeat poller every
+        # other long-running shelled-out tool (ffuf, feroxbuster, nmap-style
+        # scans) already uses, so ad-hoc multi-command pipelines stay visibly
+        # alive instead of looking dead for up to 3 minutes.
+        proc = _run_cmd_with_heartbeat(
+            command, timeout=180, emit=emit,
+            label=f"run_terminal_command ({target_host or 'target'})",
             shell=True,
-            capture_output=True,
-            text=True,
-            timeout=180
         )
         return {
             "command": command,
@@ -582,8 +723,8 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
         }
 
 
-def _run_cmd_with_heartbeat(cmd: List[str], timeout: int, emit: Any, label: str,
-                              heartbeat_interval: int = 5) -> "subprocess.CompletedProcess":
+def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
+                              heartbeat_interval: int = 5, shell: bool = False) -> "subprocess.CompletedProcess":
     """
     Runs a subprocess without blocking silently for the full timeout window.
     Long recon calls (passive OSINT lookups, DNS brute-force) previously used
@@ -592,9 +733,14 @@ def _run_cmd_with_heartbeat(cmd: List[str], timeout: int, emit: Any, label: str,
     domain (nothing found until timeout) looked exactly like a hang.
     Polls in `heartbeat_interval`-second slices and emits a progress line
     each time so the CLI stays visibly alive, then hard-kills at `timeout`.
+
+    `cmd` is a List[str] argv by default (shell=False); pass a single command
+    STRING with shell=True for callers that need real shell features (pipes,
+    heredocs, redirects, `&&` chains) — e.g. run_terminal_command's ad-hoc
+    multi-stage pipelines, which can't be expressed as a plain argv list.
     """
     start = time.monotonic()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=shell)
     try:
         while True:
             elapsed = time.monotonic() - start
@@ -4286,33 +4432,112 @@ def _execute_transport_auditor(args: Dict[str, Any], target: Target, emit: Any) 
         return {"url": url, "error": f"Transport auditor error: {e}"}
 
 
-def _execute_fuzz_hunter(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
-    """Run recursive path fuzzing with 404 similarity baseline heuristics."""
+def _execute_fuzz_hunter_internal(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """The original pure-Python fuzzer (FUZZhunter.py) — baseline-diffing
+    404 detection, no external binary required. Used only when neither
+    feroxbuster nor ffuf is installed; see _execute_fuzz_hunter for the
+    engine-selection logic that decides when this runs."""
     from hellhound.core.engine import HellhoundEngine
     url = args.get("url") or target.name
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
     spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    # FUZZhunter.run() reads options["depth"] and options["mode"] — NOT
+    # "max_depth"/"quick". Those were the exact keys this dict used to
+    # send, which meant options.get("depth", 2) and options.get("mode")
+    # never matched anything this call ever set, so the module silently
+    # fell through to its hardcoded defaults (depth=2, mode="quick" — the
+    # 25-word INTERNAL_WORDLIST, never the real SecLists wordlist) on
+    # EVERY call regardless of what max_depth/quick the orchestrator
+    # actually asked for. The tool always returned a result and never
+    # errored, so nothing surfaced this — it just quietly fuzzed the same
+    # ~25 common paths every time while reporting success. See the
+    # matching fix in FUZZhunter.run() for the "threads" side of this.
     opts = {
         "spider_intel": spider_intel,
-        "max_depth": args.get("max_depth", 2),
+        "depth": args.get("max_depth", 2),
+        "mode": "quick" if args.get("quick", False) else "deep",
         "threads": args.get("threads", 10),
-        "quick": args.get("quick", False),
     }
     engine = HellhoundEngine()
     try:
         res = engine.run_single("fuzz_hunter", url, options=opts, emit=emit)
         intel = res.get("intel", {}) if isinstance(res, dict) else {}
         endpoints = intel.get("endpoints", [])
-        return {
+        out = {
             "url": url,
             "endpoints_found": len(endpoints),
             "endpoints": endpoints[:30],
             "signals": res.get("signals", []) if isinstance(res, dict) else []
         }
+        # Propagate coverage transparency fields up from the module —
+        # without this a "no hidden files found" result is indistinguishable
+        # from a properly-covered negative, even when it secretly only
+        # tried the 25-word internal fallback list.
+        if isinstance(res, dict):
+            if "words_tried" in res:
+                out["words_tried"] = res["words_tried"]
+            if res.get("degraded_coverage_warning"):
+                out["degraded_coverage_warning"] = res["degraded_coverage_warning"]
+        return out
     except Exception as e:
         return {"url": url, "error": f"FUZZhunter error: {e}"}
+
+
+def _execute_fuzz_hunter(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Recursive path/content discovery — auto-selects the best engine
+    actually available on this machine rather than always running the
+    weakest option:
+      1. feroxbuster, if installed — purpose-built for recursive content
+         discovery, auto-recurses into found directories in one pass.
+      2. ffuf, if installed — same real-wordlist coverage as
+         content_discovery (this IS content_discovery's own executor,
+         reused directly rather than duplicated).
+      3. The internal pure-Python fuzzer (FUZZhunter.py) — always
+         available, no install required, but limited to a small internal
+         wordlist unless a SecLists-style wordlist happens to be on disk
+         (see _execute_fuzz_hunter_internal / FUZZhunter.run's
+         degraded_coverage_warning).
+    This is a fallback CHAIN, not a researcher decision — the model
+    doesn't need to know or care which binaries are installed; calling
+    fuzz_hunter always gets the strongest tool this machine can actually
+    run. Every result is tagged with "engine" so it's visible afterward
+    which one actually ran.
+    """
+    ferox_path = get_binary_path("feroxbuster")
+    if ferox_path:
+        if emit and hasattr(emit, "info"):
+            emit.info(f"[*] fuzz_hunter: feroxbuster found at {ferox_path} — using it (best available engine).")
+        result = _execute_feroxbuster_content(args, target, emit)
+        if not result.get("error"):
+            result["engine"] = "feroxbuster"
+            return result
+        # feroxbuster is installed but the run itself errored (bad
+        # wordlist, crash, etc.) — don't just give up, degrade to the
+        # next engine in the chain rather than returning the error as if
+        # nothing could be done at all.
+        if emit and hasattr(emit, "warn"):
+            emit.warn(f"[!] feroxbuster run failed ({result.get('error')}) — falling back to ffuf.")
+
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    ffuf_check = ensure_tool("ffuf", emit=None, auto_install=auto_install)
+    if ffuf_check["available"]:
+        if emit and hasattr(emit, "info"):
+            emit.info("[*] fuzz_hunter: ffuf found — using it (feroxbuster not available).")
+        result = _execute_ffuf_content(args, target, emit)
+        if not result.get("error"):
+            result["engine"] = "ffuf"
+            return result
+        if emit and hasattr(emit, "warn"):
+            emit.warn(f"[!] ffuf run failed ({result.get('error')}) — falling back to the internal fuzzer.")
+
+    if emit and hasattr(emit, "info"):
+        emit.info("[*] fuzz_hunter: neither feroxbuster nor ffuf is installed — using the internal fuzzer (weaker coverage; install one of them for better results).")
+    result = _execute_fuzz_hunter_internal(args, target, emit)
+    result["engine"] = "internal"
+    return result
 
 
 def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -4715,6 +4940,30 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     request_ref = str(args.get("request_ref", "")).strip()
     note = str(args.get("note", "")).strip()
 
+    # Refuse to (re-)record something the researcher already explicitly
+    # reviewed and rejected as a false positive on THIS target. Without
+    # this, dismiss_finding only ever removed the PAST copy — nothing
+    # stopped the very next re-test of the same endpoint from sailing
+    # straight back into target.findings under a slightly different
+    # title/note, which is exactly the "keeps flagging it, keeps calling
+    # it vulnerable" loop a researcher correction is supposed to end.
+    _dismissal = is_dismissed_as_false_positive(target, kind, request_ref)
+    if _dismissal is not None:
+        return {
+            "status": "blocked_previously_dismissed",
+            "note": (
+                f"Not recording this — the researcher already reviewed and dismissed "
+                f"'{kind}' on this exact endpoint as a false positive: \"{_dismissal.get('reason') or 'no reason given'}\". "
+                f"Do not re-flag it again unless you have genuinely NEW evidence that "
+                f"specifically addresses that stated reason (e.g. if the dismissal was "
+                f"about non-deterministic/dynamic content, new evidence would mean you "
+                f"confirmed the SAME exact value is tied to a specific OTHER account, not "
+                f"just that the response changed again). If you believe the dismissal "
+                f"itself was a mistake, say so to the researcher in plain language instead "
+                f"of silently re-recording it."
+            ),
+        }
+
     raw_evidence_matches = _lookup_curl_evidence(target, request_ref)
 
     # Dedup: the storage layer's own dedup keys on the WHOLE finding dict,
@@ -4799,6 +5048,137 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     if auto_report_path:
         result["report_path"] = auto_report_path
 
+    return result
+
+
+def _execute_dismiss_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Retracts a finding the researcher has reviewed and determined is NOT a
+    real vulnerability (a false positive) — e.g. an endpoint whose content
+    merely changes between requests because it's dynamic (live counters,
+    timestamps, randomized sample data), not because of an access-control
+    flaw.
+
+    This does three things, not just one:
+    1. Removes the matching entry from target.findings (and its evidence
+       card) so it stops counting toward "N verified findings" and stops
+       being eligible for export_report.
+    2. Permanently blocks record_finding from accepting the SAME
+       (kind, endpoint) pair again this target, citing the stated reason —
+       see is_dismissed_as_false_positive(), checked at the top of
+       _execute_record_finding.
+    3. Writes an immediate cross-target lesson (hellhound/memory/lessons.py)
+       so a DIFFERENT target with the same tech signature also benefits,
+       rather than waiting for the end-of-session LLM lesson-mining pass
+       (_finalize_target_lessons) to maybe notice it.
+
+    A researcher correction ("that's a false positive, remove it") is
+    useless if it only changes what gets said in THIS reply — it has to
+    change what the orchestrator does on the NEXT tool call and in the
+    NEXT session. That's what this tool is for.
+    """
+    reason = str(args.get("reason", "")).strip()
+    if not reason:
+        return {
+            "status": "no_reason_given",
+            "note": "Nah bro, dismiss_finding needs a reason — one sentence on WHY this isn't a real vulnerability (e.g. 'content is dynamic/live, differs between any two requests regardless of the id parameter'). That reason is what stops the same mistake from happening again.",
+        }
+
+    title = str(args.get("title", "")).strip()
+    kind = str(args.get("kind", "")).strip().lower()
+    request_ref = str(args.get("request_ref", "")).strip()
+    norm_request_ref = _normalize_endpoint(request_ref) if request_ref else ""
+
+    # Find and remove the matching recorded finding, if one exists — same
+    # matching logic as record_finding's own dedup (exact title+endpoint,
+    # then kind+normalized-endpoint). A dismiss_finding call is still
+    # valid and still worth acting on even when nothing matches (e.g. the
+    # researcher is preemptively rejecting a PATTERN before record_finding
+    # ever ran) — it just means step 1 above is a no-op.
+    existing_findings = target.findings if isinstance(target.findings, list) else []
+    removed = None
+    for f in existing_findings:
+        if not isinstance(f, dict):
+            continue
+        exact_match = (
+            title
+            and f.get("target", "").strip().lower() == request_ref.strip().lower()
+            and f.get("type", "").strip().lower() == title.strip().lower()
+        )
+        category_match = (
+            kind
+            and f.get("kind", "").strip().lower() == kind
+            and norm_request_ref
+            and _normalize_endpoint(f.get("target", "")) == norm_request_ref
+        )
+        title_only_match = (
+            not request_ref and not kind and title
+            and f.get("type", "").strip().lower() == title.strip().lower()
+        )
+        if exact_match or category_match or title_only_match:
+            removed = f
+            break
+
+    if removed is not None:
+        existing_findings.remove(removed)
+        target.findings = existing_findings
+        # Keep kind/request_ref around for the dismissal record even if the
+        # researcher's call only gave a title — pull them off what was removed.
+        kind = kind or str(removed.get("kind", "")).strip().lower()
+        request_ref = request_ref or str(removed.get("target", ""))
+        norm_request_ref = norm_request_ref or _normalize_endpoint(request_ref)
+        title = title or str(removed.get("type", ""))
+
+        # Drop the matching evidence card too, and best-effort delete its
+        # auto-saved per-finding HTML report so a retracted finding can't
+        # end up embedded in export_report via a stale file reference.
+        evidence = target.state.get("recent_evidence")
+        if isinstance(evidence, list):
+            target.state["recent_evidence"] = [
+                e for e in evidence
+                if not (isinstance(e, dict) and e.get("title") == removed.get("type") and e.get("type") == removed.get("kind"))
+            ]
+        report_path = removed.get("report_path")
+        if report_path:
+            try:
+                if os.path.exists(report_path):
+                    os.remove(report_path)
+            except Exception:
+                pass  # best-effort cleanup — the dismissal itself still proceeds
+
+    if not title and not kind:
+        return {
+            "status": "nothing_to_dismiss",
+            "note": "No title/kind+request_ref given and nothing matched an existing finding — give at least a title, or a kind+request_ref, identifying what to dismiss.",
+        }
+
+    label = title or f"{kind} on {request_ref or '(no endpoint given)'}"
+    try:
+        dismiss_false_positive(target, item=label, reason=reason, kind=kind, endpoint=request_ref)
+        # Immediate cross-target lesson — don't wait for end-of-session
+        # mining, which only fires on set_target and depends on an LLM
+        # call succeeding at summarizing the whole transcript correctly.
+        sig_tags = [t for t in (kind, *re.split(r"[.\-_/:?&=]+", (request_ref or "").lower())) if t and len(t) > 2]
+        add_lesson(
+            technique=f"Flagging '{kind or 'this'}' based on response differences at {request_ref or title}",
+            outcome="failed",
+            tech_signature=sig_tags,
+            note=f"Researcher-confirmed false positive: {reason}",
+            target_name=target.name if target else "",
+        )
+        save_target(target)
+    except Exception as e:
+        return {"error": f"Failed to dismiss finding: {e}"}
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[✓] Dismissed as false positive: {label}")
+
+    result = {
+        "status": "dismissed",
+        "label": label,
+        "removed_from_findings": removed is not None,
+        "note": f"Removed and blocked from re-recording. '{kind or 'this'}' on this endpoint will not be flagged again on this target unless genuinely new evidence contradicts: {reason}",
+    }
     return result
 
 
@@ -5649,6 +6029,21 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_record_finding
     ),
+    "dismiss_finding": ToolSpec(
+        name="dismiss_finding",
+        description="Retract a finding the researcher has told you is NOT a real vulnerability — a false positive. Call this THE MOMENT the researcher says something you flagged isn't a bug, rather than just agreeing in your reply and leaving it sitting in findings. This removes it from recorded findings AND permanently stops record_finding from accepting the same kind+endpoint pair again on this target (citing your stated reason), AND writes a cross-target lesson so other targets with a similar stack benefit too. Match what you dismiss using the SAME title (or kind+request_ref) you originally used in record_finding.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "The exact (or close) title you used in record_finding for this finding, if there is one. Omit if you never got as far as record_finding and are dismissing a pattern/lead before recording it."},
+                "kind": {"type": "string", "description": "Category, e.g. 'idor', 'sqli' — same value you used (or would have used) in record_finding. Required if title is omitted."},
+                "request_ref": {"type": "string", "description": "The URL/endpoint this applies to. Required if title is omitted — required together with kind."},
+                "reason": {"type": "string", "description": "REQUIRED. One sentence on WHY this isn't real — e.g. 'response content is dynamic/live (online user count, order totals) and differs between any two requests regardless of which user_id was passed — not evidence of per-user access control'. This exact reason is what prevents the same mistake from happening again, so be specific about the actual mechanism, not just 'false positive'."}
+            },
+            "required": ["reason"]
+        },
+        executor=_execute_dismiss_finding
+    ),
     "export_report": ToolSpec(
         name="export_report",
         description="Assemble every recorded finding and piece of evidence for this target into a single, self-contained, professional HTML report — headline, executive summary, per-finding impact statements and steps to reproduce, real captured request/response proof for each finding, and every referenced screenshot embedded directly in the file (base64, no linked images that break once the file leaves this machine — e.g. attached to a HackerOne/Bugcrowd submission). Use this at the end of a hunting session when the researcher asks for a report, a writeup, or to export/save findings — and call it again any time the researcher asks to update/add to the report; by default this OVERWRITES the target's one report file in place rather than creating a new one (see new_file). YOU write the narrative (title, executive summary, impact statement, steps to reproduce per finding) — follow the report-writing skill's methodology first (impact-first tone, CVSS 3.1 scoring, never 'could potentially' — prove it or don't claim it). Never fabricate example/placeholder evidence (made-up cookies, made-up response bodies, etc.) — this tool assembles and embeds what you give it faithfully, checks your work (every finding_ref must match something actually recorded via record_finding or logged as evidence during this session; fabricated/unmatched refs are rejected, any recorded finding you leave out gets flagged back to you), AND automatically attaches the real request/response captured during this session for each finding — you do not need to, and should not try to, retype that from memory.",
@@ -6226,14 +6621,14 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "fuzz_hunter": ToolSpec(
         name="fuzz_hunter",
-        description="FUZZhunter intelligent recursive path discovery — performs deep recursive fuzzing with dynamic 404 similarity calibration and custom wordlists.",
+        description="Recursive path/content discovery — your default fuzzing tool, call this rather than deciding between fuzzers yourself. It automatically uses the strongest engine actually installed on this machine: feroxbuster first (purpose-built recursive discovery), then ffuf (same engine as content_discovery), and only falls back to a weaker built-in Python fuzzer with a small wordlist if neither binary is present — that fallback case is flagged in the result via 'degraded_coverage_warning' when it happens, and every result says which engine actually ran via 'engine'. You do not need to choose feroxbuster/ffuf/content_discovery manually for ordinary recursive directory fuzzing; use this first and only reach for content_discovery/vhost_fuzz directly if you specifically need raw ffuf control (e.g. a custom FUZZ position that isn't a trailing path segment).",
         parameters={
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "Target base URL to fuzz."},
                 "max_depth": {"type": "integer", "description": "Maximum recursive discovery depth (default: 2).", "default": 2},
                 "threads": {"type": "integer", "description": "Concurrent HTTP workers (default: 10).", "default": 10},
-                "quick": {"type": "boolean", "description": "Quick mode with top-priority wordlist paths only (default: false).", "default": False}
+                "quick": {"type": "boolean", "description": "Quick mode with top-priority wordlist paths only (default: false). Only affects the internal fallback engine — feroxbuster/ffuf always use the full real wordlist.", "default": False}
             },
             "required": ["url"]
         },
@@ -8171,7 +8566,7 @@ INSTRUCTIONS:
         # bug again", "nice work!") that only touches a no-op record_finding
         # call still looked like a real hunting turn and got the full
         # report-register prompt instead of a normal conversational reply.
-        _NO_OP_TOOL_STATUSES = {"skipped", "already_recorded"}
+        _NO_OP_TOOL_STATUSES = {"skipped", "already_recorded", "blocked_previously_dismissed", "no_title_given", "no_reason_given", "nothing_to_dismiss"}
         _productive_tools_executed = []
         # Hard cap on record_finding per turn — enforced here, not just
         # requested in the prompt. Prompt instructions are advisory; the
@@ -8897,26 +9292,50 @@ INSTRUCTIONS:
                 self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx)
             )
         elif _timed_out:
-            # Hit the wall-clock ceiling above with no tool ever
-            # successfully dispatched this turn. The generic
-            # not-_productive_tools_executed branch below just hands the
-            # synthesizer the bare original_user_text plus full history —
-            # and that history is full of the orchestrator's own failed
-            # raw tool-call-JSON attempts from this same stuck turn, with
-            # nothing telling the synthesizer not to echo one back as its
-            # answer. Be explicit instead: say plainly that repeated
-            # attempts didn't get a tool to actually run, and forbid
-            # reproducing any JSON/tool-call syntax from that history.
-            synth_prompt = (
-                f"The researcher asked: \"{original_user_text}\"\n\n"
-                f"Repeated attempts to act on this were made, but no tool actually "
-                f"finished running before this turn's time budget ran out — nothing "
-                f"was dispatched, nothing was gathered. State that plainly in one or "
-                f"two sentences and suggest the researcher just ask again. Do NOT "
-                f"reproduce, paraphrase-as-code, or describe-in-JSON any tool-call "
-                f"syntax that may appear in the conversation history above — those "
-                f"were failed internal attempts, not something to show the researcher."
-            )
+            # Hit the wall-clock ceiling (_loop_deadline/_hard_ceiling).
+            # This USED TO mean "no tool ever successfully dispatched this
+            # turn" unconditionally — true back when only one tool call
+            # could land per iteration, so a stuck turn that never got a
+            # single clean call through would burn the whole budget on
+            # retries alone. That's no longer the only way to get here:
+            # since the orchestrator can batch many real tool calls into
+            # one response, a turn can run 40+ successful curls, record
+            # several real findings, and STILL eventually hit the 20-minute
+            # ceiling mid-investigation. Telling the synthesizer "nothing
+            # was dispatched, nothing was gathered" in that case is simply
+            # false — the model (correctly) follows that instruction to the
+            # letter and tells the researcher to just ask again, discarding
+            # a real, substantial result and producing exactly the
+            # "stuck, say continue" experience this is supposed to prevent.
+            # Branch on what actually happened instead of assuming the
+            # worst case every time.
+            if tools_executed:
+                synth_prompt = (
+                    f"The researcher asked: \"{original_user_text}\"\n\n"
+                    f"Tools executed before this turn's time budget ran out: {', '.join(tools_executed)}.\n\n"
+                    f"This turn hit its time limit mid-investigation — it did NOT fail and did NOT "
+                    f"run nothing. Summarize factually what was actually tried and found from the "
+                    f"real [TOOL RESULT: ...] entries above (confirmed findings, what came back "
+                    f"negative, anything still in progress). State plainly that the time budget for "
+                    f"this turn ran out before the investigation was fully finished, not that nothing "
+                    f"happened. End by naming the specific next step to pick up where this left off "
+                    f"(e.g. 'ask me to continue testing <specific endpoint/vector>') — do NOT tell the "
+                    f"researcher to just 'ask again' with no direction, they already know that; tell them "
+                    f"what asking again will actually continue. Do NOT reproduce, paraphrase-as-code, or "
+                    f"describe-in-JSON any raw tool-call syntax that may appear in the history above — "
+                    f"those are internal, not something to show the researcher."
+                )
+            else:
+                synth_prompt = (
+                    f"The researcher asked: \"{original_user_text}\"\n\n"
+                    f"Repeated attempts to act on this were made, but no tool actually "
+                    f"finished running before this turn's time budget ran out — nothing "
+                    f"was dispatched, nothing was gathered. State that plainly in one or "
+                    f"two sentences and suggest the researcher just ask again. Do NOT "
+                    f"reproduce, paraphrase-as-code, or describe-in-JSON any tool-call "
+                    f"syntax that may appear in the conversation history above — those "
+                    f"were failed internal attempts, not something to show the researcher."
+                )
             final_answer, tokens = _ask_synthesizer(
                 synth_prompt,
                 self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx)

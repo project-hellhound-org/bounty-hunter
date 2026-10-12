@@ -23,6 +23,11 @@ PD_TOOLS: Set[str] = {
 # install these, they need their own install hints.
 OTHER_TOOLS: Dict[str, str] = {
     "ffuf": "go install github.com/ffuf/ffuf/v2@latest",
+    # No single cross-distro install command (prebuilt binary release,
+    # cargo, or a distro package depending on OS) — the parenthetical
+    # makes try_install() treat this as a human-readable hint rather than
+    # something to exec literally, same as the nmap entry below.
+    "feroxbuster": "cargo install feroxbuster (or grab a prebuilt binary from https://github.com/epi052/feroxbuster/releases)",
     "subzy": "go install -v github.com/PentestPad/subzy@latest",
     "gowitness": "go install github.com/sensepost/gowitness@latest",
     "gau": "go install github.com/lc/gau/v2/cmd/gau@latest",

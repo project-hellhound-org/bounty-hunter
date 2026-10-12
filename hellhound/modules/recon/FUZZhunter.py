@@ -36,10 +36,11 @@ def get_wordlist_path():
         return None
 
 class FuzzWorker:
-    def __init__(self, base_url, emit, max_depth=2):
+    def __init__(self, base_url, emit, max_depth=2, threads=30):
         self.base_url = base_url.rstrip("/")
         self.emit = emit
         self.max_depth = max_depth
+        self.threads = threads
         self.results = []
         self.found_dirs = set([""]) # Initial root
         self.lock = threading.Lock()
@@ -111,6 +112,7 @@ def run(target, emit, options=None):
     url = target if target.startswith("http") else f"http://{target}"
     
     max_depth = int(options.get("depth", 2)) if options else 2
+    threads = int(options.get("threads", 30)) if options else 30
     mode = "deep" if options and options.get("mode") == "deep" else "quick"
     
     # Load Wordlist
@@ -122,6 +124,13 @@ def run(target, emit, options=None):
     if any("PHP" in t for t in tech_stack): tech_exts.extend([".php", ".php.bak"])
     if any("Node" in t for t in tech_stack): tech_exts.extend([".js", "package.json"])
     
+    # Tracked separately from `mode` so the returned result can tell the
+    # orchestrator (not just a human watching the terminal) when a "deep"
+    # request silently got the same ~25-word coverage as "quick" — emit.*
+    # calls are console/UI-only and never reach the model's own context,
+    # so without this field the model has no way to know its request for
+    # thorough coverage was downgraded.
+    degraded_wordlist = False
     if mode == "deep":
         wp = get_wordlist_path()
         if wp:
@@ -129,12 +138,18 @@ def run(target, emit, options=None):
                 with open(wp, 'r', encoding='utf-8', errors='ignore') as f:
                     words = [line.strip() for line in f if line.strip() and not line.startswith('#')]
                 emit.info(f"    [i] Loaded {len(words)} words (DEEP)")
-            except: words = INTERNAL_WORDLIST
-        else: words = INTERNAL_WORDLIST
+            except Exception:
+                words = INTERNAL_WORDLIST
+                degraded_wordlist = True
+                emit.warn(f"    [!] DEEP mode requested but wordlist at {wp} failed to load — falling back to the {len(INTERNAL_WORDLIST)}-word internal list. Coverage is degraded; consider content_discovery (ffuf) instead for this run.")
+        else:
+            words = INTERNAL_WORDLIST
+            degraded_wordlist = True
+            emit.warn(f"    [!] DEEP mode requested but no SecLists/dirb/dirbuster wordlist found on disk — falling back to the {len(INTERNAL_WORDLIST)}-word internal list. Coverage is degraded; install SecLists, or use content_discovery (ffuf) instead for this run.")
     else: words = INTERNAL_WORDLIST
 
     if tech_exts: words = list(set(words + tech_exts))
-    scanner = FuzzWorker(url, emit, max_depth=max_depth)
+    scanner = FuzzWorker(url, emit, max_depth=max_depth, threads=threads)
     baseline = scanner.check_baseline()
     emit.info(f"    [i] Baseline: {baseline} (Size: {scanner.not_found_size})")
 
@@ -151,7 +166,7 @@ def run(target, emit, options=None):
             if base in scanned_dirs: continue
             scanned_dirs.add(base)
             
-            with ThreadPoolExecutor(max_workers=30) as executor:
+            with ThreadPoolExecutor(max_workers=scanner.threads) as executor:
                 futures = [executor.submit(scanner.test_path, base, word) for word in words]
                 for f in as_completed(futures): pass
         
@@ -164,12 +179,27 @@ def run(target, emit, options=None):
         to_scan = next_scan
         current_depth += 1
 
+    wordlist_note = (
+        f"WARNING: requested mode='{mode}' but only {len(words)} words were actually tried "
+        f"(internal fallback list, not a real wordlist) — a negative result here does NOT mean "
+        f"the surface is clean, it means coverage was thin. Prefer content_discovery (ffuf) for "
+        f"a properly-covered negative result."
+    ) if degraded_wordlist else None
+
     if scanner.results:
         scanner.results.sort(key=lambda x: x['status'])
         emit.success(f"[+] Found {len(scanner.results)} interesting endpoints.")
         for res in scanner.results:
             emit.info(f"    [{res['status']}] {res['path']} ({res['size']} bytes)")
-        return {"raw": f"Found {len(scanner.results)} endpoints", "intel": {"endpoints": scanner.results}, "signals": ["HIDDEN_ENDPOINTS_FOUND"]}
-    
+        result = {"raw": f"Found {len(scanner.results)} endpoints", "intel": {"endpoints": scanner.results}, "signals": ["HIDDEN_ENDPOINTS_FOUND"], "words_tried": len(words)}
+        if wordlist_note:
+            result["degraded_coverage_warning"] = wordlist_note
+            result["signals"].append("DEGRADED_WORDLIST_COVERAGE")
+        return result
+
     emit.info("[-] No hidden files detected.")
-    return {"raw": "No files found", "signals": []}
+    result = {"raw": "No files found", "signals": [], "words_tried": len(words)}
+    if wordlist_note:
+        result["degraded_coverage_warning"] = wordlist_note
+        result["signals"].append("DEGRADED_WORDLIST_COVERAGE")
+    return result

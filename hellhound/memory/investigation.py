@@ -252,12 +252,59 @@ def record_evidence(target, kind: str, ref: str, note: str = "") -> None:
     target.state["evidence_count"] = len(target.state.get("recent_evidence", []))
 
 
-def dismiss_false_positive(target, item: str, reason: str = "") -> None:
-    """Marks a finding/lead as reviewed-and-dismissed so it is never re-suggested."""
+def _normalize_endpoint_for_dismissal(u: str) -> str:
+    """Strip query string + trailing slash + case — mirrors
+    hellhound.core.agent._normalize_endpoint (duplicated locally rather than
+    imported, to avoid a circular import between agent.py and this module).
+    Two request_refs that only differ by parameter VALUE (e.g.
+    ?user_id=1 vs ?user_id=2) must normalize to the same key, since a
+    dismissal applies to the endpoint/vuln-class pair, not one specific id."""
+    u = (u or "").strip().lower()
+    u = u.split("?", 1)[0]
+    return u.rstrip("/")
+
+
+def dismiss_false_positive(target, item: str, reason: str = "", kind: str = "", endpoint: str = "") -> None:
+    """Marks a finding/lead as reviewed-and-dismissed so it is never
+    re-suggested or re-recorded.
+
+    `item` remains the free-text label used for simple substring/equality
+    checks (see _dismissed_label_set, build_next_actions) and for the
+    tech-signature tag fed into lesson retrieval. `kind`/`endpoint` are
+    optional structured fields that — when given — let
+    is_dismissed_as_false_positive() do a precise (kind, normalized
+    endpoint) match instead of a fuzzy label comparison, which is what
+    record_finding needs to reliably refuse to re-record something the
+    researcher already explicitly rejected.
+    """
     merge_state_list(target, "dismissed_false_positives", [{
-        "item": item, "reason": reason, "ts": _now_iso(),
+        "item": item,
+        "reason": reason,
+        "kind": (kind or "").strip().lower(),
+        "endpoint": _normalize_endpoint_for_dismissal(endpoint) if endpoint else "",
+        "ts": _now_iso(),
     }])
     record_timeline(target, f"Dismissed as false positive: {item}", {"reason": reason})
+
+
+def is_dismissed_as_false_positive(target, kind: str, endpoint: str) -> Optional[Dict[str, Any]]:
+    """Returns the matching dismissal record if (kind, endpoint) was
+    already reviewed and rejected by the researcher, else None. Endpoint
+    matching ignores query string/value and trailing slash/case — the
+    whole point is that ?user_id=1, ?user_id=2, ?user_id=99 etc. are the
+    SAME endpoint for dismissal purposes, only the parameter value
+    differs."""
+    st = target.state if hasattr(target, "state") and isinstance(target.state, dict) else {}
+    kind = (kind or "").strip().lower()
+    norm_endpoint = _normalize_endpoint_for_dismissal(endpoint)
+    if not kind or not norm_endpoint:
+        return None
+    for d in st.get("dismissed_false_positives", []):
+        if not isinstance(d, dict):
+            continue
+        if d.get("kind") == kind and d.get("endpoint") == norm_endpoint:
+            return d
+    return None
 
 
 # ── Module-specific update helpers ──────────────────────────────────────────
@@ -446,6 +493,29 @@ def build_investigation_summary(target) -> str:
         lines.append("Highest priority:")
         for p in priorities:
             lines.append(f"- {p}")
+
+    # Surfaced explicitly (not just used internally to filter suggestions)
+    # so the orchestrator sees, on every turn, exactly what the researcher
+    # already reviewed and rejected — without depending on it still being
+    # in the trimmed chat history scrollback. This is what a researcher
+    # saying "that's a false positive, not a bug" is actually FOR: it
+    # should stop a re-test/re-flag of the same endpoint+vuln-class from
+    # happening again later in this session (record_finding checks this
+    # same list before accepting a new finding — see
+    # is_dismissed_as_false_positive()).
+    dismissed = [d for d in st.get("dismissed_false_positives", []) if isinstance(d, dict)]
+    if dismissed:
+        lines.append("")
+        lines.append(
+            "DISMISSED AS FALSE POSITIVE (researcher already reviewed and "
+            "rejected these — do NOT re-test or re-flag the same "
+            "endpoint+category unless you have genuinely new, different "
+            "evidence than what was dismissed):"
+        )
+        for d in dismissed[-10:]:
+            label = d.get("item") or f"{d.get('kind', '')} on {d.get('endpoint', '')}".strip()
+            reason = d.get("reason") or "no reason given"
+            lines.append(f"- {label} — {reason}")
 
     score = _confidence_score(target)
     if score is not None:
