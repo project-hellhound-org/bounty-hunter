@@ -35,7 +35,7 @@ import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-from hellhound.core.scope import is_in_scope, check_module_against_rules, normalize_host
+from hellhound.core.scope import is_in_scope, check_module_against_rules, normalize_host, ScopeRules
 from hellhound.core.tasks import Target, create_or_load_target, save_target, sanitize_target_name
 from hellhound.core.guard import AutopilotGuard
 from hellhound.core.ai_utils import (
@@ -721,6 +721,167 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
             "command": command,
             "error": f"Failed to execute command: {e}"
         }
+
+
+# Verbs accepted by manage_scope — mirrors the /scope slash-command verbs in
+# commands.py exactly (same words, same meaning) so a researcher's habits
+# transfer whether they type the command themselves or just tell the agent
+# in plain language ("add that to scope" / "drop X from scope").
+_SCOPE_ADD_VERBS = {
+    "in": "in_scope", "include": "in_scope", "add": "in_scope", "add-in": "in_scope",
+    "out": "out_scope", "exclude": "out_scope", "add-out": "out_scope",
+    "disallow": "disallowed", "prohibit": "disallowed",
+}
+_SCOPE_REMOVE_VERBS = {"remove", "rm", "delete", "del", "drop"}
+
+
+def _execute_manage_scope(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Add or remove hosts from the active target's engagement scope (in-scope,
+    out-of-scope/excluded, or disallowed-action rules), directly from a
+    researcher's natural-language instruction ("add staging.foo.com to
+    scope", "actually drop bar.foo.com, it's not in the program",
+    "no brute-force on this one") — the autonomous equivalent of the
+    /scope in / /scope out / /scope remove slash commands in commands.py.
+
+    This is scope *management*, not a scope bypass: it edits the same
+    ScopeRules object is_in_scope()/check_module_against_rules() already
+    enforce on every tool call, so a host only becomes testable here if the
+    researcher is the one widening the list — the guard itself is untouched
+    and still runs on every subsequent call exactly as before.
+    """
+    action = (args.get("action") or "").strip().lower()
+    hosts = args.get("hosts")
+    if isinstance(hosts, str):
+        hosts = [hosts]
+    hosts = [h for h in (hosts or []) if isinstance(h, str) and h.strip()]
+
+    rules = target.scope_rules
+    if rules is None:
+        rules = ScopeRules()
+        target.scope_rules = rules
+
+    if action in ("show", "", None):
+        return {
+            "status": "success", "action": "show",
+            "in_scope": list(rules.in_scope),
+            "out_scope": list(rules.out_scope),
+            "disallowed": list(rules.disallowed),
+        }
+
+    if not hosts:
+        return {"status": "error", "error": "No host(s)/rule(s) given to add or remove."}
+
+    # Split any comma-separated entries that arrived as one string (the
+    # same real-world input shape /scope's own handler had to defend
+    # against — "a.com,b.com,c.com" typed/pasted as a single token).
+    flat_hosts: List[str] = []
+    for h in hosts:
+        flat_hosts.extend(h.split(","))
+    flat_hosts = [h.strip().strip(",") for h in flat_hosts if h.strip().strip(",")]
+
+    if action in _SCOPE_REMOVE_VERBS:
+        removed: Dict[str, List[str]] = {"in_scope": [], "out_scope": [], "disallowed": []}
+        not_found = []
+        for entry in flat_hosts:
+            hit = False
+            for list_name in ("in_scope", "out_scope", "disallowed"):
+                lst = getattr(rules, list_name)
+                if entry in lst:
+                    lst.remove(entry)
+                    removed[list_name].append(entry)
+                    hit = True
+            if not hit:
+                not_found.append(entry)
+        save_target(target)
+        if emit and hasattr(emit, "success"):
+            emit.success(f"[+] Scope updated — removed: {', '.join(flat_hosts)}")
+        return {
+            "status": "success", "action": "removed", "removed": removed, "not_found": not_found,
+            "in_scope": list(rules.in_scope), "out_scope": list(rules.out_scope), "disallowed": list(rules.disallowed),
+        }
+
+    list_name = _SCOPE_ADD_VERBS.get(action)
+    if not list_name:
+        return {
+            "status": "error",
+            "error": f"Unknown action '{action}'. Use one of: in/include/add (in-scope), "
+                     f"out/exclude (out-of-scope), disallow/prohibit (prohibited action rule), "
+                     f"remove/rm/drop (take out of whichever list it's in), or show.",
+        }
+
+    target_list = getattr(rules, list_name)
+    added = []
+    for entry in flat_hosts:
+        if entry not in target_list:
+            target_list.append(entry)
+            added.append(entry)
+        # A host can't sit in two lists at once — adding it here pulls it
+        # out of the others so the state can't self-contradict.
+        for other_name in ("in_scope", "out_scope", "disallowed"):
+            if other_name == list_name:
+                continue
+            other_list = getattr(rules, other_name)
+            if entry in other_list:
+                other_list.remove(entry)
+    save_target(target)
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[+] Scope updated — {list_name}: +{', '.join(added) if added else '(no new entries)'}")
+    return {
+        "status": "success", "action": "added", "list": list_name, "added": added,
+        "in_scope": list(rules.in_scope), "out_scope": list(rules.out_scope), "disallowed": list(rules.disallowed),
+    }
+
+
+def _execute_save_file(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Write text content to a file under this target's own workspace
+    (~/.hellhound/targets/<target>/raw/) — e.g. "save the resolved
+    subdomains to a text file" after a recon pass. Deliberately NOT an
+    arbitrary-path file writer: the filename is sanitized to a bare name
+    (no directories, no traversal) and the write is containment-checked
+    into the target's own raw/ directory, the same directory view_evidence
+    already reads from — so a file saved this way is immediately
+    inspectable later via view_evidence without any extra plumbing, and
+    this tool can never be used to write outside the target's own storage.
+    """
+    filename = (args.get("filename") or "").strip()
+    content = args.get("content")
+    if not filename:
+        return {"error": "No filename specified."}
+    if content is None:
+        return {"error": "No content specified."}
+    if isinstance(content, list):
+        content = "\n".join(str(c) for c in content)
+    else:
+        content = str(content)
+
+    # Bare filename only — strip any directory components so this can't be
+    # used to climb out of the target's raw/ dir via '../' or an absolute path.
+    safe_name = os.path.basename(filename.strip().strip("/"))
+    if not safe_name or safe_name in (".", ".."):
+        return {"error": f"Invalid filename: {filename!r}"}
+
+    target_name = target.name if (target and target.name) else "default"
+    raw_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}/raw")).resolve()
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    out_path = (raw_dir / safe_name).resolve()
+    if not str(out_path).startswith(str(raw_dir)):
+        return {"error": "Resolved path escapes target storage — refusing to write."}
+
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        return {"error": f"Failed to write file: {e}"}
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[+] Saved {len(content)} bytes to {out_path}")
+    return {
+        "status": "success", "path": str(out_path),
+        "bytes_written": len(content.encode("utf-8")),
+        "note": "Readable later via view_evidence with this path.",
+    }
 
 
 def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
@@ -2681,6 +2842,13 @@ def _is_actionable_artifact(art: Dict[str, Any]) -> bool:
         return False
     if field in ("status", "status_code", "content_type", "allow_credentials", "is_admin", "admin"):
         return False
+    # Defense-in-depth against the same class of bug as the extraction-time
+    # fix above (field name substring-matching a pattern like "auth" despite
+    # being a descriptive multi-item bucket, not a credential) — covers any
+    # such entry already persisted to a target's saved state from before
+    # that fix, e.g. 'authorization_logic_snippets'.
+    if field.endswith(("_snippets", "_snippet", "_hints", "_hint", "_summary", "_notes")):
+        return False
     return any(re.search(p, field, re.I) for p in ACTIONABLE_ARTIFACT_PATTERNS)
 
 
@@ -2756,6 +2924,30 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
             leaf_key = key.split(".")[-1].split("[")[0].lower()
             if any(re.search(p, leaf_key, re.I) for p in ARTIFACT_KEY_PATTERNS) or any(re.search(p, key, re.I) for p in ARTIFACT_KEY_PATTERNS):
                 if leaf_key in ("status", "status_code", "content_type", "allow_credentials", "is_admin", "admin"):
+                    continue
+                # CAUGHT IN THE WILD: "authorization_logic_snippets" (the
+                # free-text JS/HTML line grabber a few hundred lines up —
+                # section 3, "role|owner|admin|entitlement|permission..." —
+                # built for the model to READ as context, never a literal
+                # single-value credential) matches ARTIFACT_KEY_PATTERNS'
+                # r"auth" purely as a SUBSTRING of its own field name
+                # ("auth"orization_logic_snippets) — nothing to do with its
+                # actual content. On mercadolibre.com this promoted an
+                # ordinary /.well-known/assetlinks.json line
+                # ("delegate_permission/common.handle_all_urls" — standard
+                # Android App Links boilerplate, present on nearly every
+                # major site, matching only because "permission" is a
+                # substring of "delegate_permission") into a "high-value
+                # security artifact," which then blocked subfinder/port_scan
+                # behind the ARTIFACT_PRE_FLIGHT_GATE for several turns until
+                # manually dismissed three times. Any field ending in these
+                # suffixes is a MULTI-ITEM descriptive/contextual bucket this
+                # extractor itself produces for the model to read in the
+                # response body — never a single harvested secret value — so
+                # it should never be promoted into the artifact-gate pipeline
+                # at all, regardless of what its own field NAME happens to
+                # contain.
+                if leaf_key.endswith(("_snippets", "_snippet", "_hints", "_hint", "_summary", "_notes")):
                     continue
                 new_artifacts.append({
                     "field_name": leaf_key,
@@ -3705,6 +3897,167 @@ def _execute_listener(args: Dict[str, Any], target: Target, emit: Any) -> Dict[s
         return {"status": "success", "stopped": True}
 
     return {"status": "error", "error": f"Unknown action '{action}'. Use 'start', 'poll', or 'stop'."}
+
+
+# Cookie/value names that are well-known opaque server-side session
+# identifiers — carry no embedded payload at all, so even naming them here
+# is purely for a clearer "well_known_type" note in cookie_inspector's
+# output, never the deciding factor (the dot-count/header-decode check
+# below is what actually decides jwt_candidate vs opaque).
+_WELL_KNOWN_OPAQUE_SESSION_NAMES = (
+    "phpsessid", "jsessionid", "connect.sid", "asp.net_sessionid", "aspsessionid",
+    "laravel_session", "ci_session", "sessionid", "session_id", "sid", "remember_token",
+    "csrftoken", "csrf_token", "xsrf-token", "x-xsrf-token", "_ga", "_gid",
+)
+
+
+def _b64url_decode_json_safe(segment: str) -> Optional[Dict[str, Any]]:
+    """Best-effort base64url-decode a single dot-separated segment and parse
+    it as JSON. Returns None (never raises) if it isn't decodable JSON —
+    used only for classification, not for anything that needs to trust the
+    content."""
+    try:
+        s = segment.replace("-", "+").replace("_", "/")
+        s += "=" * ((4 - len(s) % 4) % 4)
+        decoded = base64.b64decode(s)
+        parsed = json.loads(decoded)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _classify_cookie_value(name: str, value: Any) -> Dict[str, Any]:
+    """
+    Classifies a single cookie/header value so the caller can decide whether
+    jwt_forge is even worth invoking on it, WITHOUT spending a jwt_forge call
+    to find out. This mechanizes the rule jwt_forge's own description
+    already states in prose (zero dots -> not a JWT, don't call it) so it
+    doesn't depend on the model reading and following that prose every time.
+
+    Three outcomes:
+      - "jwt_candidate": dot-separated AND the first segment decodes to a
+        JSON object containing a JWT-shaped header key (alg/typ). Worth
+        calling jwt_forge for real forgery attempts.
+      - "dot_separated_non_jwt": has at least one '.' but the first segment
+        doesn't decode as a JWT header — e.g. a Flask/itsdangerous signed
+        session blob. jwt_forge can STILL be called on these (it decodes
+        and returns session content instead of forging claims) but it will
+        never produce a forged-privilege token, so this is a lower-priority
+        call than jwt_candidate, not a hard "never call" like opaque below.
+      - "opaque_session_id": zero dots at all — PHPSESSID, connect.sid,
+        a plain hex/UUID session id, an opaque bearer token. jwt_forge is
+        guaranteed to reject these outright; do not call it on these.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return {"name": name, "classification": "empty", "reason": "no value to classify"}
+
+    value = value.strip()
+    well_known = next((n for n in _WELL_KNOWN_OPAQUE_SESSION_NAMES if n == str(name).lower()), None)
+
+    dots = value.count(".")
+    if dots < 1:
+        return {
+            "name": name,
+            "classification": "opaque_session_id",
+            "well_known_type": well_known,
+            "reason": "no '.' separators — not JWT-shaped at all; jwt_forge would reject this outright.",
+            "call_jwt_forge": False,
+        }
+
+    header_json = _b64url_decode_json_safe(value.split(".", 1)[0])
+    if header_json and ("alg" in header_json or "typ" in header_json):
+        return {
+            "name": name,
+            "classification": "jwt_candidate",
+            "decoded_header": header_json,
+            "reason": "dot-separated and the header segment decodes to a JSON object with alg/typ — a real JWT.",
+            "call_jwt_forge": True,
+        }
+
+    return {
+        "name": name,
+        "classification": "dot_separated_non_jwt",
+        "well_known_type": well_known,
+        "reason": (
+            "has dot-separated segments but the header doesn't decode as a JWT header — likely a "
+            "framework-signed session cookie (e.g. Flask itsdangerous), not a real JWT. jwt_forge "
+            "can still decode this for session content, but forgery/privilege-escalation techniques "
+            "will not apply — do not expect alg:none/kid/jwk tricks to work on this one."
+        ),
+        "call_jwt_forge": "optional",
+    }
+
+
+def _execute_cookie_inspector(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Classify every cookie you're holding BEFORE deciding whether to call
+    jwt_forge on any of them. Fixes the recurring noisy-call pattern: any
+    time a Set-Cookie/cookie shows up, reflexively calling jwt_forge on it
+    regardless of shape — which just burns a turn on a guaranteed
+    'not a valid JWT' error for the common case (PHPSESSID, connect.sid,
+    JSESSIONID, a plain opaque session id). This tool costs nothing (no
+    network call, pure local classification) and tells you definitively
+    which cookies are worth sending to jwt_forge and which aren't.
+
+    Reads cookies from (in order of preference): the 'cookies' arg if
+    given (dict of name->value, or a raw 'name=value; name2=value2' Cookie
+    header string), otherwise whatever's already been observed for this
+    target in target.state['cookies'].
+    """
+    raw_input = args.get("cookies")
+    pairs: Dict[str, str] = {}
+
+    if isinstance(raw_input, dict):
+        pairs = {str(k): str(v) for k, v in raw_input.items()}
+    elif isinstance(raw_input, str) and raw_input.strip():
+        for part in raw_input.split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                if k.strip():
+                    pairs[k.strip()] = v.strip()
+    elif isinstance(raw_input, list):
+        for item in raw_input:
+            if isinstance(item, dict) and item.get("name"):
+                pairs[str(item["name"])] = str(item.get("value", ""))
+
+    source = "args"
+    if not pairs:
+        source = "target.state['cookies']"
+        if hasattr(target, "state") and isinstance(target.state, dict):
+            stored = target.state.get("cookies")
+            if isinstance(stored, dict):
+                pairs = {str(k): str(v) for k, v in stored.items()}
+
+    if not pairs:
+        return {
+            "status": "no_cookies",
+            "note": "No cookies given and none observed yet for this target (target.state['cookies'] is empty). "
+                    "Make a request first (curl/spider) so cookies are captured, or pass them explicitly.",
+        }
+
+    results = [_classify_cookie_value(name, value) for name, value in pairs.items()]
+    jwt_candidates = [r["name"] for r in results if r["classification"] == "jwt_candidate"]
+    worth_trying = [r["name"] for r in results if r["classification"] == "dot_separated_non_jwt"]
+    skip = [r["name"] for r in results if r["classification"] == "opaque_session_id"]
+
+    if emit and hasattr(emit, "info"):
+        emit.info(
+            f"[*] cookie_inspector: {len(jwt_candidates)} JWT candidate(s), "
+            f"{len(worth_trying)} dot-separated-but-not-JWT, {len(skip)} opaque (skip jwt_forge)."
+        )
+
+    return {
+        "status": "success",
+        "source": source,
+        "cookies": results,
+        "jwt_candidates": jwt_candidates,
+        "worth_trying_jwt_forge": worth_trying,
+        "skip_jwt_forge_for": skip,
+        "recommendation": (
+            f"Call jwt_forge on: {', '.join(jwt_candidates)}." if jwt_candidates else
+            f"No confirmed JWTs. {('Optionally try jwt_forge on ' + ', '.join(worth_trying) + ' for session content.') if worth_trying else 'Do not call jwt_forge — all cookies are opaque session identifiers. Look at mass assignment, IDOR, or business-logic flaws on the session instead.'}"
+        ),
+    }
 
 
 def _execute_jwt_forge(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -6348,9 +6701,34 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_curl
     ),
+    "cookie_inspector": ToolSpec(
+        name="cookie_inspector",
+        description=(
+            "Classify every cookie you're holding BEFORE calling jwt_forge on any of them. Free, "
+            "local, no network call. Call this FIRST whenever a Set-Cookie/cookie shows up that you "
+            "haven't already classified this session — before reflexively reaching for jwt_forge. "
+            "Returns, per cookie, one of: 'jwt_candidate' (call jwt_forge on this), "
+            "'dot_separated_non_jwt' (a signed-but-not-JWT session blob, e.g. Flask itsdangerous — "
+            "jwt_forge can decode it for session content but won't be able to forge claims), or "
+            "'opaque_session_id' (PHPSESSID/connect.sid/JSESSIONID/plain hex/UUID — jwt_forge is "
+            "guaranteed to reject these, do not call it on them). Also returns a ready-to-use "
+            "'jwt_candidates' / 'skip_jwt_forge_for' breakdown and a one-line recommendation. "
+            "Leave the 'cookies' arg empty to classify whatever cookies have already been observed "
+            "for this target (target.state['cookies']) instead of passing them explicitly."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "cookies": {
+                    "description": "Optional. A dict of {cookie_name: value}, a raw 'name=value; name2=value2' Cookie header string, or a list of {\"name\":..,\"value\":..} objects. Omit to classify cookies already observed for this target.",
+                },
+            },
+        },
+        executor=_execute_cookie_inspector,
+    ),
     "jwt_forge": ToolSpec(
         name="jwt_forge",
-        description="CHECK THE SHAPE BEFORE CALLING: this only ever does something useful on a value containing at least one '.' character (a 'segment.segment' or 'segment.segment.segment' structure) — real JWTs AND framework-signed session cookies (Flask/itsdangerous, and similar) share that shape, and you cannot tell which one you have until you decode it. A value with ZERO dots — a plain hex string, a UUID, an opaque API/bearer token, sess_*, connect.sid, PHPSESSID — is NOT this tool's target; calling it on one just burns a turn for a guaranteed 'not a valid JWT' error, so don't. Call this on every DOT-CONTAINING value you're holding, including cookies literally named 'session' — do NOT skip those just because the cookie name doesn't say 'jwt' or 'token'. Two outcomes: (1) it's a real JWT (has header+payload claims) — the tool attempts forgery/privilege-escalation techniques against it (alg:none, kid_injection, jwk_injection, hs256 confusion, and hs_crack). (2) it's NOT a real JWT (e.g. a Flask session) — the tool decodes it anyway and returns the raw decoded content in 'decoded_session_content' instead of forging claims; READ THAT CONTENT, since flags, secrets, or other sensitive data are frequently stored directly inside a session payload, especially in CTF-style labs — this is often faster than chasing an out-of-band callback. RECOMMENDED WORKFLOW for real JWTs: call with default algorithm='all' first — this runs only the free, no-secret-needed techniques (alg:none case/format variants, kid header path-traversal to /dev/null, embedded-JWK header self-signing, and RS256->HS256 public-key confusion if public_key_or_secret is given). Test those forged_tokens against the server. Only if all are rejected, escalate by calling again with algorithm='hs_crack' to brute-force the real HMAC secret against a built-in common-secret wordlist — this is deliberately NOT part of the default 'all' bundle, since it's the expensive fallback, not the first move. A hit produces a *legitimately* signed token, not just a bypass guess. The result's 'hs_crack_available' field tells you whether that escalation applies to this token. Automatically updates session state with the primary (best) forged token for subsequent tool calls.",
+        description="Call cookie_inspector FIRST if you haven't already classified this cookie/value this session — it's free and tells you definitively whether this is worth forging, instead of guessing from the name alone. CHECK THE SHAPE BEFORE CALLING: this only ever does something useful on a value containing at least one '.' character (a 'segment.segment' or 'segment.segment.segment' structure) — real JWTs AND framework-signed session cookies (Flask/itsdangerous, and similar) share that shape, and you cannot tell which one you have until you decode it. A value with ZERO dots — a plain hex string, a UUID, an opaque API/bearer token, sess_*, connect.sid, PHPSESSID — is NOT this tool's target; calling it on one just burns a turn for a guaranteed 'not a valid JWT' error, so don't — cookie_inspector already told you this one was 'opaque_session_id' if that's what it is. Call this on every DOT-CONTAINING value you're holding, including cookies literally named 'session' — do NOT skip those just because the cookie name doesn't say 'jwt' or 'token'. Two outcomes: (1) it's a real JWT (has header+payload claims) — the tool attempts forgery/privilege-escalation techniques against it (alg:none, kid_injection, jwk_injection, hs256 confusion, and hs_crack). (2) it's NOT a real JWT (e.g. a Flask session) — the tool decodes it anyway and returns the raw decoded content in 'decoded_session_content' instead of forging claims; READ THAT CONTENT, since flags, secrets, or other sensitive data are frequently stored directly inside a session payload, especially in CTF-style labs — this is often faster than chasing an out-of-band callback. RECOMMENDED WORKFLOW for real JWTs: call with default algorithm='all' first — this runs only the free, no-secret-needed techniques (alg:none case/format variants, kid header path-traversal to /dev/null, embedded-JWK header self-signing, and RS256->HS256 public-key confusion if public_key_or_secret is given). Test those forged_tokens against the server. Only if all are rejected, escalate by calling again with algorithm='hs_crack' to brute-force the real HMAC secret against a built-in common-secret wordlist — this is deliberately NOT part of the default 'all' bundle, since it's the expensive fallback, not the first move. A hit produces a *legitimately* signed token, not just a bypass guess. The result's 'hs_crack_available' field tells you whether that escalation applies to this token. Automatically updates session state with the primary (best) forged token for subsequent tool calls.",
         parameters={
             "type": "object",
             "properties": {
@@ -6575,6 +6953,54 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["command", "target"]
         },
         executor=_execute_terminal_command
+    ),
+    "manage_scope": ToolSpec(
+        name="manage_scope",
+        description=(
+            "Add or remove a host/domain from the active target's engagement scope, or add a "
+            "disallowed-action rule, when the RESEARCHER explicitly tells you to — e.g. 'add "
+            "staging.foo.com to scope', 'that subdomain isn't in the program, remove it', 'no "
+            "brute-force testing on this one', 'actually bank.foo.com should be out of scope'. "
+            "Only act on an explicit researcher instruction to change scope — never widen scope "
+            "on your own judgment just because a tool happened to discover a new subdomain. "
+            "Use action='show' with no hosts to read back the current scope lists."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "One of: in/include/add (mark in-scope), out/exclude (mark out-of-scope/excluded), disallow/prohibit (add a prohibited-action rule, e.g. 'no-brute-force'), remove/rm/drop (take the host out of whichever list it's currently in), show (just return the current lists).",
+                    "enum": ["in", "include", "add", "out", "exclude", "disallow", "prohibit", "remove", "rm", "delete", "del", "drop", "show"],
+                },
+                "hosts": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Host(s)/domain(s)/rule name(s) to add or remove. Not required when action='show'.",
+                },
+            },
+            "required": ["action"],
+        },
+        executor=_execute_manage_scope,
+    ),
+    "save_file": ToolSpec(
+        name="save_file",
+        description=(
+            "Save text content to a file in this target's own workspace (e.g. a list of "
+            "resolved subdomains, a wordlist you assembled, notes to reference later in the "
+            "session). The file is written under the target's own storage and can be read back "
+            "later with view_evidence. For anything needing real shell processing (piping the "
+            "saved file into another tool, sorting/deduping it, etc.) use run_terminal_command "
+            "instead — this tool is for writing content you already have in hand."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "Bare filename to save as, e.g. 'resolved_subdomains.txt' (no directory path)."},
+                "content": {"type": "string", "description": "The text content to write. For a list of items, join them with newlines first."},
+            },
+            "required": ["filename", "content"],
+        },
+        executor=_execute_save_file,
     ),
     "hydra": ToolSpec(
         name="hydra",
@@ -7643,8 +8069,13 @@ If there is nothing worth generalizing, return an empty array: []"""
         if tool_name == "set_target":
             return self._execute_set_target(args, emit)
 
-        # Internal memory & finding recording tools operate locally on target state
-        if tool_name in ("record_finding", "search_findings", "dismiss_finding", "export_report", "view_evidence", "get_investigation_graph", "ask_memory", "plan_next_steps"):
+        # Internal memory & finding recording tools operate locally on target state.
+        # manage_scope/save_file join this list for the same reason: they touch
+        # target.scope_rules / target workspace storage, not the network, so running
+        # them through the network-host scope gate below is the wrong check entirely
+        # (worse, manage_scope's own job is sometimes to ADD a not-yet-in-scope host —
+        # gating it on is_in_scope would make it unable to do the one thing it's for).
+        if tool_name in ("record_finding", "search_findings", "dismiss_finding", "export_report", "view_evidence", "get_investigation_graph", "ask_memory", "plan_next_steps", "manage_scope", "save_file", "cookie_inspector"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
