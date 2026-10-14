@@ -2918,6 +2918,30 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
         for key, value in flattened.items():
             if value is None or isinstance(value, (dict, list)):
                 continue
+            # CAUGHT IN THE WILD: this generic flatten-and-pattern-match scan
+            # was ALSO reaching into tool_output["headers"] (and ["cookies"]),
+            # which section D/E below already handle correctly on purpose —
+            # splitting a raw Set-Cookie line into its actual cookie name(s)
+            # and filtering out benign/tracking cookies. This path skipped
+            # all of that: "headers.Set-Cookie" flattens to leaf_key
+            # "set-cookie", which trivially matches the r"cookie" pattern
+            # (the key's NAME, not its content), and promoted the ENTIRE RAW
+            # header string as the "artifact value" — e.g. a routine
+            # Okta cookie-clear response (Set-Cookie: sid=""; Version=1;
+            # Path=/; Max-Age=0; Expires=...) got flagged as an unconsumed
+            # high-value credential. Worse than the authorization_logic_
+            # snippets case: that raw header blob includes response-specific
+            # attributes (Expires, Max-Age) that change on every single
+            # request, so mark_consumed_artifacts' exact-substring match can
+            # never actually match it against a later request — this
+            # permanently wedged the ARTIFACT_PRE_FLIGHT_GATE on
+            # auth-meli.adminml.com, blocking port_scan/spider across
+            # several consecutive turns no matter what was tried. Section D
+            # already exists specifically to do this correctly — skip
+            # headers/cookies sub-trees here entirely rather than re-walking
+            # them blind.
+            if key.lower().startswith(("headers.", "cookies.")):
+                continue
             v_str = str(value).strip()
             if not v_str or v_str.lower() in ("true", "false", "none", "null", "undefined", "{}", "[]"):
                 continue
@@ -2975,15 +2999,55 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                     # before any discovery tool could run. Parse the
                     # actual cookie NAME(S) out of the value and gate on
                     # that instead.
-                    cookie_names = re.findall(r"([A-Za-z0-9_\-\.]+)=", str(hv))
-                    if not cookie_names:
-                        continue
-                    for c_name in cookie_names:
+                    #
+                    # CAUGHT IN THE WILD: the old `re.findall(r"...=", ...)`
+                    # grabbed every "word=" it found across the WHOLE raw
+                    # header, which for a real Set-Cookie line is NOT just
+                    # the cookie name — it's followed by attributes
+                    # (Version=, Path=, Max-Age=, Expires=, Domain=, ...)
+                    # that look identical to a cookie's own name=value pair.
+                    # On auth-meli.adminml.com, a routine cookie-clear
+                    # response (Set-Cookie: sid=""; Version=1; Path=/;
+                    # Max-Age=0; Expires=...) produced FIVE separate
+                    # "artifacts" — sid, Version, Path, Max-Age, Expires —
+                    # each stamped with the entire raw header string as its
+                    # "value". Since that raw blob includes Expires/Max-Age
+                    # text that's different on every single response, it
+                    # could never exactly match a later request's Cookie
+                    # header, so mark_consumed_artifacts could never mark it
+                    # consumed — this permanently wedged the
+                    # ARTIFACT_PRE_FLIGHT_GATE on that target across several
+                    # turns no matter what the agent tried. Only the FIRST
+                    # name=value in each cookie segment is the actual
+                    # cookie; the rest are attributes. Also: an empty value
+                    # (sid="") is the server UNSETTING a cookie — there is
+                    # nothing to test there at all, so skip it outright
+                    # rather than manufacturing an untestable "artifact".
+                    _cookie_attr_names = {
+                        "path", "domain", "expires", "max-age", "samesite",
+                        "httponly", "secure", "version", "comment", "priority",
+                    }
+                    # requests' header dict joins multiple Set-Cookie lines
+                    # with ", " — split on a comma ONLY when it's followed by
+                    # what looks like the start of another name=value pair,
+                    # so a comma inside an Expires date ("Expires=Thu, 01-Jan
+                    # -1970", no '=' right after the comma) is left alone.
+                    for cookie_segment in re.split(r",\s*(?=[A-Za-z0-9_\-\.]+=)", str(hv)):
+                        first_pair = cookie_segment.split(";", 1)[0].strip()
+                        if "=" not in first_pair:
+                            continue
+                        c_name, c_val = first_pair.split("=", 1)
+                        c_name = c_name.strip()
+                        c_val = c_val.strip().strip('"')
+                        if not c_name or c_name.lower() in _cookie_attr_names:
+                            continue
                         if _is_benign_tracking_cookie(c_name):
+                            continue
+                        if not c_val:
                             continue
                         new_artifacts.append({
                             "field_name": c_name,
-                            "value": str(hv),
+                            "value": c_val,
                             "source": f"{tool_name.upper()} {source_url}".strip(),
                             "associated_identity": "session context",
                             "turn": turn_number,
