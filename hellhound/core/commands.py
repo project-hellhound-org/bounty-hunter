@@ -773,6 +773,13 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
     elif clean_args[0].lower() in ("synthesizer", "synth", "analysis"):
         target_role = "synthesizer"
         clean_args = clean_args[1:]
+    elif clean_args[0].lower() in ("both", "all"):
+        # Explicit "set both tiers to the same thing" — functionally
+        # identical to just omitting a role prefix (target_role stays
+        # None, which already means "update both" below), but a
+        # researcher reaching for `/model both nvidia <model>` shouldn't
+        # have that word get mistaken for a provider name and error out.
+        clean_args = clean_args[1:]
 
     if not clean_args:
         if not is_json and sys.stdin.isatty():
@@ -951,6 +958,367 @@ def handle_headers(args: List[str], session_context: Dict[str, Any], emit: Any) 
         if not is_json:
             emit.warn(msg)
         return {"status": "error", "message": msg}
+
+
+def _mask_secret(secret: str) -> str:
+    if not secret:
+        return ""
+    return secret[:6] + "..." + secret[-4:] if len(secret) > 14 else secret[:3] + "..."
+
+
+def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """
+    /mcp                            — show Burp/Caido configuration + live status
+    /mcp burp [host_or_url]          — configure Burp's MCP server (auto-detects transport; default http://127.0.0.1:9876)
+    /mcp burp remove                — remove the Burp entry from config
+    /mcp caido [url]                — configure Caido via caido-mcp-server (stdio MCP, 66 tools) if it's on PATH,
+                                       otherwise falls back to the old direct-GraphQL integration (3 tools)
+    /mcp caido graphql [url] [token] — force the direct-GraphQL path even if caido-mcp-server is installed
+    /mcp caido token [token]        — update just the GraphQL access token (for the weekly 7-day refresh)
+    /mcp caido remove               — remove the Caido entry from config (either integration)
+    /mcp test                       — re-test whatever's currently configured, without changing it
+
+    Writes directly into ~/.hellhound/config.json via load_config()/save_config()
+    (a plain read-modify-write of the whole file, so any other keys already in
+    there — ai_provider, api_keys, scope, etc. — are preserved untouched) so a
+    researcher never has to hand-edit JSON to wire up Burp or Caido. Every
+    subcommand that changes something also tries connecting immediately and
+    reports what it found, rather than leaving that to be discovered on the
+    next session start.
+
+    Caido has TWO integrations now. The preferred one is `c0tton-fluff`'s
+    third-party caido-mcp-server (https://github.com/c0tton-fluff/caido-mcp-server)
+    — a real stdio MCP server with proper OAuth auth and 66 tools/6 resources,
+    vastly more capable than bounty-hunter's original hand-rolled GraphQL
+    wrapper (3 tools, manual 7-day token refresh). If the `caido-mcp-server`
+    binary is found on PATH, `/mcp caido [url]` configures and uses it
+    automatically; the old GraphQL path is kept as a fallback (and reachable
+    explicitly via `/mcp caido graphql`) for anyone who hasn't installed it.
+    """
+    is_json = "--json" in args or getattr(emit, "json_mode", False)
+    clean_args = [a for a in args if a not in ("--json", "-j")]
+    cfg = load_config()
+
+    def _test_burp(server_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            from hellhound.core.mcp_bridge import MCPBridge
+        except ImportError:
+            return {"ok": False, "error": "The 'mcp' Python package is not installed (pip install mcp)."}
+        bridge = MCPBridge("burp", server_cfg)
+        ok = bridge.start(timeout=8.0)
+        tool_names = [t.name for t in bridge.tools] if ok else []
+        bridge.stop()
+        return {"ok": ok, "error": bridge.error, "tools": tool_names}
+
+    def _test_caido(caido_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            from hellhound.core.caido_bridge import CaidoClient, CaidoConfig
+        except ImportError:
+            return {"ok": False, "error": "The 'requests' package is not installed."}
+        client = CaidoClient(CaidoConfig(
+            url=caido_cfg.get("url") or "http://localhost:8080/graphql",
+            token=caido_cfg.get("token"),
+            verify_tls=caido_cfg.get("verify_tls", True),
+        ))
+        ok = client.ping()
+        return {"ok": ok, "error": client.last_error}
+
+    def _test_caido_mcp(server_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        # caido-mcp-server spawns its own subprocess (stdio) and, on first
+        # use, loads the OAuth session caido-mcp-server login stored on
+        # disk — there's no token to pass here, which is the whole point
+        # of switching to it. A longer timeout than Burp's HTTP probe
+        # because process startup + session load is slower than an HTTP
+        # round-trip.
+        try:
+            from hellhound.core.mcp_bridge import MCPBridge
+        except ImportError:
+            return {"ok": False, "error": "The 'mcp' Python package is not installed (pip install mcp)."}
+        bridge = MCPBridge("caido", server_cfg)
+        ok = bridge.start(timeout=15.0)
+        tool_names = [t.name for t in bridge.tools] if ok else []
+        err = bridge.error
+        bridge.stop()
+        if not ok and err and "command" not in (err or "").lower():
+            err = (
+                f"{err} — if you haven't yet, run: CAIDO_URL={server_cfg.get('env', {}).get('CAIDO_URL', 'http://localhost:8080')} "
+                f"caido-mcp-server login"
+            )
+        return {"ok": ok, "error": err, "tools": tool_names}
+
+    # ── /mcp test — re-check current config without changing it ──────────
+    if clean_args and clean_args[0].lower() == "test":
+        result: Dict[str, Any] = {"status": "success"}
+        burp_cfg = (cfg.get("mcp_servers") or {}).get("burp")
+        if burp_cfg:
+            r = _test_burp(burp_cfg)
+            result["burp"] = r
+            if not is_json:
+                if r["ok"]:
+                    emit.success(f"Burp ({burp_cfg.get('url')}) — connected, {len(r['tools'])} tool(s): {', '.join(r['tools']) or '(none exposed)'}")
+                else:
+                    emit.warn(f"Burp ({burp_cfg.get('url')}) — unreachable: {r['error']}")
+        else:
+            if not is_json:
+                emit.info("Burp is not configured. Use: /mcp burp [host_or_url]")
+        caido_mcp_cfg = (cfg.get("mcp_servers") or {}).get("caido")
+        caido_cfg = cfg.get("caido")
+        if caido_mcp_cfg:
+            r = _test_caido_mcp(caido_mcp_cfg)
+            result["caido"] = r
+            if not is_json:
+                if r["ok"]:
+                    emit.success(f"Caido (caido-mcp-server) — connected, {len(r['tools'])} tool(s) available.")
+                else:
+                    emit.warn(f"Caido (caido-mcp-server) — unreachable: {r['error']}")
+        elif caido_cfg:
+            r = _test_caido(caido_cfg)
+            result["caido"] = r
+            if not is_json:
+                if r["ok"]:
+                    emit.success(f"Caido ({caido_cfg.get('url')}) — connected.")
+                else:
+                    emit.warn(f"Caido ({caido_cfg.get('url')}) — unreachable: {r['error']}")
+        else:
+            if not is_json:
+                emit.info("Caido is not configured. Use: /mcp caido [url]")
+        return result
+
+    # ── /mcp burp [url] | /mcp burp remove ────────────────────────────────
+    if clean_args and clean_args[0].lower() == "burp":
+        sub = clean_args[1:]
+        if sub and sub[0].lower() == "remove":
+            if "mcp_servers" in cfg and "burp" in cfg["mcp_servers"]:
+                del cfg["mcp_servers"]["burp"]
+                save_config(cfg)
+                if not is_json:
+                    emit.success("Burp removed from config.")
+                return {"status": "success", "removed": "burp"}
+            if not is_json:
+                emit.info("Burp wasn't configured.")
+            return {"status": "success", "removed": None}
+
+        url = sub[0] if sub else ""
+        if not url:
+            if not is_json and sys.stdin.isatty():
+                url = _interactive_prompt(
+                    "Burp's MCP tab -> \"Server host\" / \"Server port\" (default http://127.0.0.1:9876):"
+                ) or "http://127.0.0.1:9876"
+            else:
+                url = "http://127.0.0.1:9876"
+        if not url.startswith("http"):
+            url = "http://" + url
+
+        # Burp ships TWO different MCP implementations depending on version
+        # — the older standalone PortSwigger extension JAR, which speaks
+        # legacy SSE at a /sse sub-path, and recent Burp's native MCP tab
+        # (Dashboard... > MCP), which speaks the newer Streamable HTTP
+        # transport, usually at /mcp. Pointing bounty-hunter at the wrong
+        # one produces a plain 404 that gives no hint which transport is
+        # actually right — so rather than hardcode a guess, probe every
+        # plausible transport/path combination against whatever host:port
+        # was given and use whichever one actually completes a real MCP
+        # handshake. A researcher just pastes what Burp's own settings tab
+        # shows them; this figures out the rest.
+        try:
+            from hellhound.core.mcp_bridge import probe_http_mcp_server
+        except ImportError:
+            probe_http_mcp_server = None
+
+        if not is_json:
+            emit.info(f"Probing {url} for Burp's MCP transport (tries Streamable HTTP, then legacy SSE)...")
+        resolved = probe_http_mcp_server(url) if probe_http_mcp_server else None
+
+        if resolved:
+            cfg.setdefault("mcp_servers", {})["burp"] = resolved
+            save_config(cfg)
+            r = _test_burp(cfg["mcp_servers"]["burp"])
+            if not is_json:
+                emit.success(
+                    f"Burp connected via {resolved['transport']} at {resolved['url']} — "
+                    f"{len(r['tools'])} tool(s) discovered: {', '.join(r['tools']) or '(none exposed)'}"
+                )
+            return {"status": "success", "burp": cfg["mcp_servers"]["burp"], "test": r}
+
+        # Nothing worked — save the sse+/sse guess anyway (so /mcp test can
+        # be re-run after fixing whatever's wrong without retyping the
+        # URL), but be explicit that none of the probed combinations
+        # actually answered.
+        cfg.setdefault("mcp_servers", {})["burp"] = {"transport": "sse", "url": url.rstrip("/") + "/sse"}
+        save_config(cfg)
+        if not is_json:
+            emit.warn(f"Saved {url}, but none of Burp's known MCP transports answered there.")
+            emit.info(
+                "Check: the MCP tab's \"Enabled\" toggle is on AND its status indicator "
+                "(bottom-right of that tab) doesn't still say \"Disabled\" — the toggle and the "
+                "indicator are separate controls, and the indicator is the one that reflects "
+                "whether the listener has actually started. Also confirm the host/port match "
+                "what's shown in Burp's \"Advanced Options\". Then run /mcp test."
+            )
+        return {"status": "success", "burp": cfg["mcp_servers"]["burp"], "test": {"ok": False, "error": "no transport answered"}}
+
+    # ── /mcp caido [url] | /mcp caido graphql [url] [token] | /mcp caido token [token] | /mcp caido remove ──
+    if clean_args and clean_args[0].lower() == "caido":
+        sub = clean_args[1:]
+        if sub and sub[0].lower() == "remove":
+            removed = []
+            if "mcp_servers" in cfg and "caido" in cfg["mcp_servers"]:
+                del cfg["mcp_servers"]["caido"]
+                removed.append("caido-mcp-server")
+            if "caido" in cfg:
+                del cfg["caido"]
+                removed.append("graphql")
+            if removed:
+                save_config(cfg)
+                if not is_json:
+                    emit.success(f"Caido removed from config ({', '.join(removed)}).")
+                return {"status": "success", "removed": removed}
+            if not is_json:
+                emit.info("Caido wasn't configured.")
+            return {"status": "success", "removed": None}
+
+        # ── caido-mcp-server detection ───────────────────────────────────
+        # If the user has c0tton-fluff/caido-mcp-server on PATH, it's the
+        # better integration by a wide margin — a real stdio MCP server
+        # with proper OAuth (no manual 7-day token refresh) and ~66 tools
+        # vs. our original 3 hand-rolled GraphQL ones. Prefer it unless
+        # the user explicitly asks for the old GraphQL path via
+        # `/mcp caido graphql ...`, or the binary just isn't installed.
+        import shutil as _shutil
+        force_graphql = bool(sub and sub[0].lower() == "graphql")
+        if force_graphql:
+            sub = sub[1:]
+        caido_mcp_binary = None if force_graphql else _shutil.which("caido-mcp-server")
+
+        if caido_mcp_binary and not (sub and sub[0].lower() == "token"):
+            url = sub[0] if sub else ((cfg.get("mcp_servers") or {}).get("caido", {}).get("env", {}).get("CAIDO_URL")) or "http://localhost:8080"
+            if not url.startswith("http"):
+                url = "http://" + url
+            server_cfg = {
+                "transport": "stdio",
+                "command": caido_mcp_binary,
+                "args": ["serve"],
+                "env": {"CAIDO_URL": url},
+            }
+            cfg.setdefault("mcp_servers", {})["caido"] = server_cfg
+            # the old GraphQL entry, if any, would otherwise shadow this
+            # one in status displays and /mcp test's "prefer mcp_servers"
+            # check only looks at one or the other per-feature, not both —
+            # drop it so there's one source of truth for where Caido's
+            # config lives.
+            cfg.pop("caido", None)
+            save_config(cfg)
+            if not is_json:
+                emit.info(f"Found caido-mcp-server on PATH — using it instead of the old GraphQL integration. Testing {url} ...")
+            r = _test_caido_mcp(server_cfg)
+            if not is_json:
+                if r["ok"]:
+                    emit.success(f"Caido connected via caido-mcp-server — {len(r['tools'])} tool(s) discovered.")
+                else:
+                    emit.warn(f"Saved, but couldn't connect right now: {r['error']}")
+                    emit.info(
+                        f"First time using caido-mcp-server against this Caido instance? Run: "
+                        f"CAIDO_URL={url} caido-mcp-server login  — it opens a browser consent flow once, "
+                        f"then `serve` reuses that session."
+                    )
+            return {"status": "success", "caido": server_cfg, "test": r}
+
+        if not is_json and caido_mcp_binary is None and not force_graphql:
+            emit.info(
+                "caido-mcp-server not found on PATH — using the built-in GraphQL integration (3 tools) instead. "
+                "For the fuller integration (66 tools, OAuth): "
+                "curl -fsSL https://raw.githubusercontent.com/c0tton-fluff/caido-mcp-server/main/install.sh | bash"
+            )
+
+        existing = cfg.get("caido") or {}
+
+        if sub and sub[0].lower() == "token":
+            token = sub[1] if len(sub) >= 2 else ""
+            if not token:
+                if not is_json and sys.stdin.isatty():
+                    try:
+                        import getpass
+                        token = getpass.getpass(
+                            "New Caido access token (devtools console: "
+                            "JSON.parse(localStorage.CAIDO_AUTHENTICATION).accessToken) — hidden while typing: "
+                        ).strip()
+                    except Exception:
+                        token = _interactive_prompt("New Caido access token:")
+            if not token:
+                if not is_json:
+                    emit.warn("No token given. Usage: /mcp caido token <token>")
+                return {"status": "error", "error": "missing_token"}
+            url = existing.get("url") or "http://localhost:8080/graphql"
+            cfg["caido"] = {**existing, "url": url, "token": token}
+        else:
+            url = sub[0] if sub else (existing.get("url") or "")
+            token = sub[1] if len(sub) >= 2 else ""
+            if not url:
+                if not is_json and sys.stdin.isatty():
+                    url = _interactive_prompt("Caido GraphQL URL (default http://localhost:8080/graphql):") or "http://localhost:8080/graphql"
+                else:
+                    url = "http://localhost:8080/graphql"
+            if not token:
+                token = existing.get("token", "")
+                if not token and not is_json and sys.stdin.isatty():
+                    try:
+                        import getpass
+                        token = getpass.getpass(
+                            "Caido access token (devtools console: "
+                            "JSON.parse(localStorage.CAIDO_AUTHENTICATION).accessToken) — hidden while typing: "
+                        ).strip()
+                    except Exception:
+                        token = _interactive_prompt("Caido access token:")
+            if not token:
+                if not is_json:
+                    emit.warn("No token given. Usage: /mcp caido <url> <token>")
+                return {"status": "error", "error": "missing_token"}
+            cfg["caido"] = {"url": url, "token": token}
+
+        save_config(cfg)
+        if not is_json:
+            emit.info(f"Saved. Testing connection to {cfg['caido']['url']} ...")
+        r = _test_caido(cfg["caido"])
+        if not is_json:
+            if r["ok"]:
+                emit.success("Caido connected.")
+            else:
+                emit.warn(f"Saved, but couldn't connect right now: {r['error']}")
+                emit.info("Caido access tokens expire after 7 days — if it worked before and stopped, grab a fresh one and run /mcp caido token <token>.")
+        return {"status": "success", "caido": {"url": cfg["caido"]["url"], "token": _mask_secret(cfg["caido"]["token"])}, "test": r}
+
+    # ── No args: status overview ───────────────────────────────────────────
+    burp_cfg = (cfg.get("mcp_servers") or {}).get("burp")
+    caido_mcp_cfg = (cfg.get("mcp_servers") or {}).get("caido")
+    caido_cfg = cfg.get("caido")
+    if not is_json:
+        emit.banner("MCP / INTEGRATIONS")
+        if burp_cfg:
+            emit.info(f"Burp:  configured — {burp_cfg.get('url')}")
+        else:
+            emit.info("Burp:  not configured")
+        if caido_mcp_cfg:
+            emit.info(f"Caido: configured — caido-mcp-server (stdio, {caido_mcp_cfg.get('env', {}).get('CAIDO_URL', '?')})")
+        elif caido_cfg:
+            emit.info(f"Caido: configured — GraphQL direct, {caido_cfg.get('url')} (token {_mask_secret(caido_cfg.get('token', ''))})")
+        else:
+            emit.info("Caido: not configured")
+        emit("")
+        emit.info("Configure:  /mcp burp [host_or_url]    (auto-detects transport; default http://127.0.0.1:9876)")
+        emit.info("            /mcp caido [url]           (uses caido-mcp-server if installed, else GraphQL; default http://localhost:8080)")
+        emit.info("Force the old GraphQL path:  /mcp caido graphql [url] [token]")
+        emit.info("Refresh Caido's GraphQL token:  /mcp caido token <token>")
+        emit.info("Test current config:    /mcp test")
+        emit.info("Remove:                 /mcp burp remove  |  /mcp caido remove")
+    return {
+        "status": "success",
+        "burp": burp_cfg,
+        "caido": (
+            caido_mcp_cfg
+            if caido_mcp_cfg
+            else ({"url": caido_cfg.get("url"), "token": _mask_secret(caido_cfg.get("token", ""))} if caido_cfg else None)
+        ),
+    }
 
 
 def handle_target(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
@@ -1557,9 +1925,18 @@ register_command(Command(
     name="/model",
     aliases=["/ai"],
     description="Inspect, switch active AI model for orchestrator/synthesizer, or configure API keys",
-    usage="/model [orchestrator|synthesizer] <provider/model-id>  e.g. /model orchestrator ollama qwen2.5:3b-instruct  /model synthesizer nvidia/nemotron-3-ultra-550b-a55b\n/model set-key <provider> <key>  (any NIM model ID works, not just the examples shown)",
+    usage="/model [orchestrator|synthesizer|both] <provider> <model-id>  e.g. /model orchestrator ollama qwen2.5:3b-instruct  /model synthesizer nvidia nemotron-3-ultra-550b-a55b\n/model both nvidia nvidia/nemotron-3-ultra-550b-a55b  (same as omitting the role — sets both tiers in one command)\n/model set-key <provider> <key>  (any NIM model ID works, not just the examples shown)",
     category="config",
     handler=handle_model
+))
+
+register_command(Command(
+    name="/mcp",
+    aliases=["/integrations"],
+    description="Configure and test Burp (MCP) and Caido (GraphQL) integrations — no manual config.json editing needed",
+    usage="/mcp | /mcp burp [host_or_url] | /mcp caido [url] [token] | /mcp caido token <token> | /mcp test | /mcp burp|caido remove",
+    category="config",
+    handler=handle_mcp
 ))
 
 register_command(Command(

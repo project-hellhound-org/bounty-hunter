@@ -1,5 +1,5 @@
- <p align="center">
-  <img src="Images/hellhound.gif" alt="Hellhound Bounty Hunter Animation" width="100%"/>
+<p align="center">
+  <img src="Images/hellhound.png" alt="Hellhound Bounty Hunter" width="100%"/>
 </p>
 
 <h1 align="center">HELLHOUND : BOUNTY HUNTER</h1>
@@ -106,7 +106,7 @@ Autonomous vulnerability exploitation and multi-step attack chaining require mod
 
 ## Installation & Setup
 
-Everything you need to install, configure AI backends, and run Bounty Hunter in one unified workflow.
+Everything you need to install, configure AI backends, and run Bounty Hunter in one unified workflow. The steps below cover the quick path — for more detail on any one piece (model routing options, Burp, or Caido), see the [step-by-step setup guides](docs/README.md).
 
 ### 1. Requirements & Prerequisites
 - **Operating System**: Linux (Kali, Ubuntu, Debian, Arch, Parrot OS), macOS (Apple Silicon & Intel), or Windows (WSL2).
@@ -177,6 +177,12 @@ Inside the console:
 > /model synthesizer gemini gemini-2.0-flash
 ```
 
+Want the same model doing both the orchestrator and synthesizer job? You
+don't need to run `/model` twice — `/model both <provider> <model-id>`
+sets both tiers at once (e.g. `/model both nvidia nvidia/nemotron-3-ultra-550b-a55b`).
+See [AI Model Setup](docs/ai-model-setup.md) for the full picture, including
+per-tier splits and session-only overrides.
+
 #### C. Fully Offline Local AI (Ollama)
 For air-gapped or 100% offline environments (32B+ models recommended for reliable tool chaining):
 ```bash
@@ -194,7 +200,28 @@ hellhound
 
 ---
 
-### 4. Health Check & Tool Verification
+### 4. Burp Suite & Caido Integration (MCP)
+
+Bounty Hunter can drive Burp Suite and/or Caido directly as additional
+tools, alongside its own built-in recon arsenal. Both are configured
+inside the console with one command each — no manual config editing:
+
+```bash
+hellhound
+> /mcp burp http://127.0.0.1:9876   # auto-detects Burp's MCP transport
+> /mcp caido http://localhost:8080  # uses caido-mcp-server if installed, else falls back to built-in GraphQL
+> /mcp                              # shows current config + live status for both
+> /mcp test                         # re-checks without changing anything
+```
+
+Full step-by-step guides (where to find Burp's MCP tab, getting Caido's
+token or setting up `caido-mcp-server`'s OAuth login, and a troubleshooting
+table for each): [Burp Suite MCP Setup](docs/mcp-burp-setup.md) ·
+[Caido Setup](docs/mcp-caido-setup.md).
+
+---
+
+### 5. Health Check & Tool Verification
 Verify that your environment, AI models, and binary tools are fully connected:
 ```bash
 hellhound

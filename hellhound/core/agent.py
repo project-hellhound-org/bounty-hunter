@@ -1287,11 +1287,27 @@ def _execute_tls_cert_scan(args: Dict[str, Any], target: Target, emit: Any) -> D
 
 def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     raw_target = args.get("target") or target.name
+    # CAUGHT IN THE WILD: this tool's own schema describes 'target' as
+    # "Target domain, URL, or LIST of subdomains" but types it as a plain
+    # string — there was never a real array option for the model to use for
+    # a batch. So the model (reasonably) did what the description invited:
+    # serialized a batch as "host1.com,host2.com,host3.com" in one string.
+    # isinstance(raw_target, list) was never true for that, so the whole
+    # comma-joined blob became ONE entry in targets_to_probe, got joined
+    # into httpx's stdin as a single line, and httpx tried to resolve the
+    # literal string "host1.com,host2.com,host3.com" as one (invalid)
+    # hostname — 0 live hosts, every time, for every batched call. A
+    # single plain hostname with no comma worked fine, which is exactly
+    # the "works alone, breaks as a batch" pattern this was producing.
+    # Now: accept a real list (if the caller does pass one) AND split a
+    # comma/whitespace/newline-separated string into multiple targets.
     targets_to_probe = []
     if isinstance(raw_target, list):
-        targets_to_probe = raw_target
+        for item in raw_target:
+            targets_to_probe.extend(re.split(r"[,\s]+", str(item).strip()))
     else:
-        targets_to_probe = [raw_target]
+        targets_to_probe = re.split(r"[,\s]+", str(raw_target).strip())
+    targets_to_probe = [t for t in targets_to_probe if t]
 
     auto_install = bool(load_config().get("auto_install_missing_tools", False))
     check = ensure_tool("httpx", emit=emit, auto_install=auto_install)
@@ -6525,11 +6541,17 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "httpx": ToolSpec(
         name="httpx",
-        description="Probe live web services, status codes, page titles, and web technology stack.",
+        description="Probe live web services, status codes, page titles, and web technology stack. For multiple hosts in one call, either a comma-separated string ('host1.com,host2.com') or a JSON array both work — pick whichever is natural.",
         parameters={
             "type": "object",
             "properties": {
-                "target": {"type": "string", "description": "Target domain, URL, or list of subdomains to probe."}
+                "target": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                    "description": "Target domain, URL, a comma/whitespace-separated list of them in one string, or a JSON array of them.",
+                }
             },
             "required": ["target"]
         },
@@ -7138,6 +7160,151 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         executor=_execute_set_target_stub
     ),
 }
+
+
+# Set True the first time register_mcp_servers() runs (see Agent.handle_message)
+# so a long-lived process only ever dials configured MCP servers once, not
+# on every single turn.
+_MCP_SERVERS_REGISTERED = False
+
+
+def _make_mcp_executor(call_fn: Callable[..., Dict[str, Any]]) -> Callable[[Dict[str, Any], Target, Any], Dict[str, Any]]:
+    """
+    Adapts an MCP/Caido tool's (args[, emit]) -> dict call signature to the
+    (args, target, emit) -> dict shape every other ToolSpec executor uses.
+    target is unused deliberately: the MCP server (Burp, or whatever else
+    gets configured) manages its own notion of state — bounty-hunter
+    doesn't inject target/session context into an MCP call the way it does
+    for its own curl-based tools, since the server on the other end (e.g.
+    Burp itself) is the one actually making the HTTP request and has its
+    own project/scope configuration.
+
+    emit IS passed through now (it wasn't originally) — mcp_bridge.py's
+    call_tool_with_reconnect uses it to surface "[!] connection lost —
+    reconnecting..." to the researcher live instead of that only showing up
+    in a log nobody's watching. Caido's call closures accept and ignore it
+    (no reconnect concept there — see caido_bridge.py), so this works for
+    both without special-casing which kind of integration a given tool
+    came from.
+    """
+    def _executor(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+        return call_fn(args, emit)
+    return _executor
+
+
+def register_mcp_servers(emit: Any = None) -> int:
+    """
+    Reads mcp_servers from config (~/.hellhound/config.json's "mcp_servers"
+    key — see ai_utils.load_config), connects to each configured server,
+    and registers every tool it exposes into TOOL_REGISTRY under the name
+    'mcp_<server>_<tool>' (prefixed so e.g. Burp's own 'send_to_repeater'
+    can never collide with a built-in tool of the same name, and so it's
+    always visible in logs/history which backend actually ran a call).
+
+    Example config.json entry, for Burp's official PortSwigger MCP
+    extension (Extensions -> Add -> the mcp-server JAR, then enable the
+    MCP server in its settings tab — it defaults to SSE on 127.0.0.1:9876):
+
+        "mcp_servers": {
+            "burp": {"transport": "sse", "url": "http://127.0.0.1:9876/sse"}
+        }
+
+    Best-effort and non-fatal: a server that's misconfigured, not running,
+    or not installed simply contributes zero tools for this session (with
+    a warning via emit, if given) — it never prevents bounty-hunter itself
+    from starting. Safe to call more than once; servers already connected
+    this process are not reconnected.
+    """
+    try:
+        from hellhound.core.mcp_bridge import connect_mcp_server, _bridges
+    except ImportError:
+        if emit and hasattr(emit, "warn"):
+            emit.warn("[!] MCP support unavailable — install the 'mcp' package (pip install mcp) to use mcp_servers config.")
+        return 0
+
+    cfg = load_config()
+    servers = cfg.get("mcp_servers") or {}
+    if not isinstance(servers, dict) or not servers:
+        return 0
+
+    total_registered = 0
+    for server_name, server_cfg in servers.items():
+        if not isinstance(server_cfg, dict):
+            continue
+        if server_name in _bridges:
+            continue  # already connected this process
+        discovered = connect_mcp_server(server_name, server_cfg, emit=emit)
+        for tool in discovered:
+            registry_name = f"mcp_{server_name}_{tool.name}"
+            if registry_name in TOOL_REGISTRY:
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(f"[!] MCP tool '{registry_name}' collides with an existing tool name — skipped.")
+                continue
+            TOOL_REGISTRY[registry_name] = ToolSpec(
+                name=registry_name,
+                description=f"[MCP:{server_name}] {tool.description}",
+                parameters=tool.parameters,
+                executor=_make_mcp_executor(tool.call),
+            )
+            total_registered += 1
+    return total_registered
+
+
+# Set True the first time register_caido_tools() runs — same one-shot
+# contract as _MCP_SERVERS_REGISTERED above.
+_CAIDO_TOOLS_REGISTERED = False
+
+
+def register_caido_tools(emit: Any = None) -> int:
+    """
+    Reads the "caido" block from config.json and registers Caido's tools
+    (caido_http_history_search, caido_send_request, caido_create_finding —
+    see hellhound/core/caido_bridge.py) into TOOL_REGISTRY. Caido has no
+    MCP server of its own (unlike Burp), so this isn't an MCP connection —
+    caido_bridge.py talks to Caido's local GraphQL API directly.
+
+    Example config.json entry (the token comes from Caido's own devtools:
+    log into Caido, open devtools, and in the console run
+    `JSON.parse(localStorage.CAIDO_AUTHENTICATION).accessToken` — it
+    expires after 7 days, so this needs re-pasting occasionally):
+
+        "caido": {
+            "url": "http://localhost:8080/graphql",
+            "token": "<access token>"
+        }
+
+    Best-effort and non-fatal, same contract as register_mcp_servers():
+    an unreachable/expired/misconfigured Caido instance contributes zero
+    tools (with a warning via emit, if given) and never blocks startup.
+    """
+    try:
+        from hellhound.core.caido_bridge import register_caido_tools as _discover_caido_tools
+    except ImportError:
+        if emit and hasattr(emit, "warn"):
+            emit.warn("[!] Caido support unavailable — install the 'requests' package to use the caido config block.")
+        return 0
+
+    cfg = load_config()
+    caido_cfg = cfg.get("caido")
+    if not caido_cfg:
+        return 0
+
+    discovered = _discover_caido_tools(caido_cfg, emit=emit)
+    total_registered = 0
+    for tool in discovered:
+        registry_name = f"caido_{tool['name']}" if not tool["name"].startswith("caido_") else tool["name"]
+        if registry_name in TOOL_REGISTRY:
+            if emit and hasattr(emit, "warn"):
+                emit.warn(f"[!] Caido tool '{registry_name}' collides with an existing tool name — skipped.")
+            continue
+        TOOL_REGISTRY[registry_name] = ToolSpec(
+            name=registry_name,
+            description=f"[Caido] {tool['description']}",
+            parameters=tool["parameters"],
+            executor=_make_mcp_executor(tool["call"]),
+        )
+        total_registered += 1
+    return total_registered
 
 
 # Capability fast-path removed to allow natural LLM responses
@@ -8410,6 +8577,33 @@ If there is nothing worth generalizing, return an empty array: []"""
                 self.set_target(t_name)
             if session_context.get("scope_rules"):
                 self.target.scope_rules = session_context["scope_rules"]
+
+        # ── MCP server registration (Burp, Caido, anything else configured) ──
+        # One-time, process-wide, best-effort: connects to every server
+        # listed under "mcp_servers" in ~/.hellhound/config.json and merges
+        # its tools into TOOL_REGISTRY (see register_mcp_servers()). Done
+        # here rather than in __init__ because __init__ never receives an
+        # emit — doing it on the first real turn instead means a connected
+        # Burp shows up as a normal "[+] MCP server 'burp' connected — N
+        # tool(s) discovered" line in the researcher's own session, and a
+        # missing/unreachable one degrades to a quiet warning instead of
+        # being invisible. Guarded so it only ever runs once per process,
+        # not once per turn.
+        global _MCP_SERVERS_REGISTERED, _CAIDO_TOOLS_REGISTERED
+        if not _MCP_SERVERS_REGISTERED:
+            _MCP_SERVERS_REGISTERED = True
+            try:
+                register_mcp_servers(emit=emit)
+            except Exception as _mcp_reg_err:
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(f"[!] MCP server registration failed: {_mcp_reg_err}")
+        if not _CAIDO_TOOLS_REGISTERED:
+            _CAIDO_TOOLS_REGISTERED = True
+            try:
+                register_caido_tools(emit=emit)
+            except Exception as _caido_reg_err:
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(f"[!] Caido tool registration failed: {_caido_reg_err}")
 
         # ── Self-diagnostic short-circuit ──
         # The researcher asking "why did you just dump JSON" / "why do I
