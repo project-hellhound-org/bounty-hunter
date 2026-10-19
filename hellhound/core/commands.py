@@ -1055,9 +1055,9 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
             result["burp"] = r
             if not is_json:
                 if r["ok"]:
-                    emit.success(f"Burp ({burp_cfg.get('url')}) — connected, {len(r['tools'])} tool(s): {', '.join(r['tools']) or '(none exposed)'}")
+                    emit.success(f"Burp ({burp_cfg.get('url')}) — still solid, {len(r['tools'])} tool(s): {', '.join(r['tools']) or '(none exposed)'}")
                 else:
-                    emit.warn(f"Burp ({burp_cfg.get('url')}) — unreachable: {r['error']}")
+                    emit.warn(f"Burp ({burp_cfg.get('url')}) — not talking to me: {r['error']}")
         else:
             if not is_json:
                 emit.info("Burp is not configured. Use: /mcp burp [host_or_url]")
@@ -1068,17 +1068,17 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
             result["caido"] = r
             if not is_json:
                 if r["ok"]:
-                    emit.success(f"Caido (caido-mcp-server) — connected, {len(r['tools'])} tool(s) available.")
+                    emit.success(f"Caido (caido-mcp-server) — still solid, {len(r['tools'])} tool(s) available.")
                 else:
-                    emit.warn(f"Caido (caido-mcp-server) — unreachable: {r['error']}")
+                    emit.warn(f"Caido (caido-mcp-server) — not talking to me: {r['error']}")
         elif caido_cfg:
             r = _test_caido(caido_cfg)
             result["caido"] = r
             if not is_json:
                 if r["ok"]:
-                    emit.success(f"Caido ({caido_cfg.get('url')}) — connected.")
+                    emit.success(f"Caido ({caido_cfg.get('url')}) — still solid.")
                 else:
-                    emit.warn(f"Caido ({caido_cfg.get('url')}) — unreachable: {r['error']}")
+                    emit.warn(f"Caido ({caido_cfg.get('url')}) — not talking to me: {r['error']}")
         else:
             if not is_json:
                 emit.info("Caido is not configured. Use: /mcp caido [url]")
@@ -1135,8 +1135,8 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
             r = _test_burp(cfg["mcp_servers"]["burp"])
             if not is_json:
                 emit.success(
-                    f"Burp connected via {resolved['transport']} at {resolved['url']} — "
-                    f"{len(r['tools'])} tool(s) discovered: {', '.join(r['tools']) or '(none exposed)'}"
+                    f"Found Burp via {resolved['transport']} at {resolved['url']} — "
+                    f"{len(r['tools'])} tool(s) I can use now: {', '.join(r['tools']) or '(none exposed)'}"
                 )
             return {"status": "success", "burp": cfg["mcp_servers"]["burp"], "test": r}
 
@@ -1147,7 +1147,7 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
         cfg.setdefault("mcp_servers", {})["burp"] = {"transport": "sse", "url": url.rstrip("/") + "/sse"}
         save_config(cfg)
         if not is_json:
-            emit.warn(f"Saved {url}, but none of Burp's known MCP transports answered there.")
+            emit.warn(f"Saved {url}, but nothing answered there on any transport I know — Burp's not talking to me yet.")
             emit.info(
                 "Check: the MCP tab's \"Enabled\" toggle is on AND its status indicator "
                 "(bottom-right of that tab) doesn't still say \"Disabled\" — the toggle and the "
@@ -1209,13 +1209,13 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
             cfg.pop("caido", None)
             save_config(cfg)
             if not is_json:
-                emit.info(f"Found caido-mcp-server on PATH — using it instead of the old GraphQL integration. Testing {url} ...")
+                emit.info(f"Found caido-mcp-server on your PATH — ditching the old GraphQL wrapper for it. Testing {url} ...")
             r = _test_caido_mcp(server_cfg)
             if not is_json:
                 if r["ok"]:
-                    emit.success(f"Caido connected via caido-mcp-server — {len(r['tools'])} tool(s) discovered.")
+                    emit.success(f"Caido's wired up via caido-mcp-server — {len(r['tools'])} tool(s) I can use now.")
                 else:
-                    emit.warn(f"Saved, but couldn't connect right now: {r['error']}")
+                    emit.warn(f"Saved it, but Caido's not talking to me yet: {r['error']}")
                     emit.info(
                         f"First time using caido-mcp-server against this Caido instance? Run: "
                         f"CAIDO_URL={url} caido-mcp-server login  — it opens a browser consent flow once, "
@@ -1281,9 +1281,9 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
         r = _test_caido(cfg["caido"])
         if not is_json:
             if r["ok"]:
-                emit.success("Caido connected.")
+                emit.success("Good, Caido's talking to me.")
             else:
-                emit.warn(f"Saved, but couldn't connect right now: {r['error']}")
+                emit.warn(f"Saved it, but Caido's not talking to me yet: {r['error']}")
                 emit.info("Caido access tokens expire after 7 days — if it worked before and stopped, grab a fresh one and run /mcp caido token <token>.")
         return {"status": "success", "caido": {"url": cfg["caido"]["url"], "token": _mask_secret(cfg["caido"]["token"])}, "test": r}
 

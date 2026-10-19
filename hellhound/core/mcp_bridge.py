@@ -30,9 +30,38 @@ calling (synchronous) thread for the result.
 """
 
 import asyncio
+import logging
+import random
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
+
+# CAUGHT IN THE WILD (date-free, just descriptive): when a connected MCP
+# server goes away mid-session (Burp closed, Caido restarted, a network
+# blip), the Python MCP SDK's own background reader task — a separate
+# asyncio Task it spawns internally inside sse_client()/streamable_http_
+# client(), not something _connect_and_serve() itself awaits directly —
+# catches that disconnect and calls logger.exception(...) on it (see
+# mcp/client/sse.py's sse_reader / post_writer, and the streamable-http
+# equivalent). Because bounty-hunter never configures logging itself,
+# Python's default "handler of last resort" dumps that as a full raw
+# traceback straight to the researcher's terminal — e.g. "Error in
+# sse_reader" / h11.RemoteProtocolError — even though _connect_and_serve's
+# own except block (below) already catches the same disconnect cleanly,
+# sets self._dead / self.error, and reports it as a normal one-line status
+# the next time it's relevant. The SDK's internal log is pure duplicate
+# noise on top of that, not a sign of a leftover listener still running —
+# it fires once, from the one background task that was reading the now-
+# closed connection, and nothing restarts on its own after that (the next
+# actual reconnect only happens when a tool call or /mcp test asks for
+# one). Mirrors how Claude Code itself goes quiet rather than dumping a
+# traceback when one of ITS MCP servers drops — silence the SDK's own
+# loggers here, once, at import time, and let our own clean status
+# reporting be the only thing the researcher sees.
+for _mcp_logger_name in ("mcp", "mcp.client.sse", "mcp.client.stdio", "mcp.client.streamable_http"):
+    _mcp_sdk_logger = logging.getLogger(_mcp_logger_name)
+    _mcp_sdk_logger.setLevel(logging.CRITICAL)
+    _mcp_sdk_logger.propagate = False
 
 try:
     from mcp import ClientSession
@@ -317,6 +346,60 @@ def probe_http_mcp_server(base_url: str, timeout: float = 6.0) -> Optional[Dict[
     return None
 
 
+# Bounty Hunter talks like Bounty Hunter everywhere, not just when the LLM
+# is composing a reply — JARVIS-with-a-security-clearance, dry and a little
+# sarcastic, facts always front and center (see SYNTHESIZER_PERSONA in
+# ai_utils.py). These are the only lines in the whole MCP stack that get
+# seen on every single connect/drop/reconnect, so they're the ones most
+# likely to make the tool feel like it's being run by two different
+# voices — a witty one when it's talking, a bare sysadmin one when
+# something breaks. A few phrasings per state (randomly picked, never the
+# literal same line twice in a row within a state) keep it from reading
+# like a canned joke on the fifth reconnect of a flaky session; the actual
+# server name and real error text are always interpolated in, never
+# dropped, so this never costs the researcher anything they'd need to grep
+# scrollback for.
+_MCP_VOICE_LINES: Dict[str, List[str]] = {
+    "connected": [
+        "[+] {name} is plugged in — {count} tool(s) I can actually use now.",
+        "[+] Got a line into {name}. {count} tool(s) on the table.",
+        "[+] {name}'s wired up — {count} tool(s) ready when you need them.",
+    ],
+    "unreachable": [
+        "[!] Couldn't reach {name} — {error}",
+        "[!] {name}'s not answering: {error}",
+        "[!] No luck getting into {name}: {error}",
+    ],
+    "lost_reconnecting": [
+        "[!] {name} just went dark on me. Give me a sec, trying again...",
+        "[!] Lost {name} mid-session — reconnecting now...",
+        "[!] {name} dropped on me. Hang on, going back in...",
+    ],
+    "reconnect_failed": [
+        "[!] Still nothing from {name} — {error}",
+        "[!] {name}'s still down: {error}",
+        "[!] No dice getting {name} back: {error}",
+    ],
+    "reconnected": [
+        "[+] There it is — {name}'s back, {count} tool(s) live again.",
+        "[+] {name} just came back. {count} tool(s) available again.",
+        "[+] Good, {name}'s reconnected — {count} tool(s) back on the table.",
+    ],
+}
+
+
+# Server keys in config are lowercase ("burp", "caido") — fine for code,
+# ugly mid-sentence ("burp just went dark on me"). A couple of known
+# proper-noun overrides, Title Case fallback for anything else added later.
+_MCP_DISPLAY_NAMES = {"burp": "Burp", "caido": "Caido"}
+
+
+def _mcp_voice(kind: str, name: str, count: Optional[int] = None, error: Optional[str] = None) -> str:
+    line = random.choice(_MCP_VOICE_LINES[kind])
+    display = _MCP_DISPLAY_NAMES.get(name.lower(), name.title())
+    return line.format(name=display, count=count, error=error)
+
+
 def connect_mcp_server(name: str, config: Dict[str, Any], emit: Any = None) -> List[DiscoveredMCPTool]:
     """
     Connects to one configured MCP server and returns its tools as
@@ -331,7 +414,7 @@ def connect_mcp_server(name: str, config: Dict[str, Any], emit: Any = None) -> L
     ok = bridge.start()
     if not ok:
         if emit and hasattr(emit, "warn"):
-            emit.warn(f"[!] MCP server '{name}' unreachable — skipping its tools: {bridge.error}")
+            emit.warn(_mcp_voice("unreachable", name, error=bridge.error))
         return []
 
     _bridges[name] = bridge
@@ -350,7 +433,7 @@ def connect_mcp_server(name: str, config: Dict[str, Any], emit: Any = None) -> L
             call=_make_call(name, tool_name),
         ))
     if emit and hasattr(emit, "success"):
-        emit.success(f"[+] MCP server '{name}' connected — {len(discovered)} tool(s) discovered.")
+        emit.success(_mcp_voice("connected", name, count=len(discovered)))
     return discovered
 
 
@@ -388,16 +471,16 @@ def _ensure_alive(name: str, emit: Any = None, timeout: float = 10.0) -> Optiona
             return bridge
 
         if emit and hasattr(emit, "warn"):
-            emit.warn(f"[!] MCP server '{name}' connection was lost — reconnecting...")
+            emit.warn(_mcp_voice("lost_reconnecting", name))
         new_bridge = MCPBridge(name, config)
         ok = new_bridge.start(timeout=timeout)
         _bridges[name] = new_bridge
         if ok:
             if emit and hasattr(emit, "success"):
-                emit.success(f"[+] MCP server '{name}' reconnected — {len(new_bridge.tools)} tool(s) available again.")
+                emit.success(_mcp_voice("reconnected", name, count=len(new_bridge.tools)))
         else:
             if emit and hasattr(emit, "warn"):
-                emit.warn(f"[!] MCP server '{name}' reconnect failed: {new_bridge.error}")
+                emit.warn(_mcp_voice("reconnect_failed", name, error=new_bridge.error))
         return new_bridge
 
 
