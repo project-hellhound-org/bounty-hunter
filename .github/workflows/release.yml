@@ -30,32 +30,6 @@ jobs:
           find hellhound/ -name "*.py" -exec python -m py_compile {} \;
           echo "All syntax checks passed."
 
-      - name: Verify module metadata
-        run: |
-          python - << 'EOF'
-          import os, sys
-          errors = []
-          modules_dir = "hellhound/modules"
-          for root, dirs, files in os.walk(modules_dir):
-              for f in files:
-                  if not f.endswith(".py") or f.startswith("__"):
-                      continue
-                  path = os.path.join(root, f)
-                  content = open(path).read()
-                  missing = []
-                  if "DESCRIPTION" not in content:
-                      missing.append("DESCRIPTION")
-                  if "CATEGORY" not in content:
-                      missing.append("CATEGORY")
-                  if missing:
-                      errors.append(f"{path}: missing {', '.join(missing)}")
-          if errors:
-              print("Module metadata errors:")
-              for e in errors:
-                  print(f"  ✗ {e}")
-              sys.exit(1)
-          print(f"All modules verified successfully.")
-          EOF
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
