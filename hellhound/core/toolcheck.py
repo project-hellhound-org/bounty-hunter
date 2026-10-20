@@ -37,7 +37,33 @@ OTHER_TOOLS: Dict[str, str] = {
     # try_install() below recognizes the parenthetical and skips
     # auto-exec for this one rather than running it literally.
     "nmap": "apt install nmap (or the equivalent for your OS — brew install nmap on macOS, pacman -S nmap on Arch)",
+    # Pre-installed on Kali by default; this hint only matters on a non-Kali
+    # box where it's genuinely missing.
+    "sqlmap": "apt install sqlmap (or: pip install sqlmap, or git clone https://github.com/sqlmapproject/sqlmap.git)",
 }
+
+
+def pick_available(candidates: List[str]) -> Optional[str]:
+    """
+    Given an ordered list of binary names that all satisfy the same
+    capability (e.g. ["dnsx"], or a future ["ffuf", "feroxbuster"] for
+    content discovery), returns the first one actually present on this
+    system, or None if every candidate is missing.
+
+    This is the piece a fallback-aware executor is missing today:
+    ensure_tool()/is_available() can only answer "is THIS ONE binary
+    there," so every tool executor hardcodes a single binary and just
+    fails outright if it's not installed. A caller that has more than one
+    way to do the same job (a purpose-built Go binary, a stdlib/python
+    fallback, a different CLI tool that covers the same capability) uses
+    this to pick whichever is actually available instead of hardcoding
+    one, falling all the way through to a pure-language implementation
+    with no external binary at all when none of them are installed.
+    """
+    for name in candidates:
+        if is_available(name):
+            return name
+    return None
 
 
 def _get_search_path() -> str:

@@ -67,7 +67,7 @@ from hellhound.core.skills import (
     discover_skills,
     load_skill_body,
 )
-from hellhound.core.toolcheck import ensure_tool, get_binary_path, install_hint
+from hellhound.core.toolcheck import ensure_tool, get_binary_path, install_hint, is_available, pick_available
 
 
 def _load_baseline_rules() -> str:
@@ -692,6 +692,34 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
         return {"error": "No command specified."}
 
     try:
+        # Hand the captured session (from login flows, cookie_inspector, or
+        # an imported Burp/Caido history) to whatever this command runs, as
+        # environment variables rather than baking the raw value into a
+        # saved script's source. A script that does
+        # `requests.Session(); s.cookies.set(...)` with a cookie hardcoded
+        # at write-time goes stale the instant the session rotates (re-auth,
+        # token refresh) — reading it from the environment at RUN time
+        # means every execution picks up whatever's currently authenticated,
+        # and the researcher never has to ask the model to "paste in the
+        # latest cookie" by hand. Only ever set from this target's own
+        # state — never derived from the command string itself.
+        child_env = os.environ.copy()
+        state = target.state if (target and isinstance(target.state, dict)) else {}
+        session_cookie = state.get("session_cookie") or ""
+        cookies_dict = normalize_cookies(state.get("cookies") or session_cookie)
+        auth_token = state.get("auth_token") or ""
+        headers_dict = state.get("headers") if isinstance(state.get("headers"), dict) else {}
+        if session_cookie:
+            child_env["HELLHOUND_COOKIE"] = str(session_cookie)
+        if cookies_dict:
+            child_env["HELLHOUND_COOKIES_JSON"] = json.dumps(cookies_dict)
+        if auth_token:
+            child_env["HELLHOUND_AUTH_TOKEN"] = str(auth_token)
+        if headers_dict:
+            child_env["HELLHOUND_HEADERS_JSON"] = json.dumps(headers_dict)
+        if target_host:
+            child_env["HELLHOUND_TARGET"] = target_host
+
         # Was a flat `subprocess.run(..., timeout=180)` — for a multi-stage
         # pipeline (subfinder | httpx, a heredoc writing a file then piping
         # it onward) that legitimately takes 30-90s, the CLI showed nothing
@@ -703,7 +731,7 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
         proc = _run_cmd_with_heartbeat(
             command, timeout=180, emit=emit,
             label=f"run_terminal_command ({target_host or 'target'})",
-            shell=True,
+            shell=True, env=child_env,
         )
         return {
             "command": command,
@@ -884,8 +912,64 @@ def _execute_save_file(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     }
 
 
+def _execute_delete_file(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Remove a file this session saved earlier via save_file (a scratch
+    script, a wordlist, an old draft) from this target's own workspace —
+    the counterpart save_file never had. CAUGHT IN THE WILD: asked to
+    "delete the script you saved for this target," the only answer
+    available was "I don't have a tool that can delete files — here's the
+    rm -rf command to run yourself," handing back a raw shell command that
+    nukes the ENTIRE target directory (raw/, screenshots/, everything) for
+    what was really just "remove the one script you made." This gives it
+    the one-file, contained version of that instead.
+
+    Same safety shape as save_file, deliberately: bare filename only (no
+    directory components, no traversal), and the resolved path is
+    containment-checked to stay inside this target's own storage root —
+    so this can delete a file IT created in the target's workspace and
+    nothing else on the researcher's disk, ever.
+    """
+    filename = (args.get("filename") or "").strip()
+    if not filename:
+        return {"error": "No filename specified."}
+
+    safe_name = os.path.basename(filename.strip().strip("/"))
+    if not safe_name or safe_name in (".", ".."):
+        return {"error": f"Invalid filename: {filename!r}"}
+
+    target_name = target.name if (target and target.name) else "default"
+    target_root = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}")).resolve()
+    # save_file only ever writes into raw/, but a researcher could point at
+    # a file anywhere under this target's own tree (e.g. screenshots/) —
+    # search raw/ first (the common case) then the target root itself,
+    # still never leaving target_root either way.
+    candidates = [target_root / "raw" / safe_name, target_root / safe_name]
+    out_path = None
+    for cand in candidates:
+        resolved = cand.resolve()
+        if not str(resolved).startswith(str(target_root)):
+            continue
+        if resolved.is_file():
+            out_path = resolved
+            break
+
+    if out_path is None:
+        return {"error": f"No file named '{safe_name}' found in this target's workspace (checked raw/ and the target root)."}
+
+    try:
+        out_path.unlink()
+    except Exception as e:
+        return {"error": f"Failed to delete file: {e}"}
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[+] Deleted {out_path}")
+    return {"status": "success", "deleted": str(out_path)}
+
+
 def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
-                              heartbeat_interval: int = 5, shell: bool = False) -> "subprocess.CompletedProcess":
+                              heartbeat_interval: int = 5, shell: bool = False,
+                              env: Optional[Dict[str, str]] = None) -> "subprocess.CompletedProcess":
     """
     Runs a subprocess without blocking silently for the full timeout window.
     Long recon calls (passive OSINT lookups, DNS brute-force) previously used
@@ -899,9 +983,15 @@ def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
     STRING with shell=True for callers that need real shell features (pipes,
     heredocs, redirects, `&&` chains) — e.g. run_terminal_command's ad-hoc
     multi-stage pipelines, which can't be expressed as a plain argv list.
+
+    `env`, when given, REPLACES the subprocess's environment entirely (same
+    as subprocess.Popen's own env= semantics) — callers that want to add
+    variables on top of the normal environment must pass os.environ.copy()
+    plus their additions, not a bare dict of just the new vars, or the
+    child process loses PATH and everything else it needs to run at all.
     """
     start = time.monotonic()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=shell)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=shell, env=env)
     try:
         while True:
             elapsed = time.monotonic() - start
@@ -1134,55 +1224,97 @@ def _execute_resolve_candidates(args: Dict[str, Any], target: Target, emit: Any)
     if not cleaned:
         return {"error": "No candidate domains provided for resolution."}
 
+    # dnsx is the fast path (bulk, concurrent, gives A + CNAME in one pass)
+    # but it's one specific Go binary — on a box where it (or pdtm) was
+    # never installed, this used to just fail outright with "dnsx not
+    # installed" and nothing resolved at all. There's always a way to do
+    # plain DNS resolution: dnspython if it happens to be installed, and
+    # failing that the Python standard library itself (socket), which is
+    # guaranteed present on every Python install with no extra dependency.
+    # Falls through in that order rather than refusing to resolve anything.
     auto_install = bool(load_config().get("auto_install_missing_tools", False))
-    check = ensure_tool("dnsx", emit=emit, auto_install=auto_install)
-    if not check["available"]:
-        if emit and hasattr(emit, "warn"):
-            emit.warn(check["message"])
-        return {
-            "error": "dnsx not installed",
-            "message": check["message"],
-            "hint": "pdtm -i dnsx"
-        }
-
-    binary = get_binary_path("dnsx") or "dnsx"
-
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-        f.write("\n".join(cleaned) + "\n")
-        tmp_path = f.name
-
     resolved = []
-    try:
-        resolvers = _resolve_resolvers_path()
-        cmd = [binary, "-l", tmp_path, "-silent", "-json", "-a", "-cname", "-resp"]
-        if resolvers and os.path.exists(resolvers):
-            cmd.extend(["-r", resolvers])
+    used_method = "dnsx"
 
-        proc = _run_cmd_with_heartbeat(cmd, timeout=120, emit=emit, label="resolve_candidates (DNS resolution)")
-        if proc.stdout.strip():
-            for line in proc.stdout.splitlines():
-                if line.strip():
+    if is_available("dnsx") or (auto_install and ensure_tool("dnsx", emit=emit, auto_install=True)["available"]):
+        binary = get_binary_path("dnsx") or "dnsx"
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write("\n".join(cleaned) + "\n")
+            tmp_path = f.name
+
+        try:
+            resolvers = _resolve_resolvers_path()
+            cmd = [binary, "-l", tmp_path, "-silent", "-json", "-a", "-cname", "-resp"]
+            if resolvers and os.path.exists(resolvers):
+                cmd.extend(["-r", resolvers])
+
+            proc = _run_cmd_with_heartbeat(cmd, timeout=120, emit=emit, label="resolve_candidates (DNS resolution)")
+            if proc.stdout.strip():
+                for line in proc.stdout.splitlines():
+                    if line.strip():
+                        try:
+                            item = json.loads(line.strip())
+                            host = item.get("host")
+                            if host:
+                                resolved.append({
+                                    "host": host,
+                                    "a": item.get("a", []),
+                                    "cname": item.get("cname", []),
+                                    "status_code": item.get("status_code", "NOERROR")
+                                })
+                        except Exception:
+                            pass
+        except Exception as e:
+            return {"error": f"dnsx resolution failed: {e}"}
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+    else:
+        if emit and hasattr(emit, "info"):
+            emit.info("[*] dnsx not installed — falling back to plain DNS resolution (no CNAME chain, one host at a time, slower on large lists).")
+        try:
+            import dns.resolver as _dnspython  # type: ignore
+            used_method = "dnspython"
+        except Exception:
+            _dnspython = None
+            used_method = "socket"
+
+        import socket
+        for host in cleaned:
+            a_records: List[str] = []
+            cname_records: List[str] = []
+            try:
+                if _dnspython is not None:
                     try:
-                        item = json.loads(line.strip())
-                        host = item.get("host")
-                        if host:
-                            resolved.append({
-                                "host": host,
-                                "a": item.get("a", []),
-                                "cname": item.get("cname", []),
-                                "status_code": item.get("status_code", "NOERROR")
-                            })
+                        for rr in _dnspython.resolve(host, "A"):
+                            a_records.append(str(rr))
                     except Exception:
                         pass
-    except Exception as e:
-        return {"error": f"dnsx resolution failed: {e}"}
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+                    try:
+                        for rr in _dnspython.resolve(host, "CNAME"):
+                            cname_records.append(str(rr).rstrip("."))
+                    except Exception:
+                        pass
+                else:
+                    # Plain stdlib socket — A records only, no CNAME chain
+                    # visibility (the OS resolver follows CNAMEs itself
+                    # before handing back the final address), but this
+                    # requires zero external tools or packages at all.
+                    _, aliases, addrs = socket.gethostbyname_ex(host)
+                    a_records = list(addrs)
+                    cname_records = [a for a in aliases if a != host]
+            except (socket.gaierror, Exception):
+                continue
+            if a_records or cname_records:
+                resolved.append({
+                    "host": host, "a": a_records, "cname": cname_records,
+                    "status_code": "NOERROR",
+                })
 
     # Update target state
     if "subdomains" not in target.state:
@@ -1195,7 +1327,8 @@ def _execute_resolve_candidates(args: Dict[str, Any], target: Target, emit: Any)
     return {
         "count": len(resolved),
         "resolved": resolved[:100],
-        "total_resolved": len(resolved)
+        "total_resolved": len(resolved),
+        "method": used_method,
     }
 
 
@@ -2457,6 +2590,27 @@ _DIAG_QUESTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# CAUGHT IN THE WILD (date-free, just descriptive): connecting to Burp/
+# Caido (even just to probe their tool lists) was happening unconditionally
+# on the very first message of every session — including pure small talk
+# like "hello bud how are you" — adding real connection latency plus a
+# wall of "[+] MCP server 'burp' connected..." / "caido-mcp-server v4.3.0
+# ... Registered: 66 tools" status noise to a reply that had nothing to do
+# with either tool. Gate it on the researcher's own message actually being
+# about MCP/tool access or wanting to drive Burp/Caido specifically — the
+# same bar implied by /mcp itself, which always triggers it directly and
+# is unaffected by this gate. A skipped turn leaves _MCP_SERVERS_REGISTERED
+# unset, so the very next relevant message (or an active non-default
+# target, meaning real hunting work is already underway) still registers
+# normally — nothing here is a permanent opt-out.
+_MCP_RELEVANT_RE = re.compile(
+    r"\b(mcp|burp|caido|repeater|intercept(?:ing|or)?|proxy(?:ing)?)\b"
+    r"|\btools?\b[^.?!]{0,40}\b(you\s+have|access|available|see|connected|installed)\b"
+    r"|\baccess\s+to\s+(?:the\s+|your\s+)?tools?\b"
+    r"|\bwhat\s+tools\b",
+    re.IGNORECASE,
+)
+
 
 def _format_last_turn_diagnostics(diag: Optional[Dict[str, Any]]) -> Optional[str]:
     """Render the previous turn's control-flow telemetry as plain, factual
@@ -2525,12 +2679,24 @@ def _format_last_turn_diagnostics(diag: Optional[Dict[str, Any]]) -> Optional[st
     return "\n".join(f"- {l}" for l in lines) if lines else None
 
 
-def _clean_synthesizer_output(text: str) -> str:
+def _clean_synthesizer_output(text: str, tools_executed: Optional[List[str]] = None) -> str:
     """
     Defensive net: if the synthesizer model ignored its plain-prose
     instruction and emitted a raw orchestrator-style JSON tool-call object
     instead of (or wrapped around) real prose, recover something readable
     instead of dumping raw JSON to the user's terminal.
+
+    `tools_executed` (when the caller has it) is the list of tools that
+    actually ran and returned real results EARLIER in this same turn —
+    separate from, and not to be confused with, the specific trailing
+    tool-call-shaped JSON blob this function is here to clean up (which
+    means something ELSE queued after those never fired). See the
+    "nothing ran" branch below for why this distinction matters:
+    CAUGHT IN THE WILD — a researcher watched curl calls actually execute
+    and print real HTTP results, then the turn ended with one more queued
+    tool call left as raw JSON in the final text; this function used to
+    blanket-reply "nothing ran, no results to show," flatly contradicting
+    the real output sitting right above it in the same transcript.
 
     Seen in practice with small local models on plain advisory questions
     (e.g. "how do I fix this as a developer") that need no tool at all:
@@ -2668,6 +2834,18 @@ def _clean_synthesizer_output(text: str) -> str:
                 except Exception:
                     pass
         _plural = f", plus {_total_calls - 1} more queued right after it," if _total_calls > 1 else ""
+        if tools_executed:
+            # Real tool calls already ran and produced real results earlier
+            # in this same turn (they're right there in the transcript) —
+            # only this LAST queued call never fired. Saying "nothing ran"
+            # here would flatly contradict what the researcher just watched
+            # happen, so say what's actually true: most of it ran, one more
+            # call got cut off at the end.
+            return (
+                f"Ran {', '.join(tools_executed)} already this turn — see the results above. "
+                f"One more queued call ({tool_name}{_plural}) didn't fire before the turn ended. "
+                f"Say \"continue\" or \"go ahead\" to run that last one."
+            )
         return (
             f"Started to run {tool_name}{_plural} but the turn ended before any of it actually fired — "
             f"nothing ran, no results to show. Just say \"continue\" or \"go ahead\" and it'll run properly."
@@ -4665,15 +4843,54 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
         return {"url": url, "error": f"Spider error: {e}"}
 
 
+def _target_auth_options(target: Target) -> Dict[str, Any]:
+    """
+    Pulls this target's already-captured authenticated session (from a
+    login flow, cookie_inspector, or an imported Burp/Caido history) into
+    the `options` shape http_utils.apply_session_config() reads —
+    auth_cookies / auth_headers. Shared by every rule-based recon module
+    wrapper below (wafbuster, surface_auditor, cors_checker, graphql_probe,
+    transport_auditor) so each of them tests WITH the live session instead
+    of a bare unauthenticated requests.Session(), same auth source of
+    truth every other request-sending tool (curl, httpx, run_terminal_command)
+    already reads from. Returns {} (nothing to add) when no session has
+    been captured yet — harmless no-op for a pre-auth target.
+    """
+    state = target.state if (target and isinstance(target.state, dict)) else {}
+    out: Dict[str, Any] = {}
+    cookies = state.get("cookies")
+    session_cookie = state.get("session_cookie")
+    if isinstance(cookies, dict) and cookies:
+        out["auth_cookies"] = dict(cookies)
+    elif session_cookie:
+        out["auth_cookies"] = normalize_cookies(session_cookie)
+    headers = state.get("headers")
+    if isinstance(headers, dict) and headers:
+        out["auth_headers"] = dict(headers)
+    return out
+
+
 def _execute_wafbuster(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     from hellhound.core.engine import HellhoundEngine
     url = args.get("url") or target.name
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
+    # Was calling run_single() with no `options` kwarg at all — WAFbuster.py
+    # (and every module like it) unconditionally calls
+    # http_utils.apply_session_config(session, options) near the top of
+    # run(), which crashed on options=None (AttributeError on the first
+    # .get()), caught by the module's own broad except-and-log-nothing-
+    # useful block. Net effect: wafbuster silently no-op'd on every call
+    # through the chat box — confirmed independently while wiring auth
+    # through here, not a hypothetical. Passing a real opts dict (even an
+    # empty one) fixes that outright; it also now carries the captured
+    # session same as the other four wrappers below.
+    opts = {"spider_intel": target.state.get("spider_intel", {})}
+    opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
-        res = engine.run_single("wafbuster", url, emit=emit)
+        res = engine.run_single("wafbuster", url, options=opts, emit=emit)
         return {
             "url": url,
             "result": res
@@ -4690,6 +4907,7 @@ def _execute_surface_auditor(args: Dict[str, Any], target: Target, emit: Any) ->
 
     spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
     opts = {"spider_intel": spider_intel}
+    opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
         res = engine.run_single("surface_auditor", url, options=opts, emit=emit)
@@ -4709,6 +4927,7 @@ def _execute_cors_checker(args: Dict[str, Any], target: Target, emit: Any) -> Di
 
     spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
     opts = {"spider_intel": spider_intel}
+    opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
         res = engine.run_single("corsbuster", url, options=opts, emit=emit)
@@ -4728,6 +4947,7 @@ def _execute_graphql_probe(args: Dict[str, Any], target: Target, emit: Any) -> D
 
     spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
     opts = {"spider_intel": spider_intel}
+    opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
         res = engine.run_single("graphql", url, options=opts, emit=emit)
@@ -4737,6 +4957,105 @@ def _execute_graphql_probe(args: Dict[str, Any], target: Target, emit: Any) -> D
         }
     except Exception as e:
         return {"url": url, "error": f"GraphQL check error: {e}"}
+
+
+def _execute_sqlmap_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Confirm SQL injection on a SPECIFIC url/parameter using sqlmap, instead
+    of hand-crafting payloads one at a time. Deliberately scoped tight:
+    by default this only confirms injectability and, if injectable, lists
+    database NAMES (--dbs/--current-db/--banner) as the impact proof —
+    naming a real database is already "I can extract data," which is
+    enough to back a finding without this tool also pulling row-level
+    data (no --dump here; that's a deliberate line, not a missing
+    feature). --batch keeps sqlmap from blocking on an interactive
+    prompt, and risk/level are capped to the tool's own sane defaults
+    (not sqlmap's noisiest settings) unless the caller raises them.
+
+    Reuses whatever session this target already has captured (same
+    target.state cookies/headers every other request-sending tool reads
+    from) so it doesn't need a fresh login replayed into it separately.
+    """
+    url = (args.get("url") or "").strip()
+    if not url:
+        return {"error": "No url specified — sqlmap needs one specific endpoint (and, ideally, the parameter) to target, not a whole site."}
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("sqlmap", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
+        return {"error": "sqlmap not installed", "message": check["message"], "hint": install_hint("sqlmap")}
+
+    binary = get_binary_path("sqlmap") or "sqlmap"
+
+    # Clamp rather than trust the caller blindly — this tool's whole point
+    # is confirmation with low noise, not sqlmap's most aggressive mode.
+    level = max(1, min(int(args.get("level", 1) or 1), 3))
+    risk = max(1, min(int(args.get("risk", 1) or 1), 2))
+
+    cmd = [binary, "-u", url, "--batch", "--level", str(level), "--risk", str(risk)]
+
+    data = args.get("data") or args.get("body")
+    if data:
+        cmd += ["--data", str(data)]
+    param = args.get("param") or args.get("parameter")
+    if param:
+        cmd += ["-p", str(param)]
+
+    state = target.state if (target and isinstance(target.state, dict)) else {}
+    session_cookie = state.get("session_cookie") or ""
+    if not session_cookie and isinstance(state.get("cookies"), dict) and state["cookies"]:
+        session_cookie = "; ".join(f"{k}={v}" for k, v in state["cookies"].items())
+    if session_cookie:
+        cmd += ["--cookie", str(session_cookie)]
+    headers = state.get("headers") if isinstance(state.get("headers"), dict) else {}
+    for hk, hv in headers.items():
+        if hk.lower() == "cookie":
+            continue
+        cmd += ["-H", f"{hk}: {hv}"]
+
+    # Database NAME enumeration is the default proof-of-impact step; the
+    # caller can turn it off for a pure injectability check with nothing
+    # further. Table/row-level dumping is intentionally not wired up here.
+    if args.get("list_databases", True):
+        cmd += ["--dbs"]
+    if args.get("current_db"):
+        cmd += ["--current-db"]
+    if args.get("is_dba"):
+        cmd += ["--is-dba"]
+
+    try:
+        proc = _run_cmd_with_heartbeat(cmd, timeout=240, emit=emit, label=f"sqlmap ({url})")
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    except subprocess.TimeoutExpired:
+        return {"url": url, "error": "sqlmap timed out after 240 seconds — try a narrower level/risk or a specific --param."}
+    except Exception as e:
+        return {"url": url, "error": f"sqlmap execution failed: {e}"}
+
+    injectable = bool(re.search(r"is vulnerable|injection point\(s\)|sqlmap identified the following injection point", output, re.I))
+    dbms_match = re.search(r"back-end DBMS:\s*(.+)", output)
+    databases: List[str] = []
+    db_section = re.search(r"available databases \[\d+\]:\s*\n((?:\[\*\].+\n?)+)", output)
+    if db_section:
+        databases = [line.strip().lstrip("[*]").strip() for line in db_section.group(1).splitlines() if line.strip()]
+    current_db_match = re.search(r"current database:\s*'?([^'\n]+)'?", output, re.I)
+    is_dba_match = re.search(r"current user is DBA:\s*(True|False)", output, re.I)
+
+    tail_lines = [ln for ln in output.splitlines() if ln.strip()][-40:]
+
+    return {
+        "url": url,
+        "command": " ".join(cmd),
+        "injectable": injectable,
+        "dbms": dbms_match.group(1).strip() if dbms_match else None,
+        "databases": databases,
+        "current_db": current_db_match.group(1).strip() if current_db_match else None,
+        "is_dba": (is_dba_match.group(1).lower() == "true") if is_dba_match else None,
+        "raw_tail": "\n".join(tail_lines),
+    }
 
 
 def _execute_hydra(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -4835,6 +5154,7 @@ def _execute_transport_auditor(args: Dict[str, Any], target: Target, emit: Any) 
         "check_cookies": args.get("check_cookies", True),
         "check_payment": args.get("check_payment", True),
     }
+    opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
         res = engine.run_single("transport_auditor", url, options=opts, emit=emit)
@@ -6931,6 +7251,35 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_graphql_probe
     ),
+    "sqlmap_scan": ToolSpec(
+        name="sqlmap_scan",
+        description=(
+            "Confirm SQL injection on ONE specific url/parameter with sqlmap instead of hand-testing "
+            "payloads one at a time. ONLY reach for this when there's an actual signal pointing at that "
+            "specific endpoint — a DB error signature in a response (SQLSTATE, 'you have an error in your "
+            "SQL syntax', a stack trace naming mysql/pg/mongo), a response that changed suspiciously on a "
+            "quote/boolean tweak you already tried manually, or the researcher explicitly asking you to "
+            "test a given endpoint/parameter for SQLi. Don't sweep every parameter on every endpoint through "
+            "this 'just in case' — that's noisy and exactly what the researcher doesn't want. By default it "
+            "only confirms injectability and lists database NAMES (list_databases=true) as impact proof — it "
+            "does not dump table/row data; that's a deliberate limit of this tool, not a missing option."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The exact URL to test (query string params included if testing GET)."},
+                "data": {"type": "string", "description": "POST body to test instead of/alongside the URL's query string, e.g. 'id=1&name=foo'."},
+                "param": {"type": "string", "description": "Narrow testing to this one parameter name, when known — faster and quieter than testing every param."},
+                "level": {"type": "integer", "description": "sqlmap test depth, 1-3 (default 1). Higher = more payload variants, more requests."},
+                "risk": {"type": "integer", "description": "sqlmap risk level, 1-2 (default 1). Higher includes riskier payloads (e.g. time-based)."},
+                "list_databases": {"type": "boolean", "description": "If injectable, enumerate database names as proof (default true)."},
+                "current_db": {"type": "boolean", "description": "Also report the current database name."},
+                "is_dba": {"type": "boolean", "description": "Also report whether the injected user has DBA privileges."}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_sqlmap_scan
+    ),
     "dns_bruteforce": ToolSpec(
         name="dns_bruteforce",
         description=(
@@ -7029,7 +7378,24 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "run_terminal_command": ToolSpec(
         name="run_terminal_command",
-        description="Run an arbitrary terminal command or Kali tool (e.g., custom nmap, gobuster, sqlmap, custom ffuf pipes) targeting a specific host. You MUST specify the target host parameter for scope validation.",
+        description=(
+            "Run an arbitrary terminal command or Kali tool (e.g., custom nmap, gobuster, "
+            "sqlmap, custom ffuf pipes), or execute a script previously written with save_file "
+            "(python3 <path>, chmod +x <path> && <path>), targeting a specific host. You MUST "
+            "specify the target host parameter for scope validation. "
+            "AUTH IS INJECTED AUTOMATICALLY — don't hardcode it: whenever this target has a "
+            "captured session (from a login flow, cookie_inspector, or an imported Burp/Caido "
+            "history), the command's environment carries it as HELLHOUND_COOKIE (raw 'k=v' "
+            "cookie string), HELLHOUND_COOKIES_JSON (all cookies as a JSON object), "
+            "HELLHOUND_AUTH_TOKEN (bearer/auth token if one was captured), and "
+            "HELLHOUND_HEADERS_JSON (captured headers, e.g. Authorization, as JSON). A script "
+            "that needs the authenticated session should read these from os.environ at RUN "
+            "time (e.g. requests.Session().headers.update({'Cookie': os.environ.get("
+            "'HELLHOUND_COOKIE', '')})) instead of a literal cookie/token pasted into the "
+            "script's source — the env vars always reflect the CURRENT session, so the script "
+            "keeps working even after re-auth rotates the cookie/token, and nothing stale ends "
+            "up permanently saved on disk."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -7087,6 +7453,25 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["filename", "content"],
         },
         executor=_execute_save_file,
+    ),
+    "delete_file": ToolSpec(
+        name="delete_file",
+        description=(
+            "Delete one file you (or the researcher, via save_file) saved earlier in THIS "
+            "target's own workspace — e.g. a scratch script, a one-off wordlist, an old draft "
+            "no longer needed. Bare filename only, same as save_file; this can only remove a "
+            "file inside this target's own storage, never anything else on the researcher's "
+            "disk. Use this instead of handing back a raw `rm` command when asked to clean up "
+            "something you created."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "Bare filename to delete, e.g. 'cleanup_and_note.py' (no directory path)."},
+            },
+            "required": ["filename"],
+        },
+        executor=_execute_delete_file,
     ),
     "hydra": ToolSpec(
         name="hydra",
@@ -7201,13 +7586,18 @@ def register_mcp_servers(emit: Any = None) -> int:
     can never collide with a built-in tool of the same name, and so it's
     always visible in logs/history which backend actually ran a call).
 
-    Example config.json entry, for Burp's official PortSwigger MCP
-    extension (Extensions -> Add -> the mcp-server JAR, then enable the
-    MCP server in its settings tab — it defaults to SSE on 127.0.0.1:9876):
+    Example config.json entry for Burp's MCP tab (recent Burp: native,
+    Streamable HTTP; older standalone PortSwigger extension JAR: legacy
+    SSE at /sse — both exist in the wild, which is why `/mcp burp` probes
+    for the right one instead of hardcoding either):
 
         "mcp_servers": {
-            "burp": {"transport": "sse", "url": "http://127.0.0.1:9876/sse"}
+            "burp": {"transport": "streamable_http", "url": "http://127.0.0.1:9876/mcp"}
         }
+
+    (or {"transport": "sse", "url": "http://127.0.0.1:9876/sse"} for the
+    older extension — don't hand-edit this; use `/mcp burp` and let it
+    resolve and save the right one.)
 
     Best-effort and non-fatal: a server that's misconfigured, not running,
     or not installed simply contributes zero tools for this session (with
@@ -8301,12 +8691,14 @@ If there is nothing worth generalizing, return an empty array: []"""
             return self._execute_set_target(args, emit)
 
         # Internal memory & finding recording tools operate locally on target state.
-        # manage_scope/save_file join this list for the same reason: they touch
-        # target.scope_rules / target workspace storage, not the network, so running
-        # them through the network-host scope gate below is the wrong check entirely
-        # (worse, manage_scope's own job is sometimes to ADD a not-yet-in-scope host —
-        # gating it on is_in_scope would make it unable to do the one thing it's for).
-        if tool_name in ("record_finding", "search_findings", "dismiss_finding", "export_report", "view_evidence", "get_investigation_graph", "ask_memory", "plan_next_steps", "manage_scope", "save_file", "cookie_inspector"):
+        # manage_scope/save_file/delete_file join this list for the same reason: they
+        # touch target.scope_rules / target workspace storage, not the network, so
+        # running them through the network-host scope gate below is the wrong check
+        # entirely (worse, manage_scope's own job is sometimes to ADD a not-yet-in-scope
+        # host — gating it on is_in_scope would make it unable to do the one thing it's
+        # for; delete_file's only "target" is a bare filename, which _extract_target_
+        # from_args would wrongly try to parse as a host/URL).
+        if tool_name in ("record_finding", "search_findings", "dismiss_finding", "export_report", "view_evidence", "get_investigation_graph", "ask_memory", "plan_next_steps", "manage_scope", "save_file", "delete_file", "cookie_inspector"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
@@ -8588,22 +8980,43 @@ If there is nothing worth generalizing, return an empty array: []"""
         # tool(s) discovered" line in the researcher's own session, and a
         # missing/unreachable one degrades to a quiet warning instead of
         # being invisible. Guarded so it only ever runs once per process,
-        # not once per turn.
+        # not once per turn — and only attempted at all once the turn looks
+        # like it actually wants tool access (see _MCP_RELEVANT_RE above);
+        # plain conversation doesn't pay this latency/noise cost.
+        #
+        # CAUGHT IN THE WILD: this used to ALSO fire whenever a non-default
+        # target was active, on the theory that real hunting work deserved
+        # tool access even without the researcher naming MCP/Burp/Caido
+        # explicitly. In practice that defeated the whole gate — a target
+        # gets set once near the start of a session and stays set for
+        # everything after, so "active non-default target" was true for
+        # almost every later message regardless of content, and MCP
+        # registration (with its connect banner) fired on things like
+        # "can you delete the script you saved for this target" — plain
+        # workspace housekeeping, nothing to do with Burp/Caido at all.
+        # Text relevance alone is the actual bar the researcher asked for:
+        # registration is a one-time, process-wide event anyway (the flag
+        # below), so the first message that DOES mention tools/MCP/Burp/
+        # Caido still registers everything for the rest of the session —
+        # nothing is lost by dropping the target-based fallback, only the
+        # false-positive firing on unrelated target-scoped messages.
         global _MCP_SERVERS_REGISTERED, _CAIDO_TOOLS_REGISTERED
-        if not _MCP_SERVERS_REGISTERED:
-            _MCP_SERVERS_REGISTERED = True
-            try:
-                register_mcp_servers(emit=emit)
-            except Exception as _mcp_reg_err:
-                if emit and hasattr(emit, "warn"):
-                    emit.warn(f"[!] MCP server registration failed: {_mcp_reg_err}")
-        if not _CAIDO_TOOLS_REGISTERED:
-            _CAIDO_TOOLS_REGISTERED = True
-            try:
-                register_caido_tools(emit=emit)
-            except Exception as _caido_reg_err:
-                if emit and hasattr(emit, "warn"):
-                    emit.warn(f"[!] Caido tool registration failed: {_caido_reg_err}")
+        _mcp_relevant_turn = bool(_MCP_RELEVANT_RE.search(user_text or ""))
+        if _mcp_relevant_turn:
+            if not _MCP_SERVERS_REGISTERED:
+                _MCP_SERVERS_REGISTERED = True
+                try:
+                    register_mcp_servers(emit=emit)
+                except Exception as _mcp_reg_err:
+                    if emit and hasattr(emit, "warn"):
+                        emit.warn(f"[!] MCP server registration failed: {_mcp_reg_err}")
+            if not _CAIDO_TOOLS_REGISTERED:
+                _CAIDO_TOOLS_REGISTERED = True
+                try:
+                    register_caido_tools(emit=emit)
+                except Exception as _caido_reg_err:
+                    if emit and hasattr(emit, "warn"):
+                        emit.warn(f"[!] Caido tool registration failed: {_caido_reg_err}")
 
         # ── Self-diagnostic short-circuit ──
         # The researcher asking "why did you just dump JSON" / "why do I
@@ -9162,6 +9575,17 @@ INSTRUCTIONS:
   message) — never say you "can't execute" or "can only guide/advise."
   Don't invent tools not in the list above, and don't claim capabilities
   (browsers, GUIs, live network access outside these tools) you don't have.
+- DESCRIBE CAPABILITIES IN PLAIN ENGLISH, NOT RAW TOOL NAMES: when asked
+  "what can you do" / "what tools do you have," answer the way you'd
+  describe yourself in conversation — "I can export a findings report,"
+  "I can test for SQL injection," "I can brute-force subdomains" — not by
+  reciting the literal registry identifiers (export_report, sqlmap_scan,
+  dns_bruteforce) verbatim. The exact identifier is implementation detail,
+  not how you'd naturally talk about yourself, and reciting it breaks the
+  persona for no benefit. Exception: if the researcher is clearly asking
+  at the technical/dev level — "what's the exact tool name for X," "list
+  your tool registry," "what args does save_file take" — answer precisely
+  with the real identifier; that's a different, legitimate question.
 - Concretely: if asked whether you can write up / export / produce a
   report, a polished writeup, an HTML file, or something with screenshots
   in it — export_report in the list above already does exactly that
@@ -9170,6 +9594,32 @@ INSTRUCTIONS:
   polished/submission-ready report" — you can, via that tool. The only
   real caveat is division of labor: YOU write the narrative (title,
   impact, repro steps), the tool assembles and embeds it.
+- CAUGHT IN THE WILD: asked to "create a script and run it" instead of
+  doing something step-by-step, you have denied having any scripting/
+  execution capability at all ("I can't write and execute arbitrary
+  scripts on your machine... not a general-purpose scripting runtime").
+  That's false — you DO have this, via two tools already in the list
+  above working together: save_file writes the script to this target's
+  own workspace, then run_terminal_command runs it (e.g. `python3
+  <the saved path>` or `chmod +x <path> && <path>`). Never claim you
+  can only fire individual HTTP requests one at a time — chaining
+  save_file + run_terminal_command IS writing and executing a real
+  script. When the researcher asks you to write something as a script
+  (not a one-off command), save it to the target workspace with
+  save_file AS PART OF doing the task, without being asked a second
+  time to save it — don't make them repeat "can you save this" after
+  you've already shown them the code once. When asked to clean up
+  something you saved (a scratch script, an old wordlist), use
+  delete_file on that one filename — don't hand back a raw `rm -rf`
+  command for the researcher to run themselves; delete_file already
+  does this safely, contained to this target's own workspace.
+- SELF-INITIATED SCRIPT: if the researcher didn't ask for a script and
+  you're the one proposing writing one (not just executing one they asked
+  for), say so and ask first in one line before reaching for save_file —
+  e.g. "want me to write a quick script for that?" If they say no or tell
+  you not to, drop it — don't re-propose it later in the conversation.
+  A script the researcher explicitly requested doesn't need this ask;
+  save and run it as part of doing the task, per the capability note above.
 - If the researcher actually asks you to run/generate/export something a
   local tool above covers (export_report for a report, record_finding for
   a finding, etc.) — even with no target configured, tools like
@@ -9236,7 +9686,99 @@ INSTRUCTIONS:
   - Holding a session cookie for an intermediate stepping-stone user is NOT takeover of the primary target.
 - NEVER fabricate credentials, tokens, or exploit results. If a login attempt failed or an exploit didn't work, state that fact clearly.
 - Only generate a formal HackerOne markdown vulnerability report if the researcher explicitly requested a report and high-impact findings were confirmed. This ban isn't just on the HackerOne template by name — it covers ANY rigid, formal write-up structure by default: a numbered "Investigation Summary" with one heading per tool call (e.g. "1. Skill Loading", "2. Initial Landing Page", "3. API Endpoint — Posts"), a step-by-step audit log mirroring the tool-call trace, or dumping full raw request/response JSON bodies for every step. That's report-doc structure wearing a different name, and it's just as much the wrong default as the HackerOne template. Unless a report was actually asked for, tell the researcher what happened the way you'd say it out loud: what you found, how you got there, what it means — conversationally, weaving in only the specific evidence (a token, a status code, a snippet) that actually matters to the story, not a full transcript of every tool call.
-- When asked about your capabilities, tools, or what you can do: answer ONLY from the AVAILABLE TOOLS list above. Never claim access to external tools not in that list.
+- When asked about your capabilities, tools, or what you can do: answer ONLY from the AVAILABLE TOOLS list above, but describe them in plain English the way you'd talk about yourself ("I can test for SQL injection," "I can enumerate subdomains") rather than reciting the raw registry identifiers (sqlmap_scan, subfinder) verbatim — same reasoning as the casual-chat guidance, just applied here too. Exact identifiers are fine, and expected, when the researcher is clearly asking at the technical/dev level (tool registry, exact arg names, etc.). Never claim access to external tools not in that list.
+- CAUGHT IN THE WILD: asked to turn a repeated manual task (deleting N
+  things one by one, bulk-checking a list, etc.) into a script instead of
+  doing it step-by-step, you have claimed you "can't write and execute
+  arbitrary scripts" and can only fire one request at a time. That's
+  false. save_file + run_terminal_command above, used together, ARE
+  script writing and execution: save_file writes the code to this
+  target's workspace, run_terminal_command runs it (`python3 <path>`,
+  `chmod +x <path> && <path>`, etc.). Never deny this capability. When you
+  write a script for the researcher, save it with save_file as part of
+  doing the task — don't make them ask a second time for something you
+  already showed them.
+- SMALL, NON-DESTRUCTIVE AUTOMATION DOESN'T NEED PERMISSION FOR EACH STEP:
+  a short built-in wordlist of common paths probed with GET requests,
+  piping/filtering/grepping an already-saved artifact (view_evidence +
+  run_terminal_command), or testing a POST/PUT/PATCH body for logic flaws
+  — privilege-escalation fields (isAdmin/role), prototype-pollution keys
+  (__proto__/constructor), injection payloads to confirm a finding — is
+  normal bug-hunting technique on an in-scope target, not something to
+  pause and ask about first. That's what you're here to do.
+- FALLBACK TOOLS / MISSING BINARIES: a registered tool can fail with "X not
+  installed" on a box that's missing one specific Go/pip binary — that's
+  not a dead end. resolve_candidates already falls back from dnsx to
+  dnspython to plain Python socket resolution on its own, no action needed
+  from you. For anything else that comes back missing, run_terminal_command
+  is the general escape hatch: check what's actually on this system (e.g.
+  `which host dig nslookup` for DNS, `which curl wget` for fetching) and
+  use whatever IS installed to get the same job done, rather than reporting
+  the whole step as blocked because one specific named tool wasn't there.
+- DON'T REACH FOR A TOOL JUST BECAUSE IT EXISTS: having more tools
+  available (sqlmap_scan included) is not a reason to run more of them.
+  Every tool call should be backed by an actual reason tied to what's in
+  front of you — a real signal, a specific finding to confirm, something
+  the researcher asked for — same as the existing non-destructive-
+  automation guidance above. sqlmap_scan especially: fire it at a
+  SPECIFIC endpoint/parameter only once something already points at SQL
+  injection there (an error signature, a response that changed on a
+  quote/boolean probe you ran, or the researcher naming the endpoint) —
+  never as a blind sweep across every parameter on every page "just to
+  check," which is exactly the kind of noise the rate limiter/circuit
+  breaker and the safe-method policy already exist to keep out.
+- SCRIPTS THAT NEED THE AUTHENTICATED SESSION: don't paste a cookie or
+  token value into a saved script's source. run_terminal_command injects
+  the current session automatically — HELLHOUND_COOKIE, HELLHOUND_COOKIES_JSON,
+  HELLHOUND_AUTH_TOKEN, HELLHOUND_HEADERS_JSON (whichever were actually
+  captured, via login, cookie_inspector, or an imported Burp/Caido
+  history) — into the environment of whatever command/script it runs.
+  Write scripts to read `os.environ.get("HELLHOUND_COOKIE")` etc. at run
+  time instead of hardcoding the value. That way the script keeps working
+  after a re-auth rotates the session, and the researcher is never stuck
+  asking you to "paste in the fresh cookie" and re-save the file.
+- SCRIPTS SHOULD HAND BACK STRUCTURED RESULTS, NOT JUST TEXT YOU SUMMARIZE
+  FROM MEMORY: when a saved script finds something worth acting on (a list
+  of vulnerable endpoints, IDs that responded 200, whatever it was built
+  to check), have it print that as JSON to stdout (run_terminal_command
+  returns stdout directly) or write it to a results file with save_file-
+  style content so it can be read back precisely with view_evidence —
+  rather than you eyeballing a wall of raw output and transcribing numbers
+  from it. This is already possible with the tools you have; it just needs
+  the script itself to emit something structured.
+- SELF-INITIATED SCRIPT CREATION: ASK FIRST, AND RESPECT "NO". The
+  "small, non-destructive automation doesn't need permission" rule above
+  covers steps WITHIN a task the researcher already asked for (probing a
+  wordlist, filtering a saved artifact, testing a field for IDOR/pollution
+  as part of what they set you to do). It does NOT cover you deciding, on
+  your own initiative, that writing a whole new script/automation would be
+  a good idea when nobody asked for one — e.g. you notice a repeated
+  manual pattern and think "I should script this." For THAT case: say what
+  you'd write and why in one line, and ask first ("want me to script this
+  up?") BEFORE calling save_file — don't just go write and run it off your
+  own idea. This is a plain conversational check-in, not the DELETE
+  approval-prompt mechanism — there's no UI gate enforcing it, it's on
+  you to actually ask and wait for the reply. If the researcher says no,
+  or "don't create that script," or anything to that effect: drop it.
+  Don't re-propose the same script again later in this conversation, and
+  don't quietly write it anyway under a different justification. A script
+  the researcher explicitly asked you to write ("create a script that
+  does X", "automate this") is NOT self-initiated — go ahead and save +
+  run it per the rule above, no need to ask permission for something
+  already requested.
+- DELETE IS DIFFERENT, AND NOT JUST BECAUSE OF THE APPROVAL PROMPT: a
+  DELETE requires human approval at the code level (SafeMethodPolicy in
+  guard.py — same for any URL path containing delete/destroy/purge/wipe/
+  drop/truncate/terminate), so it technically can't run without the
+  researcher explicitly saying yes to the prompt. But don't even PROPOSE
+  or queue one on your own initiative — deleting something is almost
+  always a CTF/lab-specific action (clearing a solved challenge, resetting
+  lab state), never something a real engagement calls for, and "is there
+  anything that would help you find bugs better" is not the same as "go
+  ahead and delete that." Only reach for DELETE when the researcher
+  explicitly asked you to delete something, and let the approval prompt
+  do its job from there — don't chain it in as a self-initiated "next
+  step" off an open-ended or reflective question.
 - EDUCATIONAL & TECHNIQUE QUERIES: When the researcher asks about offensive security techniques (e.g. 403 bypass, IDOR, SQLi, XSS, SSRF, JWT attacks, auth bypass, privilege escalation, parameter pollution), provide comprehensive, detailed technical explanations with concrete examples, payloads, headers, and methodology. This is educational content essential to bug bounty work — NEVER refuse to explain a technique. You are a bug bounty assistant, not a content filter.
 - OUTPUT FORMAT: Respond in plain natural-language prose with clean markdown structure (headings, bullet points, and code blocks for evidence/PoC). NEVER output a raw tool-call object. Default to a short, flowing explanation (a few paragraphs, not a numbered section per tool call) — reach for headings/sections only when the researcher actually asked for a report or the content genuinely needs that structure to stay readable (e.g. comparing several distinct findings).
 - The conversation history above may end with one or more raw {{"tool": ...}} JSON objects — these are the orchestrator's own failed or stuck tool-call attempts from earlier this turn (malformed JSON, a repeated call, or it simply ran out of attempts), not a real result and not anything the researcher has seen. NEVER copy, quote, or reproduce that JSON — not even inside a code block — as your answer. Treat it as if it weren't there: summarize strictly from the real tool results that actually came back (visible as [TOOL RESULT: ...] entries), and if nothing useful came back at all, say so plainly instead of echoing the stuck attempt.
@@ -10100,7 +10642,7 @@ INSTRUCTIONS:
             )
         else:
             final_response = ai_resp or "Hit a blank response twice in a row on my end — try that again?"
-        final_response = _clean_synthesizer_output(final_response)
+        final_response = _clean_synthesizer_output(final_response, tools_executed=tools_executed)
         self.history.append({"role": "assistant", "content": final_response})
         self._compact_history_if_needed()
         self.target.state["history"] = self.history

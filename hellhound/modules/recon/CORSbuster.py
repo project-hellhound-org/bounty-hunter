@@ -101,51 +101,90 @@ def run(target, emit, options=None):
         urls_to_test = list(urls_to_test)[:100]
     
     payloads = [
-        "https://evil.com", 
-        "null", 
+        "https://evil.com",
+        "null",
         f"https://{domain}.evil.com",    # Post-domain trust (subdomain of evil)
         f"https://evil{domain}",         # Pre-domain trust (joined word)
         f"https://{domain}evil.com",     # Post-domain trust (joined word)
         f"http://{domain}",              # HTTP trust on HTTPS
         f"https://sub.{domain}.evil.com", # Deep subdomain of evil
         f"https://{domain}.local",       # Local variant trust
-        f"https://{domain.replace('.', '-')}.evil.com" # Hyphenated variant
+        f"https://{domain.replace('.', '-')}.evil.com", # Hyphenated variant
+        # Three classes folded in from Corsy (s0md3v/Corsy) — each one
+        # catches a specific origin-validation IMPLEMENTATION bug, not just
+        # "does it trust an arbitrary domain" like the payloads above:
+        f"https://{domain}_.evil.com",   # Unrecognized-underscore bypass — a
+        # validation regex anchored on the raw domain string sometimes
+        # treats '_' as a normal hostname char it doesn't need to escape
+        # against, so "target.com_.evil.com" slips past a check written to
+        # stop at the real domain boundary.
+        f"https://{domain}%60.evil.com", # Broken-parser / backtick bypass —
+        # Origin header carries a literal '%60' in the host position; some
+        # origin-checking code urldecodes before validating (header values
+        # normally shouldn't be) and a raw backtick then confuses whatever
+        # split/parse logic draws the trust boundary. Matched on substring
+        # below, not equality, since what's being checked for is the
+        # backtick showing up unescaped in the reflected ACAO value.
     ]
-    
+    if domain.count(".") > 1:
+        # Unescaped-regex-dot bypass — only meaningful for a multi-label
+        # domain (sub.example.com), same guard Corsy itself uses: replaces
+        # the FIRST literal '.' with 'x'. If the origin-validation regex
+        # was written as /sub.example.com$/ instead of /sub\.example\.com$/,
+        # the unescaped '.' matches ANY character — including 'x' — so this
+        # mutated origin gets reflected back as trusted even though it's
+        # not the real domain. This is arguably the single most valuable
+        # check in the whole list: it catches a specific, common regex-
+        # authoring mistake that none of the payloads above would ever
+        # trigger (they all either match exactly or clearly don't).
+        payloads.append(f"https://{domain.replace('.', 'x', 1)}")
+
     findings = []
     signals = []
     risk_score = 0
-    
+
     for url in urls_to_test:
         for payload in payloads:
             result = test_cors(url, payload, session=session)
             if not result:
                 continue
-                
+
             acao = result["acao"]
             acac = result["credentials"]
-            
+
             vuln_type = None
             risk_val = 0
-            
-            if acao == payload:
+
+            if "%60.evil.com" in payload and acao and "`.evil.com" in acao:
+                # Substring match, not equality — the thing being confirmed
+                # is that the server reflected an UNESCAPED backtick, not
+                # that it echoed the payload verbatim.
+                vuln_type = "Broken Origin Parser (Backtick)"
+                risk_val = 4
+
+            elif acao == payload:
                 vuln_type = "Origin Reflection"
                 if payload == "null": vuln_type = "Null Origin Trust"
+                elif payload.endswith(f"{domain}_.evil.com"): vuln_type = "Unrecognized Underscore Bypass"
+                elif domain.count(".") > 1 and payload == f"https://{domain.replace('.', 'x', 1)}":
+                    vuln_type = "Unescaped Regex Validation (dot-as-wildcard)"
+                    risk_val = 4
                 elif "evil" in payload: vuln_type = "Arbitrary Origin Trust"
                 elif payload == f"http://{domain}": vuln_type = "Insecure HTTP Trust"
-                
-                risk_val = 5 if acac else 3
-                
+
+                if not risk_val:
+                    risk_val = 5 if acac else 3
+
             elif acao == "*" and acac:
                 vuln_type = "Wildcard with Credentials"
-                risk_val = 5 
-                
+                risk_val = 5
+
             elif acao == "*" and not acac:
                 # Open CORS (Wildcard) is only a minor issue for public files
                 # Don't flood the results if it's the same across many URLs
                 vuln_type = "Open CORS (Wildcard)"
                 risk_val = 1
-                
+
             if vuln_type:
                 # Deduplication: If many URLs have the same 'Open CORS' issue, only report it once for the base target
                 is_repetitive = vuln_type == "Open CORS (Wildcard)"

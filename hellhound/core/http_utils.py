@@ -43,13 +43,25 @@ def apply_proxy_to_session(session, proxy_url: str):
 def apply_session_config(session, options: dict):
     """
     Standardizes session configuration for all Hellhound modules.
-    Applies proxy, merges global headers, and adds WAF bypass if enabled.
+    Applies proxy, merges global headers, carries over the target's
+    captured authenticated session (if any), and adds WAF bypass if enabled.
+
+    `options=None` is tolerated (treated as {}) rather than crashing — a
+    caller that forgets to pass options used to blow up here with
+    AttributeError on the very first `.get()` below, which every module's
+    own broad `except Exception` then swallowed silently: the module
+    LOOKED like it ran (no visible error) but every request inside it
+    never actually fired. wafbuster's own agent.py wrapper was hitting
+    exactly this (never passed `options` at all) — confirmed independently
+    while wiring auth through here, not a hypothetical.
     """
+    options = options or {}
+
     # 1. Apply Proxy
     proxy = options.get("proxy")
     if proxy:
         apply_proxy_to_session(session, proxy)
-    
+
     # 2. Merge Headers
     options["global_headers"] = options.get("global_headers", {})
     headers = merge_global_context(options, session.headers.copy())
@@ -60,7 +72,32 @@ def apply_session_config(session, options: dict):
             session.headers.update(headers)
         except (AttributeError, TypeError):
             pass # Immutable headers (like aiohttp) should be handled by the caller or during creation
-    
+
+    # 2b. Carry over the target's already-captured authenticated session.
+    # Every one of these rule-based modules (CORSbuster, GraphQL hunter,
+    # WAFbuster, SurfaceAuditor, TransportAuditor) used to build its own
+    # bare, unauthenticated requests.Session() — a real gap for exactly
+    # the checks that matter most while logged in (does this CORS misconfig
+    # actually leak an authenticated response, does this GraphQL mutation
+    # work once authenticated, does the WAF behave differently for a real
+    # session). Callers pass the captured state as auth_cookies (dict) and
+    # auth_headers (dict) in options; this applies both onto the session
+    # that's about to be used, same source of truth (target.state) every
+    # other request-sending tool already reads from.
+    auth_cookies = options.get("auth_cookies")
+    if isinstance(auth_cookies, dict):
+        for k, v in auth_cookies.items():
+            try:
+                session.cookies.set(str(k), str(v))
+            except Exception:
+                pass
+    auth_headers = options.get("auth_headers")
+    if isinstance(auth_headers, dict) and hasattr(session, "headers"):
+        try:
+            session.headers.update({str(k): str(v) for k, v in auth_headers.items()})
+        except (AttributeError, TypeError):
+            pass
+
     # 3. Security configurations
     session.verify = False # Modules typically handle internal/self-signed certs
 
@@ -157,5 +194,3 @@ def merge_global_context(options: Any, runtime_headers: Optional[Dict[str, Any]]
         headers.update(get_waf_bypass_header())
         
     return headers
-
-
