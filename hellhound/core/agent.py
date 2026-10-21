@@ -868,9 +868,9 @@ def _execute_save_file(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     subdomains to a text file" after a recon pass. Deliberately NOT an
     arbitrary-path file writer: the filename is sanitized to a bare name
     (no directories, no traversal) and the write is containment-checked
-    into the target's own raw/ directory, the same directory view_evidence
+    into the target's own raw/ directory, the same directory read_artifact
     already reads from — so a file saved this way is immediately
-    inspectable later via view_evidence without any extra plumbing, and
+    inspectable later via read_artifact without any extra plumbing, and
     this tool can never be used to write outside the target's own storage.
     """
     filename = (args.get("filename") or "").strip()
@@ -908,7 +908,7 @@ def _execute_save_file(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     return {
         "status": "success", "path": str(out_path),
         "bytes_written": len(content.encode("utf-8")),
-        "note": "Readable later via view_evidence with this path.",
+        "note": "Readable later via read_artifact with this path.",
     }
 
 
@@ -7440,7 +7440,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "Save text content to a file in this target's own workspace (e.g. a list of "
             "resolved subdomains, a wordlist you assembled, notes to reference later in the "
             "session). The file is written under the target's own storage and can be read back "
-            "later with view_evidence. For anything needing real shell processing (piping the "
+            "later with read_artifact. For anything needing real shell processing (piping the "
             "saved file into another tool, sorting/deduping it, etc.) use run_terminal_command "
             "instead — this tool is for writing content you already have in hand."
         ),
@@ -8698,7 +8698,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # host — gating it on is_in_scope would make it unable to do the one thing it's
         # for; delete_file's only "target" is a bare filename, which _extract_target_
         # from_args would wrongly try to parse as a host/URL).
-        if tool_name in ("record_finding", "search_findings", "dismiss_finding", "export_report", "view_evidence", "get_investigation_graph", "ask_memory", "plan_next_steps", "manage_scope", "save_file", "delete_file", "cookie_inspector"):
+        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "save_file", "delete_file", "cookie_inspector"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
@@ -9282,7 +9282,7 @@ RULES:
    - Once TARGET is no longer "default", do not call `set_target` again for the same host on every subsequent turn — only when the researcher clearly shifts to a genuinely different host.
 
 1. DECISION & TOOL SELECTION (CRITICAL):
-   - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network/recon tools (curl, spider, subfinder, httpx, etc.) — call `set_target` per rule 0 first if the message actually warrants it, otherwise there is nothing to point them at. This does NOT apply to target-independent tools that touch no network and don't need a scoped host: export_report, record_finding, search_findings, dismiss_finding, view_evidence, get_investigation_graph, ask_memory, plan_next_steps. If the researcher asks for a sample/demo/example report or output from one of those, CALL the tool for real (with clearly-labeled sample/placeholder data if no real findings exist yet) — do not output "DONE" and describe what you would generate instead, and do not print a fake tool-call JSON object as prose. Only fall back to "DONE" with a plain-language answer when nothing in the tool list, local or network, actually applies.
+   - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network/recon tools (curl, spider, subfinder, httpx, etc.) — call `set_target` per rule 0 first if the message actually warrants it, otherwise there is nothing to point them at. This does NOT apply to target-independent tools that touch no network and don't need a scoped host: export_report, record_finding, dismiss_finding, read_artifact. If the researcher asks for a sample/demo/example report or output from one of those, CALL the tool for real (with clearly-labeled sample/placeholder data if no real findings exist yet) — do not output "DONE" and describe what you would generate instead, and do not print a fake tool-call JSON object as prose. Only fall back to "DONE" with a plain-language answer when nothing in the tool list, local or network, actually applies.
    - CONVERSATIONAL & EDUCATIONAL QUERIES — DECIDE BY THIS TEST, NOT BY MATCHING EXAMPLE PHRASES: Before considering any tool, ask yourself: "Can I fully and correctly answer THIS message using only what's already in ALREADY GATHERED THIS SESSION / conversation history, with zero new information from the target?" If yes — it's a question, a request to explain/recap something already done, an identity/capability/greeting question, a methodology question, anything answerable from existing context — output "DONE" immediately with a normal conversational reply. Only emit a tool call if answering genuinely requires NEW data or a NEW action against the target that isn't already sitting in front of you. Illustrative (not exhaustive) examples of the "no new data needed" case: "explain...", "how does...", "what is...", "why did...", "hi", "hello", "what can you do", "who are you", "who am i", "what's my name", "how does this work", "why did that fail", "what did you find". This test applies EVEN IF a target is already active and tools were run earlier in the session — an ongoing mission does not mean every subsequent message is part of it; judge THIS message on its own, by whether IT needs new data, not by session momentum. Being the first message in a session, or a target already being scoped, is NOT on its own a reason to start testing — the message itself has to actually require new information.
    - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a valid, in-scope target endpoint is required right now.
    - SCOPED TARGET & GOAL — SKIP UNNEEDED DISCOVERY: If the researcher already gave a specific, fully-qualified target (a single host/URL) AND a specific goal that doesn't call for discovering additional hosts/subdomains, do NOT run subfinder, dns_bruteforce, or other subdomain/asset-discovery tools before going at the given target — those are for when the attack surface itself is the unknown, not a habitual first step. Go straight at the given URL/endpoint with curl/spider/whatever the goal actually needs. Only reach for discovery tools if the goal explicitly requires finding more hosts, or the direct approach against the given target genuinely dead-ends and broadening scope is the only path left.
@@ -9700,7 +9700,7 @@ INSTRUCTIONS:
   already showed them.
 - SMALL, NON-DESTRUCTIVE AUTOMATION DOESN'T NEED PERMISSION FOR EACH STEP:
   a short built-in wordlist of common paths probed with GET requests,
-  piping/filtering/grepping an already-saved artifact (view_evidence +
+  piping/filtering/grepping an already-saved artifact (read_artifact +
   run_terminal_command), or testing a POST/PUT/PATCH body for logic flaws
   — privilege-escalation fields (isAdmin/role), prototype-pollution keys
   (__proto__/constructor), injection payloads to confirm a finding — is
@@ -9742,7 +9742,7 @@ INSTRUCTIONS:
   of vulnerable endpoints, IDs that responded 200, whatever it was built
   to check), have it print that as JSON to stdout (run_terminal_command
   returns stdout directly) or write it to a results file with save_file-
-  style content so it can be read back precisely with view_evidence —
+  style content so it can be read back precisely with read_artifact —
   rather than you eyeballing a wall of raw output and transcribing numbers
   from it. This is already possible with the tools you have; it just needs
   the script itself to emit something structured.

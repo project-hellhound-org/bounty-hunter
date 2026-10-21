@@ -6,7 +6,7 @@
 <p align="center">
   <b>Autonomous AI Bug Bounty & Penetration Testing Framework by Project Hellhound</b>
   <br>
-  <i>Target enumeration, two-tier neural reasoning, 27 methodology skills, persistent artifact blackboard, live SPA crawling, visual evidence capture, and zero-bypass scope guardrails — from recon to submission-ready report.</i>
+  <i>Target enumeration, two-tier neural reasoning, 30 methodology skills, persistent artifact blackboard, live SPA crawling, visual evidence capture, and zero-bypass scope guardrails — from recon to submission-ready report.</i>
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
 
 <p align="center">
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
-  <a href="https://github.com/project-hellhound-org/bounty-hunter/releases"><img src="https://img.shields.io/badge/Release-v12.7.0-red?style=flat-square" alt="Release Version"/></a>
+  <a href="https://github.com/project-hellhound-org/bounty-hunter/releases"><img src="https://img.shields.io/badge/Release-v13.21-red?style=flat-square" alt="Release Version"/></a>
   <img src="https://img.shields.io/badge/AI--Powered-Ollama%20%7C%20NVIDIA%20NIM%20%7C%20Claude%20%7C%20Gemini%20%7C%20OpenAI-red?style=flat-square" alt="AI Support"/>
   <img src="https://img.shields.io/badge/Recon-Shuffledns%20%7C%20AlterX%20%7C%20DNSX%20%7C%20Naabu%20%7C%20HTTPX%20%7C%20FFUF%20%7C%20Gowitness-orange?style=flat-square" alt="Recon Toolchain"/>
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20WSL2-lightgrey?style=flat-square" alt="Platform"/>
@@ -62,7 +62,7 @@ You ──> /recon target.com ──> Orchestrator (Tool Selection) ──> Scop
                           └─ Headless SPA Spider      
                                      │
                                      ▼ (Populates Non-Prunable Artifact Ledger)
-                          Synthesizer (Report Write-up) <── 26 Methodology Skills
+                          Synthesizer (Report Write-up) <── 30 Methodology Skills
                                      │                     (Access Control, Auth Bypass,
                                      ▼                      Web2, Web3, Mobile, CTF)
                                 /report (Submission-ready markdown/JSON/HTML)
@@ -292,32 +292,25 @@ All actions can be triggered via slash commands or natural language:
 
 ## The Recon & Triage Arsenal
 
-Bounty Hunter coordinates specialized security tooling into a unified, scope-governed execution pipeline:
+Bounty Hunter coordinates **50 tools** into a unified, scope-governed execution pipeline — recon, active probing, logic/BAC auditing, cloud asset discovery, takeover checks, threat intel, and local workspace/reporting utilities:
 
-| Module | Category | Binary / Engine | Description |
-| :--- | :--- | :--- | :--- |
-| `curl` | Surgical Probing | Native HTTP Engine | Low-noise HTTP requests, route harvesting, and automatic session state tracking. |
-| `spider` | SPA Crawling | Headless SPA Engine | Intercepts dynamic background XHR/Fetch calls, forms, query params, and embedded JS state. |
-| `gowitness` | Visual Recon | Gowitness | High-fidelity headless screenshot capture & visual evidence indexing into target workspace. |
-| `subfinder` | Passive OSINT | ProjectDiscovery Subfinder | Passive subdomain harvesting from certificate transparency logs and APIs. |
-| `dns_bruteforce` | Active Recon | Shuffledns + MassDNS | High-speed active DNS brute-forcing with wildcard handling and custom resolvers. |
-| `permute_subdomains`| Speculative Recon | AlterX | Subdomain permutation and mutation generation from discovered assets. |
-| `resolve_candidates`| Bulk DNS | DNSX | Multi-threaded candidate resolution with CNAME, A, AAAA, and wildcard filtering. |
-| `port_scan` | Network Recon | Naabu | High-performance port scanning across top ports (`top-100`, `top-1000`, `full`). |
-| `httpx` | Live Probing | ProjectDiscovery HTTPX | Probes live services, status codes, tech stacks, redirects, and titles. |
-| `tls_cert_scan` | TLS Inspection | TLSX | Extracts Subject Alternative Names (SANs) and certificate chains. |
-| `vhost_fuzz` | Active Fuzzing | FFUF | Virtual-host fuzzing on target IPs with custom host header routing. |
-| `content_discovery` | Path Discovery | FFUF + SecLists | Active path and endpoint discovery on live web applications. |
-| `fuzz_hunter` | Smart Fuzzing | FUZZhunter Engine | Deep recursive path fuzzing with dynamic 404 similarity baseline calibration. |
-| `subzy` | Takeover Triage | Subzy / CNAME Engine | Verifies dangling CNAME records against cloud takeover signatures. |
-| `wafbuster` | WAF Profiling | Signature Matrix | Detects WAF / CDN signatures (Cloudflare, AWS WAF, Akamai) and headers. |
-| `surface_auditor` | Surface Audit | Native Engine Auditor | Audits OpenAPI/Swagger specs, `.well-known` endpoints, and sensitive files. |
-| `cors_checker` | Logic Audit | CORS Engine | Active CORS audit for arbitrary origin reflection and credential exposure. |
-| `graphql_probe` | API Recon | GraphQL Engine | Detects GraphQL endpoints and audits schema introspection status. |
-| `hydra` | Logic & BAC | Hydra Engine | Multi-engine differential mutation probe for broken access control & parameter anomalies. |
-| `cloudscout` | Cloud Assets | CloudScout Engine | Discovers and verifies public AWS S3, Azure Blob, GCP, and Firebase buckets. |
-| `transport_auditor` | Transport Audit | SSL/TLS & Cookie Engine| Audits TLS ciphers, HSTS enforcement, and cookie security flags (HttpOnly/Secure/SameSite). |
-| `hackerone_search` | Threat Intel | Hacktivity Engine | Retrieves disclosed HackerOne reports and program policy scopes. |
+```
+403_bypass · cloudscout · content_discovery · cookie_inspector ·
+cors_checker · curl · delete_file · dig · dismiss_finding ·
+dns_bruteforce · export_report · fuzz_hunter · gau_nuclei_sweep ·
+generate_cors_poc · google_dork · gowitness · graphql_probe ·
+hackerone_policy · hackerone_search · hackerone_stats · httpx ·
+hydra · jwt_forge · listener · load_skill · manage_scope ·
+nmap_service_scan · otx_urls · permute_subdomains · port_scan ·
+punycode_homoglyphs · read_artifact · record_finding ·
+resolve_candidates · run_terminal_command · save_file · set_target ·
+spider · sqlmap_scan · subfinder · subzy · surface_auditor ·
+takeover_scanner · tls_cert_scan · transport_auditor ·
+urlscan_recon · vhost_fuzz · virustotal_lookup · wafbuster ·
+wayback_urls
+```
+
+Ask the agent itself ("what tools do you have for X?") for what any one of these actually does — asking beats a wall of description text here, and the answer always reflects the real, current tool list instead of a snapshot that can drift out of date.
 
 ---
 
@@ -339,35 +332,19 @@ Bounty Hunter coordinates specialized security tooling into a unified, scope-gov
 
 ## Hunting Methodology Skills
 
-Bounty Hunter includes **27 specialized methodology skills** loaded dynamically into the agent reasoning context:
+Bounty Hunter includes **30 specialized methodology skills**, loaded dynamically into the agent's reasoning context only when a turn actually needs one — not injected all at once:
 
-| Skill | Category | Description |
-| :--- | :--- | :--- |
-| `access-control` | Access Control | IDOR, Broken Object-Level Authorization, and privilege escalation mechanics. |
-| `auth-bypass` | Auth Bypass | Leaked delegation tokens, impersonation chaining, and session hijacking. |
-| `authentication` | Authentication | OAuth, JWT, 2FA/MFA, password recovery, and session token auditing. |
-| `bb-methodology` | Core Mindset | Systematic 5-phase bug bounty workflow and session discipline. |
-| `bug-bounty` | Master Playbook | End-to-end bug bounty lifecycle orchestration and triage tracking. |
-| `web2-recon` | Surface Mapping | Comprehensive subdomain enumeration, port scanning, and live service mapping. |
-| `web2-vuln-classes`| Vulnerability Rules | In-depth heuristics for IDOR, SSRF, SQLi, XSS, SSTI, and OAuth flaws. |
-| `security-arsenal` | Payloads & Bypasses | Curated payload lists, filter bypasses, and WAF evasion techniques. |
-| `triage-validation`| Quality Gate | Strict finding validation to eliminate false positives before reporting. |
-| `report-writing` | Submissions | Formatted templates for HackerOne, Bugcrowd, Intigriti, and Immunefi. |
-| `graphql-audit` | API Security | Introspection queries, batching attacks, and field suggestion exploitation. |
-| `web3-audit` | Smart Contracts | EVM / Solidity vulnerability patterns, reentrancy, and flash loan attacks. |
-| `meme-coin-audit` | Token Security | Liquidity pool manipulation, honeypot detection, and bonding curve flaws. |
-| `mobile-pentest` | Mobile Security | Android/iOS static analysis, deep-link routing, and certificate pinning bypasses. |
-| `cicd-security` | Pipeline Security | GitHub Actions / GitLab CI misconfigurations, secret leakage, and runner abuse. |
-| `credential-attack`| Identity Recon | Password spray strategies, username enumeration, and credential auditing. |
-| `client-reverse` | Reverse Eng | Request-signing analysis and anti-bot token de-obfuscation. |
-| `exposed-source-recon` | Source Code | Git dumps, `.env` leakage, source map recovery, and hardcoded secrets. |
-| `insecure-deserialization` | Deserialization | Python Pickle, PHP serialization, and Java gadget chain exploitation. |
-| `llm-prompt-injection` | AI Security | Indirect prompt injection, system prompt extraction, and guardrail bypass. |
-| `prototype-pollution-mass-assignment`| JS & Object Flaws | JavaScript prototype pollution, object merge flaws, and HTTP mass assignment. |
-| `race-condition` | Concurrency | Limit-overrun, balance exhaustion, TOCTOU flaws, and parallel request probing. |
-| `ssrf` | SSRF | Server-Side Request Forgery, cloud metadata extraction, and internal network pivots. |
-| `ssti` | Template Injection | Server-Side Template Injection across Jinja2, Twig, Freemarker, and Mako. |
-| `argus` | Threat Intel | Deep intelligence correlation and entity relationship graphing. |
+```
+403-bypass · access-control · argus · auth-bypass · authentication ·
+bb-methodology · bug-bounty · cicd-security · client-reverse ·
+cors-misconfig · credential-attack · exposed-source-recon ·
+graphql-audit · idor · insecure-deserialization ·
+llm-prompt-injection · meme-coin-audit · mobile-pentest ·
+prototype-pollution-mass-assignment · race-condition ·
+report-writing · security-arsenal · server-side-parameter-pollution ·
+ssrf · ssti · triage-validation · web2-recon · web2-vuln-classes ·
+web3-audit · xss
+```
 
 Search skills anytime inside the console:
 ```bash
