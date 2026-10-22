@@ -345,7 +345,7 @@ def run(target, emit, options=None):
         for root, _, files in os.walk(source_dir):
             for file in files:
                 files_to_scan.append(os.path.join(root, file))
-        
+
         emit.progress_update(0, label="SOURCE-AUDIT")
         for i, filepath in enumerate(files_to_scan):
             emit.progress_update(i + 1)
@@ -353,36 +353,53 @@ def run(target, emit, options=None):
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     content = f.read()
-                    auditor.audit_file(content, rel_path, use_ai=use_ai, 
+                    auditor.audit_file(content, rel_path, use_ai=use_ai,
                                      ai_key=ai_key, ai_provider=ai_provider,
                                      ai_model=ai_model)
                     auditor.loot["files_scanned"] += 1
             except:
                 pass
+    else:
+        # BUG FIX: this branch used to be written as a `for...else` nested
+        # INSIDE the `if os.path.exists(source_dir):` block above (same
+        # indentation as the `for` loop, not the `if`) — Python's for-else
+        # runs after a loop that completes without `break`, which this one
+        # always does, so the branch only ever executed when source_dir
+        # (`./reconstructed_source/<host>/`) already existed on disk.
+        # Nothing in this codebase ever writes files there — BlobUnpacker
+        # keeps everything in memory (`loot["reconstructed_content"]`) and
+        # hands it over via `options["blobunpacker_intel"]` instead — so in
+        # every real call this whole branch was unreachable dead code:
+        # `os.path.exists(source_dir)` was False, the `if` was skipped
+        # entirely, and `audit_file()` never ran on anything. The function
+        # returned a clean-looking empty result instead of an error, so
+        # this went unnoticed rather than failing loudly. Fixed by making
+        # it the proper `else` of the `if` above, so the in-memory
+        # blobunpacker_intel path — the one every real caller actually
+        # uses — is reachable.
+        blob_intel = options.get("blobunpacker_intel", {})
+        reconstructed_content = blob_intel.get("reconstructed_content", {})
+        minified_content = blob_intel.get("minified_content", {})
+
+        if not reconstructed_content and minified_content:
+            emit.info(f"    [i] Auditing {len(minified_content)} minified files from memory (AI: {'ENABLED' if use_ai else 'OFF'})...")
+            for url, content in minified_content.items():
+                filename = url.split("/")[-1]
+                auditor.audit_file(content, filename, use_ai=use_ai,
+                                 ai_key=ai_key, ai_provider=ai_provider,
+                                 ai_model=ai_model)
+                auditor.loot["files_scanned"] += 1
+        elif reconstructed_content:
+            auditor.loot["reconstructed_files"] = list(reconstructed_content.keys())
+            emit.info(f"    [i] Auditing {len(reconstructed_content)} reconstructed files from memory (AI: {'ENABLED' if use_ai else 'OFF'})...")
+            for filename, content in reconstructed_content.items():
+                auditor.audit_file(content, filename, use_ai=use_ai,
+                                 ai_key=ai_key, ai_provider=ai_provider,
+                                 ai_model=ai_model)
+                auditor.loot["files_scanned"] += 1
         else:
-            blob_intel = options.get("blobunpacker_intel", {})
-            reconstructed_content = blob_intel.get("reconstructed_content", {})
-            minified_content = blob_intel.get("minified_content", {}) 
-            
-            if not reconstructed_content and minified_content:
-                emit.info(f"    [i] Auditing {len(minified_content)} minified files from memory (AI: {'ENABLED' if use_ai else 'OFF'})...")
-                for url, content in minified_content.items():
-                    filename = url.split("/")[-1]
-                    auditor.audit_file(content, filename, use_ai=use_ai, 
-                                     ai_key=ai_key, ai_provider=ai_provider,
-                                     ai_model=ai_model)
-                    auditor.loot["files_scanned"] += 1
-            elif reconstructed_content:
-                auditor.loot["reconstructed_files"] = list(reconstructed_content.keys())
-                emit.info(f"    [i] Auditing {len(reconstructed_content)} reconstructed files from memory (AI: {'ENABLED' if use_ai else 'OFF'})...")
-                for filename, content in reconstructed_content.items():
-                    auditor.audit_file(content, filename, use_ai=use_ai, 
-                                     ai_key=ai_key, ai_provider=ai_provider,
-                                     ai_model=ai_model)
-                    auditor.loot["files_scanned"] += 1
-            else:
-                emit.warn("    [!] No source found (reconstructed or minified). Run 'BlobUnpacker' first.")
-                return {"raw": "No source files found for auditing.", "intel": {}, "risk_score": 0}
+            emit.warn("    [!] No source found (reconstructed or minified). Run 'BlobUnpacker' first.")
+            return {"raw": "No source files found for auditing.", "intel": {}, "risk_score": 0}
 
     # Cross-Module Fix: Process headers from BlobUnpacker
     blob_intel = options.get("blobunpacker_intel", {})

@@ -55,8 +55,17 @@ def shannon_entropy(data):
     return entropy
 
 class BlobUnpacker:
-    def __init__(self, emit):
+    def __init__(self, emit, session=None):
         self.emit = emit
+        # Was always a bare, unauthenticated `requests.get` with no way to
+        # carry this target's captured session — JS bundles/sourcemaps
+        # served only to logged-in users (common for internal/admin SPA
+        # bundles) were silently unreachable. Caller passes a
+        # pre-configured requests.Session() (same auth_cookies/auth_headers
+        # path every other rule-based module now uses via
+        # http_utils.apply_session_config); falls back to a bare session
+        # so this class still works standalone.
+        self.session = session or requests.Session()
         self.loot = {
             "reconstructed_files": [],
             "reconstructed_content": {}, # filename -> content
@@ -85,7 +94,7 @@ class BlobUnpacker:
                 data = json.loads(map_content)
                 resp_headers = {"Content-Type": "application/json", "X-Source-Map-Source": "inline"}
             else:
-                resp = requests.get(map_url, timeout=10, verify=False, allow_redirects=True)
+                resp = self.session.get(map_url, timeout=10, verify=False, allow_redirects=True)
                 if resp.status_code != 200:
                     self.emit.error(f"Failed to fetch map: {display_name} (Status: {resp.status_code})")
                     return
@@ -237,7 +246,7 @@ class BlobUnpacker:
     def scan_js_for_maps(self, js_url: str):
         """Fetches a JS file, mines it for secrets/routes, and looks for a source map using De-Caffeinator logic"""
         try:
-            resp = requests.get(js_url, timeout=5, verify=False)
+            resp = self.session.get(js_url, timeout=5, verify=False)
             if resp.status_code == 200:
                 # 1. Beautify and Mine the JS file itself
                 beautified = self._beautify_js(resp.text)
@@ -279,6 +288,10 @@ def run(target, emit, options=None):
     
     opt = options or {}
     spider_intel = opt.get("spider_intel", {})
+
+    from hellhound.core import http_utils
+    session = requests.Session()
+    http_utils.apply_session_config(session, opt)
     raw_maps = spider_intel.get("sourcemaps", [])
     maps = set()
     
@@ -299,7 +312,7 @@ def run(target, emit, options=None):
     # --- UPGRADE: Active Ingestion / Crawling (Ported from De-Caffeinator) ---
     emit.info("Running active JS discovery (HTML & Next.js chunk parsing)...")
     try:
-        idx_resp = requests.get(target, timeout=10, verify=False)
+        idx_resp = session.get(target, timeout=10, verify=False)
         if idx_resp.status_code == 200:
             html = idx_resp.text
             
@@ -315,7 +328,7 @@ def run(target, emit, options=None):
                 build_id = manifest_match.group(1)
                 manifest_url = urljoin(target, f"/_next/static/{build_id}/_buildManifest.js")
                 
-                m_resp = requests.get(manifest_url, timeout=5, verify=False)
+                m_resp = session.get(manifest_url, timeout=5, verify=False)
                 if m_resp.status_code == 200:
                     emit.info("Discovered Next.js build manifest! Extracting hidden chunks...")
                     chunks = re.findall(r'["\']([^"\']+\.js)["\']', m_resp.text)
@@ -330,7 +343,7 @@ def run(target, emit, options=None):
     # Remove duplicates
     js_files = list(set(js_files))
     
-    unpacker = BlobUnpacker(emit)
+    unpacker = BlobUnpacker(emit, session=session)
     
     emit.progress_start("BlobUnpacker")
     emit.info(f"Blob Unpacker (Intelligence Mastery): {target}")
