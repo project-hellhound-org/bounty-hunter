@@ -553,7 +553,30 @@ class ThinkingIndicator:
         immediately. Just relabels the already-running spinner; does not
         touch the thread.
         """
+        self._progress_label = desc
+        self._progress_total = total
         self.set_label(desc)
+
+    def progress_update(self, current, label=None):
+        """Modules that run through engine.run_single() (BlobUnpacker,
+        SourceAuditor, and anything else with a per-item scan loop) call
+        emit.progress_update(current, label=...) throughout their run —
+        PlainEmit/ConsoleEmit always implemented this, but a raw
+        ThinkingIndicator (what the interactive console's main REPL loop
+        actually passes as `emit`, see chat_ui.py) never did, so any such
+        module crashed with AttributeError partway through — e.g.
+        js_static_analysis/BlobUnpacker hitting this the moment it started
+        iterating JS files, aborting the whole scan. Mirrors progress_start:
+        just relabels the already-running spinner, now reflecting live
+        current/total counts instead of going silent on exactly the modules
+        that actually report granular progress.
+        """
+        desc = label or getattr(self, "_progress_label", None) or "Working"
+        total = getattr(self, "_progress_total", 0) or 0
+        if total:
+            self.set_label(f"{desc} ({current}/{total})")
+        else:
+            self.set_label(f"{desc} ({current})")
 
     def progress_stop(self):
         """Counterpart to progress_start(). Deliberately a no-op rather
@@ -571,15 +594,27 @@ class ThinkingIndicator:
             self.status_callback("tool_start", {"tool": tool_name, "args": args})
             return
         formatted_name = tool_name.replace("_", " ").title().replace(" ", "")
+        # The researcher needs to actually SEE what's about to run — a
+        # privileged ssh/sudo/cron command truncated to "ssh -o StrictHo..."
+        # at 35 chars tells them nothing and means the first time they find
+        # out what really ran is by scrolling back through a wall of
+        # "still running" lines after the fact. The command/script/payload-
+        # carrying args below get a much higher cap than everything else;
+        # for run_terminal_command specifically (the one that actually
+        # executes shell commands against a target), the command is shown
+        # close to in full and the overall-line cap is skipped entirely.
+        _HIGH_VISIBILITY_ARGS = ("command", "script", "payload", "data", "body")
+        per_value_cap = 220 if tool_name == "run_terminal_command" else 90
         args_items = []
         for k, v in (args or {}).items():
             val_str = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
-            if len(val_str) > 35:
-                val_str = val_str[:32] + "..."
+            cap = per_value_cap if (k in _HIGH_VISIBILITY_ARGS or tool_name == "run_terminal_command") else 55
+            if len(val_str) > cap:
+                val_str = val_str[:cap - 3] + "..."
             args_items.append(f"{k}={val_str}")
         args_str = ", ".join(args_items)
-        if len(args_str) > 75:
-            args_str = args_str[:72] + "..."
+        if tool_name != "run_terminal_command" and len(args_str) > 140:
+            args_str = args_str[:137] + "..."
         with self.lock:
             try:
                 if sys.stdout and not sys.stdout.closed:

@@ -17,6 +17,7 @@ import logging
 import time
 import os
 import threading
+import concurrent.futures
 from pathlib import Path
 import re
 import subprocess
@@ -36,13 +37,18 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from hellhound.core.scope import is_in_scope, check_module_against_rules, normalize_host, ScopeRules
-from hellhound.core.tasks import Target, create_or_load_target, save_target, sanitize_target_name
+from hellhound.core.tasks import (
+    Target, create_or_load_target, save_target, sanitize_target_name,
+    attach_target_to_program, set_program_scope, list_program_targets,
+    load_program, sanitize_program_name,
+)
 from hellhound.core.guard import AutopilotGuard
 from hellhound.core.ai_utils import (
     load_config,
     ask_neural_core,
     SYNTHESIZER_PERSONA,
     CHAT_PERSONA_SLM,
+    ThinkingIndicator,
 )
 from hellhound.core.http_utils import (
     merge_global_context,
@@ -733,6 +739,44 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
             label=f"run_terminal_command ({target_host or 'target'})",
             shell=True, env=child_env,
         )
+
+        # Best-effort capture of a credential pair that just got CONFIRMED
+        # INVALID (ssh/sshpass/expect auth failure) — without this, the
+        # only record of "james13 already failed against james/joe/ninja"
+        # lived in free-text conversation history, which a long tool-heavy
+        # turn can lose track of, leading to the exact thing this exists to
+        # stop: re-testing a password that was already proven wrong.
+        # Recorded into target.state so _get_orchestrator_system_prompt can
+        # surface it as hard evidence, not just hope the model remembers.
+        try:
+            combined_out = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+            auth_fail_signal = any(s in combined_out for s in (
+                "Permission denied", "Authentication failed", "Login incorrect",
+                "incorrect password", "Access denied", "auth fail",
+            ))
+            looks_like_auth_attempt = any(t in command for t in ("ssh", "sshpass", "expect", "ftp", "mysql -u", "psql"))
+            if auth_fail_signal and looks_like_auth_attempt and hasattr(target, "state") and isinstance(target.state, dict):
+                identity = None
+                password = None
+                m_user = re.search(r'([A-Za-z0-9_.-]+)@(?:[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}|[A-Za-z0-9_.-]+)', command)
+                if m_user:
+                    identity = m_user.group(1)
+                m_pw = re.search(r"sshpass\s+-p\s+'([^']*)'", command) or re.search(r'sshpass\s+-p\s+"([^"]*)"', command)
+                if not m_pw:
+                    m_pw = re.search(r'send\s+"([^"\\]*)\\r"', command)
+                if m_pw:
+                    password = m_pw.group(1)
+                if identity and password:
+                    failed_creds = target.state.setdefault("failed_credentials", [])
+                    entry = {"identity": identity, "password": password, "method": "ssh/auth", "target": target_host or target.name}
+                    if entry not in failed_creds:
+                        failed_creds.append(entry)
+                        if len(failed_creds) > 30:
+                            del failed_creds[: len(failed_creds) - 30]
+                        save_target(target)
+        except Exception:
+            pass  # credential-failure capture is best-effort and must never break the actual command result
+
         return {
             "command": command,
             "stdout": proc.stdout,
@@ -859,6 +903,109 @@ def _execute_manage_scope(args: Dict[str, Any], target: Target, emit: Any) -> Di
         "status": "success", "action": "added", "list": list_name, "added": added,
         "in_scope": list(rules.in_scope), "out_scope": list(rules.out_scope), "disallowed": list(rules.disallowed),
     }
+
+
+def _execute_manage_program(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Groups several in-scope domains from the SAME bug-bounty program/
+    engagement (e.g. a program called "AGOV" shipping 10 in-scope domains)
+    under one program record, instead of each domain becoming its own
+    disconnected flat target with no relationship to the others.
+
+    This is the fix for a real organizational bug: before this, the only
+    way to represent "a program with multiple in-scope domains" was to
+    rename the CURRENT target to the program's name and add every domain
+    to ITS scope_rules.in_scope list — which meant there was exactly one
+    target/session/findings-bucket for the whole program, every domain's
+    recon/curl history/session state got mashed into that same bucket, and
+    switching "to" a specific domain to actually test it didn't exist as a
+    concept (set_target just renamed the active target again). Now: each
+    in-scope domain still gets its OWN real Target (own session, own
+    findings, own curl/evidence history — set_target still switches to it
+    normally), but they're tagged with the same `program` and share one
+    scope definition, so adding/removing a domain from the program's scope
+    (set_scope action) updates every domain under it at once, and `list`/
+    `show` give a single view of "everything in this engagement."
+    """
+    action = (args.get("action") or "show").strip().lower()
+    program_name = str(args.get("program_name") or target.program or "").strip()
+
+    if action == "show" or action == "list":
+        if not program_name:
+            return {"status": "error", "error": "No program_name given and the current target isn't attached to a program yet."}
+        record = load_program(program_name)
+        if not record:
+            return {"status": "not_found", "error": f"No program named '{program_name}' has been created yet. Use action='create' first."}
+        return {
+            "status": "success", "action": action,
+            "program": record["name"], "display_name": record.get("display_name", record["name"]),
+            "targets": record.get("targets", []),
+            "scope_rules": record.get("scope_rules", {}),
+        }
+
+    if action == "create":
+        if not program_name:
+            return {"status": "error", "error": "program_name is required to create a program."}
+        attach_target_to_program(target, program_name)
+        domains_arg = args.get("domains")
+        if isinstance(domains_arg, str):
+            domains_arg = [domains_arg]
+        attached = [target.name]
+        for d in (domains_arg or []):
+            d = str(d).strip().lower()
+            if not d or d == target.name:
+                continue
+            d_target = create_or_load_target(d)
+            attach_target_to_program(d_target, program_name)
+            attached.append(d_target.name)
+        if emit and hasattr(emit, "success"):
+            emit.success(f"[+] Program '{program_name}' created with {len(attached)} target(s): {', '.join(attached)}")
+        return {
+            "status": "success", "action": "create", "program": sanitize_program_name(program_name),
+            "targets": attached,
+            "note": "Each domain listed is its own real target (own findings/session) tagged with this program — switch to one with set_target(name=<domain>) to actually work on it.",
+        }
+
+    if action == "add_domain":
+        if not program_name:
+            return {"status": "error", "error": "program_name is required."}
+        domains_arg = args.get("domains") or args.get("hosts")
+        if isinstance(domains_arg, str):
+            domains_arg = [domains_arg]
+        domains_arg = [str(d).strip().lower() for d in (domains_arg or []) if str(d).strip()]
+        if not domains_arg:
+            return {"status": "error", "error": "No domain(s) given to add — pass 'domains': ['a.example.com', ...]."}
+        attached = []
+        for d in domains_arg:
+            d_target = create_or_load_target(d)
+            attach_target_to_program(d_target, program_name)
+            attached.append(d_target.name)
+        if emit and hasattr(emit, "success"):
+            emit.success(f"[+] Added {len(attached)} domain(s) to program '{program_name}': {', '.join(attached)}")
+        return {
+            "status": "success", "action": "add_domain", "program": sanitize_program_name(program_name),
+            "domains_added": attached,
+            "note": "Each is now its own target under this program and inherited the program's current scope. Switch to one with set_target(name=<domain>).",
+        }
+
+    if action == "set_scope":
+        if not program_name:
+            return {"status": "error", "error": "program_name is required."}
+        raw_text = args.get("scope_text")
+        if not raw_text:
+            domains_arg = args.get("domains")
+            if isinstance(domains_arg, str):
+                domains_arg = [domains_arg]
+            if domains_arg:
+                raw_text = "\n".join(str(d).strip() for d in domains_arg if str(d).strip())
+        if not raw_text:
+            return {"status": "error", "error": "Give either 'scope_text' (raw program rules/domain list) or 'domains' (a list of in-scope domain strings)."}
+        result = set_program_scope(program_name, str(raw_text))
+        if emit and hasattr(emit, "success"):
+            emit.success(f"[+] Program '{program_name}' scope updated — propagated to {len(result['targets_updated'])} target(s): {', '.join(result['targets_updated'])}")
+        return {"status": "success", "action": "set_scope", **result}
+
+    return {"status": "error", "error": f"Unknown action '{action}'. Use one of: create, add_domain, set_scope, show, list."}
 
 
 def _execute_save_file(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -1007,8 +1154,42 @@ def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
                 stdout, stderr = proc.communicate(timeout=min(heartbeat_interval, remaining))
                 return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
             except subprocess.TimeoutExpired:
-                if emit and hasattr(emit, "info"):
-                    emit.info(f"[*] {label} still running ({int(time.monotonic() - start)}s)...")
+                # Was emit.info(...) — ThinkingIndicator.info()/print_step()
+                # prints a brand-new permanent scrollback line on every call,
+                # so a long-running command produced a wall of near-identical
+                # "still running (5s)... still running (10s)..." lines
+                # instead of one line updating in place. set_label() instead
+                # relabels the ALREADY-RUNNING spinner (which already shows
+                # its own live elapsed-time counter), so this now reads as a
+                # single line that updates in place, not N accumulating
+                # ones. Falls back to info() only for a backend with no
+                # spinner to update (e.g. plain headless/API emit), where a
+                # one-line-per-tick log is the correct behavior anyway.
+                elapsed_s = int(time.monotonic() - start)
+                # PlainEmit/ConsoleEmit both define set_label() as a no-op
+                # (nothing to relabel without a live spinner) — checking
+                # hasattr() alone would silently swallow this heartbeat for
+                # every non-interactive backend. The ORIGINAL version of
+                # this check only looked for a `.indicator` attribute,
+                # assuming `emit` would always be chat_ui.py's
+                # InteractiveAgentEmit WRAPPER (which stores its
+                # ThinkingIndicator as self.indicator). CAUGHT IN THE WILD:
+                # the actual interactive console's main REPL loop
+                # (chat_ui.py, start_chat_session) passes the raw
+                # ThinkingIndicator itself as `emit` — it has no
+                # `.indicator` attribute (it IS the indicator), so that
+                # check was always False on the real deployed path and
+                # this silently kept falling through to the info()
+                # branch — printing a brand-new "still running (Ns)..."
+                # scrollback line every heartbeat tick, i.e. the exact
+                # flooding this was supposed to have already fixed.
+                # Detect BOTH shapes: the wrapper (has .indicator) and a
+                # bare ThinkingIndicator passed directly as emit.
+                _live_indicator = isinstance(emit, ThinkingIndicator) or getattr(emit, "indicator", None) is not None
+                if emit and _live_indicator and hasattr(emit, "set_label"):
+                    emit.set_label(f"{label} still running ({elapsed_s}s)")
+                elif emit and hasattr(emit, "info"):
+                    emit.info(f"[*] {label} still running ({elapsed_s}s)...")
                 continue
     finally:
         if proc.poll() is None:
@@ -3034,7 +3215,7 @@ def _is_actionable_artifact(art: Dict[str, Any]) -> bool:
         return False
     if val.lower() in ("true", "false", "null", "none", "undefined", "{}", "[]"):
         return False
-    if field in ("status", "status_code", "content_type", "allow_credentials", "is_admin", "admin"):
+    if field in ("status", "status_code", "content_type", "allow_credentials", "is_admin", "admin", "session_status"):
         return False
     # Defense-in-depth against the same class of bug as the extraction-time
     # fix above (field name substring-matching a pattern like "auth" despite
@@ -3042,6 +3223,25 @@ def _is_actionable_artifact(art: Dict[str, Any]) -> bool:
     # such entry already persisted to a target's saved state from before
     # that fix, e.g. 'authorization_logic_snippets'.
     if field.endswith(("_snippets", "_snippet", "_hints", "_hint", "_summary", "_notes")):
+        return False
+    # CAUGHT IN THE WILD (www.me.agov.admin.ch): curl's own
+    # "SESSION LIKELY DEAD (...) despite a stored session/auth token being
+    # sent..." diagnostic sentence (field_name='session_status', see its
+    # construction ~line 4297) got promoted to a "high-value security
+    # artifact" purely because 'session' is a substring of its field name —
+    # the same bug class as the two cases above, just a field name not yet
+    # on the exclusion list. That sentence can never literally appear in a
+    # later request's headers/cookies (it's prose Hellhound itself wrote
+    # for the model to read, not a value harvested from the target), so it
+    # could never be marked "consumed" and permanently wedged the
+    # ARTIFACT_PRE_FLIGHT_GATE, blocking wayback_urls/spider/etc. for the
+    # rest of the engagement — even while the session it supposedly
+    # concerned was being actively, successfully re-tested turn after
+    # turn. Rather than keep enumerating every future diagnostic field name
+    # one at a time, exclude by SHAPE too: an actual credential/token/
+    # session ID/cookie value is always one contiguous blob (no spaces) —
+    # multi-word prose is a description, never a literal secret to replay.
+    if " " in val and len(val.split()) >= 4:
         return False
     return any(re.search(p, field, re.I) for p in ACTIONABLE_ARTIFACT_PATTERNS)
 
@@ -3141,7 +3341,21 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                 continue
             leaf_key = key.split(".")[-1].split("[")[0].lower()
             if any(re.search(p, leaf_key, re.I) for p in ARTIFACT_KEY_PATTERNS) or any(re.search(p, key, re.I) for p in ARTIFACT_KEY_PATTERNS):
-                if leaf_key in ("status", "status_code", "content_type", "allow_credentials", "is_admin", "admin"):
+                if leaf_key in ("status", "status_code", "content_type", "allow_credentials", "is_admin", "admin", "session_status"):
+                    continue
+                # Same shape-based guard as _is_actionable_artifact below:
+                # curl's own "SESSION LIKELY DEAD (...)" diagnostic sentence
+                # (field_name='session_status') matched r"session" as a pure
+                # field-name substring and got stored as a "high-value
+                # artifact" whose prose value could never literally appear
+                # in a later request, permanently wedging the
+                # ARTIFACT_PRE_FLIGHT_GATE on www.me.agov.admin.ch even
+                # while that very session was being actively re-tested and
+                # confirmed alive turn after turn. A real credential/token/
+                # session ID is always one contiguous blob — multi-word
+                # text is a description Hellhound wrote for the model to
+                # read, never a literal secret to replay.
+                if " " in v_str and len(v_str.split()) >= 4:
                     continue
                 # CAUGHT IN THE WILD: "authorization_logic_snippets" (the
                 # free-text JS/HTML line grabber a few hundred lines up —
@@ -3619,6 +3833,52 @@ def _singular_plural_variants(word: str) -> List[str]:
     return list(variants)
 
 
+# Shared single-worker pool for _bounded_request — requests are dispatched
+# onto it one at a time per call (not pooled connections, just a place to
+# run the blocking call so the calling thread can enforce a real wall-clock
+# ceiling on it). Module-level so it's created once, not per-call.
+_BOUNDED_REQUEST_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="hh-http")
+
+
+def _bounded_request(fn: Callable[[], Any], hard_timeout: float = 20.0):
+    """
+    Runs a blocking network call (a requests.get/post/request(...) lambda)
+    with a REAL wall-clock ceiling, regardless of what it's actually stuck
+    on inside.
+
+    Why this exists: every direct `requests.*` call in this file already
+    passes timeout=N, but requests'/urllib3's timeout only covers the
+    connect and read phases of an established socket — it does NOT cover
+    DNS resolution (socket.getaddrinfo()), which happens first and has no
+    timeout of its own. On a network where a name silently doesn't resolve
+    (firewalled, sinkholed, a slow/overloaded resolver), getaddrinfo() can
+    block for the OS resolver's own retry/timeout budget — tens of seconds
+    to a few minutes, far past the "timeout=10" the code asked for. Because
+    that's a blocking C-level call, it's also NOT interruptible by the
+    console's cooperative SIGINT-based soft-cancel (_InterruptGuard in
+    chat_ui.py) on the first Ctrl-C, which is exactly the "stuck for
+    minutes, Ctrl-C does nothing" behavior this fixes.
+
+    Running the call on a worker thread and bounding it with .result(
+    timeout=hard_timeout) guarantees the CALLING thread (the orchestrator
+    loop) gets control back within hard_timeout seconds no matter what —
+    the worker thread may still be blocked and leak until the OS-level hang
+    finally resolves on its own, but it's a daemon-pool thread, so it never
+    keeps the process alive and never blocks the researcher's session
+    again. Raises TimeoutError, which callers turn into a clean error dict
+    instead of hanging.
+    """
+    future = _BOUNDED_REQUEST_POOL.submit(fn)
+    try:
+        return future.result(timeout=hard_timeout)
+    except concurrent.futures.TimeoutError:
+        raise TimeoutError(
+            f"Network call did not complete within {hard_timeout}s (DNS resolution and/or connection appear "
+            f"to be hanging rather than cleanly timing out/refusing — this is usually a firewalled, "
+            f"sinkholed, or unresponsive host, not a slow-but-working one)."
+        )
+
+
 def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     url = args.get("url") or target.name
     method = args.get("method", "GET").upper()
@@ -3720,7 +3980,7 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
 
     try:
         if json_payload is not None:
-            r = requests.request(
+            r = _bounded_request(lambda: requests.request(
                 method=method,
                 url=url,
                 headers=headers,
@@ -3729,9 +3989,9 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                 timeout=10,
                 verify=False,
                 allow_redirects=False
-            )
+            ))
         else:
-            r = requests.request(
+            r = _bounded_request(lambda: requests.request(
                 method=method,
                 url=url,
                 headers=headers,
@@ -3740,7 +4000,7 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                 timeout=10,
                 verify=False,
                 allow_redirects=False
-            )
+            ))
 
         # ── Capture REAL, unedited proof of this exact request/response ──
         # This is what record_finding/export_report pull from later instead
@@ -4978,6 +5238,144 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
         return {"url": url, "error": f"Spider error: {e}"}
 
 
+def _execute_katana(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Targeted crawl via ProjectDiscovery's katana — a purpose-built, fast Go
+    crawler (JS-aware endpoint discovery, form/field extraction) that
+    complements the built-in Spider module rather than replacing it: Spider
+    is Hellhound's own crawler with deep intel extraction (credentials,
+    secrets, JS orphan params) wired straight into investigation memory;
+    katana is the researcher's preferred tool for FAST, EFFICIENT crawling
+    on a specific scope when they want katana specifically rather than
+    Spider's own slower, deeper pass. Use this when the researcher names
+    katana directly, or when Spider already ran and a quicker, narrower
+    pass is what's needed. Discovered endpoints feed the same
+    target.state["endpoints"]/js_routes bucket Spider uses, so later tools
+    (content_discovery, js_static_analysis, etc.) see the combined result
+    either way.
+    """
+    url = args.get("url") or target.name
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    depth = args.get("depth", 2)
+    try:
+        depth = max(1, min(int(depth), 5))
+    except (TypeError, ValueError):
+        depth = 2
+    js_crawl = bool(args.get("js_crawl", True))
+    known_files = args.get("known_files")  # e.g. "robotstxt,sitemapxml" — katana's own flag values
+
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("katana", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
+        return {
+            "error": "katana not installed",
+            "message": check["message"],
+            "hint": "pdtm -i katana",
+            "note": "The built-in 'spider' tool still works without katana — use that instead if katana can't be installed right now.",
+        }
+
+    binary = get_binary_path("katana") or "katana"
+    cmd = [binary, "-u", url, "-d", str(depth), "-silent", "-jsonl", "-timeout", "15", "-no-color"]
+    if js_crawl:
+        cmd.append("-jc")
+    if known_files:
+        cmd.extend(["-kf", str(known_files)])
+
+    auth_opts = _target_auth_options(target)
+    auth_headers = auth_opts.get("auth_headers") or {}
+    auth_cookies = auth_opts.get("auth_cookies") or {}
+    for hk, hv in auth_headers.items():
+        cmd.extend(["-H", f"{hk}: {hv}"])
+    if auth_cookies:
+        cookie_str = "; ".join(f"{k}={v}" for k, v in auth_cookies.items())
+        cmd.extend(["-H", f"Cookie: {cookie_str}"])
+
+    try:
+        proc = _run_cmd_with_heartbeat(cmd, timeout=90, emit=emit, label=f"katana crawl ({url})")
+    except subprocess.TimeoutExpired:
+        return {"url": url, "error": "katana timed out after 90s — try a lower depth."}
+    except Exception as e:
+        return {"url": url, "error": f"katana execution failed: {e}"}
+
+    endpoints: List[str] = []
+    js_routes: List[str] = []
+    forms_found = 0
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            # Not every katana build/flag-set emits valid JSON per line —
+            # fall back to treating the raw line as a bare URL rather than
+            # silently dropping the whole crawl's output.
+            if line.startswith(("http://", "https://")):
+                endpoints.append(line)
+            continue
+        req = rec.get("request") if isinstance(rec, dict) else None
+        ep = (req or {}).get("endpoint") or (rec.get("url") if isinstance(rec, dict) else None)
+        if not ep:
+            continue
+        ep = str(ep).strip()
+        if ep.lower().endswith(".js") or ".js?" in ep.lower():
+            if ep not in js_routes:
+                js_routes.append(ep)
+        elif ep not in endpoints:
+            endpoints.append(ep)
+        if isinstance(rec, dict) and rec.get("response", {}).get("forms"):
+            forms_found += len(rec["response"]["forms"])
+
+    try:
+        update_from_spider(target, endpoints=endpoints, js_routes=js_routes)
+        save_target(target)
+    except Exception:
+        pass
+
+    return {
+        "url": url,
+        "depth": depth,
+        "endpoints_found": len(endpoints),
+        "js_routes_found": len(js_routes),
+        "sample_endpoints": endpoints[:50],
+        "js_routes": js_routes[:30],
+        "forms_found": forms_found,
+        "stderr_tail": (proc.stderr or "").strip()[-500:] if proc.returncode != 0 else None,
+    }
+
+
+_LAB_TLDS = (".thm", ".htb", ".local", ".test", ".lan", ".internal")
+
+
+def _is_likely_lab_target(target: Target) -> bool:
+    """
+    Best-effort heuristic: is this host almost certainly a CTF/lab/internal
+    engagement rather than a real public bug-bounty/pentest target? Used to
+    decide whether privilege-escalation-flavored actions (cron hijacking,
+    sudo abuse, writing to root-owned paths) can proceed on the researcher's
+    standing say-so for this session, or should pause and ask first — a
+    private RFC1918/loopback/link-local IP or a known lab TLD (.thm/.htb/
+    etc, TryHackMe/HackTheBox conventions) is overwhelmingly a VPN-routed
+    lab box, never a real company's production asset. A real public host
+    always falls through to "ask first" instead of guessing.
+    """
+    import ipaddress
+    host = (target.host or target.name or "").strip().lower()
+    if not host:
+        return False
+    host_no_port = host.split(":")[0].split("/")[0]
+    if any(host_no_port.endswith(tld) for tld in _LAB_TLDS) or host_no_port in ("localhost",):
+        return True
+    try:
+        ip = ipaddress.ip_address(host_no_port)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    except ValueError:
+        return False
+
+
 def _target_auth_options(target: Target) -> Dict[str, Any]:
     """
     Pulls this target's already-captured authenticated session (from a
@@ -5310,13 +5708,13 @@ def _execute_waf_evasion_probe(args: Dict[str, Any], target: Target, emit: Any) 
             if method == "GET":
                 sep = "&" if "?" in url else "?"
                 probe_url = f"{url}{sep}{param}={mut['value']}"
-                r = requests.get(probe_url, headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False)
+                r = _bounded_request(lambda: requests.get(probe_url, headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False))
             else:
                 probe_url = url
                 headers_post = dict(headers)
                 headers_post.setdefault("Content-Type", "application/x-www-form-urlencoded")
-                r = requests.request(method, probe_url, headers=headers_post, cookies=cookies,
-                                      data=f"{param}={mut['value']}", timeout=10, verify=False, allow_redirects=False)
+                r = _bounded_request(lambda: requests.request(method, probe_url, headers=headers_post, cookies=cookies,
+                                      data=f"{param}={mut['value']}", timeout=10, verify=False, allow_redirects=False))
             blocked = _looks_waf_blocked(r.status_code, r.text)
             attempts.append({
                 "mutation": mut["name"], "payload_sent": mut["value"],
@@ -5446,8 +5844,8 @@ def _execute_schema_fuzz(args: Dict[str, Any], target: Target, emit: Any) -> Dic
                 bola_results.append({**cand, "tested": False, "note": "No numeric ID to mutate automatically — try this one manually with a second known object ID (e.g. another test account)."})
                 continue
             try:
-                r_base = requests.request(cand["method"], cand["url"], headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False)
-                r_mut = requests.request(cand["method"], cand["mutated_url"], headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False)
+                r_base = _bounded_request(lambda: requests.request(cand["method"], cand["url"], headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False))
+                r_mut = _bounded_request(lambda: requests.request(cand["method"], cand["mutated_url"], headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False))
                 suspicious = (
                     r_mut.status_code == 200
                     and r_base.status_code == 200
@@ -5485,8 +5883,8 @@ def _execute_schema_fuzz(args: Dict[str, Any], target: Target, emit: Any) -> Dic
             body = {p: "test" for p in legit_params if p}
             body.update(_MASS_ASSIGNMENT_FIELDS)
             try:
-                r = requests.request(method, url, headers={**headers, "Content-Type": "application/json"},
-                                      cookies=cookies, json=body, timeout=10, verify=False, allow_redirects=False)
+                r = _bounded_request(lambda: requests.request(method, url, headers={**headers, "Content-Type": "application/json"},
+                                      cookies=cookies, json=body, timeout=10, verify=False, allow_redirects=False))
                 accepted_fields = []
                 if r.status_code in (200, 201, 202, 204):
                     try:
@@ -5695,6 +6093,152 @@ def _execute_js_static_analysis(args: Dict[str, Any], target: Target, emit: Any)
         "static_analysis_findings": len(findings),
         "findings": findings[:50],
         "risk_score": sa_intel.get("risk_score", blob_intel.get("risk_score", 0)),
+    }
+
+
+def _execute_jsluice(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    JS endpoint/secret extraction via jsluice (BishopFox) — the
+    researcher's preferred alternative to BlobUnpacker's own JS secret/
+    endpoint scan when they want jsluice specifically (it parses the
+    actual JS AST rather than BlobUnpacker's regex-based scan, so it finds
+    structurally-embedded URLs/secrets BlobUnpacker's patterns can miss,
+    at the cost of not doing BlobUnpacker's other job — sourcemap
+    unpacking). Use this when the researcher names jsluice directly, or
+    js_static_analysis (BlobUnpacker) crashed/came back empty and a second
+    pass with a different tool is worth trying on the same JS files.
+
+    jsluice itself only operates on local files, not live URLs, so this
+    fetches each JS file's content first (reusing the target's already-
+    captured session the same way every other tool here does) and feeds
+    it to `jsluice urls` / `jsluice secrets` as temp files.
+    """
+    js_urls = args.get("js_urls")
+    if isinstance(js_urls, str):
+        js_urls = [js_urls]
+    if not js_urls:
+        single = args.get("url")
+        if single:
+            js_urls = [single]
+    if not js_urls:
+        # Fall back to whatever JS files spider/katana already discovered
+        # for this target this session, rather than making the researcher
+        # re-list every .js URL by hand.
+        js_urls = list(target.state.get("js_routes", []) or [])[:20]
+    if not js_urls:
+        return {
+            "error": "No JS file(s) to analyze — pass 'js_urls' (or 'url' for a single file), or run spider/katana first so this can pick up discovered JS files automatically.",
+        }
+
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("jsluice", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
+        return {
+            "error": "jsluice not installed",
+            "message": check["message"],
+            "hint": "go install github.com/BishopFox/jsluice/cmd/jsluice@latest",
+            "note": "js_static_analysis (BlobUnpacker) still works without jsluice — use that instead if jsluice can't be installed right now.",
+        }
+
+    binary = get_binary_path("jsluice") or "jsluice"
+    auth_opts = _target_auth_options(target)
+    fetch_headers = dict(auth_opts.get("auth_headers") or {})
+    fetch_cookies = dict(auth_opts.get("auth_cookies") or {})
+
+    import tempfile
+    all_urls: List[Dict[str, Any]] = []
+    all_secrets: List[Dict[str, Any]] = []
+    fetched = []
+    fetch_errors = []
+
+    with tempfile.TemporaryDirectory(prefix="hh_jsluice_") as tmpdir:
+        local_files = []
+        for js_url in js_urls[:20]:
+            try:
+                r = _bounded_request(lambda u=js_url: requests.get(
+                    u, headers=fetch_headers, cookies=fetch_cookies, timeout=15, verify=False
+                ))
+                if r.status_code >= 400 or not r.text:
+                    fetch_errors.append(f"{js_url}: HTTP {r.status_code}")
+                    continue
+                fname = os.path.join(tmpdir, f"js_{len(local_files)}.js")
+                with open(fname, "w", encoding="utf-8", errors="replace") as f:
+                    f.write(r.text)
+                local_files.append(fname)
+                fetched.append(js_url)
+            except Exception as e:
+                fetch_errors.append(f"{js_url}: {e}")
+
+        if not local_files:
+            return {
+                "error": "Could not fetch any of the given JS file(s) to analyze.",
+                "fetch_errors": fetch_errors,
+            }
+
+        for subcmd, sink in (("urls", all_urls), ("secrets", all_secrets)):
+            try:
+                proc = _run_cmd_with_heartbeat(
+                    [binary, subcmd, *local_files], timeout=45, emit=emit,
+                    label=f"jsluice {subcmd} ({len(local_files)} file(s))"
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception as e:
+                logger.warning(f"jsluice {subcmd} execution failed: {e}")
+                continue
+            for line in (proc.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(rec, dict):
+                    sink.append(rec)
+
+    # Normalize into the same shape extract_and_store_artifacts/record_finding
+    # already know how to read from other recon tools, rather than a
+    # jsluice-specific schema nothing downstream understands.
+    new_endpoints = []
+    for rec in all_urls:
+        u = rec.get("url") or rec.get("path") or rec.get("endpoint")
+        if u and str(u).strip() and str(u) not in new_endpoints:
+            new_endpoints.append(str(u).strip())
+
+    secrets_exposed = []
+    for rec in all_secrets:
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        value = data.get("key") or data.get("secret") or data.get("value") or data.get("token")
+        secrets_exposed.append({
+            "kind": rec.get("kind") or rec.get("type") or "secret",
+            "value": value,
+            "raw": rec if not value else None,  # keep the full record only when we couldn't pull a clean value out of it
+        })
+
+    if new_endpoints and hasattr(target, "state"):
+        try:
+            update_from_spider(target, endpoints=new_endpoints)
+            save_target(target)
+        except Exception:
+            pass
+
+    return {
+        "files_analyzed": len(fetched),
+        "fetched_urls": fetched,
+        "fetch_errors": fetch_errors or None,
+        "new_endpoints_found": len(new_endpoints),
+        "new_endpoints": new_endpoints[:50],
+        "secrets_found": len(secrets_exposed),
+        "secrets_exposed": secrets_exposed[:25],
+        "note": (
+            "jsluice's exact JSON field names can vary by version — if 'secrets_exposed' entries "
+            "show up with raw!=null instead of a clean value, the raw record is still there to "
+            "read manually; the field-name guesses here (data.key/secret/value/token) cover the "
+            "common cases but haven't been verified against every jsluice release."
+        ) if all_secrets else None,
     }
 
 
@@ -6327,6 +6871,46 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     if matched_existing is not None:
         return _merge_into_existing_finding(target, matched_existing, title, note, request_ref, raw_evidence_matches, emit)
 
+    # CAUGHT IN THE WILD (PortSwigger OAuth implicit-flow lab): a finding
+    # titled "OAuth Implicit Flow Authentication - Successfully
+    # authenticated as 'wiener' ... via OAuth implicit flow" got recorded
+    # under kind='auth_bypass' — but that's just the normal login flow
+    # completing with the EXACT valid credentials the researcher supplied
+    # (wiener:peter) for wiener's own account. Nothing was bypassed and no
+    # OTHER identity's account was accessed; it's not a finding, it's a
+    # successful step in the plan. Hard to catch every such case
+    # mechanically, but the shape is recognizable: an auth-bypass/IDOR/
+    # privilege-escalation-category title/note that only describes a plain
+    # successful authentication/login, with no language anywhere indicating
+    # a DIFFERENT identity was actually accessed. This doesn't block the
+    # record — the model's explicit judgment call still wins — but flags it
+    # back so a likely-bogus finding doesn't sail through silently; the
+    # orchestrator prompt has the fuller doctrine on this.
+    caution = None
+    _watch_kinds = ("auth_bypass", "broken_auth", "authentication_bypass", "account_takeover",
+                     "privilege_escalation", "idor", "access_control", "authz_bypass")
+    if kind in _watch_kinds:
+        combined = f"{title} {note}".lower()
+        _login_language = bool(re.search(r"\b(successfully authenticated|logged? ?in|login successful|signed in)\b", combined))
+        _bypass_language = bool(re.search(
+            r"(without (?:a |the |knowing )?password|without knowing|no password|bypass|impersonat|"
+            r"victim|different account|another user|other user'?s|swapped?|substitut|cross-account|"
+            r"account takeover of|as the victim|someone else'?s account|unauthorized access to)",
+            combined
+        ))
+        if _login_language and not _bypass_language:
+            caution = (
+                f"CAUTION: this finding (kind='{kind}') reads like a normal, successful login/"
+                f"authentication with valid credentials you were given — not a description of "
+                f"unauthorized access to a DIFFERENT identity/account. Completing the login step "
+                f"itself is never a vulnerability. Before trusting this finding: does the evidence "
+                f"actually show you accessing data/functionality belonging to an identity OTHER "
+                f"than the one whose credentials were used? If not, call dismiss_finding on this "
+                f"and keep working toward the real objective instead of reporting this as done."
+            )
+            if emit and hasattr(emit, "warn"):
+                emit.warn(f"[!] {caution}")
+
     finding = {"type": title, "kind": kind, "target": request_ref, "severity": severity, "note": note}
     # Attach the REAL captured request/response for this endpoint, if any
     # was seen during this session — not what the model typed from memory.
@@ -6359,6 +6943,8 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         result["raw_evidence_attached"] = len(raw_evidence_matches)
     if auto_report_path:
         result["report_path"] = auto_report_path
+    if caution:
+        result["caution"] = caution
 
     return result
 
@@ -6980,6 +7566,28 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
         refs = item.get("screenshot_refs") or []
         if isinstance(refs, str):
             refs = [refs]
+        # Auto-attach a screenshot the researcher never had to ask for:
+        # the model routinely forgets to pass screenshot_refs even when
+        # gowitness/browser_control already captured one for this exact
+        # endpoint earlier in the session — the report then has a PoC curl
+        # but no visual, which is exactly what got flagged ("no images that
+        # he captured were attached"). Match on the finding's own recorded
+        # target URL (same fuzzy containment-either-direction match used
+        # for curl evidence above) against target.state["screenshots"]
+        # (gowitness) — only when the model gave nothing explicit, so a
+        # deliberate screenshot_refs list is never overridden.
+        if not refs:
+            finding_target_url = (real_finding.get("target") if real_finding else "") or ""
+            if finding_target_url:
+                ft_lower = finding_target_url.strip().lower()
+                for shot in reversed(target.state.get("screenshots") or []):
+                    if not isinstance(shot, dict):
+                        continue
+                    shot_url = (shot.get("url") or shot.get("final_url") or "").strip().lower()
+                    shot_path = shot.get("file_path")
+                    if shot_url and shot_path and (ft_lower in shot_url or shot_url in ft_lower):
+                        refs = [shot_path]
+                        break
         for ref in refs:
             p = _resolve_report_evidence_path(target, str(ref))
             if p:
@@ -7178,14 +7786,41 @@ function hhCopy(id, btn) {{
     except Exception as e:
         return {"error": f"Failed to write report file: {e}"}
 
+    # Also save the SAME report content as a standalone .md file, reusing
+    # report_md_text already built above for the HTML's "Copy as Markdown"
+    # button — no separate generation step. This is what actually fixes a
+    # real duplication bug: before this, the only way to get a GitHub-
+    # flavored Markdown version was the model retyping the whole report a
+    # second time directly into the chat reply when asked for "clean
+    # GitHub Markdown," producing two different-looking write-ups of the
+    # same findings. Now there's one real artifact in each format, both
+    # generated from the exact same data, and nothing needs to be pasted
+    # into the chat response at all — see the doctrine note at this tool's
+    # registration about never re-emitting this text in prose.
+    md_fname = fname[:-5] + ".md" if fname.endswith(".html") else fname + ".md"
+    md_out_path = reports_dir / md_fname
+    md_write_error = None
+    try:
+        md_out_path.write_text(report_md_text, encoding="utf-8")
+    except Exception as e:
+        md_write_error = str(e)  # non-fatal — the HTML report is still the primary deliverable
+
     if emit and hasattr(emit, "success"):
         emit.success(f"[✓] Report written: {out_path} ({len(resolved_findings)} finding(s), {total_screenshots_embedded} screenshot(s) embedded)")
 
     result = {
         "status": "success",
         "path": str(out_path),
+        "markdown_path": str(md_out_path) if not md_write_error else None,
         "findings_included": len(resolved_findings),
         "screenshots_embedded": total_screenshots_embedded,
+        "note": (
+            "Both the HTML report and a matching .md file were written to disk from the same data — "
+            "do NOT also retype/paste the report (or a markdown version of it) into your chat reply. "
+            "Tell the researcher it's ready and give the path(s); if they specifically want the "
+            "Markdown text pasted inline for a quick copy-paste, that's fine to do ONCE on explicit "
+            "request, but it is not the default."
+        ),
     }
     if unmatched_refs:
         result["unmatched_refs"] = unmatched_refs
@@ -7327,7 +7962,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "record_finding": ToolSpec(
         name="record_finding",
-        description="Log a finding you have ALREADY CONFIRMED (via curl/spider/other tools — not a plan or a guess) into the investigation's structured memory, so it persists across turns and feeds the running investigation summary. Use this once you've verified something real: a confirmed IDOR, a role you successfully escalated to, a token leak, etc. Do not use this to record intentions or untested hypotheses.",
+        description="Log a finding you have ALREADY CONFIRMED (via curl/spider/other tools — not a plan or a guess) into the investigation's structured memory, so it persists across turns and feeds the running investigation summary. Use this once you've verified something real: a confirmed IDOR, a role you successfully escalated to, a token leak, etc. Do not use this to record intentions or untested hypotheses. CRITICAL: completing a normal, successful login/authentication with credentials you were legitimately given is NEVER itself a finding, no matter how technically involved the flow was (OAuth, SAML, SSO) — e.g. logging in as 'wiener' using the wiener:peter credentials the researcher gave you is just step one of the task, not a vulnerability. Only call this once you've demonstrated actual unauthorized impact: access to a DIFFERENT identity/account's data or privileges than the one whose credentials you used, an authorization check that should have blocked you but didn't, or similar. If what you have is 'I completed the intended login flow' and the researcher's actual objective (e.g. 'log in as carlos without his password') is still unmet, do not record a finding — keep working toward the real objective, or say plainly what's blocking you.",
         parameters={
             "type": "object",
             "properties": {
@@ -7358,7 +7993,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "export_report": ToolSpec(
         name="export_report",
-        description="Assemble every recorded finding and piece of evidence for this target into a single, self-contained, professional HTML report — headline, executive summary, per-finding impact statements and steps to reproduce, real captured request/response proof for each finding, and every referenced screenshot embedded directly in the file (base64, no linked images that break once the file leaves this machine — e.g. attached to a HackerOne/Bugcrowd submission). Use this at the end of a hunting session when the researcher asks for a report, a writeup, or to export/save findings — and call it again any time the researcher asks to update/add to the report; by default this OVERWRITES the target's one report file in place rather than creating a new one (see new_file). YOU write the narrative (title, executive summary, impact statement, steps to reproduce per finding) — follow the report-writing skill's methodology first (impact-first tone, CVSS 3.1 scoring, never 'could potentially' — prove it or don't claim it). Never fabricate example/placeholder evidence (made-up cookies, made-up response bodies, etc.) — this tool assembles and embeds what you give it faithfully, checks your work (every finding_ref must match something actually recorded via record_finding or logged as evidence during this session; fabricated/unmatched refs are rejected, any recorded finding you leave out gets flagged back to you), AND automatically attaches the real request/response captured during this session for each finding — you do not need to, and should not try to, retype that from memory.",
+        description="Assemble every recorded finding and piece of evidence for this target into a single, self-contained, professional HTML report — headline, executive summary, per-finding impact statements and steps to reproduce, real captured request/response proof for each finding, and every referenced screenshot embedded directly in the file (base64, no linked images that break once the file leaves this machine — e.g. attached to a HackerOne/Bugcrowd submission). It ALSO auto-attaches a matching gowitness screenshot for a finding even when you didn't pass screenshot_refs, if one was captured earlier for that same endpoint — explicit screenshot_refs still wins when you give them. This writes TWO files from the exact same data: the HTML report, and a matching .md file (markdown_path in the result) — a GitHub-flavored Markdown version of the whole report, so you never need to retype/paste the report a second time into your chat reply when the researcher wants Markdown; just point them at both file paths. Use this at the end of a hunting session when the researcher asks for a report, a writeup, or to export/save findings — and call it again any time the researcher asks to update/add to the report; by default this OVERWRITES the target's one report file in place rather than creating a new one (see new_file). YOU write the narrative (title, executive summary, impact statement, steps to reproduce per finding) — follow the report-writing skill's methodology first (impact-first tone, CVSS 3.1 scoring, never 'could potentially' — prove it or don't claim it). Never fabricate example/placeholder evidence (made-up cookies, made-up response bodies, etc.) — this tool assembles and embeds what you give it faithfully, checks your work (every finding_ref must match something actually recorded via record_finding or logged as evidence during this session; fabricated/unmatched refs are rejected, any recorded finding you leave out gets flagged back to you), AND automatically attaches the real request/response captured during this session for each finding — you do not need to, and should not try to, retype that from memory.",
         parameters={
             "type": "object",
             "properties": {
@@ -7805,6 +8440,27 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_spider
     ),
+    "katana": ToolSpec(
+        name="katana",
+        description=(
+            "Fast, targeted crawl via ProjectDiscovery's katana — complements the built-in 'spider' tool (which "
+            "does a slower, deeper pass with full credential/secret/parameter extraction wired into investigation "
+            "memory). Use katana specifically when the researcher names it directly, or when they want a quicker, "
+            "narrower crawl than spider's full pass. Discovered endpoints/JS routes feed the same shared endpoint "
+            "state spider uses, so later tools see the combined result either way."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Base URL of the target application to crawl."},
+                "depth": {"type": "integer", "description": "Crawl recursion depth, 1-5 (default: 2).", "default": 2},
+                "js_crawl": {"type": "boolean", "description": "Follow and parse JS files for additional endpoints (katana's -jc flag). Default true.", "default": True},
+                "known_files": {"type": "string", "description": "Optional: also fetch well-known files, e.g. 'robotstxt,sitemapxml' (katana's -kf flag)."},
+            },
+            "required": ["url"]
+        },
+        executor=_execute_katana
+    ),
     "wafbuster": ToolSpec(
         name="wafbuster",
         description="Detect WAF / CDN signatures and security headers on the target web application.",
@@ -8083,6 +8739,52 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_manage_scope,
     ),
+    "manage_program": ToolSpec(
+        name="manage_program",
+        description=(
+            "Use when the RESEARCHER describes a whole bug-bounty PROGRAM/engagement that has "
+            "several in-scope domains under one umbrella — e.g. 'we're starting the AGOV "
+            "program, in-scope domains are a.gov.sg, b.gov.sg, c.gov.sg', or 'add d.gov.sg to "
+            "the AGOV program', or 'what domains are in the AGOV program'. This is DIFFERENT "
+            "from manage_scope: manage_scope edits one already-selected target's own scope "
+            "lists, while manage_program groups MULTIPLE separate targets (one per in-scope "
+            "domain, each keeping its own findings/session) under a shared program name and a "
+            "shared scope definition. Do NOT rename the current target to the program's name "
+            "and dump every domain into its scope_rules — create a real target per domain "
+            "instead and attach each to the program. Actions: 'create' (start a new program, "
+            "optionally with an initial 'domains' list — also attaches the CURRENTLY ACTIVE "
+            "target to it), 'add_domain' (attach one or more additional in-scope domains/"
+            "targets to an existing program via 'domains'), 'set_scope' (define/replace the "
+            "program's overall scope — pass 'domains' or raw 'scope_text' — propagates to "
+            "every target already attached), 'show' or 'list' (list the program's targets and "
+            "scope). After creating/adding domains, switch to a specific one with the "
+            "set_target tool using that domain's name to actually work on it."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "One of: create, add_domain, set_scope, show, list.",
+                    "enum": ["create", "add_domain", "set_scope", "show", "list"],
+                },
+                "program_name": {
+                    "type": "string",
+                    "description": "The bug-bounty program/engagement name, e.g. 'AGOV'. Required for every action except when the current target is already attached to a program and you're using action='show'.",
+                },
+                "domains": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "In-scope domain(s) to create/attach under this program (create, add_domain), or to use as the scope list (set_scope).",
+                },
+                "scope_text": {
+                    "type": "string",
+                    "description": "Raw multi-line scope/program rules text (alternative to 'domains' for action='set_scope') — anything the program's scope page would contain.",
+                },
+            },
+            "required": ["action"],
+        },
+        executor=_execute_manage_program,
+    ),
     "save_file": ToolSpec(
         name="save_file",
         description=(
@@ -8174,6 +8876,28 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_js_static_analysis
     ),
+    "jsluice": ToolSpec(
+        name="jsluice",
+        description=(
+            "JS endpoint/secret extraction via jsluice (BishopFox) — parses the actual JS AST rather than "
+            "js_static_analysis/BlobUnpacker's regex-based scan, so it can catch structurally-embedded URLs and "
+            "secrets that regex patterns miss. Use this when the researcher names jsluice directly, or as a "
+            "second pass if js_static_analysis crashed or came back empty on JS files that are clearly there. "
+            "Does NOT unpack sourcemaps the way js_static_analysis does — the two are complementary, not "
+            "interchangeable. Operates on specific JS file URLs, not a whole app — pass 'js_urls' if you already "
+            "know which files to check, or omit it to auto-pick up JS files spider/katana already discovered "
+            "this session."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "js_urls": {"type": "array", "items": {"type": "string"}, "description": "JS file URL(s) to analyze. If omitted, falls back to JS files already discovered by spider/katana this session."},
+                "url": {"type": "string", "description": "Shorthand for a single JS file URL (alternative to js_urls)."},
+            },
+            "required": []
+        },
+        executor=_execute_jsluice
+    ),
     "transport_auditor": ToolSpec(
         name="transport_auditor",
         description="Transport & cookie security auditor — inspects SSL/TLS certificates, cipher suites, HSTS enforcement, and cookie security flags (Secure, HttpOnly, SameSite).",
@@ -8207,12 +8931,30 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "set_target": ToolSpec(
         name="set_target",
-        description="Declare the host/domain/IP the researcher wants you to actively hunt against, switching the active session to it. Call this ONLY when the researcher's message is actually directing you to test, scan, recon, or hunt a specific host — never when a domain merely appears in the message as an example, a quoted payload, part of an email address, something being asked ABOUT rather than asked to be tested, or unrelated conversation. When in doubt, don't call it — answer conversationally instead (you can always call it on a later turn once the researcher confirms). No network/recon tool can run until a real target is set this way (or via /target or /scope).",
+        description=(
+            "Declare the host/domain/IP the researcher wants you to actively hunt against, switching the active "
+            "session to it. Call this ONLY when the researcher's message is actually directing you to test, scan, "
+            "recon, or hunt a specific host — never when a domain merely appears in the message as an example, a "
+            "quoted payload, part of an email address, something being asked ABOUT rather than asked to be tested, "
+            "or unrelated conversation. When in doubt, don't call it — answer conversationally instead (you can "
+            "always call it on a later turn once the researcher confirms). No network/recon tool can run until a "
+            "real target is set this way (or via /target or /scope). IMPORTANT: if the researcher's message names "
+            "MULTIPLE hosts belonging to the SAME engagement up front (e.g. 'me.agov.admin.ch is the main app, "
+            "auth.agov.admin.ch is the auth server, idp.agov.admin.ch is the identity provider'), pass every one of "
+            "those additional hosts in 'related_hosts' on THIS call — don't just set the primary one and hope to "
+            "remember to add the rest later with manage_scope, that's what caused real blocked-tool-call friction "
+            "before. Only include hosts the researcher ACTUALLY named this way, never a guess at what else might "
+            "be related."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "host": {"type": "string", "description": "The exact domain, hostname, or IP (with optional :port) the researcher wants tested — copied verbatim from their message, not reconstructed from memory."},
-                "reason": {"type": "string", "description": "One short phrase: what in the researcher's message makes this an actual hunting target (e.g. 'researcher said \"start recon on acme.com\"'), for the audit trail."}
+                "reason": {"type": "string", "description": "One short phrase: what in the researcher's message makes this an actual hunting target (e.g. 'researcher said \"start recon on acme.com\"'), for the audit trail."},
+                "related_hosts": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Other hosts the researcher named in the SAME message as part of this engagement (auth server, IdP, API subdomain, etc.) — pre-authorizes them into scope alongside the primary host so you don't hit a SCOPE_VIOLATION the first time you need to touch one. Only hosts the researcher actually named, never inferred ones.",
+                },
             },
             "required": ["host"]
         },
@@ -9125,14 +9867,56 @@ If there is nothing worth generalizing, return an empty array: []"""
             return {"target": self.target.name, "host": self._display_host, "note": "already the active target — no change made."}
 
         new_target = self.set_target(normalized)
+
+        # Pre-authorize any other hosts the researcher named in the SAME
+        # message as part of this engagement (auth server, IdP, API
+        # subdomain, etc.) — e.g. "me.agov.admin.ch is the main app,
+        # auth.agov.admin.ch is the auth server, idp.agov.admin.ch is the
+        # identity provider". Without this, the primary host got set but
+        # every one of those other explicitly-named hosts still tripped a
+        # SCOPE_VIOLATION the first time a tool actually touched it,
+        # forcing a separate manage_scope detour (or several blocked
+        # attempts) mid-investigation for something the researcher had
+        # already authorized up front in plain language.
+        related_added = []
+        related_rejected = []
+        raw_related = args.get("related_hosts")
+        if isinstance(raw_related, str):
+            raw_related = [raw_related]
+        if isinstance(raw_related, list) and raw_related:
+            if not new_target.scope_rules.in_scope:
+                # No explicit scope existed yet — seed it with the primary
+                # host too, so adding related hosts doesn't accidentally
+                # tip this target from "implicit single-host pin" (any
+                # non-matching host blocked) into "explicit in_scope list"
+                # with the primary host itself missing from it.
+                new_target.scope_rules.in_scope.append(normalized)
+            for rh in raw_related:
+                rh_norm, _ = normalize_host(str(rh).strip())
+                if not rh_norm:
+                    related_rejected.append(str(rh))
+                    continue
+                if rh_norm not in new_target.scope_rules.in_scope:
+                    new_target.scope_rules.in_scope.append(rh_norm)
+                related_added.append(rh_norm)
+            if related_added:
+                save_target(new_target)
+
         msg = f"Target set to '{new_target.name}' ({args.get('reason', '').strip() or 'directed by researcher'})."
+        if related_added:
+            msg += f" Also pre-authorized related host(s) into scope: {', '.join(related_added)}."
         if emit and hasattr(emit, "info"):
             emit.info(f"[*] {msg}")
-        return {
+        result = {
             "target": new_target.name,
             "host": self._display_host,
             "message": msg + " Recon/testing tools may now be used against this host.",
         }
+        if related_added:
+            result["related_hosts_added"] = related_added
+        if related_rejected:
+            result["related_hosts_rejected"] = related_rejected
+        return result
 
     @property
     def _display_host(self) -> str:
@@ -9372,7 +10156,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # host — gating it on is_in_scope would make it unable to do the one thing it's
         # for; delete_file's only "target" is a bare filename, which _extract_target_
         # from_args would wrongly try to parse as a host/URL).
-        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "save_file", "delete_file", "cookie_inspector"):
+        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
@@ -9857,6 +10641,26 @@ If there is nothing worth generalizing, return an empty array: []"""
             if self._turn_path_scope:
                 path_scope_prompt = f"\nACTIVE LAB PATH SCOPE: '{self._turn_path_scope}' (ALL tool URLs MUST begin with 'https://{self._display_host}{self._turn_path_scope}/...'; root '/' and other paths are out of scope)\n"
 
+            if _is_likely_lab_target(self.target):
+                escalation_prompt = (
+                    "\nTARGET CLASSIFICATION: this host (private/internal IP or a .thm/.htb/.local-style "
+                    "lab TLD) looks like a CTF/lab/VPN-routed box, not a real public asset — go ahead and "
+                    "chase privilege escalation (cron hijacking, sudo abuse, SUID binaries, writing to "
+                    "root-owned paths, etc.) once you have a foothold, without pausing to ask each step.\n"
+                )
+            else:
+                escalation_prompt = (
+                    "\nTARGET CLASSIFICATION: this host does NOT look like a private/lab box (not a "
+                    "reserved IP range, not a known lab TLD) — treat it as a real engagement. Enumeration, "
+                    "recon, and confirming a foothold (auth bypass, SQLi, a working login) are fine on your "
+                    "own initiative. Before actually EXECUTING a privilege-escalation step on this host "
+                    "(abusing a cron job, sudo, a SUID binary, modifying anything root-owned) — as opposed "
+                    "to just reading/enumerating what's there — stop and tell the researcher what you found "
+                    "and what you'd do next, and wait for their go-ahead. If they've already told you this "
+                    "engagement is a CTF/lab/authorized pentest, that counts as the go-ahead — don't ask "
+                    "again every single step, just say it once up front.\n"
+                )
+
             known_eps = (self.target.state.get("endpoints") or [])[:35]
             known_params = (self.target.state.get("spider_intel") or {}).get("parameters", [])[:15]
             known_creds = self.target.state.get("credentials") or (self.target.state.get("spider_intel") or {}).get("credentials", [])
@@ -9891,6 +10695,12 @@ If there is nothing worth generalizing, return an empty array: []"""
                         cred_lines.append(f"  - {c}")
                 if cred_lines:
                     intel_parts.append("HARVESTED IDENTITIES, CREDENTIALS & LEAKED TOKENS:\n" + "\n".join(cred_lines))
+            failed_creds = self.target.state.get("failed_credentials") or []
+            if failed_creds:
+                fail_lines = [f"  - [{c.get('identity')}] password={c.get('password')!r} (confirmed invalid via {c.get('method', 'auth attempt')})" for c in failed_creds[:20]]
+                intel_parts.append(
+                    "CREDENTIALS ALREADY CONFIRMED INVALID — DO NOT RETRY THESE EXACT PAIRS:\n" + "\n".join(fail_lines)
+                )
             if active_cookies or active_auth:
                 session_lines = []
                 if active_cookies:
@@ -9933,7 +10743,7 @@ NON-NEGOTIABLE, before anything else in this prompt: every response you give is 
 
 TARGET: {self._display_host}
 RESEARCHER MISSION & OBJECTIVE: {original_user_text}
-SCOPE: {scope_summary}{path_scope_prompt}
+SCOPE: {scope_summary}{path_scope_prompt}{escalation_prompt}
 {artifact_header}
 {skills_block}
 
@@ -10453,6 +11263,98 @@ INSTRUCTIONS:
   explicitly asked you to delete something, and let the approval prompt
   do its job from there — don't chain it in as a self-initiated "next
   step" off an open-ended or reflective question.
+- WHEN THE RESEARCHER SAYS THE TARGET'S ADDRESS CHANGED, THIS IS THE SAME
+  ENGAGEMENT, NOT A NEW ONE: if the researcher says the IP changed, to use
+  a hostname instead (e.g. an /etc/hosts entry), or that the box got a new
+  address, that is a connection-detail update to the investigation already
+  under way — NOT an instruction to start over. Don't create a fresh target
+  and re-run recon (spider, content discovery, subdomain enum, etc.) that
+  already completed under the old address; everything already learned
+  (endpoints, credentials, session, findings) still applies, only the
+  host/IP used to reach it changes. If you're not sure whether a brand-new
+  `set_target` is warranted versus just switching the connection string,
+  ask rather than silently redoing hours of recon from zero.
+- WHEN THE RESEARCHER NAMES A PROGRAM WITH MULTIPLE IN-SCOPE DOMAINS, GROUP
+  THEM — DON'T RENAME THE CURRENT TARGET: if the researcher describes a
+  whole bug-bounty program/engagement and lists several in-scope domains
+  (e.g. "we're starting the AGOV program, in-scope domains are a.gov.sg,
+  b.gov.sg, c.gov.sg"), call manage_program with action='create', the
+  program name, and the domain list — this creates one real target per
+  domain (each keeping its own findings/session/recon history) and tags
+  them all under the shared program, rather than renaming your current
+  target to the program's name and cramming every domain into ITS own
+  scope_rules.in_scope (which mashes unrelated domains' state into one
+  bucket and leaves no way to switch between them cleanly). If the
+  researcher adds a domain to an already-existing program later, use
+  manage_program action='add_domain' — it automatically inherits the
+  program's current scope. If the researcher updates the program's overall
+  scope, use manage_program action='set_scope' once — it propagates to
+  every domain already attached, instead of repeating /scope per domain.
+  To actually test a specific domain under a program, switch to it with
+  set_target the normal way; manage_program only organizes which targets
+  belong together, it doesn't replace set_target for switching.
+- WHEN THE RESEARCHER NAMES SEVERAL HOSTS FOR ONE TARGET UP FRONT, PRE-
+  AUTHORIZE THEM ON THE SAME set_target CALL: if the researcher's message
+  that directs you to a target also names its related hosts by role (e.g.
+  "me.agov.admin.ch is the main app, auth.agov.admin.ch is the auth app,
+  idp.agov.admin.ch is the identity provider"), pass ALL of those other
+  hosts in set_target's `related_hosts` list on that same call. Don't just
+  set the primary host and find out later, mid-investigation, that every
+  one of those explicitly-named hosts still trips a SCOPE_VIOLATION the
+  first time you actually need one — that's wasted turns on something the
+  researcher already authorized in plain language. Only include hosts the
+  researcher actually named this way, never a guess at what else might be
+  related.
+- A SCOPE_VIOLATION ON A HOST REACHED VIA A LEGITIMATE REDIRECT MID-FLOW
+  (OAuth/SSO/SAML) MEANS CALL manage_scope ONCE, NOT RETRY THE BLOCKED
+  CALL: testing login/auth necessarily involves following the in-scope
+  app's own redirect to its identity/OAuth/SAML provider (a `Location`
+  header, an `/auth?...redirect_uri=...` flow, a SAML `AuthnRequest`
+  destination) — that provider is often a genuinely different host/domain
+  you couldn't have known about before the redirect happened, so it's
+  expected to be blocked the FIRST time. The fix is NOT to retry the same
+  curl/browser_control call again hoping it passes, and NOT to abandon the
+  flow — call manage_scope with action='add' for that exact host the
+  moment you see the block, then continue the flow once. If you're not
+  sure the redirect target is really part of the same login flow (vs. an
+  unrelated third-party domain), say so and ask rather than guessing.
+- A SUCCESSFUL LOGIN WITH VALID, GIVEN CREDENTIALS IS NOT A FINDING: when
+  the researcher hands you credentials for an account (e.g. "log in with
+  wiener:peter") as a STEP toward a larger objective (e.g. "the real goal
+  is to access carlos's account without his password"), completing that
+  login is just the setup — it proves nothing was bypassed, because you
+  used real valid credentials for that exact identity. Don't call
+  record_finding for "successfully authenticated as X" when X is the same
+  identity the credentials belong to, however many hops the flow took
+  (OAuth implicit flow, SAML, SSO redirect chains all count — the
+  mechanism being complex doesn't make a normal login into a vulnerability).
+  Keep working toward the actual stated objective (reaching a DIFFERENT
+  identity's account/data without its owner's credentials) and only record
+  a finding once you've demonstrated that. If the researcher points out a
+  recorded finding was actually just this — "that's not a finding, that's
+  just the normal flow" — immediately call dismiss_finding on it and
+  resume working toward the real objective, don't just agree in your reply
+  and leave the bogus finding sitting in the report.
+- NEVER RETRY A CREDENTIAL PAIR ALREADY CONFIRMED INVALID: if this prompt's
+  intel block lists a "CREDENTIALS ALREADY CONFIRMED INVALID" entry, or the
+  conversation/tool history already shows a given identity+password/token
+  combo failing (wrong password, 401, "Permission denied"), do not test
+  that exact pair again against the same or a different account on this
+  target — that's wasted turns and, worse, it can look like credential
+  stuffing/brute-forcing to anyone watching. If the researcher gave you a
+  SPECIFIC credential and said to use it, and it already failed, say so
+  plainly and ask for a different one or move to another vector — don't
+  quietly keep re-trying it hoping for a different result.
+- KATANA AND JSLUICE ARE RESEARCHER-PREFERRED TOOLS, NOT JUST FALLBACKS:
+  the researcher has their own installed copies of katana (crawling) and
+  jsluice (JS endpoint/secret extraction) and prefers them over the
+  built-in spider/js_static_analysis(BlobUnpacker) when they ask for them
+  by name, or when js_static_analysis errors out/comes back empty on JS
+  that's clearly reachable (don't just silently give up on JS analysis at
+  that point — try jsluice as a second pass on the same files). katana and
+  spider are NOT redundant — reach for katana specifically when the
+  researcher wants a faster, narrower crawl rather than spider's slower,
+  deeper pass with full credential/secret extraction.
 - EDUCATIONAL & TECHNIQUE QUERIES: When the researcher asks about offensive security techniques (e.g. 403 bypass, IDOR, SQLi, XSS, SSRF, JWT attacks, auth bypass, privilege escalation, parameter pollution), provide comprehensive, detailed technical explanations with concrete examples, payloads, headers, and methodology. This is educational content essential to bug bounty work — NEVER refuse to explain a technique. You are a bug bounty assistant, not a content filter.
 - OUTPUT FORMAT: Respond in plain natural-language prose with clean markdown structure (headings, bullet points, and code blocks for evidence/PoC). NEVER output a raw tool-call object. Default to a short, flowing explanation (a few paragraphs, not a numbered section per tool call) — reach for headings/sections only when the researcher actually asked for a report or the content genuinely needs that structure to stay readable (e.g. comparing several distinct findings).
 - The conversation history above may end with one or more raw {{"tool": ...}} JSON objects — these are the orchestrator's own failed or stuck tool-call attempts from earlier this turn (malformed JSON, a repeated call, or it simply ran out of attempts), not a real result and not anything the researcher has seen. NEVER copy, quote, or reproduce that JSON — not even inside a code block — as your answer. Treat it as if it weren't there: summarize strictly from the real tool results that actually came back (visible as [TOOL RESULT: ...] entries), and if nothing useful came back at all, say so plainly instead of echoing the stuck attempt.
@@ -11260,7 +12162,27 @@ INSTRUCTIONS:
                 self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx)
             )
         else:
-            if report_requested and has_critical_findings:
+            if report_requested and has_critical_findings and "export_report" in tools_executed:
+                # export_report already wrote the real deliverable this
+                # turn (HTML report + matching .md, both from the same
+                # data, screenshots auto-attached) — regenerating the full
+                # report text here AGAIN as chat prose was the actual
+                # duplication bug: the researcher got the real file plus a
+                # second, differently-written version pasted into the
+                # conversation. Just confirm what was written and where.
+                synth_prompt = (
+                    f"The researcher requested: \"{original_user_text}\"\n\n"
+                    f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
+                    f"export_report already wrote the actual report file(s) this turn (HTML report, plus a "
+                    f"matching .md file written from the exact same data — see that tool's result for both "
+                    f"paths). Do NOT regenerate or retype the report content, findings write-up, or a "
+                    f"Markdown version of it here — that would just be a second, different-looking copy of "
+                    f"what's already saved to disk. Instead, in 2-4 sentences: confirm the report is ready, "
+                    f"state both file paths, and name the finding(s)/severity it covers. Only include the "
+                    f"full report text in your reply if the researcher explicitly asked to see/paste it here "
+                    f"in addition to the file."
+                )
+            elif report_requested and has_critical_findings:
                 synth_prompt = (
                     f"The researcher requested: \"{original_user_text}\"\n\n"
                     f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"

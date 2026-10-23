@@ -8,6 +8,47 @@ warnings.filterwarnings("ignore", message=".*RequestsDependencyWarning.*")
 import click
 
 
+def _configure_logging():
+    """
+    Routes Python's `logging` module to a file instead of the terminal.
+
+    Nothing in this codebase ever called logging.basicConfig()/addHandler(),
+    so every logger.warning()/logger.error() call (e.g. agent.py's
+    "Synthesizer failed after tool execution..." diagnostic, which can
+    include the full raw orchestrator response) fell through to Python's
+    default "handler of last resort" — a bare StreamHandler on sys.stderr,
+    printed with zero coordination with the interactive console's Rich
+    Live/spinner rendering on stdout. The result: a raw, unformatted log
+    line could land mid-character inside an actively-redrawing spinner
+    line, producing exactly the garbled, half-rendered output interleaved
+    with tool output that the console is supposed to never show. Giving the
+    root logger a real FileHandler (and nothing else) means that text now
+    always goes to a log file for later debugging, and NEVER touches the
+    terminal the researcher is actually watching.
+    """
+    import logging
+    from pathlib import Path
+
+    log_dir = Path.home() / ".hellhound" / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(log_dir / "hellhound.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        root = logging.getLogger()
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        # Belt-and-suspenders: explicitly disable the stderr "last resort"
+        # fallback so a logger call before this point (or from a module
+        # that grabs its own logger before configure runs) still can't
+        # reach the terminal even without this handler.
+        logging.lastResort = None
+    except Exception:
+        # Logging to a file failing (e.g. unwritable home dir) must never
+        # block the console from starting — worst case, falls back to
+        # Python's default behavior for that run.
+        pass
+
+
 # -------------------------------------------------
 # Root CLI Group
 # invoke_without_command=True means bare `hellhound`
@@ -41,6 +82,7 @@ def cli(ctx, print_cmd, json_output):
 
 def _execute_headless(command_str: str, force_json: bool = False):
     """Executes a command via central dispatcher in headless mode."""
+    _configure_logging()
     from hellhound.core.commands import dispatch
     from hellhound.core.emit import PlainEmit
     from hellhound.core.ai_utils import load_config
@@ -168,6 +210,7 @@ def terminal_clear():
 # Shared launcher
 # -------------------------------------------------
 def _launch_console():
+    _configure_logging()
     try:
         from hellhound.core.chat_ui import start_chat_session
         start_chat_session()

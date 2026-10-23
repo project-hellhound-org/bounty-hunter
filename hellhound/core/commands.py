@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hellhound.core.scope import ScopeRules, is_in_scope, check_module_against_rules
-from hellhound.core.tasks import create_or_load_target, set_scope as task_set_scope, save_target
+from hellhound.core.tasks import create_or_load_target, set_scope as task_set_scope, save_target, list_program_targets
 from hellhound.core.ai_utils import (
     load_config, save_config, ask_neural_core,
     ping_ollama, list_available_models, detect_ai_config,
@@ -677,6 +677,170 @@ def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         emit.info(f"  Disallowed: {target_obj.scope_rules.disallowed}")
 
     return {"status": "success", "action": "updated", "target": target_obj.name, "scope": target_obj.scope_rules.to_dict()}
+
+
+def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """
+    /program [show [name] | list | create <name> [domain1,domain2,...] | add <domain...> | scope <policy text>]
+
+    For a bug-bounty PROGRAM/engagement with several in-scope domains
+    (e.g. "AGOV" shipping a.gov.sg, b.gov.sg, c.gov.sg) — groups them
+    under one program instead of each domain being its own disconnected
+    flat target. Each domain still gets its own real target (own
+    findings/session/recon history); /program only tags them together and
+    gives them one shared scope. This is entirely separate from /target —
+    nothing here runs automatically when you set a target; use /program
+    explicitly whenever you actually want this structure, so a quick
+    one-off "here's your target, go find X" never gets interrupted asking
+    about programs.
+
+    show [name]              — show a program's attached targets + scope
+                                (default: the CURRENT target's program, if any)
+    list                     — list every program name created so far
+    create <name> [domains]  — create (or re-attach to) a program, attaching the
+                                CURRENT target to it, plus any extra comma-separated
+                                in-scope domains given (each becomes its own real
+                                target, created if it doesn't exist yet) — creates
+                                the program's folder under ~/.hellhound/programs/
+    add <domain...>          — add more in-scope domain(s) to the CURRENT target's
+                                program (comma-separated or space-separated) — the
+                                current target must already belong to one; run
+                                'create' first if not
+    scope <policy text>      — set/REPLACE the whole program's scope (in-scope,
+                                out-of-scope, disallowed), parsed the same free-form
+                                way /scope accepts a pasted program policy page —
+                                propagates to every target already attached to this
+                                program in one shot, instead of repeating /scope on
+                                each domain by hand. Applies to the CURRENT target's
+                                program.
+    """
+    from hellhound.core.tasks import (
+        attach_target_to_program, set_program_scope, load_program,
+        sanitize_program_name, list_programs, list_program_targets,
+    )
+
+    is_json = "--json" in args or getattr(emit, "json_mode", False)
+    clean_args = [a for a in args if a not in ("--json", "-j")]
+
+    target_name = session_context.get("target") or "default"
+    from hellhound.core.tasks import sanitize_target_name as _sanitize_target_name
+    target_name = _sanitize_target_name(target_name)
+    target_obj = create_or_load_target(target_name) if target_name != "default" else None
+
+    def _show_program(prog_name: str) -> Dict[str, Any]:
+        record = load_program(prog_name)
+        if not record:
+            msg = f"No program named '{prog_name}' exists yet. Create one with: /program create {prog_name} [domain1,domain2,...]"
+            if not is_json:
+                emit.warn(msg)
+            return {"status": "not_found", "program": prog_name, "message": msg}
+        rules = record.get("scope_rules") or {}
+        if not is_json:
+            emit.info(f"Program: [bold cyan]{record.get('display_name', record['name'])}[/bold cyan]")
+            emit.info(f"Targets ({len(record.get('targets', []))}): {', '.join(record.get('targets', [])) or 'None'}")
+            emit.info(f"In-Scope ({len(rules.get('in_scope', []))}): {', '.join(rules.get('in_scope', [])) or 'None'}")
+            emit.info(f"Out-of-Scope ({len(rules.get('out_scope', []))}): {', '.join(rules.get('out_scope', [])) or 'None'}")
+            emit.info(f"Disallowed ({len(rules.get('disallowed', []))}): {', '.join(rules.get('disallowed', [])) or 'None'}")
+        return {"status": "success", "program": record["name"], "targets": record.get("targets", []), "scope_rules": rules}
+
+    if not clean_args or clean_args[0] == "show":
+        prog_name = clean_args[1] if len(clean_args) > 1 else (getattr(target_obj, "program", "") if target_obj else "")
+        if not prog_name:
+            msg = (
+                "No program specified and the active target isn't attached to one. "
+                "Usage: /program [show [name] | list | create <name> [domains] | add <domain...> | scope <policy text>]"
+            )
+            if not is_json:
+                emit.info(msg)
+            return {"status": "no_program", "message": msg}
+        return _show_program(prog_name)
+
+    verb = clean_args[0].lower()
+
+    if verb == "list":
+        names = list_programs()
+        if not is_json:
+            if names:
+                emit.info(f"Programs ({len(names)}): {', '.join(names)}")
+            else:
+                emit.info("No programs created yet. Use: /program create <name> [domain1,domain2,...]")
+        return {"status": "success", "programs": names}
+
+    if verb == "create":
+        if len(clean_args) < 2:
+            msg = "Usage: /program create <name> [domain1,domain2,...]"
+            emit.warn(msg)
+            return {"status": "error", "error": "missing_name", "message": msg}
+        prog_name = clean_args[1]
+        if target_name == "default" or target_obj is None:
+            msg = "No active target to attach — set one first with /target <domain>, or pass it as the first in-scope domain."
+            emit.warn(msg)
+            return {"status": "error", "error": "no_active_target", "message": msg}
+        attach_target_to_program(target_obj, prog_name)
+        attached = [target_obj.name]
+        extra_domains = []
+        for raw_entry in clean_args[2:]:
+            extra_domains.extend(raw_entry.split(","))
+        for d in extra_domains:
+            d = d.strip().strip(",").lower()
+            if not d or d == target_obj.name:
+                continue
+            d_target = create_or_load_target(d)
+            attach_target_to_program(d_target, prog_name)
+            attached.append(d_target.name)
+        if not is_json:
+            emit.success(f"Program '{sanitize_program_name(prog_name)}' created — {len(attached)} target(s) attached: {', '.join(attached)}")
+            emit.info(f"Next: /program scope <policy text>  to set the program's shared in-scope/out-of-scope rules.")
+        return {"status": "success", "action": "created", "program": sanitize_program_name(prog_name), "targets": attached}
+
+    if verb == "add":
+        prog_name = getattr(target_obj, "program", "") if target_obj else ""
+        if not prog_name:
+            msg = "The active target isn't attached to a program yet — run /program create <name> first."
+            emit.warn(msg)
+            return {"status": "error", "error": "no_active_program", "message": msg}
+        raw_domains = []
+        for raw_entry in clean_args[1:]:
+            raw_domains.extend(raw_entry.split(","))
+        added = []
+        for d in raw_domains:
+            d = d.strip().strip(",").lower()
+            if not d:
+                continue
+            d_target = create_or_load_target(d)
+            attach_target_to_program(d_target, prog_name)
+            added.append(d_target.name)
+        if not added:
+            msg = "Usage: /program add <domain1,domain2,...>"
+            emit.warn(msg)
+            return {"status": "error", "error": "no_domains_given", "message": msg}
+        if not is_json:
+            emit.success(f"Added {len(added)} domain(s) to program '{prog_name}': {', '.join(added)}")
+        return {"status": "success", "action": "added", "program": prog_name, "domains_added": added}
+
+    if verb == "scope":
+        prog_name = getattr(target_obj, "program", "") if target_obj else ""
+        if not prog_name:
+            msg = "The active target isn't attached to a program yet — run /program create <name> first."
+            emit.warn(msg)
+            return {"status": "error", "error": "no_active_program", "message": msg}
+        raw_text = " ".join(clean_args[1:]).strip()
+        if not raw_text:
+            msg = "Usage: /program scope <policy text>  (same free-form format /scope accepts — domain list or a pasted program policy page)"
+            emit.warn(msg)
+            return {"status": "error", "error": "no_scope_text", "message": msg}
+        result = set_program_scope(prog_name, raw_text)
+        if not is_json:
+            emit.success(f"Scope updated for program '{prog_name}' — propagated to {len(result['targets_updated'])} target(s): {', '.join(result['targets_updated'])}")
+            rules = result.get("scope_rules") or {}
+            emit.info(f"  In-Scope: {rules.get('in_scope', [])}")
+            emit.info(f"  Out-of-Scope: {rules.get('out_scope', [])}")
+            emit.info(f"  Disallowed: {rules.get('disallowed', [])}")
+        return {"status": "success", "action": "scope_updated", **result}
+
+    msg = f"Unknown /program subcommand '{verb}'. Usage: /program [show [name] | list | create <name> [domains] | add <domain...> | scope <policy text>]"
+    emit.warn(msg)
+    return {"status": "error", "error": "unknown_subcommand", "message": msg}
 
 
 def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
@@ -1372,10 +1536,24 @@ def handle_target(args: List[str], session_context: Dict[str, Any], emit: Any) -
         emit.success(f"Active target switched to: [bold cyan]{new_target_name}[/bold cyan]")
         if target_obj.scope_rules.in_scope:
             emit.info(f"In-Scope Target(s): {', '.join(target_obj.scope_rules.in_scope)}")
+        # If this target belongs to a program (set up via the manage_program
+        # tool / an in-chat request to group a bug-bounty program's several
+        # in-scope domains), surface that here too, so switching between a
+        # program's domains makes the grouping visible rather than looking
+        # like a set of unrelated flat targets.
+        if getattr(target_obj, "program", ""):
+            try:
+                sibling_domains = list_program_targets(target_obj.program)
+            except Exception:
+                sibling_domains = []
+            others = [d for d in sibling_domains if d != new_target_name]
+            if others:
+                emit.info(f"Part of program '{target_obj.program}' — other in-scope domain(s): {', '.join(others)}")
 
     return {
         "status": "success",
         "target": new_target_name,
+        "program": getattr(target_obj, "program", ""),
         "scope_rules": target_obj.scope_rules.to_dict()
     }
 
@@ -1727,10 +1905,25 @@ def handle_howl(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
 
 def handle_help(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
-    /help
-    Displays reference table for all available slash commands grouped by category.
+    /help [skills]
+    Displays reference table for all available slash commands grouped by
+    category. Deliberately does NOT list the individual per-skill slash
+    commands (/access-control, /auth-bypass, etc. — auto-registered by
+    _register_skill_commands() purely for tab-completion convenience) —
+    those used to flood the main listing with one row per skill the moment
+    a new skill got added, drowning out the actual commands in a wall of
+    skill descriptions nobody asked for here. That listing lives at
+    /help skills (or just /skills) instead, which already formats it
+    properly (short descriptions, usage counts) rather than as the same
+    flat command-row format as everything else.
     """
     is_json = "--json" in args or getattr(emit, "json_mode", False)
+    clean_args = [a for a in args if a not in ("--json", "-j")]
+
+    # /help skills — explicit opt-in to the skill library listing, instead
+    # of it being baked into the default /help output.
+    if clean_args and clean_args[0].lower() in ("skills", "skill"):
+        return handle_skills([a for a in clean_args[1:]] + (["--json"] if is_json else []), session_context, emit)
 
     catalog = []
     seen = set()
@@ -1738,6 +1931,13 @@ def handle_help(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
         if cmd.name in seen:
             continue
         seen.add(cmd.name)
+        # Per-skill auto-registered commands (category="skills", one per
+        # discovered skill) are deliberately excluded from the general
+        # help catalog — see docstring above. They still work as real
+        # slash commands (tab-complete finds them fine); this only keeps
+        # them out of /help's wall of text.
+        if getattr(cmd, "category", "general").lower() == "skills":
+            continue
         catalog.append({
             "command": cmd.name,
             "aliases": cmd.aliases,
@@ -1780,9 +1980,10 @@ def handle_help(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
                     emit(f"    [dim]Usage:[/dim] [yellow]{escape(u)}[/yellow]")
             emit("")
 
-        # Handle any uncategorized or extra categories
+        # Handle any uncategorized or extra categories (deliberately
+        # excludes "skills" — see docstring above).
         for cat_key, items in grouped.items():
-            if cat_key in category_order:
+            if cat_key in category_order or cat_key == "skills":
                 continue
             emit(f"\n[bold red]─── {cat_key.upper()} ───[/bold red]")
             for item in items:
@@ -1793,6 +1994,8 @@ def handle_help(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
                 for u in usage_lines:
                     emit(f"    [dim]Usage:[/dim] [yellow]{escape(u)}[/yellow]")
             emit("")
+
+        emit("[dim]For the full methodology skill library, run /skills (or /help skills).[/dim]")
 
     return {"status": "success", "commands": catalog}
 
@@ -1919,6 +2122,15 @@ register_command(Command(
     usage="/scope [show | clear | in <host...> | out <host...> | disallow <rule...> | <pasted program policy text>]",
     category="config",
     handler=handle_scope
+))
+
+register_command(Command(
+    name="/program",
+    aliases=["/programs", "/engagement"],
+    description="Group several in-scope domains of one bug-bounty program/engagement under a shared scope (each domain keeps its own findings/session) — entirely optional, never triggered automatically by /target",
+    usage="/program [show [name] | list | create <name> [domain1,domain2,...] | add <domain...> | scope <policy text>]",
+    category="config",
+    handler=handle_program
 ))
 
 register_command(Command(

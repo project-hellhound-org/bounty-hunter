@@ -32,6 +32,7 @@ OTHER_TOOLS: Dict[str, str] = {
     "gowitness": "go install github.com/sensepost/gowitness@latest",
     "gau": "go install github.com/lc/gau/v2/cmd/gau@latest",
     "nuclei": "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+    "jsluice": "go install github.com/BishopFox/jsluice/cmd/jsluice@latest",
     "uro": "pip install uro",
     # Not a single runnable command (varies by distro/package manager) —
     # try_install() below recognizes the parenthetical and skips

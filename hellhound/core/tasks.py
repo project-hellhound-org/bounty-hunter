@@ -106,6 +106,13 @@ class Target:
     host: str = ""  # real, connectable host[:port] — see extract_raw_host(). `name`
                      # is the filesystem-safe folder name and must NEVER be used to
                      # build an actual URL/hostname (colons get mangled to underscores).
+    program: str = ""  # safe-name of the bug-bounty PROGRAM/engagement this target
+                        # belongs to (e.g. "agov-engagement"), if any — see
+                        # get_program_dir() / attach_target_to_program() below. A
+                        # single program can have many in-scope domains, each its
+                        # own Target (own findings/session/state), grouped by this
+                        # field so they can be listed and scoped together instead
+                        # of each one being a disconnected flat target.
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -119,6 +126,7 @@ class Target:
             "findings": self.findings,
             "state": redact_sensitive_dict_keys(self.state),
             "host": self.host,
+            "program": self.program,
         }
 
     @classmethod
@@ -150,6 +158,7 @@ class Target:
             findings=findings,
             state=state,
             host=str(data.get("host", "")),  # "" for targets saved before this field existed
+            program=str(data.get("program", "")),  # "" for targets saved before this field existed, or ungrouped
         )
 
 
@@ -234,3 +243,185 @@ def list_targets(exclude_default: bool = True) -> List[str]:
     # Sort most recently modified first
     targets_with_time.sort(key=lambda x: x[1], reverse=True)
     return [t[0] for t in targets_with_time]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PROGRAM / ENGAGEMENT GROUPING
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A bug-bounty PROGRAM (e.g. "AGOV") typically ships with several in-scope
+# domains, each of which needs its own independent Target (own findings,
+# own session/auth state, own curl history) — but they're one engagement,
+# sharing one scope and one "which domains am I allowed to touch" answer.
+# Before this, /target <domain> only ever created a flat, disconnected
+# target with no relationship to any other domain from the same program,
+# and there was no way to apply one scope update to every domain in a
+# program at once — setting scope under a program name ended up replacing
+# that one target's identity instead of fanning out to its domains. This
+# section stores one program.json per program (its own scope_raw/
+# scope_rules, plus the list of target names that belong to it) and keeps
+# every attached Target's own scope_rules in sync with it.
+
+def _get_programs_dir() -> str:
+    base = os.path.expanduser("~/.hellhound/programs")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def sanitize_program_name(name: str) -> str:
+    """Same filesystem-safe normalization as sanitize_target_name, kept as
+    its own function (rather than reusing that one directly) because a
+    program name is free text ("AGOV Engagement"), not a domain/URL — no
+    scheme-stripping, no STOPWORDS collapse-to-"default"."""
+    if not name:
+        return ""
+    cleaned = name.strip().lower()
+    cleaned = re.sub(r'[:/\\?#%*|"<> ]', '-', cleaned)
+    cleaned = re.sub(r'-+', '-', cleaned).strip('.-')
+    return cleaned
+
+
+def get_program_path(program_name: str) -> str:
+    safe_name = sanitize_program_name(program_name)
+    program_dir = os.path.join(_get_programs_dir(), safe_name)
+    os.makedirs(program_dir, exist_ok=True)
+    return os.path.join(program_dir, "program.json")
+
+
+def load_program(program_name: str) -> Optional[Dict[str, Any]]:
+    """Returns the program's stored record, or None if it hasn't been
+    created yet (e.g. referenced by name but never set up)."""
+    safe_name = sanitize_program_name(program_name)
+    if not safe_name:
+        return None
+    path = get_program_path(safe_name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[!] Warning: Failed to load program {safe_name} from disk (corrupted JSON?): {e}")
+        return None
+
+
+def _save_program(record: Dict[str, Any]) -> None:
+    path = get_program_path(record["name"])
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+
+
+def list_programs() -> List[str]:
+    base = _get_programs_dir()
+    if not os.path.exists(base):
+        return []
+    out = []
+    for entry in os.listdir(base):
+        if os.path.isfile(os.path.join(base, entry, "program.json")):
+            out.append(entry)
+    return sorted(out)
+
+
+def attach_target_to_program(target: Target, program_name: str) -> Target:
+    """
+    Tags `target` as belonging to `program_name` and, if that program
+    already has scope rules saved (from set_program_scope, or a prior
+    target attached to it), applies them to this target too — so a NEW
+    in-scope domain added under an existing program immediately inherits
+    the program's full in-scope list (itself included) rather than
+    starting with an empty scope the researcher has to re-set by hand.
+    Creates the program's own record if this is the first target attached
+    to it. Idempotent — attaching the same target to the same program
+    twice is a harmless no-op beyond a dedup check.
+    """
+    safe_program = sanitize_program_name(program_name)
+    if not safe_program:
+        return target
+
+    record = load_program(safe_program)
+    if record is None:
+        record = {
+            "name": safe_program,
+            "display_name": program_name.strip(),
+            "scope_raw": "",
+            "scope_rules": ScopeRules().to_dict(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "targets": [],
+        }
+
+    if target.name not in record["targets"]:
+        record["targets"].append(target.name)
+        _save_program(record)
+
+    target.program = safe_program
+    # Only overwrite this target's scope if the PROGRAM actually has scope
+    # rules worth inheriting — an empty program (just created) shouldn't
+    # blank out scope a researcher already set directly on this target.
+    prog_scope = record.get("scope_rules") or {}
+    if prog_scope.get("in_scope") or prog_scope.get("out_scope") or prog_scope.get("disallowed"):
+        target.scope_raw = record.get("scope_raw", "")
+        target.scope_rules = ScopeRules.from_dict(prog_scope)
+        in_count = len(target.scope_rules.in_scope)
+        out_count = len(target.scope_rules.out_scope)
+        dis_count = len(target.scope_rules.disallowed)
+        target.scope_summary = f"{in_count} in-scope domains, {out_count} out-of-scope exclusions, {dis_count} prohibited rules"
+    save_target(target)
+    return target
+
+
+def set_program_scope(program_name: str, raw_text: str) -> Dict[str, Any]:
+    """
+    Parses `raw_text` (the program's scope policy — a domain list, or full
+    program rules markdown, same format set_scope() on a single target
+    already accepts) into ScopeRules, saves it as this PROGRAM's scope, and
+    propagates it to EVERY target currently attached to the program — this
+    is what actually fixes "setting scope under the program name changed
+    the target instead of spreading to all its in-scope domains": one call
+    here updates the shared scope once, and every domain under the program
+    picks it up, instead of the researcher having to repeat /scope on each
+    domain individually (and instead of the AI mistakenly treating the
+    program name itself as if it were one of the domains).
+    """
+    safe_program = sanitize_program_name(program_name)
+    record = load_program(safe_program) or {
+        "name": safe_program,
+        "display_name": program_name.strip(),
+        "scope_raw": "",
+        "scope_rules": ScopeRules().to_dict(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "targets": [],
+    }
+
+    scope_rules = parse_program_rules(raw_text)
+    record["scope_raw"] = raw_text
+    record["scope_rules"] = scope_rules.to_dict()
+    _save_program(record)
+
+    updated_targets = []
+    for target_name in record.get("targets", []):
+        try:
+            t = create_or_load_target(target_name)
+        except Exception:
+            continue
+        t.scope_raw = raw_text
+        t.scope_rules = parse_program_rules(raw_text)  # fresh instance per target, not a shared mutable object
+        in_count = len(t.scope_rules.in_scope)
+        out_count = len(t.scope_rules.out_scope)
+        dis_count = len(t.scope_rules.disallowed)
+        t.scope_summary = f"{in_count} in-scope domains, {out_count} out-of-scope exclusions, {dis_count} prohibited rules"
+        save_target(t)
+        updated_targets.append(target_name)
+
+    return {
+        "program": safe_program,
+        "scope_rules": scope_rules.to_dict(),
+        "scope_summary": record.get("scope_rules"),
+        "targets_updated": updated_targets,
+    }
+
+
+def list_program_targets(program_name: str) -> List[str]:
+    record = load_program(program_name)
+    if not record:
+        return []
+    return list(record.get("targets", []))
