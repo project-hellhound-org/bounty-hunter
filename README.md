@@ -17,6 +17,8 @@
   <a href="#the-recon--triage-arsenal">Arsenal</a> ·
   <a href="#what-it-finds">What It Finds</a> ·
   <a href="#hunting-methodology-skills">Skills</a> ·
+  <a href="#recent-upgrades">Recent Upgrades</a> ·
+  <a href="#roadmap--whats-next">Roadmap</a> ·
   <a href="#license">License</a>
 </p>
 
@@ -280,6 +282,8 @@ All actions can be triggered via slash commands or natural language:
 | `/scan` | `/strike` | Execute a specific discovery or audit module | `/scan <module> [target] [key=val...]` |
 | `/howl` | `/correlate`, `/graph` | Correlate discoveries or generate visual attack graph | `/howl [--graph] [target]` |
 | `/scope` | `/rules` | View, clear, or configure program scope rules | `/scope [show \| clear \| <rules_text>]` |
+| `/program` | `/programs`, `/engagement` | Group several in-scope domains of one engagement under a shared scope | `/program [show \| list \| create <name> [domains] \| add <domain...> \| scope <text>]` |
+| `/output` | `/tail`, `/show-output` | Show the full captured output of the last long-running tool call | `/output [stderr] [N]` |
 | `/skills` | `/skill` | Search or list loaded methodology skills & checklists | `/skills [query] [--json]` |
 | `/model` | `/ai` | Inspect/switch active model for orchestrator/synthesizer | `/model [orchestrator\|synthesizer] <model-id>` |
 | `/headers` | `/head` | Manage custom HTTP request & BugBounty identity headers | `/headers [Header: Value \| --clear]` |
@@ -292,23 +296,18 @@ All actions can be triggered via slash commands or natural language:
 
 ## The Recon & Triage Arsenal
 
-Bounty Hunter coordinates **50 tools** into a unified, scope-governed execution pipeline — recon, active probing, logic/BAC auditing, cloud asset discovery, takeover checks, threat intel, and local workspace/reporting utilities:
+Bounty Hunter coordinates **57 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
 
-```
-403_bypass · cloudscout · content_discovery · cookie_inspector ·
-cors_checker · curl · delete_file · dig · dismiss_finding ·
-dns_bruteforce · export_report · fuzz_hunter · gau_nuclei_sweep ·
-generate_cors_poc · google_dork · gowitness · graphql_probe ·
-hackerone_policy · hackerone_search · hackerone_stats · httpx ·
-hydra · jwt_forge · listener · load_skill · manage_scope ·
-nmap_service_scan · otx_urls · permute_subdomains · port_scan ·
-punycode_homoglyphs · read_artifact · record_finding ·
-resolve_candidates · run_terminal_command · save_file · set_target ·
-spider · sqlmap_scan · subfinder · subzy · surface_auditor ·
-takeover_scanner · tls_cert_scan · transport_auditor ·
-urlscan_recon · vhost_fuzz · virustotal_lookup · wafbuster ·
-wayback_urls
-```
+| Category | Tools |
+| :--- | :--- |
+| **Passive & Active Recon** | `subfinder` `permute_subdomains` `resolve_candidates` `dns_bruteforce` `dig` `port_scan` `tls_cert_scan` `httpx` `nmap_service_scan` `wayback_urls` `gau_nuclei_sweep` `urlscan_recon` `google_dork` `otx_urls` `virustotal_lookup` `cloudscout` |
+| **Crawling & Content Discovery** | `spider` `katana` `content_discovery` `fuzz_hunter` `vhost_fuzz` `403_bypass` `wafbuster` |
+| **Visual & Browser** | `browser_control` `gowitness` |
+| **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` |
+| **Takeover & Subdomain Health** | `takeover_scanner` `subzy` |
+| **Session, Scope & Workspace** | `cookie_inspector` `curl` `run_terminal_command` `set_target` `manage_scope` `manage_program` `listener` |
+| **HackerOne Program Intel** | `hackerone_policy` `hackerone_search` `hackerone_stats` |
+| **Findings, Artifacts & Reporting** | `record_finding` `dismiss_finding` `export_report` `read_artifact` `save_file` `delete_file` `load_skill` |
 
 Ask the agent itself ("what tools do you have for X?") for what any one of these actually does — asking beats a wall of description text here, and the answer always reflects the real, current tool list instead of a snapshot that can drift out of date.
 
@@ -332,19 +331,15 @@ Ask the agent itself ("what tools do you have for X?") for what any one of these
 
 ## Hunting Methodology Skills
 
-Bounty Hunter includes **30 specialized methodology skills**, loaded dynamically into the agent's reasoning context only when a turn actually needs one — not injected all at once:
+Bounty Hunter includes **30 specialized methodology skills**, loaded dynamically into the agent's reasoning context only when a turn actually needs one — not injected all at once.
 
-```
-403-bypass · access-control · argus · auth-bypass · authentication ·
-bb-methodology · bug-bounty · cicd-security · client-reverse ·
-cors-misconfig · credential-attack · exposed-source-recon ·
-graphql-audit · idor · insecure-deserialization ·
-llm-prompt-injection · meme-coin-audit · mobile-pentest ·
-prototype-pollution-mass-assignment · race-condition ·
-report-writing · security-arsenal · server-side-parameter-pollution ·
-ssrf · ssti · triage-validation · web2-recon · web2-vuln-classes ·
-web3-audit · xss
-```
+| Category | Skills |
+| :--- | :--- |
+| **Access Control & Auth** | `access-control` `auth-bypass` `authentication` `idor` `credential-attack` `403-bypass` |
+| **Web Vulnerability Classes** | `web2-vuln-classes` `xss` `ssrf` `ssti` `insecure-deserialization` `prototype-pollution-mass-assignment` `server-side-parameter-pollution` `cors-misconfig` `race-condition` |
+| **Recon & Methodology** | `web2-recon` `bb-methodology` `bug-bounty` `exposed-source-recon` `argus` `security-arsenal` `graphql-audit` |
+| **Specialized Targets** | `web3-audit` `meme-coin-audit` `mobile-pentest` `client-reverse` `cicd-security` `llm-prompt-injection` |
+| **Validation & Reporting** | `triage-validation` `report-writing` |
 
 Search skills anytime inside the console:
 ```bash
@@ -352,6 +347,39 @@ Search skills anytime inside the console:
 > /skills ctf
 > /skills graphql
 ```
+
+---
+
+## Recent Upgrades
+
+A few things landed recently that materially change how the agent feels to run:
+
+- **Real-time fuzzer output** — `ffuf` and `feroxbuster` now stream actual hit lines live as they're found (`[301] /admin`, `[200] /robots.txt`, ...), the same live-feed feel as the spider crawl, instead of a static "still running" placeholder for the whole scan.
+- **Configurable rate limiting** — every fuzzing run (`content_discovery`, `vhost_fuzz`, `fuzz_hunter`) is capped at a sane requests/sec by default (`fuzz_rate_limit` in config, 150 by default) so an aggressive scan doesn't trip a WAF or lock out an account on a live target. Override per-call with `rate_limit`, or set it to `0` to go uncapped on a disposable lab/CTF box.
+- **`/output`** — pull the complete stdout/stderr of the last tool run on demand. In-memory only, nothing extra written to disk.
+- **`/program`** — group several in-scope domains of one engagement under a shared scope: create a program, set in/out-of-scope rules once, every attached domain inherits them. Entirely optional, never forced on a plain `/target` call, and switching between domains across different programs mid-session just works via `/target <domain>` — no restart needed.
+- **Cleaner `/help`** — no longer dumps all 30 skill descriptions into the main command listing; that lives at `/skills` (or `/help skills`) instead.
+- **`katana` + `jsluice`** added to the arsenal, for faster crawling and JS secret/endpoint extraction.
+- **Correctness fixes** — no more duplicated "still running" spinner lines; a successful login with valid, given credentials is no longer auto-recorded as a finding; related hosts named up front (e.g. an OAuth/IdP server needed for legitimate auth testing) can be pre-authorized into scope in one shot instead of tripping the scope gate mid-flow.
+
+---
+
+## Roadmap — What's Next
+
+The honest gap between "runs tools well" and "hunts like a pro" is architecture, not more tools. Rough priority order for what's next:
+
+1. **Persistent, scriptable browser** — record an auth flow once (login → 2FA → token capture), replay it headless; programmatic DOM read/write; request/response interception; multi-tab sessions for cross-user IDOR testing.
+2. **Unified session state** — one cookie jar shared by the browser, `curl`, `fuzz_hunter`, `sqlmap_scan`, `hydra`, and Burp/Caido, so logging in once is inherited everywhere instead of manually copying headers across tools. *(Smallest, highest-leverage piece of this — see below.)*
+3. **Intelligent request/response correlation** — spider output auto-parameterized and fed to the fuzzer by param type (ID, email, file, JSON); built-in response diffing against a baseline; endpoints auto-grouped by function (auth, payments, admin).
+4. **Real race/logic testing** — single-packet / last-byte synced requests across endpoints with configurable jitter, automatic state-mutation detection, multi-context coordinated race attacks.
+5. **Cross-session campaign memory** — target profiles (tech stack, WAF behavior, rate limits, quirks) and structured finding templates that survive past one context window, not just chat history.
+6. **Stealth/evasion as a first-class profile** — UA/TLS-fingerprint/IP rotation, WAF-fingerprint-driven bypass selection, distributed scan coordination with deduped results.
+7. **Validation over detection** — auto-extract one row on a confirmed SQLi, render XSS in a headless browser to confirm it actually executes, verify SSRF reaches an internal endpoint, confirm BOLA actually crosses accounts — not just "the request went through."
+8. **Report-ready evidence capture** — request/response pairs, screenshots, and curl repros auto-assembled per finding; finding-chaining (e.g. "XSS on /profile + IDOR on /api/user/{id} = account takeover").
+9. **Passive → active intel fusion** — CT logs + Wayback + gau + OTX deduped straight into `httpx`/fuzzing; JS sourcemap recovery → secret extraction → endpoint mapping, fed straight back into the fuzzer.
+10. **A real playbook engine** — conditional branching workflows ("new subdomain → screenshot → tech-detect → if WordPress, run X"), not just sequential tool chaining.
+
+**Next concrete step:** item 2's easy win — a single `CookieJar` per target, shared between `browser_control` and `curl` (~50 lines of backend glue) — turns "browser for auth, curl for the API" into one continuous session instead of manual cookie hand-offs between tools.
 
 ---
 

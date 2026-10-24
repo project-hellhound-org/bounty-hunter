@@ -15,6 +15,7 @@ import sys
 import json
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1485,6 +1486,82 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
     }
 
 
+def handle_output(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """
+    /output [stderr] [N]
+    Shows the FULL captured output of the last long-running tool call for
+    the active target (ffuf, feroxbuster, run_terminal_command, etc.) —
+    the terminal only ever streams a capped live feed of hits as a tool
+    runs (so it doesn't flood the scrollback), this pulls the complete
+    stdout/stderr of whichever one ran last. Held in memory only for the
+    current session (target.state["_last_tool_output"], set by
+    _run_cmd_with_heartbeat) — nothing is written to disk for this, and it
+    only ever holds the single most recent run; it's gone once a
+    different tool runs or the session ends.
+    """
+    is_json = "--json" in args or getattr(emit, "json_mode", False)
+    clean_args = [a for a in args if a != "--json"]
+
+    want_stderr = False
+    tail_n = None
+    for a in clean_args:
+        if a.lower() == "stderr":
+            want_stderr = True
+        elif a.isdigit():
+            tail_n = int(a)
+
+    target_name = session_context.get("target") or "default"
+    agent = get_agent(target_name)
+    last = (agent.target.state or {}).get("_last_tool_output") if hasattr(agent.target, "state") else None
+
+    if not last:
+        if not is_json:
+            emit.info("No tool output captured yet for this target this session — run a fuzzer or terminal command first.")
+        return {"status": "empty"}
+
+    stream_key = "stderr" if want_stderr else "stdout"
+    text = last.get(stream_key, "") or ""
+    truncated = bool(last.get(f"{stream_key}_truncated"))
+
+    if tail_n:
+        lines = text.splitlines()
+        text = "\n".join(lines[-tail_n:])
+
+    if is_json:
+        return {
+            "status": "success",
+            "label": last.get("label"),
+            "cmd": last.get("cmd"),
+            "returncode": last.get("returncode"),
+            "stream": stream_key,
+            "output": text,
+            "truncated_in_memory": truncated,
+        }
+
+    age_s = int(time.time() - last.get("ts", time.time()))
+    emit.info(f"Last tool: [bold cyan]{last.get('label')}[/bold cyan]  (exit {last.get('returncode')}, {age_s}s ago)")
+    emit.info(f"Command: {last.get('cmd')}")
+    if truncated:
+        emit.warn(f"{stream_key} was longer than the in-memory cap — showing the last portion kept, not the absolute start of the run.")
+    dump = text if text.strip() else "(empty)"
+    # print_always exists on PlainEmit/ConsoleEmit but NOT on a raw
+    # ThinkingIndicator (the actual `emit` the main interactive REPL passes
+    # into dispatch()) -- fall back to a direct stdout write rather than
+    # routing a multi-line raw dump through info()/print_step(), which
+    # prefixes every call with a single icon and tree-branch glyph meant
+    # for one-line status messages, not a wall of tool output.
+    printer = getattr(emit, "print_always", None)
+    if callable(printer):
+        printer(dump)
+    else:
+        try:
+            sys.stdout.write(dump + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+    return {"status": "success", "label": last.get("label"), "stream": stream_key, "chars": len(text)}
+
+
 def handle_target(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
     /target [domain_or_name] [--clear-history]
@@ -2131,6 +2208,15 @@ register_command(Command(
     usage="/program [show [name] | list | create <name> [domain1,domain2,...] | add <domain...> | scope <policy text>]",
     category="config",
     handler=handle_program
+))
+
+register_command(Command(
+    name="/output",
+    aliases=["/tail", "/show-output"],
+    description="Show the FULL output of the last long-running tool call (ffuf, feroxbuster, run_terminal_command, etc.) for the active target — the terminal only streams a capped live feed of hits while a tool runs; this pulls the complete captured stdout/stderr. In-memory only, no file written.",
+    usage="/output [stderr] [N]  (N = only the last N lines; add 'stderr' to see stderr instead of stdout)",
+    category="hunting",
+    handler=handle_output
 ))
 
 register_command(Command(

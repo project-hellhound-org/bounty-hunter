@@ -131,6 +131,15 @@ def load_config() -> Dict[str, Any]:
         # a genuinely runaway loop, not the primary control.
         "max_agent_iterations": 60,
         "auto_install_missing_tools": False,
+        # Default requests/sec cap applied to ffuf/feroxbuster fuzzing runs
+        # (vhost_fuzz, content_discovery, fuzz_hunter). Neither tool caps
+        # its own request rate by default -- they hammer the target as fast
+        # as their thread count allows, which is exactly the kind of thing
+        # that trips a WAF, burns a rate-limited API key, or locks an
+        # account on a sensitive target (auth/IdP hosts above all). A
+        # per-call rate_limit argument overrides this for one run; 0 or a
+        # negative value here/there means "no cap, go full thread speed."
+        "fuzz_rate_limit": 150,
         "show_recaps": True,
         "api_keys": {},
         "global_headers": {},
@@ -152,6 +161,8 @@ def load_config() -> Dict[str, Any]:
                     data["auto_install_missing_tools"] = False
                 if "max_agent_iterations" not in data:
                     data["max_agent_iterations"] = default_config["max_agent_iterations"]
+                if "fuzz_rate_limit" not in data:
+                    data["fuzz_rate_limit"] = default_config["fuzz_rate_limit"]
                 # Two-tier model backward compatibility fallbacks
                 legacy_prov = data.get("ai_provider", "ollama")
                 legacy_model = data.get("ai_model", "")

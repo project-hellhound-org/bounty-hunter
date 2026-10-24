@@ -380,35 +380,69 @@ def _execute_ffuf_vhost(args: Dict[str, Any], target: Target, emit: Any) -> Dict
         return {"error": "No vhost wordlist found."}
 
     target_url = target_ip if target_ip.startswith(("http://", "https://")) else f"http://{target_ip}"
+
+    import tempfile
+    temp_json = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+            temp_json = tf.name
+    except Exception:
+        temp_json = None
+
     cmd = [
         binary,
         "-w", wordlist,
         "-u", target_url,
         "-H", f"Host: FUZZ.{domain}",
         "-mc", "200,301,302,403",
-        "-of", "json",
-        "-o", "-",
-        "-s"
     ]
+    rate_limit = _resolve_fuzz_rate_limit(args)
+    if rate_limit > 0:
+        cmd.extend(["-rate", str(rate_limit)])
+    if temp_json:
+        cmd.extend(["-of", "json", "-o", temp_json])
+    else:
+        # No writable tempfile -- fall back to the old stdout-JSON mode,
+        # which requires -s (silent) since nothing else may share stdout.
+        cmd.extend(["-of", "json", "-o", "-", "-s"])
 
+    results = []
     try:
-        proc = _run_cmd_with_heartbeat(cmd, timeout=120, emit=emit, label="vhost_fuzz (Host header fuzzing)")
-        results = []
-        if proc.stdout.strip():
+        # -s (silent) dropped when we have a tempfile to write structured
+        # results to: ffuf's normal per-match hit lines ("admin.example.com
+        # [Status: 200, ...]") then go to stdout instead, so the same live
+        # hit parser used for content discovery surfaces them in real time
+        # rather than a static "still running" spinner for the whole scan.
+        live_parser = _ffuf_live_parser if temp_json else None
+        proc = _run_cmd_with_heartbeat(cmd, timeout=120, emit=emit, label="vhost_fuzz (Host header fuzzing)", live_parser=live_parser, target=target)
+
+        if temp_json and os.path.exists(temp_json) and os.path.getsize(temp_json) > 0:
+            with open(temp_json, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+        elif proc.stdout.strip():
             data = json.loads(proc.stdout)
-            raw_res = data.get("results", [])
-            for r in raw_res:
-                vhost = r.get("input", {}).get("FUZZ", "")
-                status = r.get("status", 0)
-                length = r.get("length", 0)
-                full_host = f"{vhost}.{domain}" if vhost else ""
-                results.append({
-                    "host": full_host,
-                    "status": status,
-                    "length": length
-                })
+        else:
+            data = {}
+
+        raw_res = data.get("results", [])
+        for r in raw_res:
+            vhost = r.get("input", {}).get("FUZZ", "")
+            status = r.get("status", 0)
+            length = r.get("length", 0)
+            full_host = f"{vhost}.{domain}" if vhost else ""
+            results.append({
+                "host": full_host,
+                "status": status,
+                "length": length
+            })
     except Exception as e:
         results = []
+    finally:
+        if temp_json and os.path.exists(temp_json):
+            try:
+                os.remove(temp_json)
+            except Exception:
+                pass
 
     return {
         "domain": domain,
@@ -416,6 +450,45 @@ def _execute_ffuf_vhost(args: Dict[str, Any], target: Target, emit: Any) -> Dict
         "vhosts_found": results,
         "count": len(results)
     }
+
+
+def _resolve_fuzz_rate_limit(args: Dict[str, Any]) -> int:
+    """
+    Resolves the requests/sec cap for a fuzzing run: an explicit per-call
+    `rate_limit` arg wins, otherwise falls back to the configured
+    `fuzz_rate_limit` default (see ai_utils.load_config). 0 or a negative
+    value means "uncapped" -- the caller asked to skip the throttle (e.g.
+    a disposable CTF/lab box where speed matters more than stealth).
+    """
+    explicit = args.get("rate_limit")
+    if explicit is not None:
+        try:
+            return int(explicit)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return int(load_config().get("fuzz_rate_limit", 150) or 0)
+    except (TypeError, ValueError):
+        return 150
+
+
+_FFUF_LIVE_HIT_RE = re.compile(r'^(\S+)\s+\[Status:\s*(\d+),\s*Size:\s*(\d+)')
+
+
+def _ffuf_live_parser(line: str) -> Optional[str]:
+    """
+    Parses one line of ffuf's normal (non-silent) stdout — a match line
+    looks like "admin   [Status: 301, Size: 0, Words: 1, Lines: 1,
+    Duration: 15ms]" — into a short, real-time "found this" line for
+    _run_cmd_with_heartbeat's live_parser. Everything else ffuf prints
+    (its banner, the progress bar, blank lines) simply doesn't match this
+    pattern and is silently ignored, so only actual hits surface.
+    """
+    m = _FFUF_LIVE_HIT_RE.match(line.strip())
+    if not m:
+        return None
+    word, status, size = m.group(1), m.group(2), m.group(3)
+    return f"[{status}] /{word}  ({size} bytes)"
 
 
 def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -470,8 +543,15 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
         "-mc", "200,204,301,302,307,401,403,405",
         "-t", "40",
         "-timeout", "5",
-        "-s"
     ]
+
+    # Uncapped ffuf hits a target as fast as 40 threads can go -- fine on a
+    # disposable CTF box, a good way to trip a WAF/account-lockout on a
+    # live/production target. rate_limit arg (or config fuzz_rate_limit
+    # default) caps requests/sec; 0 or negative explicitly means uncapped.
+    rate_limit = _resolve_fuzz_rate_limit(args)
+    if rate_limit > 0:
+        cmd.extend(["-rate", str(rate_limit)])
 
     if temp_json:
         cmd.extend(["-of", "json", "-o", temp_json])
@@ -494,7 +574,12 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
 
     results = []
     try:
-        proc = _run_cmd_with_heartbeat(cmd, timeout=90, emit=emit, label="content_discovery (path fuzzing)")
+        # -s (silent) dropped deliberately: ffuf's normal output prints one
+        # line per match as it happens ("admin   [Status: 301, Size: 0,
+        # ...]") — _ffuf_live_parser surfaces those live instead of the
+        # researcher seeing nothing but a static "still running" spinner
+        # for the entire fuzz run, same live-feed feel as the spider tool.
+        proc = _run_cmd_with_heartbeat(cmd, timeout=90, emit=emit, label="content_discovery (path fuzzing)", live_parser=_ffuf_live_parser, target=target)
         
         # Read structured JSON output from tempfile
         if temp_json and os.path.exists(temp_json) and os.path.getsize(temp_json) > 0:
@@ -554,6 +639,26 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
     }
 
 
+_FEROXBUSTER_LIVE_HIT_RE = re.compile(r'^(\d{3})\s+\w+\s+\d+l\s+\d+w\s+\d+c\s+(\S+)')
+
+
+def _feroxbuster_live_parser(line: str) -> Optional[str]:
+    """
+    Parses one line of feroxbuster's normal (non-quiet) stdout -- a hit
+    line looks like "200      GET       10l       25w      162c
+    https://target/robots.txt" -- into a short, real-time "found this"
+    line for _run_cmd_with_heartbeat's live_parser. feroxbuster's --json
+    formatting only applies to the -o file (a separate stream from
+    stdout), so stdout stays human-readable even with --json set, and
+    the banner/progress-bar noise simply won't match this pattern.
+    """
+    m = _FEROXBUSTER_LIVE_HIT_RE.match(line.strip())
+    if not m:
+        return None
+    status, hit_url = m.group(1), m.group(2)
+    return f"[{status}] {hit_url}"
+
+
 def _execute_feroxbuster_content(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Content & directory fuzzing via feroxbuster — purpose-built for
     recursive content discovery (auto-recurses into discovered directories
@@ -605,9 +710,24 @@ def _execute_feroxbuster_content(args: Dict[str, Any], target: Target, emit: Any
         "-d", str(depth),
         "-s", "200,204,301,302,307,308,401,403,405",
         "-k",   # don't choke on self-signed certs on lab/internal targets
-        "-q",   # suppress banner/progress bar — only the JSON events matter
         "--json",
     ]
+
+    # feroxbuster's recursion multiplies total request volume fast (every
+    # discovered directory gets re-fuzzed up to `depth` deep), so an
+    # unthrottled rate matters even more here than for a single-pass ffuf
+    # run. Same rate_limit arg / fuzz_rate_limit config default as the ffuf
+    # executors; 0 or negative explicitly means uncapped.
+    rate_limit = _resolve_fuzz_rate_limit(args)
+    if rate_limit > 0:
+        cmd.extend(["--rate-limit", str(rate_limit)])
+    # -q (quiet) deliberately dropped: it was suppressing feroxbuster's
+    # normal per-hit stdout lines entirely, leaving the researcher staring
+    # at a static "still running" spinner for the whole scan with zero
+    # visibility into what was actually being found. --json only reformats
+    # what goes to the -o file (a separate stream), so stdout keeps
+    # printing its normal human-readable hit lines, which
+    # _feroxbuster_live_parser now surfaces live as they happen.
     if temp_json:
         cmd.extend(["-o", temp_json])
 
@@ -627,7 +747,7 @@ def _execute_feroxbuster_content(args: Dict[str, Any], target: Target, emit: Any
 
     results = []
     try:
-        _run_cmd_with_heartbeat(cmd, timeout=120, emit=emit, label="fuzz_hunter (feroxbuster, recursive)")
+        _run_cmd_with_heartbeat(cmd, timeout=120, emit=emit, label="fuzz_hunter (feroxbuster, recursive)", live_parser=_feroxbuster_live_parser, target=target)
         # feroxbuster writes one JSON object per line to -o when --json is
         # set — NOT a single JSON document like ffuf's -of json, so this
         # is parsed line-by-line rather than with one json.load().
@@ -1114,9 +1234,15 @@ def _execute_delete_file(args: Dict[str, Any], target: Target, emit: Any) -> Dic
     return {"status": "success", "deleted": str(out_path)}
 
 
+_LAST_TOOL_OUTPUT_CAP = 200_000  # chars kept per stream — in-memory only, bounds worst case (e.g. a huge unfiltered fuzz run) without needing a file on disk
+
+
 def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
                               heartbeat_interval: int = 5, shell: bool = False,
-                              env: Optional[Dict[str, str]] = None) -> "subprocess.CompletedProcess":
+                              env: Optional[Dict[str, str]] = None,
+                              live_parser: Optional[Callable[[str], Optional[str]]] = None,
+                              max_live_lines: int = 40,
+                              target: Any = None) -> "subprocess.CompletedProcess":
     """
     Runs a subprocess without blocking silently for the full timeout window.
     Long recon calls (passive OSINT lookups, DNS brute-force) previously used
@@ -1136,9 +1262,85 @@ def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
     variables on top of the normal environment must pass os.environ.copy()
     plus their additions, not a bare dict of just the new vars, or the
     child process loses PATH and everything else it needs to run at all.
+
+    `live_parser`, when given, is called with EVERY new stdout line as the
+    subprocess produces it — not just at the end. A fuzzer/brute-forcer
+    (ffuf, feroxbuster) run through this used to show NOTHING but a static
+    "still running (Ns)..." placeholder the whole time, with zero
+    visibility into what it was actually finding, unlike spider's live
+    crawl feed. Return a short string from live_parser to surface it
+    immediately via emit.info() (a real new scrollback line, same as
+    spider), or None to ignore that line. Capped at max_live_lines
+    surfaced hits per call — a huge wordlist run finding hundreds of hits
+    still returns ALL of them in the final parsed result, just not all
+    individually echoed to a scrolling terminal.
+
+    `target`, when given, stashes this run's FULL captured stdout/stderr
+    (not just the capped live-surfaced lines) into
+    target.state["_last_tool_output"] after a successful run, in memory
+    only — no file written. That's what the /output command reads back,
+    so a researcher who only saw a handful of live-streamed hits can still
+    pull the complete output of the run that just finished. Capped at
+    _LAST_TOOL_OUTPUT_CAP chars per stream so one huge unfiltered run can't
+    grow memory unboundedly; this never touches disk and is overwritten by
+    the next call that passes a target, so it only ever holds the LAST run.
+
+    Implementation note: this reads stdout/stderr via background threads
+    instead of the simpler `proc.communicate(timeout=...)` loop the
+    original version used, because communicate() owns the pipes outright —
+    nothing else can read from them while it's blocked inside one call, so
+    there was no way to inspect output AS it arrived, only after the next
+    communicate() call returned (at most once per heartbeat_interval, and
+    even then only the output accumulated in that slice, already consumed
+    silently). The reader threads drain the pipes continuously (also
+    avoiding the classic deadlock where a full stdout buffer blocks the
+    child while nothing is reading it) and `live_parser` runs inline as
+    each line arrives.
     """
     start = time.monotonic()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=shell, env=env)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=shell, env=env, bufsize=1)
+
+    stdout_lines: List[str] = []
+    stderr_lines: List[str] = []
+    _lock = threading.Lock()
+    _live_shown = [0]  # single-element list so the nested reader can mutate it without `nonlocal` gymnastics across two readers
+
+    def _reader(stream, sink: List[str], is_stdout: bool):
+        try:
+            for line in iter(stream.readline, ''):
+                if line == '':
+                    break
+                with _lock:
+                    sink.append(line)
+                if is_stdout and live_parser is not None:
+                    try:
+                        surfaced = live_parser(line.rstrip('\n'))
+                    except Exception:
+                        surfaced = None
+                    if surfaced:
+                        do_emit = False
+                        with _lock:
+                            if _live_shown[0] < max_live_lines:
+                                _live_shown[0] += 1
+                                do_emit = True
+                        if do_emit and emit and hasattr(emit, "info"):
+                            try:
+                                emit.info(surfaced)
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    t_out = threading.Thread(target=_reader, args=(proc.stdout, stdout_lines, True), daemon=True)
+    t_err = threading.Thread(target=_reader, args=(proc.stderr, stderr_lines, False), daemon=True)
+    t_out.start()
+    t_err.start()
+
     try:
         while True:
             elapsed = time.monotonic() - start
@@ -1146,12 +1348,36 @@ def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
             if remaining <= 0:
                 proc.kill()
                 try:
-                    proc.communicate(timeout=5)
+                    proc.wait(timeout=5)
                 except Exception:
                     pass
                 raise subprocess.TimeoutExpired(cmd, timeout)
             try:
-                stdout, stderr = proc.communicate(timeout=min(heartbeat_interval, remaining))
+                proc.wait(timeout=min(heartbeat_interval, remaining))
+                # Process finished — give the reader threads a brief moment
+                # to drain any last buffered bytes/EOF, then assemble the
+                # same (stdout, stderr) string shape communicate() used to
+                # return, so every existing caller's parsing code keeps
+                # working unchanged.
+                t_out.join(timeout=2)
+                t_err.join(timeout=2)
+                with _lock:
+                    stdout = ''.join(stdout_lines)
+                    stderr = ''.join(stderr_lines)
+                if target is not None and hasattr(target, "state") and isinstance(target.state, dict):
+                    try:
+                        target.state["_last_tool_output"] = {
+                            "label": label,
+                            "cmd": cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd),
+                            "returncode": proc.returncode,
+                            "stdout": stdout[-_LAST_TOOL_OUTPUT_CAP:],
+                            "stdout_truncated": len(stdout) > _LAST_TOOL_OUTPUT_CAP,
+                            "stderr": stderr[-_LAST_TOOL_OUTPUT_CAP:],
+                            "stderr_truncated": len(stderr) > _LAST_TOOL_OUTPUT_CAP,
+                            "ts": time.time(),
+                        }
+                    except Exception:
+                        pass
                 return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
             except subprocess.TimeoutExpired:
                 # Was emit.info(...) — ThinkingIndicator.info()/print_step()
@@ -1189,7 +1415,14 @@ def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
                 if emit and _live_indicator and hasattr(emit, "set_label"):
                     emit.set_label(f"{label} still running ({elapsed_s}s)")
                 elif emit and hasattr(emit, "info"):
-                    emit.info(f"[*] {label} still running ({elapsed_s}s)...")
+                    # No leading "[*] " here — every emit backend's own
+                    # info() already prefixes its own icon (ThinkingIndicator's
+                    # print_step() renders its "*" icon, PlainEmit/ConsoleEmit
+                    # render a "[*]" of their own via rich markup), so a
+                    # literal "[*]" baked into the message text here doubled
+                    # up into a visible "* [*] ..." / "[*] [*] ..." on every
+                    # single line.
+                    emit.info(f"{label} still running ({elapsed_s}s)...")
                 continue
     finally:
         if proc.poll() is None:
@@ -8612,7 +8845,8 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "type": "object",
             "properties": {
                 "domain": {"type": "string", "description": "Base domain for the Host header."},
-                "target_ip": {"type": "string", "description": "IP or URL to fuzz against."}
+                "target_ip": {"type": "string", "description": "IP or URL to fuzz against."},
+                "rate_limit": {"type": "integer", "description": "Max requests/sec (default: the configured fuzz_rate_limit, normally 150). Pass 0 to go uncapped -- only do this on a disposable CTF/lab box, never a live or production target."}
             },
             "required": ["domain", "target_ip"]
         },
@@ -8675,7 +8909,8 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         parameters={
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "Base URL of the target application to fuzz."}
+                "url": {"type": "string", "description": "Base URL of the target application to fuzz."},
+                "rate_limit": {"type": "integer", "description": "Max requests/sec (default: the configured fuzz_rate_limit, normally 150). Pass 0 to go uncapped -- only do this on a disposable CTF/lab box, never a live or production target."}
             },
             "required": ["url"]
         },
@@ -8923,7 +9158,8 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "url": {"type": "string", "description": "Target base URL to fuzz."},
                 "max_depth": {"type": "integer", "description": "Maximum recursive discovery depth (default: 2).", "default": 2},
                 "threads": {"type": "integer", "description": "Concurrent HTTP workers (default: 10).", "default": 10},
-                "quick": {"type": "boolean", "description": "Quick mode with top-priority wordlist paths only (default: false). Only affects the internal fallback engine — feroxbuster/ffuf always use the full real wordlist.", "default": False}
+                "quick": {"type": "boolean", "description": "Quick mode with top-priority wordlist paths only (default: false). Only affects the internal fallback engine — feroxbuster/ffuf always use the full real wordlist.", "default": False},
+                "rate_limit": {"type": "integer", "description": "Max requests/sec (default: the configured fuzz_rate_limit, normally 150). Recursion multiplies request volume fast, so this matters more here than for a single-pass fuzz. Pass 0 to go uncapped -- only do this on a disposable CTF/lab box, never a live or production target."}
             },
             "required": ["url"]
         },
