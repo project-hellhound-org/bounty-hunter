@@ -4545,6 +4545,24 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                     "1) Run 'spider' on the internal portal (e.g. url='https://.../portal') or systematically fetch all internal routes with 'curl'. "
                     "2) Thoroughly inspect all accessible internal staff, directory, user, and profile pages for leaked target personal information, bios, security question answers, or password reset flows."
                 )
+                # Remember exactly how this login was done -- url, method,
+                # body, and the headers the caller explicitly supplied (not
+                # the auto-injected cookie/CSRF ones, which get re-derived
+                # fresh on replay) -- so a later dead-session detection can
+                # automatically replay THIS SAME successful request instead
+                # of the researcher/AI having to notice and redo it by hand.
+                if hasattr(target, "state") and isinstance(target.state, dict):
+                    try:
+                        target.state["last_login_recipe"] = {
+                            "url": url,
+                            "method": method,
+                            "json": json_payload,
+                            "data": data_payload if json_payload is None else None,
+                            "headers": dict(custom_headers),
+                            "ts": time.time(),
+                        }
+                    except Exception:
+                        pass
 
         # Session-death detection -- surface clearly when a request that
         # carried a stored session/auth token came back unauthenticated, so
@@ -4575,13 +4593,130 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                     session_dead = True
                     reason = "logout/expiry language in response body"
             if session_dead:
-                resp_dict["session_status"] = (
+                base_status_msg = (
                     f"SESSION LIKELY DEAD ({reason}) despite a stored session/auth token being sent on this "
                     f"request. Do not keep fuzzing with this session as if it's still valid -- a dead session "
                     f"produces 401/403 or empty results on EVERYTHING, which looks like 'not vulnerable' but "
-                    f"actually means 'not logged in'. Re-run the login flow to get a fresh session before "
-                    f"continuing, or treat this engagement thread as ended."
+                    f"actually means 'not logged in'."
                 )
+                recipe = target.state.get("last_login_recipe")
+                last_attempt = target.state.get("last_reauth_attempt_ts", 0) or 0
+                # Short cooldown -- not to be polite to the target, but so a
+                # tight fuzzing loop hitting a dead session on every single
+                # request doesn't hammer the login endpoint once per request.
+                # One real attempt per window is enough: it either fixes the
+                # session for every request after it, or it doesn't and
+                # retrying instantly on request #2 won't change that.
+                cooldown_remaining = 30 - (time.time() - last_attempt)
+
+                if not recipe:
+                    resp_dict["session_status"] = (
+                        f"{base_status_msg} No stored login recipe to auto re-login with yet (this session hasn't "
+                        f"observed a successful POST login through curl). Re-run the login flow manually to get a "
+                        f"fresh session, or treat this engagement thread as ended."
+                    )
+                elif cooldown_remaining > 0:
+                    resp_dict["session_status"] = (
+                        f"{base_status_msg} An auto re-login was already attempted recently "
+                        f"(cooldown: {int(cooldown_remaining)}s remaining) -- not retrying again this request. If "
+                        f"the session is still dead after the cooldown, the stored credentials themselves may no "
+                        f"longer be valid."
+                    )
+                else:
+                    target.state["last_reauth_attempt_ts"] = time.time()
+                    save_target(target)
+                    relogin_ok = False
+                    relogin_error = None
+                    try:
+                        relogin_kwargs: Dict[str, Any] = dict(
+                            method=recipe.get("method", "POST"),
+                            url=recipe.get("url"),
+                            headers=recipe.get("headers") or {},
+                            timeout=10, verify=False, allow_redirects=False,
+                        )
+                        if recipe.get("json") is not None:
+                            relogin_kwargs["json"] = recipe["json"]
+                        elif recipe.get("data") is not None:
+                            relogin_kwargs["data"] = recipe["data"]
+                        r_relogin = _bounded_request(lambda: requests.request(**relogin_kwargs))
+                        relogin_failed_phrase = any(
+                            err in (r_relogin.text or "").lower()
+                            for err in ("invalid username or password", "invalid credentials", "incorrect password", "login failed", "authentication failed")
+                        )
+                        if r_relogin.status_code in (200, 302, 303) and not relogin_failed_phrase:
+                            raw_set_cookie2 = r_relogin.headers.get("set-cookie") or r_relogin.headers.get("Set-Cookie")
+                            if r_relogin.cookies or raw_set_cookie2:
+                                if "cookies" not in target.state or not isinstance(target.state["cookies"], dict):
+                                    target.state["cookies"] = {}
+                                if r_relogin.cookies:
+                                    target.state["cookies"].update(r_relogin.cookies.get_dict())
+                                    for ck, cv in r_relogin.cookies.get_dict().items():
+                                        if any(x in ck.lower() for x in ("sess", "token", "auth", "sid", "jwt", "id", "cookie", "key")):
+                                            target.state["session_cookie"] = f"{ck}={cv}"
+                                if raw_set_cookie2:
+                                    for part in raw_set_cookie2.split(";"):
+                                        if "=" in part:
+                                            k, v = part.strip().split("=", 1)
+                                            k_clean, v_clean = k.strip(), v.strip()
+                                            if k_clean.lower() not in ("path", "domain", "expires", "max-age", "samesite", "httponly", "secure"):
+                                                target.state["cookies"][k_clean] = v_clean
+                                                if any(x in k_clean.lower() for x in ("sess", "token", "auth", "sid", "jwt", "id", "cookie", "key")):
+                                                    target.state["session_cookie"] = f"{k_clean}={v_clean}"
+                                relogin_ok = True
+                        if not relogin_ok:
+                            relogin_error = (
+                                "re-login was rejected (invalid credentials/login failed) -- the stored recipe's "
+                                "credentials may no longer be valid"
+                                if relogin_failed_phrase else
+                                f"re-login attempt returned HTTP {r_relogin.status_code}"
+                            )
+                    except Exception as e:
+                        relogin_error = f"re-login attempt raised {type(e).__name__}: {e}"
+
+                    if relogin_ok:
+                        save_target(target)
+                        # Retry the ORIGINAL request once with the fresh
+                        # session -- reported as separate retry_* fields
+                        # rather than overwritten into status_code/body_preview,
+                        # since everything already extracted above (leaks,
+                        # JWT info, discovered routes) was computed from the
+                        # DEAD response and would be misleading paired with a
+                        # silently-swapped-in fresh body.
+                        try:
+                            fresh_cookies = normalize_cookies(target.state.get("cookies") or target.state.get("session_cookie"))
+                            retry_headers = dict(headers)
+                            fresh_token = target.state.get("auth_token")
+                            if fresh_token:
+                                retry_headers["Authorization"] = f"Bearer {fresh_token}"
+                            if json_payload is not None:
+                                r_retry = _bounded_request(lambda: requests.request(method=method, url=url, headers=retry_headers, cookies=fresh_cookies or None, json=json_payload, timeout=10, verify=False, allow_redirects=False))
+                            else:
+                                r_retry = _bounded_request(lambda: requests.request(method=method, url=url, headers=retry_headers, cookies=fresh_cookies or None, data=data_payload, timeout=10, verify=False, allow_redirects=False))
+                            resp_dict["session_auto_relogged_in"] = True
+                            resp_dict["retry_status_code"] = r_retry.status_code
+                            resp_dict["retry_body_preview"] = (r_retry.text or "")[:35000]
+                            resp_dict["session_status"] = (
+                                f"{base_status_msg} Automatically replayed the last known-good login (recorded "
+                                f"earlier this session) and got a fresh session, then retried this exact request "
+                                f"once -- see 'retry_status_code'/'retry_body_preview' for that retry's result "
+                                f"(status_code/body_preview above are still from the ORIGINAL dead-session "
+                                f"request). If the retry still looks wrong, the target may need a completely "
+                                f"fresh login (changed credentials/MFA), not just a session refresh."
+                            )
+                        except Exception as e:
+                            resp_dict["session_auto_relogged_in"] = True
+                            resp_dict["session_status"] = (
+                                f"{base_status_msg} Auto re-login succeeded (fresh session now stored) but "
+                                f"retrying this exact request failed ({type(e).__name__}: {e}) -- just re-issue "
+                                f"the same request again now that the session's fresh."
+                            )
+                    else:
+                        resp_dict["session_auto_relogged_in"] = False
+                        resp_dict["session_status"] = (
+                            f"{base_status_msg} Tried to auto re-login using the last known-good login recorded "
+                            f"earlier this session, but {relogin_error or 'it did not produce a usable session'}. "
+                            f"Re-run the login flow manually before continuing."
+                        )
 
         if html_comments:
             resp_dict["discovered_html_comments"] = html_comments[:10]
@@ -4747,6 +4882,15 @@ def _execute_browser_control(args: Dict[str, Any], target: Target, emit: Any) ->
     then poke at the now-authenticated page) can be driven one action at a
     time, each action its own tool call the model can reason about in
     between.
+
+    MULTIPLE INDEPENDENT SESSIONS: pass a `session` name (e.g. "victim",
+    "attacker") to get its own isolated browser CONTEXT — own cookie jar,
+    own storage, own page — instead of the single shared "default" one.
+    This is what real cross-user IDOR/BAC testing needs: log in as user A
+    in one session, user B in another, both still open and interactive at
+    the same time, instead of a second login destroying the first user's
+    session in a shared context. Omit `session` (or use "default") for
+    ordinary single-session flows — nothing changes there.
     """
     from hellhound.core import browser_control
 
@@ -4754,17 +4898,42 @@ def _execute_browser_control(args: Dict[str, Any], target: Target, emit: Any) ->
     if not action:
         return {
             "status": "error",
-            "error": "browser_control requires an 'action': goto, click, fill, eval_js, get_storage, get_cookies, get_network_log, screenshot, or close.",
+            "error": (
+                "browser_control requires an 'action': goto, click, fill, eval_js, get_storage, get_cookies, "
+                "get_network_log, screenshot, close, list_sessions (which sessions are open for this target), "
+                "or close_all (tear down every session for this target at once)."
+            ),
         }
 
-    key = target.name if (target and target.name) else "default"
+    target_prefix = target.name if (target and target.name) else "default"
+    session_id = (args.get("session") or args.get("session_id") or "default").strip() or "default"
+
+    if action == "list_sessions":
+        return browser_control.list_sessions(target_prefix)
+
+    if action in ("close_all", "close_all_sessions"):
+        return browser_control.close_all_sessions(target_prefix)
+
+    key = f"{target_prefix}::{session_id}"
     result = browser_control.run_browser_action(key, action, args)
+    if isinstance(result, dict):
+        result["session"] = session_id
 
     # Mirror curl's behavior: whatever cookies the browser is holding after
     # this action get folded into target.state, so curl/other tools (and a
     # later browser_control call) can reuse a session the browser itself
     # established (e.g. after a JS-driven login redirect curl can't follow).
-    if result.get("status") == "success" and action in ("goto", "click", "fill", "get_cookies") and hasattr(target, "state") and isinstance(target.state, dict):
+    # Deliberately scoped to the "default" session only — syncing a NAMED
+    # second session's cookies (e.g. "attacker") into target.state would
+    # silently clobber the primary session every other tool (curl,
+    # fuzz_hunter, sqlmap_scan...) reuses, defeating the point of having
+    # two independent identities open at once.
+    if (
+        session_id == "default"
+        and result.get("status") == "success"
+        and action in ("goto", "click", "fill", "get_cookies")
+        and hasattr(target, "state") and isinstance(target.state, dict)
+    ):
         try:
             cookie_result = browser_control.run_browser_action(key, "get_cookies", {}, timeout=15)
             cookies = cookie_result.get("cookies") if cookie_result.get("status") == "success" else None
@@ -5959,6 +6128,32 @@ def _execute_waf_evasion_probe(args: Dict[str, Any], target: Target, emit: Any) 
         except Exception as e:
             attempts.append({"mutation": mut["name"], "payload_sent": mut["value"], "error": str(e)})
 
+    # Immediate cross-target lesson, same reasoning as dismiss_finding's and
+    # record_finding's: a WAF bypass (or a confirmed dead end) is exactly
+    # the kind of generalizable thing the NEXT target with a similar stack
+    # should start with instead of re-discovering it from scratch — don't
+    # wait on the end-of-session LLM mining pass for this.
+    try:
+        tech_sig = (list(target.state.get("technologies") or []) if hasattr(target, "state") and isinstance(target.state, dict) else []) + [payload_type]
+        if winning:
+            add_lesson(
+                technique=f"WAF-evasion mutation '{winning}' got a {payload_type} payload past a blocking WAF/filter",
+                outcome="worked",
+                tech_signature=tech_sig,
+                note=f"Baseline payload was blocked; '{winning}' encoding/case mutation got a non-blocked response.",
+                target_name=target.name if target else "",
+            )
+        elif attempts:
+            add_lesson(
+                technique=f"Standard encoding/case/whitespace WAF-evasion mutations for {payload_type} payloads",
+                outcome="failed",
+                tech_signature=tech_sig,
+                note="None of the tried mutations (" + ", ".join(a.get("mutation", "?") for a in attempts) + ") got past this WAF.",
+                target_name=target.name if target else "",
+            )
+    except Exception:
+        pass
+
     return {
         "url": url,
         "param": param,
@@ -6003,6 +6198,19 @@ def _execute_waf_evasion_probe(args: Dict[str, Any], target: Target, emit: Any) 
 _ID_PATH_RE = re.compile(r'^\d+$')
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
 _ID_PARAM_NAME_RE = re.compile(r'(^id$|_id$|^uid$|^uuid$)', re.I)
+
+# Leaf field names (case-insensitive, last path segment of a flattened JSON
+# key) worth diffing between a BOLA baseline and mutated-ID response. A
+# difference in one of THESE specifically is real evidence the mutated ID
+# returned a different identity's data — unlike a raw whole-body diff, which
+# flips on a timestamp or CSRF token with zero relation to whose data it is.
+_BOLA_IDENTITY_FIELDS = frozenset({
+    "email", "useremail", "user_email", "username", "user_name", "name",
+    "fullname", "full_name", "firstname", "first_name", "lastname",
+    "last_name", "displayname", "display_name", "phone", "phonenumber",
+    "phone_number", "address", "accountid", "account_id", "userid",
+    "user_id", "ssn", "dob", "dateofbirth",
+})
 
 _MASS_ASSIGNMENT_FIELDS: Dict[str, Any] = {
     "role": "admin", "isAdmin": True, "is_admin": True, "admin": True,
@@ -6079,24 +6287,72 @@ def _execute_schema_fuzz(args: Dict[str, Any], target: Target, emit: Any) -> Dic
             try:
                 r_base = _bounded_request(lambda: requests.request(cand["method"], cand["url"], headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False))
                 r_mut = _bounded_request(lambda: requests.request(cand["method"], cand["mutated_url"], headers=headers, cookies=cookies, timeout=10, verify=False, allow_redirects=False))
-                suspicious = (
+                raw_diff = (
                     r_mut.status_code == 200
                     and r_base.status_code == 200
                     and len(r_mut.text or "") > 20
                     and r_mut.text != r_base.text
                 )
+
+                # Raw body-diff alone is noisy — a timestamp, nonce, or CSRF
+                # token embedded anywhere in the page flips `text != text`
+                # even when the object is identical, which is exactly why
+                # this was "possible_bola" with a manual-confirm caveat
+                # rather than something closer to proof. Where both
+                # responses parse as JSON, diff identity-revealing fields
+                # specifically (email, username, name, phone, account ids)
+                # instead of the whole blob — if those differ between the
+                # SAME session's baseline and mutated-ID response, that's a
+                # much stronger signal the mutated ID actually belongs to a
+                # different real identity, not noise elsewhere in the body.
+                identity_diff: Dict[str, List[Any]] = {}
+                confirmation_level = "weak"
+                if raw_diff:
+                    try:
+                        base_json = r_base.json()
+                        mut_json = r_mut.json()
+                        base_flat = _flatten_json_dict(base_json) if isinstance(base_json, (dict, list)) else {}
+                        mut_flat = _flatten_json_dict(mut_json) if isinstance(mut_json, (dict, list)) else {}
+                        for fk, fv in mut_flat.items():
+                            leaf = fk.split(".")[-1].split("[")[0].lower()
+                            if leaf in _BOLA_IDENTITY_FIELDS:
+                                base_v = base_flat.get(fk)
+                                if base_v is not None and fv is not None and base_v != fv and str(fv).strip():
+                                    identity_diff[fk] = [base_v, fv]
+                        if identity_diff:
+                            confirmation_level = "strong"
+                    except Exception:
+                        pass  # non-JSON or unparseable response — fall back to the raw body-diff signal below
+
+                suspicious = raw_diff
+                if suspicious and confirmation_level == "strong":
+                    note = (
+                        f"STRONG signal: identity-revealing field(s) {list(identity_diff.keys())} actually "
+                        f"differ between YOUR session's baseline response and the mutated-ID response "
+                        f"(e.g. {next(iter(identity_diff.values()))}) — this is real evidence the mutated ID "
+                        f"returned a DIFFERENT identity's data, not just incidental body noise (timestamps, "
+                        f"nonces, CSRF tokens). Still confirm the mutated ID genuinely belongs to someone else "
+                        f"(not a second resource of your own) before recording a finding."
+                    )
+                elif suspicious:
+                    note = (
+                        "WEAK signal: mutated ID returned 200 with a different body using the SAME session, but "
+                        "no identity-revealing field could be diffed (non-JSON response, or no "
+                        "email/username/name/id-type field present) — this could just as easily be a timestamp, "
+                        "nonce, or CSRF token changing. Manually confirm the returned object actually belongs to "
+                        "a different user/account before recording a finding."
+                    )
+                else:
+                    note = "No signal — same status/body pattern, or mutated ID was rejected."
+
                 bola_results.append({
                     **cand, "tested": True,
                     "baseline_status": r_base.status_code, "mutated_status": r_mut.status_code,
                     "baseline_body_len": len(r_base.text or ""), "mutated_body_len": len(r_mut.text or ""),
                     "possible_bola": suspicious,
-                    "note": (
-                        "Mutated ID returned 200 with a DIFFERENT body using the SAME session — possible "
-                        "horizontal privilege escalation. Manually confirm the returned object actually "
-                        "belongs to a different user/account before recording a finding (it may simply be a "
-                        "different but still-yours resource, e.g. a second of your own orders)."
-                        if suspicious else "No signal — same status/body pattern, or mutated ID was rejected."
-                    ),
+                    "confirmation_level": confirmation_level if suspicious else None,
+                    "identity_fields_diff": identity_diff or None,
+                    "note": note,
                 })
             except Exception as e:
                 bola_results.append({**cand, "tested": False, "error": str(e)})
@@ -7167,6 +7423,31 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         save_target(target)
     except Exception as e:
         return {"error": f"Failed to record finding: {e}"}
+
+    # Immediate cross-target "worked" lesson — the confirmed-finding
+    # counterpart to dismiss_finding's immediate "failed" lesson above.
+    # Don't wait for the end-of-session LLM mining pass (_finalize_target_
+    # lessons), which only fires on set_target, needs 4+ history turns,
+    # and depends on an LLM call correctly summarizing the whole
+    # transcript — a real confirmed technique should start helping the
+    # NEXT target immediately, not only if/when that pass happens to
+    # notice it. Deliberately generalized (kind + title + note, no raw
+    # target hostnames/tokens/cookies) since this feeds a GLOBAL store
+    # read by every future target/program, not just this one.
+    try:
+        sig_tags = list(target.state.get("technologies") or []) if hasattr(target, "state") and isinstance(target.state, dict) else []
+        sig_tags += [t for t in re.split(r"[.\-_/:?&=]+", (request_ref or "").lower()) if t and len(t) > 2]
+        if kind:
+            sig_tags.append(kind)
+        add_lesson(
+            technique=f"{kind}: {title}" if kind and kind not in title.lower() else title,
+            outcome="worked",
+            tech_signature=sig_tags,
+            note=note or "",
+            target_name=target.name if target else "",
+        )
+    except Exception:
+        pass  # lesson capture is best-effort and must never block a real recorded finding
 
     if emit and hasattr(emit, "success"):
         emit.success(f"[✓] Finding recorded: {title}")
@@ -8528,8 +8809,14 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "auto-injected (header + body field) into your next POST/PUT/PATCH/DELETE unless you pass your "
             "own; and if a stored session/token is sent but the response looks logged-out (401/403, a "
             "redirect to a login page, or 'please log in'/'session expired' text), the result includes a "
-            "'session_status' field flagging the session as dead -- don't keep fuzzing on one that's flagged, "
-            "re-run the login flow first."
+            "'session_status' field describing what happened. AUTO RE-LOGIN: once a successful POST login has "
+            "been observed through this tool, that exact login (url/method/body) is remembered for the rest of "
+            "the session — the NEXT time a dead session is detected, it's automatically replayed to get a fresh "
+            "session, and the original request that found it dead is retried once (see 'retry_status_code'/"
+            "'retry_body_preview' when that happens; 'session_auto_relogged_in' says whether it worked). Rate-"
+            "limited to one attempt per 30s per target so a fuzzing loop can't hammer the login endpoint. If no "
+            "login has been observed yet, or re-login fails (credentials may have changed), 'session_status' "
+            "says so plainly — re-run the login flow yourself in that case."
         ),
         parameters={
             "type": "object",
@@ -8637,15 +8924,23 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "all as separate tool calls that build on each other, exactly like a human clicking through a "
             "browser. Cookies the browser picks up are automatically folded into the shared target session, "
             "so curl/other tools can reuse whatever the browser just authenticated. Use curl for plain HTTP "
-            "recon — reach for this only when JS execution or real click/fill interaction is actually needed."
+            "recon — reach for this only when JS execution or real click/fill interaction is actually needed. "
+            "MULTIPLE SESSIONS FOR CROSS-USER TESTING: pass `session` (e.g. 'victim', 'attacker') to get an "
+            "independent browser context — own cookies, own storage, own page — for real two-identity BAC/IDOR "
+            "testing (log in as user A in one session, user B in another, both still open and usable at the "
+            "same time). Only the 'default' session's cookies are folded into the shared target session that "
+            "curl/other tools reuse, specifically so a second named session never clobbers the primary one. "
+            "'list_sessions' shows what's currently open for this target; 'close_all' tears all of them down "
+            "at once ('close' alone only closes the one session it was called with)."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "One of: 'goto' (navigate), 'click' (click an element), 'fill' (type into a field), 'eval_js' (run JavaScript in the page and return its result), 'get_storage' (read localStorage + sessionStorage), 'get_cookies' (read all cookies), 'get_network_log' (requests/responses seen so far), 'screenshot' (base64 PNG), or 'close' (tear the browser down for this target).",
+                    "description": "One of: 'goto' (navigate), 'click' (click an element), 'fill' (type into a field), 'eval_js' (run JavaScript in the page and return its result), 'get_storage' (read localStorage + sessionStorage), 'get_cookies' (read all cookies), 'get_network_log' (requests/responses seen so far), 'screenshot' (base64 PNG), 'close' (tear down the current `session` only), 'list_sessions' (show every open session for this target), or 'close_all' (tear down every open session for this target at once).",
                 },
+                "session": {"type": "string", "description": "Optional. Name of an independent browser context/session (e.g. 'victim', 'attacker') — defaults to 'default', the single ordinary session. Different names get fully isolated cookies/storage, for testing two logged-in identities at once."},
                 "url": {"type": "string", "description": "Required for action='goto'. Full URL to navigate to."},
                 "selector": {"type": "string", "description": "Required for 'click'/'fill'. A CSS selector, e.g. '#username', 'button[type=submit]'."},
                 "value": {"type": "string", "description": "Required for 'fill'. The text to type into the selected field."},
@@ -8801,9 +9096,14 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "Schema-driven BOLA and mass-assignment checks, seeded from the endpoint/param table 'spider' "
             "already built (target.state spider_intel) instead of guessing endpoints blind. Run 'spider' "
             "first. BOLA check: for endpoints with a numeric path/query ID, tries the adjacent ID (id+1) with "
-            "YOUR current session and flags it if a DIFFERENT 200 response comes back — a possible horizontal "
-            "privilege escalation signal (NOT a confirmed finding — verify the returned object really belongs "
-            "to someone else before recording). Mass-assignment check: for POST/PUT/PATCH endpoints, sends "
+            "YOUR current session and flags it if a DIFFERENT 200 response comes back. Each flagged result "
+            "carries a 'confirmation_level': 'strong' means an identity-revealing field (email, username, "
+            "name, phone, account id, etc.) actually differed between the baseline and mutated-ID response — "
+            "real evidence the mutated ID returned a different identity's data, not incidental body noise; "
+            "'weak' means only the raw body differed with no identity field to diff against (could still be a "
+            "timestamp/nonce/CSRF token). Treat 'strong' results as much more worth recording, but EITHER way "
+            "this is still NOT a confirmed finding — verify the returned object really belongs to someone else "
+            "before recording. Mass-assignment check: for POST/PUT/PATCH endpoints, sends "
             "the known legitimate params plus a batch of extra privilege/financial fields the client was "
             "never supposed to set (role, isAdmin, balance, etc.) and flags it if the server echoes them back "
             "as accepted. Both checks are capped (max_checks) and report signals only, by design — they do "
