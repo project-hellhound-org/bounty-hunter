@@ -487,6 +487,36 @@ def build_investigation_summary(target) -> str:
         for s in stat_lines:
             lines.append(f"• {s}")
 
+    # Surfaced explicitly, not just counted — the dismissed-findings block
+    # below already got this treatment (listed with reason, not just a
+    # number); confirmed findings didn't, which is a real asymmetry: a
+    # model that only sees "3 unresolved finding(s)" has no way to notice
+    # it's about to contradict one of them ("LFI not found here") on a
+    # later turn, especially after a target migration/IP rotation carries
+    # findings forward without the turn that confirmed them still being in
+    # the trimmed chat history. This is what actually enforces "you may
+    # not claim a verified vuln doesn't exist without dismissing it first"
+    # — not a separate guardrail mechanism, just making sure the model
+    # can't claim to not know.
+    active_findings = [f for f in target.findings if isinstance(f, dict)] if isinstance(target.findings, list) else []
+    if active_findings:
+        lines.append("")
+        lines.append(
+            "CONFIRMED FINDINGS ALREADY RECORDED ON THIS TARGET (do NOT state or imply any of these "
+            "'doesn't exist' / 'not vulnerable' / 'couldn't reproduce' without first calling "
+            "dismiss_finding with a specific reason — an IP/session change does not itself invalidate "
+            "a finding that was confirmed against the same underlying box/application):"
+        )
+        for f in active_findings[-15:]:
+            f_title = f.get("type") or f.get("title") or "(untitled)"
+            f_kind = f.get("kind", "")
+            f_sev = f.get("severity", "")
+            f_target = f.get("target", "")
+            label = f"- [{f_sev or '?'}] {f_title}" + (f" ({f_kind})" if f_kind and f_kind.lower() not in f_title.lower() else "")
+            if f_target:
+                label += f" — {f_target}"
+            lines.append(label)
+
     priorities = build_next_actions(target, limit=3)
     if priorities:
         lines.append("")

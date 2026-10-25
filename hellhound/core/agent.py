@@ -802,6 +802,87 @@ def _execute_feroxbuster_content(args: Dict[str, Any], target: Target, emit: Any
     }
 
 
+_HTTP_CLIENT_CMD_RE = re.compile(r"\b(curl|wget|http|httpie)\b")
+_TERMINAL_URL_RE = re.compile(r"https?://[^\s\"'`|><\\]+")
+
+
+def _mirror_http_evidence_from_terminal(command: str, proc: Any, target: Target, target_host: str) -> None:
+    """
+    Closes the real gap behind a real bug: a PoC run via raw curl inside
+    run_terminal_command (sqlmap-style injection chains, a heredoc python
+    script, or just a researcher-dictated curl one-liner) produced NO
+    evidence record_finding/export_report could ever find — only requests
+    made through the dedicated `curl` TOOL were ever written to
+    target.state['curl_evidence_log']. The agent's own read on this was
+    "pure discipline, not a code problem" (told to use the curl tool every
+    time); that doesn't hold up — a model consistently reaching for
+    run_terminal_command instead is a code problem, and the fix is to make
+    this path ALSO capture evidence rather than relying on the model to
+    always choose the right tool for an exploit that could just as easily
+    be a 3-line python/requests script as a single curl call.
+
+    Deliberately narrow and best-effort: only fires when the command looks
+    like an HTTP client (curl/wget/http[ie]) hitting a URL on the active
+    target, extracts whatever came back (status line if present, otherwise
+    just the raw output — an LFI/RCE PoC's output IS the evidence even
+    with no HTTP status line visible), and appends it in the exact shape
+    _execute_curl already writes so _lookup_curl_evidence finds it
+    automatically on the next record_finding/export_report call. Never
+    raises — evidence capture must never break the actual command result.
+    """
+    try:
+        if not _HTTP_CLIENT_CMD_RE.search(command):
+            return
+        url_match = _TERMINAL_URL_RE.search(command)
+        if not url_match:
+            return
+        url = url_match.group(0).rstrip("'\"")
+
+        # Only mirror requests that actually touch the active target — a
+        # curl pulling a wordlist/tool from GitHub shouldn't end up filed
+        # as "evidence" against this target.
+        host_for_match = (target_host or (target.host if target and target.host else "") or (target.name if target else "")).lower()
+        if host_for_match and host_for_match not in url.lower():
+            return
+
+        method_match = re.search(r"-X\s+([A-Za-z]+)", command) or re.search(r"--request\s+([A-Za-z]+)", command)
+        if method_match:
+            method = method_match.group(1).upper()
+        elif re.search(r"(-d\b|--data\b|--data-raw\b|--data-binary\b)", command):
+            method = "POST"
+        else:
+            method = "GET"
+
+        output = (proc.stdout or "") if (proc.stdout or "").strip() else (proc.stderr or "")
+        if not output.strip():
+            return
+        # Cap what gets stored — this is proof-of-impact evidence, not a
+        # full log dump; _lookup_curl_evidence/export_report only ever
+        # want a representative excerpt anyway.
+        output_capped = output[:4000]
+
+        status_match = re.search(r"^HTTP/[\d.]+\s+(\d+)", output, re.M)
+        status = int(status_match.group(1)) if status_match else None
+
+        raw_evidence = f"$ {command}\n\n{output_capped}"
+
+        if hasattr(target, "state") and isinstance(target.state, dict):
+            evidence_log = target.state.setdefault("curl_evidence_log", [])
+            evidence_log.append({
+                "url": url,
+                "method": method,
+                "origin_sent": None,
+                "status": status,
+                "raw": raw_evidence,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "source": "run_terminal_command",  # distinguishes a mirrored entry from a real curl-tool call, for anything that cares later
+            })
+            if len(evidence_log) > 40:
+                del evidence_log[: len(evidence_log) - 40]
+    except Exception:
+        pass
+
+
 def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Execute a custom terminal command/Kali tool targeting a specified host/IP.
@@ -896,6 +977,8 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
                         save_target(target)
         except Exception:
             pass  # credential-failure capture is best-effort and must never break the actual command result
+
+        _mirror_http_evidence_from_terminal(command, proc, target, target_host)
 
         return {
             "command": command,
@@ -3095,6 +3178,61 @@ def _format_last_turn_diagnostics(diag: Optional[Dict[str, Any]]) -> Optional[st
     else:
         lines.append("No tool actually executed that turn.")
     return "\n".join(f"- {l}" for l in lines) if lines else None
+
+
+_RESEARCHER_QUESTION_RE = re.compile(
+    r"(\?\s*$|\bwhich (?:one|option|approach|path|endpoint|account|direction)\b|\bshould I\b|"
+    r"\bdo you want\b|\bwould you like\b|\blet me know\b|\bwaiting for your\b|\bneed your\b|"
+    r"\byour call\b|\bconfirm (?:this|that|before|whether)\b|\bokay to\b|\bgo ahead\b.*\?|"
+    r"\bwant me to\b|\bshall I\b)",
+    re.I,
+)
+
+
+def _looks_like_question_for_researcher(text: str) -> bool:
+    """
+    Best-effort heuristic for the auto-continue decision at the end of a
+    turn (see handle_message): does the final synthesized answer read like
+    it's actually asking the researcher something, rather than just
+    reporting progress? Checked against only the LAST couple of lines
+    (where a closing question actually lives) rather than the whole
+    answer, since a PoC or report body legitimately contains plenty of
+    '?' characters (query strings, payloads) that aren't the agent asking
+    anything. False positives here only cost one extra pause for
+    confirmation; false negatives would mean plowing ahead past a question
+    that genuinely needed the researcher's input, which is the worse
+    failure of the two — kept deliberately permissive.
+    """
+    if not text:
+        return False
+    tail = "\n".join(text.strip().splitlines()[-4:])
+    return bool(_RESEARCHER_QUESTION_RE.search(tail))
+
+
+def _compute_auto_continue(
+    timed_out: bool,
+    was_cancelled: bool,
+    tools_executed: List[str],
+    new_finding_this_turn: bool,
+    final_response: str,
+    streak: int,
+    streak_cap: int = 8,
+) -> bool:
+    """
+    Pure decision function for whether handle_message's caller (the CLI
+    loop) should immediately re-invoke it with "continue" instead of
+    waiting for the researcher to type it — pulled out of handle_message
+    itself so this can be unit-tested without a real LLM call. See the
+    AUTO-CONTINUE DECISION comment at its call site for the full reasoning;
+    this is just the boolean logic.
+    """
+    if not timed_out or was_cancelled or not tools_executed:
+        return False
+    if new_finding_this_turn:
+        return False
+    if _looks_like_question_for_researcher(final_response):
+        return False
+    return streak < streak_cap
 
 
 def _clean_synthesizer_output(text: str, tools_executed: Optional[List[str]] = None) -> str:
@@ -7466,6 +7604,37 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
 
     raw_evidence_matches = _lookup_curl_evidence(target, request_ref)
 
+    # EVIDENCE GUARDRAIL — the actual fix for the "LFI report had no PoC"
+    # bug: a finding that names a SPECIFIC endpoint (request_ref given) but
+    # has no captured request/response to back it is exactly how a report
+    # ends up looking like a false positive at triage. This used to be
+    # purely additive (raw_evidence attached if found, silently skipped if
+    # not) — now it's a hard gate for the endpoint-specific case. Evidence
+    # is looked up from curl_evidence_log, which run_terminal_command now
+    # ALSO writes to for HTTP-shaped commands (see
+    # _mirror_http_evidence_from_terminal), so this isn't "only use the
+    # curl tool" — any HTTP PoC that actually ran against this request_ref,
+    # through either path, satisfies it. request_ref-less findings (a weak
+    # SSH password, a design-level issue with no single URL) aren't gated
+    # here at all — there's nothing to look an HTTP evidence match up
+    # against.
+    no_evidence_reason = str(args.get("no_http_evidence_reason", "")).strip()
+    if request_ref and not raw_evidence_matches and not no_evidence_reason:
+        return {
+            "status": "blocked_no_evidence",
+            "note": (
+                f"Not recording this yet — request_ref '{request_ref}' is given, but there's no captured "
+                f"request/response for it in this session's evidence log, so the report would end up with no "
+                f"real PoC attached (exactly what made an earlier finding look like a false positive at "
+                f"triage). Before recording: actually hit '{request_ref}' with the curl tool (or "
+                f"run_terminal_command, which now also captures HTTP evidence automatically) so the real "
+                f"request/response gets saved, then call record_finding again — it'll be picked up "
+                f"automatically. If this genuinely has no HTTP evidence to show (e.g. a local privilege "
+                f"escalation, a weak SSH credential, something confirmed by direct observation rather than an "
+                f"HTTP request), pass 'no_http_evidence_reason' explaining why, and this will record normally."
+            ),
+        }
+
     # Dedup: the storage layer's own dedup keys on the WHOLE finding dict,
     # which differs any time the title is reworded even slightly — this let
     # the same flag get logged 5+ times under different titles ("Flag
@@ -8570,6 +8739,138 @@ def _migrate_target_state(old_target: Target, new_host: str) -> Target:
     return new_target
 
 
+def _format_campaign_plan_block(target: Target) -> str:
+    """
+    Renders target.state['campaign_plan'] (set/updated via the update_plan
+    tool) into the same kind of always-injected prompt block lessons/
+    investigation-summary already use. This is the direct answer to "the
+    agent can't plan or think ahead, it just reacts turn to turn": the plan
+    itself now PERSISTS in the same structured target.state every other
+    piece of cross-turn memory lives in (survives a target-IP migration,
+    a session restart, a long gap between messages), and is re-shown on
+    EVERY orchestrator turn without the researcher re-explaining the
+    objective or the model needing to re-derive it from scrollback.
+
+    Deliberately NOT a separate planner/executor process or an external
+    orchestrator loop — this runs inside the existing single-turn tool-call
+    loop, same as every other tool here. What it actually buys: the model
+    can set a multi-step goal once, see exactly which steps are done/
+    pending/blocked on every subsequent turn (including a brand new
+    message hours later), and a researcher saying "continue" has something
+    concrete to continue FROM instead of the model re-reading chat history
+    and guessing. What it does NOT buy on its own: running for hours
+    without any new researcher message — that's a property of the host
+    loop that calls this agent per-message, not of what's stored here.
+    """
+    plan = target.state.get("campaign_plan") if (target and isinstance(target.state, dict)) else None
+    if not isinstance(plan, dict) or not plan.get("steps"):
+        return ""
+    lines = ["ACTIVE CAMPAIGN PLAN (persists across turns and target-IP migrations — update it with `update_plan` as steps complete; do not silently abandon it without saying so):"]
+    goal = plan.get("goal")
+    if goal:
+        lines.append(f"Goal: {goal}")
+    for step in plan.get("steps", [])[:25]:
+        if not isinstance(step, dict):
+            continue
+        status = step.get("status", "pending")
+        marker = {"done": "[x]", "blocked": "[!]", "pending": "[ ]"}.get(status, "[ ]")
+        line = f"  {marker} {step.get('desc', '(no description)')}"
+        if status == "blocked" and step.get("note"):
+            line += f" — blocked: {step['note']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _execute_update_plan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Sets or updates the persistent multi-step campaign plan for this
+    target, stored in target.state['campaign_plan'] — survives target-IP
+    migration (_migrate_target_state carries it forward), survives a gap
+    between researcher messages, and is re-injected into every
+    orchestrator turn via _format_campaign_plan_block, so the plan doesn't
+    need to be re-explained or re-derived from chat history.
+
+    Three actions:
+      - "set": (re)defines the plan from scratch — goal + an ordered list
+        of step descriptions, all starting "pending". Use when a
+        multi-step objective first becomes clear (e.g. after initial
+        recon surfaces 3-4 concrete attack paths worth tracking), not for
+        a single simple action.
+      - "update_step": marks ONE existing step done/blocked/pending by
+        matching its description (substring match, case-insensitive) or
+        its 0-based index. Call this as steps actually complete — don't
+        batch updates at the end of a turn, the whole point is that a
+        later turn (or the researcher checking in) sees real-time status.
+      - "show": returns the current plan without changing anything.
+    """
+    action = str(args.get("action", "")).strip().lower()
+    if action not in ("set", "update_step", "show"):
+        return {"error": "update_plan needs an 'action': 'set', 'update_step', or 'show'."}
+
+    state = target.state if (target and isinstance(target.state, dict)) else None
+    if state is None:
+        return {"error": "No target state available to store a plan against."}
+    plan = state.get("campaign_plan")
+    if not isinstance(plan, dict):
+        plan = {"goal": "", "steps": []}
+
+    if action == "show":
+        return {"status": "success", "plan": plan}
+
+    if action == "set":
+        goal = str(args.get("goal", "")).strip()
+        raw_steps = args.get("steps")
+        if not goal or not isinstance(raw_steps, list) or not raw_steps:
+            return {"error": "action='set' needs both a non-empty 'goal' and a non-empty 'steps' list (array of short step descriptions)."}
+        plan = {
+            "goal": goal,
+            "steps": [{"id": i, "desc": str(s).strip(), "status": "pending", "note": ""} for i, s in enumerate(raw_steps) if str(s).strip()],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        state["campaign_plan"] = plan
+        save_target(target)
+        if emit and hasattr(emit, "info"):
+            emit.info(f"[*] Campaign plan set: {goal} ({len(plan['steps'])} step(s))")
+        return {"status": "success", "plan": plan}
+
+    # action == "update_step"
+    step_ref = args.get("step")
+    new_status = str(args.get("status", "")).strip().lower()
+    note = str(args.get("note", "")).strip()
+    if step_ref is None or step_ref == "":
+        return {"error": "action='update_step' needs 'step' (the step's description text, or its 0-based index)."}
+    if new_status not in ("done", "blocked", "pending"):
+        return {"error": "action='update_step' needs 'status' to be 'done', 'blocked', or 'pending'."}
+    steps = plan.get("steps") or []
+    if not steps:
+        return {"error": "No plan steps exist yet — call action='set' first."}
+
+    target_step = None
+    try:
+        idx = int(step_ref)
+        if 0 <= idx < len(steps):
+            target_step = steps[idx]
+    except (TypeError, ValueError):
+        pass
+    if target_step is None:
+        ref_lower = str(step_ref).strip().lower()
+        for s in steps:
+            if ref_lower in str(s.get("desc", "")).lower():
+                target_step = s
+                break
+    if target_step is None:
+        return {"error": f"No plan step matched '{step_ref}' — check the current steps with action='show' and match the wording more closely, or its index."}
+
+    target_step["status"] = new_status
+    target_step["note"] = note
+    plan["updated_at"] = datetime.now(timezone.utc).isoformat()
+    state["campaign_plan"] = plan
+    save_target(target)
+    if emit and hasattr(emit, "info"):
+        emit.info(f"[*] Plan step marked {new_status}: {target_step.get('desc')}")
+    return {"status": "success", "plan": plan}
+
+
 def _execute_set_target_stub(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Placeholder to satisfy ToolSpec's executor signature (args, target, emit)
@@ -8710,8 +9011,9 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "title": {"type": "string", "description": "One-line description of the confirmed finding, e.g. 'IDOR: account B's invoices readable from account A session'."},
                 "kind": {"type": "string", "description": "Category, e.g. 'idor', 'auth_bypass', 'mass_assignment', 'interesting_endpoint'. Free text.", "default": "interesting_endpoint"},
                 "severity": {"type": "string", "description": "Your assessed severity: critical, high, medium, or low.", "default": "medium"},
-                "request_ref": {"type": "string", "description": "The URL/endpoint the finding applies to."},
-                "note": {"type": "string", "description": "Your own short analysis of why this confirms the finding. You do NOT need to retype raw request/response data here — the real request/response for this exact request_ref is captured automatically from the curl calls already made this session and attached to the report; this field is for your interpretation, not for reconstructing evidence from memory."}
+                "request_ref": {"type": "string", "description": "The URL/endpoint the finding applies to. If given, this call is BLOCKED unless a real request/response for this exact endpoint was actually captured this session (via the curl tool, or run_terminal_command running an HTTP-shaped command) — a finding with no real PoC attached is exactly what makes a report look like a false positive at triage. Omit only for a finding with no single endpoint (e.g. a weak SSH credential)."},
+                "note": {"type": "string", "description": "Your own short analysis of why this confirms the finding. You do NOT need to retype raw request/response data here — the real request/response for this exact request_ref is captured automatically from requests already made this session and attached to the report; this field is for your interpretation, not for reconstructing evidence from memory."},
+                "no_http_evidence_reason": {"type": "string", "description": "Only needed if request_ref is given but there's genuinely no HTTP request/response to show (a local privesc, a cracked SSH credential, something confirmed by direct observation). Explain why — this overrides the evidence gate. Never use this as a shortcut to skip actually re-running an HTTP PoC that's missing only because it was never tried through curl/run_terminal_command."}
             },
             "required": ["title"]
         },
@@ -8731,6 +9033,34 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["reason"]
         },
         executor=_execute_dismiss_finding
+    ),
+    "update_plan": ToolSpec(
+        name="update_plan",
+        description=(
+            "Set or update a persistent, multi-step campaign plan for the active target — stored in this "
+            "target's own state, so it survives a target-IP migration (same_target_as), a gap between "
+            "researcher messages, and doesn't need re-deriving from chat history on a later turn. Use "
+            "action='set' once a multi-step objective becomes concrete (e.g. after recon surfaces several "
+            "attack paths worth tracking: 'confirm the LFI, pivot to RCE via log poisoning, escalate to "
+            "admin') — not for a single simple action. Use action='update_step' as each step actually "
+            "completes or gets blocked, not batched at the end. This is what lets a later turn (or a "
+            "researcher checking in after a break) see exactly what's done and what's next, instead of the "
+            "model re-reading scrollback and guessing. It does NOT make the agent run unattended for hours "
+            "without a new researcher message — it's cross-turn memory of intent, not a background scheduler."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["set", "update_step", "show"], "description": "'set' (re)defines the whole plan, 'update_step' marks one step's status, 'show' just returns the current plan."},
+                "goal": {"type": "string", "description": "Required for action='set'. One sentence: the overall objective this plan works toward."},
+                "steps": {"type": "array", "items": {"type": "string"}, "description": "Required for action='set'. Ordered list of short step descriptions, e.g. ['Confirm LFI is still reachable after IP change', 'Escalate LFI to RCE via log poisoning', 'Record finding with full PoC', 'Attempt privilege escalation to root']."},
+                "step": {"description": "Required for action='update_step'. The step's description text (substring match) or its 0-based index in the steps list."},
+                "status": {"type": "string", "enum": ["done", "blocked", "pending"], "description": "Required for action='update_step'."},
+                "note": {"type": "string", "description": "Optional for action='update_step' — why it's blocked, or any other short context."}
+            },
+            "required": ["action"]
+        },
+        executor=_execute_update_plan
     ),
     "export_report": ToolSpec(
         name="export_report",
@@ -10335,6 +10665,8 @@ class Agent:
         self._turn_path_scope: Optional[str] = None  # e.g. "/app" — set per-turn in handle_message
         self._forced_skill: Optional[str] = None  # set by /skill-name slash command — one-shot, consumed next turn
         self._active_session_context: Optional[Dict[str, Any]] = None  # this turn's session_context, if any — see set_target()
+        self._auto_continue_streak: int = 0  # consecutive auto-continued turns this process, in-memory only — see the AUTO-CONTINUE DECISION block in handle_message
+        self._last_turn_auto_continue: bool = False  # read by the CLI loop right after handle_message() returns to decide whether to auto-send "continue"
 
     def _compact_history_if_needed(self) -> None:
         """
@@ -10605,6 +10937,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # previous target's.
         self.session_digest = self.target.state.get("session_digest") or ""
         self._turn_path_scope = None  # Reset path scope to prevent bleeding from previous target
+        self._auto_continue_streak = 0  # a target switch is a fresh context — don't carry an auto-continue streak over from whatever was happening on the previous target
         self.guard = AutopilotGuard(  # Reset circuit breaker and rate limiters for the new target
             circuit_threshold=5,
             circuit_cooldown=60.0,
@@ -11562,6 +11895,10 @@ If there is nothing worth generalizing, return an empty array: []"""
             except Exception:
                 pass  # memory module is best-effort context, never blocks the loop
 
+            plan_block_text = _format_campaign_plan_block(self.target)
+            if plan_block_text:
+                intel_block += "\n\n" + plan_block_text
+
             if self.session_digest:
                 intel_block += (
                     "\n\nCONDENSED MEMORY OF EARLIER TURNS (older raw history was "
@@ -11628,6 +11965,7 @@ RULES:
      * Gaining access to a stepping-stone account (e.g. standard user, support account) is an intermediate step to learn mechanics.
      * When authenticated as a stepping-stone user, probe for IDOR or parameter escalation on profile/setting endpoints (`curl` GET `/api/user/<target_id>`, `/profile/<target_id>`) and inspect client-side JavaScript state (`window.__INITIAL_STATE__`, embedded objects) to harvest the target's credentials or tokens.
      * Before constructing a request accepting tokens or keys, cross-check every entry in the HARVESTED ARTIFACT INVENTORY.
+   - PLANNING AHEAD, NOT JUST REACTING: the moment recon or an initial finding surfaces a genuinely multi-step path to the objective (confirm a vuln -> escalate it -> pivot to another host/account -> reach the real goal), call `update_plan` with action='set' to write that path down as steps, BEFORE executing the first of them — don't wait to be told each next step one at a time. Mark each step done/blocked with `update_step` as you actually complete or hit a wall on it, not all at once at the end. If an ACTIVE CAMPAIGN PLAN is already shown above (set on an earlier turn, possibly before a target-IP migration), treat it as still in force — continue the next pending step rather than re-deriving a plan from scratch or waiting for the researcher to restate the objective.
 
 3. Low-Noise Surgical Reconnaissance First (HTML & JavaScript Inspection Over Blind Fuzzing):
    - Always start reconnaissance by using `curl` to fetch the landing page HTML, comments, embedded `<script src="...">` tags, forms, and HTTP response headers.
@@ -11705,6 +12043,8 @@ RULES:
    - A privilege escalation or bypass is ONLY confirmed when privileged data (billing secrets, API keys, member directories, configuration settings) of the TARGET role/account is genuinely returned or unlocked.
    - GUARD / HUMAN APPROVAL & ERROR HONESTY: If a tool returns an error indicating that a request was blocked, required approval, or was rejected by the user (e.g. 'requires human approval', 'Action rejected by user', 'blocked'), the requested action DID NOT HAPPEN. You must NEVER claim that an action was executed, completed, or initiated if the underlying tool call was blocked or rejected.
    - PROOF OF PRIMARY TARGET ONLY: Capture `gowitness` screenshots and record findings for the PRIMARY target account once compromised. Screenshot the authenticated administrative dashboard (`/admin`), user list, or target view, rather than re-requesting destructive action URLs. Do NOT capture a screenshot of an allowed stepping-stone user and treat it as proof of the primary goal's completion.
+   - record_finding with a `request_ref` is BLOCKED unless a real request/response for that exact endpoint was actually captured this session — see the tool's own description. This is not "always use the curl tool": run_terminal_command also captures HTTP evidence automatically now, so a sqlmap/python-requests/raw-curl PoC run that way still counts, as long as it actually ran against that URL.
+   - NEVER state or imply that a vulnerability "doesn't exist," "isn't reproducible," or "isn't there anymore" for anything listed under CONFIRMED FINDINGS ALREADY RECORDED ON THIS TARGET above, including after a target/IP switch — call `dismiss_finding` with a specific reason first if you've genuinely disproven it, otherwise keep treating it as live.
    - MANDATORY ACTION BEFORE OUTPUTTING 'DONE': Whenever you successfully authenticate as the PRIMARY requested target role/account:
      1. Capture visual proof of the unlocked page or dashboard using `gowitness`.
      2. Record the confirmed vulnerability and reproduction proof using `record_finding`.
@@ -12206,6 +12546,13 @@ INSTRUCTIONS:
 
         turn_start_idx = len(self.history)
         self.history.append({"role": "user", "content": user_text})
+        # Snapshot for the auto-continue decision at the end of this turn —
+        # see the `_should_auto_continue` block right before `return
+        # final_response`. A finding recorded DURING this turn is one of
+        # the conditions that stops auto-continuation (the researcher asked
+        # to be shown a found vuln, not have it quietly logged while the
+        # agent keeps going).
+        _findings_count_at_turn_start = len(self.target.findings) if isinstance(self.target.findings, list) else 0
         tools_executed = []
         # Separate from tools_executed above: only tool calls that actually
         # DID something new (not a dedup/no-op skip like record_finding
@@ -13104,6 +13451,45 @@ INSTRUCTIONS:
             "provider_retries": _diag_provider_retries,
             "provider_gaveup": _diag_provider_gaveup,
         }
+
+        # AUTO-CONTINUE DECISION — the "stop asking me to type continue"
+        # fix. Only relevant while the researcher is actively in this live
+        # session (the CLI loop checks this flag and, if set, immediately
+        # re-invokes handle_message("continue") itself without waiting for
+        # another message) — this is NOT a background/unattended scheduler;
+        # nothing here runs when nobody is watching the session. Auto-
+        # continue fires ONLY when ALL of the following hold:
+        #   1. This turn hit the wall-clock time budget mid-investigation
+        #      (ended_reason == "timed_out") with real tool work done —
+        #      i.e. the orchestrator was still actively working, not a
+        #      case where it already decided DONE on its own.
+        #   2. Nothing was cancelled by the researcher (Ctrl+C).
+        #   3. No NEW finding was recorded this turn — the researcher
+        #      explicitly wants a found vuln surfaced and reviewed, not
+        #      silently logged while the agent keeps going past it.
+        #   4. The final answer doesn't read like it's actually asking the
+        #      researcher something (a genuine decision point still stops
+        #      and waits, same as it always did).
+        # A capped consecutive-auto-continue counter (not persisted; lives
+        # only on this Agent instance for this process) is the hard
+        # backstop against a logic bug turning this into an effectively
+        # infinite loop even while the researcher is sitting right there.
+        _findings_count_at_turn_end = len(self.target.findings) if isinstance(self.target.findings, list) else 0
+        _new_finding_this_turn = _findings_count_at_turn_end > _findings_count_at_turn_start
+        _auto_continue_streak = getattr(self, "_auto_continue_streak", 0)
+        should_auto_continue = _compute_auto_continue(
+            timed_out=_timed_out,
+            was_cancelled=_was_cancelled,
+            tools_executed=tools_executed,
+            new_finding_this_turn=_new_finding_this_turn,
+            final_response=final_response,
+            streak=_auto_continue_streak,
+        )
+        self._auto_continue_streak = (_auto_continue_streak + 1) if should_auto_continue else 0
+        self.target.state["last_turn_diagnostics"]["auto_continue"] = should_auto_continue
+        self.target.state["last_turn_diagnostics"]["new_finding_this_turn"] = _new_finding_this_turn
+        self._last_turn_auto_continue = should_auto_continue
+
         save_target(self.target)
         return final_response
 
