@@ -40,7 +40,7 @@ from hellhound.core.scope import is_in_scope, check_module_against_rules, normal
 from hellhound.core.tasks import (
     Target, create_or_load_target, save_target, sanitize_target_name,
     attach_target_to_program, set_program_scope, list_program_targets,
-    load_program, sanitize_program_name,
+    load_program, sanitize_program_name, extract_raw_host,
 )
 from hellhound.core.guard import AutopilotGuard
 from hellhound.core.ai_utils import (
@@ -2359,17 +2359,18 @@ def _execute_urlscan_recon(args: Dict[str, Any], target: Target, emit: Any) -> D
     """
     Queries urlscan.io's search API for pages it has crawled under this
     domain, pulling out either discovered subdomains or discovered URLs.
-    Needs an urlscan.io API key — set with `/model set-key urlscan <key>`
-    (stored the same way LLM provider keys are) or the URLSCAN_API_KEY
-    env var.
+    Needs an urlscan.io API key — set with `/apikey urlscan <key>` or the
+    URLSCAN_API_KEY env var. The older `/model set-key urlscan <key>`
+    still works too (same value, read as a fallback below).
     """
     cfg = load_config()
+    tool_keys = cfg.get("tool_api_keys", {}) if isinstance(cfg.get("tool_api_keys"), dict) else {}
     api_keys = cfg.get("api_keys", {}) if isinstance(cfg.get("api_keys"), dict) else {}
-    api_key = api_keys.get("urlscan") or os.environ.get("URLSCAN_API_KEY", "")
+    api_key = tool_keys.get("urlscan") or api_keys.get("urlscan") or os.environ.get("URLSCAN_API_KEY", "")
     if not api_key:
         return {
             "status": "no_api_key",
-            "note": "Nah bro, urlscan_recon needs an urlscan.io API key — none is configured. Set one first: /model set-key urlscan <your_api_key> (or export URLSCAN_API_KEY), then retry.",
+            "note": "Nah bro, urlscan_recon needs an urlscan.io API key — none is configured. Set one first: /apikey urlscan <your_api_key> (free key: https://urlscan.io/user/signup), then retry.",
         }
 
     domain = str(args.get("domain") or target.name).strip().lower()
@@ -2399,7 +2400,7 @@ def _execute_urlscan_recon(args: Dict[str, Any], target: Target, emit: Any) -> D
         return {"error": f"urlscan.io request failed: {e}"}
 
     if resp.status_code == 401:
-        return {"status": "bad_api_key", "note": "Nah bro, urlscan.io rejected that API key (401) — check it with /model set-key urlscan <key> and retry."}
+        return {"status": "bad_api_key", "note": "Nah bro, urlscan.io rejected that API key (401) — check it with /apikey urlscan <key> and retry."}
     if resp.status_code != 200:
         return {"error": f"urlscan.io returned HTTP {resp.status_code}"}
 
@@ -2438,17 +2439,20 @@ def _execute_virustotal_lookup(args: Dict[str, Any], target: Target, emit: Any) 
     hostnames (for an IP) and previously-seen-but-undetected URLs — useful
     for finding sibling hosts/forgotten subdomains sitting on shared
     infrastructure. Needs a VirusTotal API key — set with
-    `/model set-key virustotal <key>` (comma-separate multiple keys there
-    to rotate across the free-tier rate limit) or VT_API_KEY env var.
+    `/apikey virustotal <key>` (comma-separate multiple keys there to
+    rotate across the free-tier rate limit) or VT_API_KEY env var. The
+    older `/model set-key virustotal <key>` still works too (same value,
+    read as a fallback below) — /apikey is just the one place to look now.
     """
     cfg = load_config()
+    tool_keys = cfg.get("tool_api_keys", {}) if isinstance(cfg.get("tool_api_keys"), dict) else {}
     api_keys = cfg.get("api_keys", {}) if isinstance(cfg.get("api_keys"), dict) else {}
-    raw_keys = api_keys.get("virustotal") or os.environ.get("VT_API_KEY", "")
+    raw_keys = tool_keys.get("virustotal") or api_keys.get("virustotal") or os.environ.get("VT_API_KEY", "")
     keys = [k.strip() for k in str(raw_keys).split(",") if k.strip()]
     if not keys:
         return {
             "status": "no_api_key",
-            "note": "Nah bro, virustotal_lookup needs a VirusTotal API key — none is configured. Set one first: /model set-key virustotal <your_api_key> (or export VT_API_KEY), then retry.",
+            "note": "Nah bro, virustotal_lookup needs a VirusTotal API key — none is configured. Set one first: /apikey virustotal <your_api_key> (free key: https://www.virustotal.com/gui/my-apikey), then retry.",
         }
 
     raw_input = str(args.get("input") or args.get("domain") or args.get("ip") or target.name).strip()
@@ -2474,9 +2478,9 @@ def _execute_virustotal_lookup(args: Dict[str, Any], target: Target, emit: Any) 
         return {"error": f"VirusTotal request failed: {e}"}
 
     if resp.status_code == 403:
-        return {"status": "bad_api_key", "note": "Nah bro, VirusTotal rejected that API key (403) — check it with /model set-key virustotal <key> and retry."}
+        return {"status": "bad_api_key", "note": "Nah bro, VirusTotal rejected that API key (403) — check it with /apikey virustotal <key> and retry."}
     if resp.status_code == 204:
-        return {"status": "rate_limited", "note": "VirusTotal rate-limited this key (204) — the public API is 4 req/min. Wait a bit or add more keys (comma-separated) to /model set-key virustotal."}
+        return {"status": "rate_limited", "note": "VirusTotal rate-limited this key (204) — the public API is 4 req/min. Wait a bit or add more keys (comma-separated) to /apikey virustotal."}
     if resp.status_code != 200:
         return {"error": f"VirusTotal returned HTTP {resp.status_code}"}
 
@@ -5902,10 +5906,20 @@ def _execute_sqlmap_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dic
     database NAMES (--dbs/--current-db/--banner) as the impact proof —
     naming a real database is already "I can extract data," which is
     enough to back a finding without this tool also pulling row-level
-    data (no --dump here; that's a deliberate line, not a missing
-    feature). --batch keeps sqlmap from blocking on an interactive
+    data. --batch keeps sqlmap from blocking on an interactive
     prompt, and risk/level are capped to the tool's own sane defaults
     (not sqlmap's noisiest settings) unless the caller raises them.
+
+    Opt-in `dump_sample_rows` (default off, hard-capped at 5) goes one
+    step further: a SMALL sample dump (--dump --limit 0-N), not a full
+    extraction. A mass-PII-leak report backed by 4 real rows (names,
+    emails, hashes — whatever's actually in the table) is categorically
+    stronger evidence than "a database named X exists," and most
+    programs pay more for it. Still a proof-of-impact slice, not row-level
+    exfiltration — N stays small on purpose. If the caller names a
+    table/db (`table`/`db`), the dump targets that one; otherwise sqlmap
+    dumps whatever table it lands on by default, which is fine for
+    confirming impact but may not be the most interesting table.
 
     Reuses whatever session this target already has captured (same
     target.state cookies/headers every other request-sending tool reads
@@ -5962,6 +5976,26 @@ def _execute_sqlmap_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dic
     if args.get("is_dba"):
         cmd += ["--is-dba"]
 
+    dump_sample = False
+    sample_limit = 0
+    if args.get("dump_sample_rows"):
+        dump_sample = True
+        try:
+            sample_limit = int(args.get("dump_sample_rows"))
+        except (TypeError, ValueError):
+            sample_limit = 4
+        # Hard cap regardless of what the caller asked for -- this is a
+        # proof-of-impact sample, not a row-dump tool. 1 is floored so
+        # "dump_sample_rows: true" (no number) still does something.
+        sample_limit = max(1, min(sample_limit, 5))
+        db_name = args.get("db") or args.get("database")
+        table_name = args.get("table")
+        if db_name:
+            cmd += ["-D", str(db_name)]
+        if table_name:
+            cmd += ["-T", str(table_name)]
+        cmd += ["--dump", "--limit", f"0-{sample_limit - 1}"]
+
     try:
         proc = _run_cmd_with_heartbeat(cmd, timeout=240, emit=emit, label=f"sqlmap ({url})")
         output = (proc.stdout or "") + "\n" + (proc.stderr or "")
@@ -5981,7 +6015,7 @@ def _execute_sqlmap_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dic
 
     tail_lines = [ln for ln in output.splitlines() if ln.strip()][-40:]
 
-    return {
+    result = {
         "url": url,
         "command": " ".join(cmd),
         "injectable": injectable,
@@ -5991,6 +6025,127 @@ def _execute_sqlmap_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dic
         "is_dba": (is_dba_match.group(1).lower() == "true") if is_dba_match else None,
         "raw_tail": "\n".join(tail_lines),
     }
+
+    if dump_sample:
+        # sqlmap's dump table render looks like:
+        #   Database: wordpress
+        #   Table: wp_users
+        #   [4 entries]
+        #   +----+------------+-------------------------+
+        #   | id | user_login | user_email               |
+        #   +----+------------+-------------------------+
+        #   | 1  | elyana     | elyana@example.com       |
+        #   +----+------------+-------------------------+
+        dump_table_match = re.search(r"Database:\s*(.+?)\nTable:\s*(.+?)\n\[\d+ entries?\]\n(\+[-+]+\+\n.*?\+[-+]+\+)", output, re.S)
+        result["dump_sample_requested"] = sample_limit
+        if dump_table_match:
+            result["dumped"] = True
+            result["dumped_db"] = dump_table_match.group(1).strip()
+            result["dumped_table"] = dump_table_match.group(2).strip()
+            result["dumped_sample"] = dump_table_match.group(3).strip()
+            # Cheap PII signal off the dumped column header row, so the
+            # caller doesn't have to re-parse the ASCII table itself to
+            # judge whether this is worth reporting as a mass-PII leak.
+            header_match = re.search(r"\+[-+]+\+\n\|(.+?)\|\n\+[-+]+\+", dump_table_match.group(3))
+            pii_cols = []
+            if header_match:
+                cols = [c.strip().lower() for c in header_match.group(1).split("|")]
+                pii_markers = ("email", "mail", "pass", "hash", "phone", "ssn", "address", "dob", "name", "token", "secret")
+                pii_cols = [c for c in cols if any(m in c for m in pii_markers)]
+            result["dumped_columns_with_pii_signal"] = pii_cols
+        else:
+            result["dumped"] = False
+            result["dump_note"] = "--dump ran but no table output was parsed from sqlmap's output -- check raw_tail (sqlmap may have needed an interactive choice despite --batch, found an empty table, or the table/db name didn't exist)."
+
+    return result
+
+
+def _execute_wpscan_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Runs wpscan against a confirmed WordPress target. Exists mainly to fix
+    a real, observed failure mode of running wpscan ad hoc via
+    run_terminal_command: an API token (WPScan's vulnerability database
+    lookup) either got passed as an empty string (sqlmap-style '--api-token
+    \"\"'), which wpscan flat-out rejects and aborts on, or was silently
+    skipped with no mention back to the researcher that vuln-DB matching
+    was running degraded. Neither is right — the fix is to actually LOOK
+    for a configured token first and only fall back to keyless with a
+    clear, structured note about what that costs, so the researcher (or
+    the model) can supply one if they have it instead of a failed/guessed
+    command.
+
+    Token resolution order: explicit args.api_token -> target.state
+    (already supplied once this engagement) -> the persistent
+    tool_api_keys.wpscan config value (saved once via /apikey, reused on
+    every future target automatically) -> keyless.
+    """
+    url = (args.get("url") or "").strip()
+    if not url:
+        return {"error": "wpscan_scan needs a 'url' (the WordPress site root, e.g. http://10.0.0.5/wordpress/)."}
+    if not url.startswith(("http://", "https://")):
+        url = f"http://{url}"
+
+    auto_install = bool(load_config().get("auto_install_missing_tools", False))
+    check = ensure_tool("wpscan", emit=emit, auto_install=auto_install)
+    if not check["available"]:
+        if emit and hasattr(emit, "warn"):
+            emit.warn(check["message"])
+        return {"error": "wpscan not installed", "message": check["message"], "hint": install_hint("wpscan")}
+
+    binary = get_binary_path("wpscan") or "wpscan"
+
+    state = target.state if (target and isinstance(target.state, dict)) else {}
+    token = (
+        str(args.get("api_token", "") or "").strip()
+        or str(state.get("wpscan_api_token", "") or "").strip()
+        or str((load_config().get("tool_api_keys") or {}).get("wpscan", "") or "").strip()
+    )
+    token_source = None
+    if token:
+        token_source = "argument" if args.get("api_token") else ("target session" if state.get("wpscan_api_token") else "saved config (/apikey)")
+        # Remember it on this target so it doesn't need to be supplied again
+        # for the rest of THIS engagement even if it only arrived via args.
+        if isinstance(target.state, dict):
+            target.state["wpscan_api_token"] = token
+
+    enumerate_opt = str(args.get("enumerate", "vp,vt,u") or "vp,vt,u")
+    cmd = [binary, "--url", url, "--enumerate", enumerate_opt, "--random-user-agent", "--no-update"]
+    if token:
+        cmd += ["--api-token", token]
+
+    try:
+        proc = _run_cmd_with_heartbeat(cmd, timeout=180, emit=emit, label=f"wpscan ({url})")
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    except subprocess.TimeoutExpired:
+        return {"url": url, "error": "wpscan timed out after 180 seconds."}
+    except Exception as e:
+        return {"url": url, "error": f"wpscan execution failed: {e}"}
+
+    vulns = re.findall(r"\[!\]\s+Title:\s*(.+)", output)
+    version_match = re.search(r"WordPress version\s+([\d.]+)\s+identified", output)
+
+    result = {
+        "url": url,
+        "command": " ".join(cmd if not token else cmd[:-1] + ["<redacted>"]),
+        "ran_with_api_token": bool(token),
+        "wordpress_version": version_match.group(1) if version_match else None,
+        "vulnerabilities_found": vulns,
+        "raw_tail": "\n".join([ln for ln in output.splitlines() if ln.strip()][-60:]),
+    }
+    if not token:
+        result["note"] = (
+            "Ran KEYLESS — no WPScan API token configured anywhere (argument, this target's "
+            "session, or saved config), so the vulnerability-database lookup for plugins/themes/"
+            "core was skipped or limited; version/user/enum results above are still valid. If the "
+            "researcher has a free WPScan API token, ask them for it and pass it as 'api_token' "
+            "next time (it'll be remembered for the rest of this target's session), or save it "
+            "permanently with /apikey wpscan <token> so every future target picks it up "
+            "automatically without asking again."
+        )
+    else:
+        result["api_token_source"] = token_source
+
+    return result
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -8343,6 +8498,78 @@ function hhCopy(id, btn) {{
     return result
 
 
+def _rehost_value(obj: Any, old_host: str, new_host: str) -> Any:
+    """Recursively rewrites any string in obj that contains old_host to use
+    new_host instead -- used by _migrate_target_state so carried-forward
+    state (a captured login recipe's URL, discovered routes, spider_intel,
+    etc.) doesn't silently keep pointing at a dead IP after a rotating-IP
+    box (THM/HTB-style) hands out a new one."""
+    if not old_host or old_host == new_host:
+        return obj
+    if isinstance(obj, str):
+        return obj.replace(old_host, new_host) if old_host in obj else obj
+    if isinstance(obj, dict):
+        return {k: _rehost_value(v, old_host, new_host) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_rehost_value(v, old_host, new_host) for v in obj]
+    return obj
+
+
+def _migrate_target_state(old_target: Target, new_host: str) -> Target:
+    """
+    Carries everything learned on `old_target` forward onto a target for
+    `new_host` -- for the "same logical box, IP rotated" case (THM/HTB
+    machines that hand out a fresh IP on every reboot/restart). Without
+    this, switching to the new IP via plain set_target silently starts a
+    brand-new, EMPTY Target: every bit of recon already done (users found,
+    plugins fingerprinted, a captured login recipe, notes, findings, the
+    whole prior conversation) is gone, and the agent re-discovers the site
+    from scratch and has to be manually re-told "it's the same target" --
+    exactly the failure this closes.
+
+    Deliberately asymmetric about what's carried forward: nearly everything
+    survives a reboot (what plugins/users/endpoints exist, what's been
+    tried, what's been found), but live session cookies/tokens almost
+    certainly do NOT survive a full machine restart, so those are dropped
+    rather than carried forward as a guaranteed-dead session that would
+    silently poison every following request-sending tool call. The login
+    RECIPE (url/method/payload shape) is kept -- that's what lets
+    auto-relogin immediately re-establish a session against the new host
+    instead of needing the login flow re-discovered too.
+    """
+    old_host_str = old_target.host or old_target.name
+    new_raw_host = extract_raw_host(new_host) or new_host
+    new_target = create_or_load_target(new_host)
+
+    carried_state = _rehost_value(dict(old_target.state or {}), old_host_str, new_raw_host)
+    # Drop anything tied to a session that's almost certainly dead after a
+    # full machine restart -- carrying these forward would make every
+    # following curl/content-discovery/sqlmap call look authenticated while
+    # silently hitting a logged-out response, which is worse than starting
+    # with none at all (that case is already handled -- curl's session-dead
+    # detection + auto-relogin -- but only if it's told there's no session).
+    for dead_key in ("cookies", "session_cookie", "_last_tool_output", "last_reauth_attempt_ts"):
+        carried_state.pop(dead_key, None)
+    history = carried_state.pop("history", None)
+
+    new_target.state.update(carried_state)
+    if isinstance(history, list):
+        new_target.state["history"] = history
+
+    new_target.findings = list(old_target.findings or [])
+    timestamp = datetime.now(timezone.utc).isoformat()
+    migration_note = f"[{timestamp}] Migrated from {old_host_str} — same logical target, IP rotated (old box restarted/respawned)."
+    new_target.notes = (str(old_target.notes or "") + "\n" + migration_note).strip()
+
+    # Breadcrumb on the OLD target too, so it's a traceable handoff rather
+    # than a silent dead end if anything ever looks it up again.
+    old_target.state["rotated_to_host"] = new_raw_host
+    old_target.notes = (str(old_target.notes or "") + f"\n[{timestamp}] Superseded — IP rotated to {new_raw_host}.").strip()
+    save_target(old_target)
+    save_target(new_target)
+    return new_target
+
+
 def _execute_set_target_stub(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Placeholder to satisfy ToolSpec's executor signature (args, target, emit)
@@ -8661,7 +8888,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "urlscan_recon": ToolSpec(
         name="urlscan_recon",
-        description="Searches urlscan.io's crawl index for a domain and extracts either discovered subdomains or discovered URLs from pages it has already scanned. Needs an urlscan.io API key configured via /model set-key urlscan <key> or the URLSCAN_API_KEY env var.",
+        description="Searches urlscan.io's crawl index for a domain and extracts either discovered subdomains or discovered URLs from pages it has already scanned. Needs an urlscan.io API key configured via /apikey urlscan <key> (free key: https://urlscan.io/user/signup) or the URLSCAN_API_KEY env var.",
         parameters={
             "type": "object",
             "properties": {
@@ -8674,7 +8901,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "virustotal_lookup": ToolSpec(
         name="virustotal_lookup",
-        description="Looks up a domain or IP in VirusTotal's v2 API: resolved hostnames (for an IP, revealing sibling hosts on shared infra) and previously-seen undetected URLs. Needs a VirusTotal API key via /model set-key virustotal <key> (comma-separate several keys there to rotate across the free-tier rate limit) or VT_API_KEY env var.",
+        description="Looks up a domain or IP in VirusTotal's v2 API: resolved hostnames (for an IP, revealing sibling hosts on shared infra) and previously-seen undetected URLs. Needs a VirusTotal API key via /apikey virustotal <key> (free key: https://www.virustotal.com/gui/my-apikey; comma-separate several keys there to rotate across the free-tier rate limit) or VT_API_KEY env var.",
         parameters={
             "type": "object",
             "properties": {
@@ -9047,8 +9274,13 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "quote/boolean tweak you already tried manually, or the researcher explicitly asking you to "
             "test a given endpoint/parameter for SQLi. Don't sweep every parameter on every endpoint through "
             "this 'just in case' — that's noisy and exactly what the researcher doesn't want. By default it "
-            "only confirms injectability and lists database NAMES (list_databases=true) as impact proof — it "
-            "does not dump table/row data; that's a deliberate limit of this tool, not a missing option."
+            "only confirms injectability and lists database NAMES (list_databases=true) as impact proof. Set "
+            "dump_sample_rows to go one step further and pull a SMALL sample (capped at 5 rows) of actual "
+            "table data with --dump --limit — real PII in a few rows (emails, password hashes, names) is "
+            "stronger, higher-paying proof than a database name alone for a mass-data-exposure finding. This "
+            "is still a small proof-of-impact sample, not a full row-level extraction — don't raise the cap "
+            "past what the tool allows, and don't reach for it on a plain confirmed-injectable finding where "
+            "a database name is already enough evidence."
         ),
         parameters={
             "type": "object",
@@ -9060,11 +9292,39 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "risk": {"type": "integer", "description": "sqlmap risk level, 1-2 (default 1). Higher includes riskier payloads (e.g. time-based)."},
                 "list_databases": {"type": "boolean", "description": "If injectable, enumerate database names as proof (default true)."},
                 "current_db": {"type": "boolean", "description": "Also report the current database name."},
-                "is_dba": {"type": "boolean", "description": "Also report whether the injected user has DBA privileges."}
+                "is_dba": {"type": "boolean", "description": "Also report whether the injected user has DBA privileges."},
+                "dump_sample_rows": {"type": "integer", "description": "Opt-in: pull a small sample dump of real row data as mass-PII-leak proof (1-5 rows, hard-capped at 5). Pairs well with 'table'/'db' if you already know which table matters (e.g. a users table); otherwise sqlmap picks one itself."},
+                "db": {"type": "string", "description": "Database name to target the sample dump at, when known (used only with dump_sample_rows)."},
+                "table": {"type": "string", "description": "Table name to target the sample dump at, when known (used only with dump_sample_rows)."}
             },
             "required": ["url"]
         },
         executor=_execute_sqlmap_scan
+    ),
+    "wpscan_scan": ToolSpec(
+        name="wpscan_scan",
+        description=(
+            "Run wpscan against a confirmed WordPress site to enumerate plugins/themes/users and check them "
+            "against the vulnerability database. PREFER THIS over running wpscan through run_terminal_command — "
+            "this tool automatically finds and uses a configured API token (if one was already given this "
+            "session, or saved via /apikey) instead of trying an empty '--api-token' flag (which wpscan rejects "
+            "outright) or silently running keyless with no record of why. If no token is configured anywhere, "
+            "it still runs — just keyless, with a clear note on what that costs — and if the researcher's "
+            "message doesn't already answer the question, you can ask them in plain text whether they have a "
+            "free WPScan API token to pass in before running, instead of guessing. A free token is available "
+            "at https://wpscan.com/api (sign up, then Profile -> API Token) — mention this if the researcher "
+            "says they don't have one but want deeper results. Save it permanently with /apikey wpscan <token>."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The WordPress site root, e.g. http://10.0.0.5/wordpress/."},
+                "api_token": {"type": "string", "description": "WPScan vulnerability-database API token, if the researcher gave one. Remembered for the rest of this target's session once passed — no need to pass it again on a later call for the same target."},
+                "enumerate": {"type": "string", "description": "wpscan --enumerate value (default 'vp,vt,u' — vulnerable plugins, vulnerable themes, users). Pass a broader value like 'vp,vt,tt,cb,dbe,u,m' only when you actually want the slower full sweep."}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_wpscan_scan
     ),
     "waf_evasion_probe": ToolSpec(
         name="waf_evasion_probe",
@@ -9220,9 +9480,12 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         name="run_terminal_command",
         description=(
             "Run an arbitrary terminal command or Kali tool (e.g., custom nmap, gobuster, "
-            "sqlmap, custom ffuf pipes), or execute a script previously written with save_file "
+            "custom ffuf pipes), or execute a script previously written with save_file "
             "(python3 <path>, chmod +x <path> && <path>), targeting a specific host. You MUST "
-            "specify the target host parameter for scope validation. "
+            "specify the target host parameter for scope validation. Prefer the dedicated tools "
+            "(sqlmap_scan, wpscan_scan) over running sqlmap/wpscan here directly — they handle "
+            "session cookies, API tokens, and output parsing correctly where a hand-built command "
+            "line is easy to get subtly wrong (e.g. an empty --api-token flag wpscan rejects outright). "
             "AUTH IS INJECTED AUTOMATICALLY — don't hardcode it: whenever this target has a "
             "captured session (from a login flow, cookie_inspector, or an imported Burp/Caido "
             "history), the command's environment carries it as HELLHOUND_COOKIE (raw 'k=v' "
@@ -9480,7 +9743,13 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "those additional hosts in 'related_hosts' on THIS call — don't just set the primary one and hope to "
             "remember to add the rest later with manage_scope, that's what caused real blocked-tool-call friction "
             "before. Only include hosts the researcher ACTUALLY named this way, never a guess at what else might "
-            "be related."
+            "be related. IMPORTANT — rotating-IP labs (THM/HTB-style): if the researcher says this new host is "
+            "the SAME target as one you already set (e.g. 'the IP is dead, use this IP now', 'same box, new IP', "
+            "'it respawned, here's the new address' — anything saying 'same machine/target/box', not a genuinely "
+            "new, unrelated host), pass the PREVIOUS host/IP in 'same_target_as' on this call. That carries "
+            "forward everything already learned (findings, notes, fingerprinted plugins/users/tech, the login "
+            "recipe) onto the new host instead of silently starting over from zero and forcing the researcher to "
+            "re-explain the whole site a second time."
         ),
         parameters={
             "type": "object",
@@ -9490,6 +9759,10 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "related_hosts": {
                     "type": "array", "items": {"type": "string"},
                     "description": "Other hosts the researcher named in the SAME message as part of this engagement (auth server, IdP, API subdomain, etc.) — pre-authorizes them into scope alongside the primary host so you don't hit a SCOPE_VIOLATION the first time you need to touch one. Only hosts the researcher actually named, never inferred ones.",
+                },
+                "same_target_as": {
+                    "type": "string",
+                    "description": "The PREVIOUS host/IP this new 'host' replaces, when the researcher is saying it's the same logical target under a new address (IP rotated after a lab machine restarted/respawned). Carries findings/notes/fingerprinted tech/login-recipe forward onto the new target; live session cookies are dropped (presumed dead after a restart). Leave unset for a genuinely new, unrelated target.",
                 },
             },
             "required": ["host"]
@@ -10402,6 +10675,36 @@ If there is nothing worth generalizing, return an empty array: []"""
         if already_active:
             return {"target": self.target.name, "host": self._display_host, "note": "already the active target — no change made."}
 
+        # "same_target_as": the researcher is saying this NEW host is the
+        # SAME logical target as one already hunted, just under a different
+        # IP/hostname (the classic THM/HTB case — a lab box hands out a
+        # fresh IP every time it's rebooted/respawned, but it's still the
+        # same machine with the same findings so far). Without this, every
+        # IP rotation silently started a brand-new, empty Target and threw
+        # away everything already learned (users found, plugins
+        # fingerprinted, login recipe, notes, findings) until someone
+        # noticed and manually re-explained the whole site — see the
+        # _migrate_target_state docstring for exactly what is and isn't
+        # carried forward.
+        migrated_from = None
+        same_target_as = str(args.get("same_target_as", "") or "").strip()
+        if same_target_as:
+            old_normalized, _ = normalize_host(same_target_as)
+            if old_normalized and sanitize_target_name(old_normalized) != sanitize_target_name(normalized):
+                if self.target and sanitize_target_name(old_normalized) == self.target.name:
+                    # The researcher is CURRENTLY on the old target's session
+                    # — reuse the in-memory object, which may hold state from
+                    # this very turn that hasn't been saved to disk yet.
+                    old_target_obj = self.target
+                else:
+                    old_target_obj = create_or_load_target(old_normalized)
+                old_had_state = bool(old_target_obj.state) or bool(old_target_obj.findings) or bool(old_target_obj.notes)
+                if old_had_state:
+                    _migrate_target_state(old_target_obj, normalized)
+                    migrated_from = old_target_obj.host or old_target_obj.name
+                elif emit and hasattr(emit, "info"):
+                    emit.info(f"[*] same_target_as='{same_target_as}' given, but no prior state was found for it — nothing to carry forward, starting '{normalized}' fresh.")
+
         new_target = self.set_target(normalized)
 
         # Pre-authorize any other hosts the researcher named in the SAME
@@ -10439,6 +10742,8 @@ If there is nothing worth generalizing, return an empty array: []"""
                 save_target(new_target)
 
         msg = f"Target set to '{new_target.name}' ({args.get('reason', '').strip() or 'directed by researcher'})."
+        if migrated_from:
+            msg += f" Carried forward everything already learned from '{migrated_from}' (same logical target, IP rotated) — findings, notes, fingerprinted tech, and the login recipe all still apply; session cookies were dropped as presumed-dead after the restart, so re-auth may be needed."
         if related_added:
             msg += f" Also pre-authorized related host(s) into scope: {', '.join(related_added)}."
         if emit and hasattr(emit, "info"):
@@ -10452,6 +10757,8 @@ If there is nothing worth generalizing, return an empty array: []"""
             result["related_hosts_added"] = related_added
         if related_rejected:
             result["related_hosts_rejected"] = related_rejected
+        if migrated_from:
+            result["migrated_from"] = migrated_from
         return result
 
     @property

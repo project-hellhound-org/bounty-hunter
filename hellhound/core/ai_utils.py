@@ -142,6 +142,12 @@ def load_config() -> Dict[str, Any]:
         "fuzz_rate_limit": 150,
         "show_recaps": True,
         "api_keys": {},
+        # API keys/tokens for external SECURITY TOOLS this invokes (wpscan's
+        # WPVulnDB token, and anywhere else the pattern applies later) —
+        # deliberately separate from api_keys above, which is LLM-provider
+        # keys only. Saved once (via /apikey) and reused on every future
+        # target instead of needing to be re-pasted into chat each time.
+        "tool_api_keys": {},
         "global_headers": {},
         "scope": {
             "in_scope": [],
@@ -163,6 +169,8 @@ def load_config() -> Dict[str, Any]:
                     data["max_agent_iterations"] = default_config["max_agent_iterations"]
                 if "fuzz_rate_limit" not in data:
                     data["fuzz_rate_limit"] = default_config["fuzz_rate_limit"]
+                if "tool_api_keys" not in data:
+                    data["tool_api_keys"] = {}
                 # Two-tier model backward compatibility fallbacks
                 legacy_prov = data.get("ai_provider", "ollama")
                 legacy_model = data.get("ai_model", "")

@@ -1131,6 +1131,89 @@ def _mask_secret(secret: str) -> str:
     return secret[:6] + "..." + secret[-4:] if len(secret) > 14 else secret[:3] + "..."
 
 
+# Every non-LLM tool that actually reads a key from tool_api_keys (see
+# agent.py's _execute_wpscan_scan / _execute_virustotal_lookup /
+# _execute_urlscan_recon) gets an entry here so `/apikey` with no args can
+# show EVERY key the system knows how to use — set or not — plus where to
+# get one. Without this, a researcher has no way to discover that
+# virustotal_lookup/urlscan_recon even take a key short of reading the
+# source; it looked like wpscan was the only tool this applied to.
+# Update this alongside any new tool wired to read tool_api_keys.
+KNOWN_TOOL_API_KEYS: Dict[str, str] = {
+    "wpscan": "Free token: https://wpscan.com/api (sign up, then Profile -> API Token). Used by wpscan_scan for its vulnerability-database lookups.",
+    "virustotal": "Free key: https://www.virustotal.com/gui/my-apikey. Used by virustotal_lookup for passive DNS/subdomain discovery.",
+    "urlscan": "Free key: https://urlscan.io/user/signup (Settings -> API). Used by urlscan_recon for crawl-index search.",
+}
+
+
+def handle_apikey(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """
+    /apikey                        — list every tool this system knows how to use a key for (set or not), with a hint on where to get one
+    /apikey <tool> <value>         — save/update an API key/token for ANY external tool, known or not
+    /apikey <tool> --clear         — remove a saved key
+
+    One persistent store for every non-LLM tool's key (wpscan, virustotal,
+    urlscan, and anything added later) — separate from the LLM-provider
+    api_keys used for the orchestrator/synthesizer themselves, and
+    replacing the old per-tool '/model set-key <tool> <key>' convention
+    (which still works as a fallback read, but isn't where new keys get
+    written). 'tool' isn't restricted to KNOWN_TOOL_API_KEYS — any future
+    tool_api_keys consumer works immediately with this same command, it
+    just won't get a hint line until it's added to that table.
+    """
+    is_json = "--json" in args or getattr(emit, "json_mode", False)
+    clean_args = [a for a in args if a not in ("--json", "-j")]
+
+    cfg = load_config()
+    tool_keys = cfg.get("tool_api_keys")
+    if not isinstance(tool_keys, dict):
+        tool_keys = {}
+
+    if not clean_args:
+        if not is_json:
+            emit.info("API keys for external tools (/apikey <tool> <value> to set, /apikey <tool> --clear to remove):")
+            all_names = sorted(set(KNOWN_TOOL_API_KEYS) | set(tool_keys))
+            for name in all_names:
+                if name in tool_keys and tool_keys[name]:
+                    emit(f"  [set]   {name}: {_mask_secret(str(tool_keys[name]))}")
+                else:
+                    hint = KNOWN_TOOL_API_KEYS.get(name, "")
+                    emit(f"  [unset] {name}" + (f" — {hint}" if hint else ""))
+            if not all_names:
+                emit.info("Nothing configured yet. e.g. /apikey wpscan <token>")
+        return {
+            "status": "success",
+            "tool_api_keys": {k: _mask_secret(str(v)) for k, v in tool_keys.items() if v},
+            "known_tools": KNOWN_TOOL_API_KEYS,
+        }
+
+    tool_name = clean_args[0].strip().lower()
+    if len(clean_args) == 1:
+        hint = KNOWN_TOOL_API_KEYS.get(tool_name, "")
+        msg = f"No value given. Usage: /apikey {tool_name} <value>  or  /apikey {tool_name} --clear"
+        if hint:
+            msg += f"\n{hint}"
+        if not is_json:
+            emit.warn(msg)
+        return {"status": "error", "message": msg}
+
+    if clean_args[1] in ("--clear", "-c", "clear"):
+        tool_keys.pop(tool_name, None)
+        cfg["tool_api_keys"] = tool_keys
+        save_config(cfg)
+        if not is_json:
+            emit.success(f"Cleared the saved API key for '{tool_name}'.")
+        return {"status": "success", "tool": tool_name, "cleared": True}
+
+    value = " ".join(clean_args[1:]).strip()
+    tool_keys[tool_name] = value
+    cfg["tool_api_keys"] = tool_keys
+    save_config(cfg)
+    if not is_json:
+        emit.success(f"Saved API key for '{tool_name}': {_mask_secret(value)} — every future target will use it automatically.")
+    return {"status": "success", "tool": tool_name, "key_masked": _mask_secret(value)}
+
+
 def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
     /mcp                            — show Burp/Caido configuration + live status
@@ -2244,6 +2327,15 @@ register_command(Command(
     usage="/headers [Header: Value | --clear]",
     category="config",
     handler=handle_headers
+))
+
+register_command(Command(
+    name="/apikey",
+    aliases=["/apikeys", "/tool-key"],
+    description="Save/view/clear API keys or tokens for external security tools (wpscan, virustotal, urlscan, and anything else wired to use one) — with a sign-up hint for each. Saved once, reused automatically on every future target so you're never asked for it mid-engagement again",
+    usage="/apikey | /apikey <tool> <value> | /apikey <tool> --clear  (e.g. /apikey wpscan abc123...)",
+    category="config",
+    handler=handle_apikey
 ))
 
 register_command(Command(
