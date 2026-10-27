@@ -491,6 +491,45 @@ def _ffuf_live_parser(line: str) -> Optional[str]:
     return f"[{status}] /{word}  ({size} bytes)"
 
 
+def _probe_soft_404_baseline(url: str, headers: Dict[str, str], cookies: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """
+    Requests a guaranteed-nonexistent path and records its status/length,
+    so a fuzzer's hits can be checked against it before being reported as
+    real finds. Many apps (SPAs, PHP front controllers, anything with a
+    catch-all route) answer EVERY unknown path with HTTP 200 and the same
+    body instead of a real 404 — content_discovery had no defense against
+    this at all (only filtered by status code via -mc), which is exactly
+    why a run against a soft-404 app reported hundreds of ".env", ".git",
+    "config.php", etc. as "discovered" when every single one was the same
+    4514-byte catch-all page. Returns None if the probe itself fails (no
+    baseline to compare against — caller should not filter in that case).
+    """
+    import random
+    import string
+    probe_path = "zzz-hellhound-404-check-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    probe_url = url.rstrip("/") + "/" + probe_path
+    try:
+        r = requests.get(probe_url, headers=headers or {}, cookies=cookies or {}, timeout=8, allow_redirects=False, verify=False)
+        return {"status": r.status_code, "length": len(r.content)}
+    except Exception:
+        return None
+
+
+def _is_soft_404_hit(hit_status: int, hit_length: int, baseline: Optional[Dict[str, Any]]) -> bool:
+    """
+    True if a fuzzer hit looks like the same catch-all/soft-404 response
+    the baseline probe got, rather than a genuinely distinct resource.
+    Status AND length must both match the baseline — a real file that
+    happens to share the baseline's status code but has a different size
+    (or vice versa) is NOT filtered, only an exact match on both, which
+    is what a templated "no route matched" page looks like across every
+    guessed path.
+    """
+    if not baseline:
+        return False
+    return hit_status == baseline.get("status") and hit_length == baseline.get("length")
+
+
 def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Content & directory fuzzing via ffuf."""
     import tempfile
@@ -536,6 +575,27 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
     except Exception:
         temp_json = None
 
+    # Pass authenticated headers/cookies if available -- resolved BEFORE
+    # building cmd now, because the soft-404 baseline probe below needs
+    # the exact same headers/cookies ffuf itself will send (an auth'd
+    # app's soft-404 page can differ from its anonymous one).
+    req_headers = normalize_headers(args.get("headers"))
+    if not req_headers and hasattr(target, "state") and isinstance(target.state, dict):
+        req_headers = normalize_headers(target.state.get("headers"))
+
+    req_cookies = normalize_cookies(args.get("cookies") or args.get("cookie"))
+    if not req_cookies and hasattr(target, "state") and isinstance(target.state, dict):
+        req_cookies = normalize_cookies(target.state.get("cookies") or target.state.get("session_cookie"))
+
+    # ── Soft-404 baseline: probe one definitely-nonexistent path up front
+    # and remember its status+length so every ffuf "hit" can be checked
+    # against it afterward. Without this, an app that answers every
+    # unknown path with HTTP 200 and the same catch-all body (SPA router,
+    # PHP front controller, etc.) makes ffuf report its ENTIRE wordlist as
+    # "discovered" -- ffuf's own -mc status filter can't tell a real find
+    # from a soft-404 since both come back 200.
+    baseline = _probe_soft_404_baseline(url, req_headers, req_cookies)
+
     cmd = [
         binary,
         "-w", wordlist,
@@ -543,6 +603,16 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
         "-mc", "200,204,301,302,307,401,403,405",
         "-t", "40",
         "-timeout", "5",
+        # ffuf's own behavioral auto-calibration: sends a handful of
+        # randomized-path requests before the real run and auto-derives
+        # -fs/-fw filters from whatever they have in common. This is the
+        # same class of defense feroxbuster already does automatically
+        # (seen working in the fuzz_hunter run's "Auto-filtering" line) --
+        # content_discovery had no equivalent at all before this. Kept in
+        # addition to (not instead of) the explicit baseline check below,
+        # since -ac is heuristic and can miss a target with inconsistent
+        # soft-404 bodies across different generated probe paths.
+        "-ac",
     ]
 
     # Uncapped ffuf hits a target as fast as 40 threads can go -- fine on a
@@ -556,23 +626,16 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
     if temp_json:
         cmd.extend(["-of", "json", "-o", temp_json])
 
-    # Pass authenticated headers/cookies if available
-    req_headers = normalize_headers(args.get("headers"))
-    if not req_headers and hasattr(target, "state") and isinstance(target.state, dict):
-        req_headers = normalize_headers(target.state.get("headers"))
     for hk, hv in req_headers.items():
         if isinstance(hv, str) and hv.strip():
             cmd.extend(["-H", f"{hk}: {hv.strip()}"])
 
-    # Pass cookies
-    req_cookies = normalize_cookies(args.get("cookies") or args.get("cookie"))
-    if not req_cookies and hasattr(target, "state") and isinstance(target.state, dict):
-        req_cookies = normalize_cookies(target.state.get("cookies") or target.state.get("session_cookie"))
     if req_cookies:
         cookie_str = "; ".join(f"{k}={v}" for k, v in req_cookies.items())
         cmd.extend(["-H", f"Cookie: {cookie_str}"])
 
     results = []
+    soft_404_filtered = 0
     try:
         # -s (silent) dropped deliberately: ffuf's normal output prints one
         # line per match as it happens ("admin   [Status: 301, Size: 0,
@@ -592,6 +655,9 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
                     length = r.get("length", 0)
                     redirect = r.get("redirectlocation", "")
                     hit_url = r.get("url", f"{url.rstrip('/')}/{path}")
+                    if _is_soft_404_hit(status, length, baseline):
+                        soft_404_filtered += 1
+                        continue
                     results.append({
                         "url": hit_url,
                         "path": path,
@@ -631,11 +697,16 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
                 target.state["endpoints"].append(hit_url)
         save_target(target)
 
+    if soft_404_filtered and emit and hasattr(emit, "info"):
+        emit.info(f"[*] Filtered {soft_404_filtered} soft-404 hit(s) — same status+length as a known-nonexistent path, not real finds.")
+
     return {
         "target_url": url,
         "paths": paths,
         "discovered_endpoints": results[:100],
-        "count": len(results)
+        "count": len(results),
+        "soft_404_filtered_count": soft_404_filtered,
+        "soft_404_baseline": baseline,
     }
 
 
@@ -898,6 +969,17 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
     if not command:
         return {"error": "No command specified."}
 
+    # Configurable, clamped the same way sqlmap_scan's own timeout is --
+    # a custom sqlmap/hydra/nmap invocation run through this generic tool
+    # hits the exact same "needs more than 180s" wall sqlmap_scan used to,
+    # and raising this is the correct fix, not retrying the same command
+    # again (which was the actual field failure: a dump that needed ~4
+    # minutes got retried 6+ times at 180s each instead of once at 300s).
+    try:
+        timeout_s = max(60, min(int(args.get("timeout", 180) or 180), 600))
+    except (TypeError, ValueError):
+        timeout_s = 180
+
     try:
         # Hand the captured session (from login flows, cookie_inspector, or
         # an imported Burp/Caido history) to whatever this command runs, as
@@ -936,7 +1018,7 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
         # scans) already uses, so ad-hoc multi-command pipelines stay visibly
         # alive instead of looking dead for up to 3 minutes.
         proc = _run_cmd_with_heartbeat(
-            command, timeout=180, emit=emit,
+            command, timeout=timeout_s, emit=emit,
             label=f"run_terminal_command ({target_host or 'target'})",
             shell=True, env=child_env,
         )
@@ -986,11 +1068,39 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
             "stderr": proc.stderr,
             "exit_code": proc.returncode
         }
-    except subprocess.TimeoutExpired:
-        return {
+    except subprocess.TimeoutExpired as e:
+        # _run_cmd_with_heartbeat attaches whatever its reader threads had
+        # captured at the moment of kill to the exception it raises --
+        # surface that instead of a bare "timed out" with nothing to show
+        # for it. This is exactly the sqlmap_scan fix, generalized: a
+        # hand-built sqlmap/hydra/nmap command run through THIS tool hit
+        # the identical failure (confirmed injection + enumerated DBs
+        # discarded on every timeout, forcing repeated 180s re-runs that
+        # never got further because the same wall was hit every time).
+        partial_stdout = getattr(e, "stdout", None) or getattr(e, "output", None) or ""
+        partial_stderr = getattr(e, "stderr", None) or ""
+        if isinstance(partial_stdout, bytes):
+            partial_stdout = partial_stdout.decode("utf-8", errors="ignore")
+        if isinstance(partial_stderr, bytes):
+            partial_stderr = partial_stderr.decode("utf-8", errors="ignore")
+        result = {
             "command": command,
-            "error": "Command execution timed out after 180 seconds."
+            "timed_out": True,
+            "stdout": partial_stdout,
+            "stderr": partial_stderr,
+            "note": (
+                f"Command exceeded its {timeout_s}s timeout and was killed, but the output captured "
+                f"before the kill is included above -- read it before deciding whether to retry. If "
+                f"the partial output shows real progress (e.g. sqlmap had already confirmed injection "
+                f"or enumerated databases/tables), re-running the exact same command from scratch is "
+                f"wasted work; instead raise the timeout parameter (up to 600s) and/or narrow the "
+                f"command (e.g. target one table/column at a time instead of a full --dump) so it "
+                f"completes within the window."
+            ),
         }
+        if partial_stdout or partial_stderr:
+            _mirror_http_evidence_from_terminal(command, type("P", (), {"stdout": partial_stdout, "stderr": partial_stderr, "returncode": None})(), target, target_host)
+        return result
     except Exception as e:
         return {
             "command": command,
@@ -4849,7 +4959,19 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                     f"actually means 'not logged in'."
                 )
                 recipe = target.state.get("last_login_recipe")
-                last_attempt = target.state.get("last_reauth_attempt_ts", 0) or 0
+                last_attempt_raw = target.state.get("last_reauth_attempt_ts", 0) or 0
+                # This crashed the whole curl call with "unsupported operand
+                # type(s) for -: 'float' and 'str'" whenever
+                # last_reauth_attempt_ts came back as anything but a plain
+                # number (e.g. state round-tripped through a save/load path
+                # that stringified it) -- a type hiccup on a cooldown timer
+                # has no business aborting the request it's gating, so coerce
+                # defensively and fall back to "no cooldown" rather than
+                # raising.
+                try:
+                    last_attempt = float(last_attempt_raw)
+                except (TypeError, ValueError):
+                    last_attempt = 0.0
                 # Short cooldown -- not to be polite to the target, but so a
                 # tight fuzzing loop hitting a dead session on every single
                 # request doesn't hammer the login endpoint once per request.
@@ -10242,13 +10364,22 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "'HELLHOUND_COOKIE', '')})) instead of a literal cookie/token pasted into the "
             "script's source — the env vars always reflect the CURRENT session, so the script "
             "keeps working even after re-auth rotates the cookie/token, and nothing stale ends "
-            "up permanently saved on disk."
+            "up permanently saved on disk. "
+            "TIMEOUT: defaults to 180s, raise via the timeout parameter (up to 600s) for anything "
+            "that legitimately needs longer — a sqlmap --dump, a large nmap sweep, a slow custom "
+            "script. On a timeout the command is killed but whatever it had already printed is "
+            "still returned (stdout/stderr + timed_out=true) rather than discarded, so check that "
+            "partial output before deciding what to do next: if it shows real progress (e.g. sqlmap "
+            "already confirmed the injection or listed databases/tables), re-running the exact same "
+            "command from scratch wastes the work already done — raise the timeout and/or narrow the "
+            "command instead of blindly retrying it at the same timeout, which just times out again."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The exact shell command line string to execute."},
-                "target": {"type": "string", "description": "The target domain, IP, or URL being tested (used for safety scope verification)."}
+                "target": {"type": "string", "description": "The target domain, IP, or URL being tested (used for safety scope verification)."},
+                "timeout": {"type": "integer", "description": "Seconds to allow before killing the command (default 180, clamped 60-600). Raise this for a command known to take longer (a sqlmap --dump, a large scan) instead of letting it time out and retrying."}
             },
             "required": ["command", "target"]
         },
