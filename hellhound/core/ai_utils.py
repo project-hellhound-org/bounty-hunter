@@ -724,15 +724,16 @@ class ThinkingIndicator:
         elif tool_name == "vhost_fuzz":
             vhosts = result.get("vhosts", [])
             return f"Discovered {len(vhosts)} virtual host(s)"
-        elif tool_name == "content_discovery":
-            paths = result.get("paths", [])
-            return f"Discovered {len(paths)} path(s)"
         elif tool_name in ("subzy", "takeover_scanner"):
             subs = result.get("takeovers", [])
             return f"Scanned {len(subs)} service(s) for subdomain takeover"
         elif tool_name == "hydra":
-            vulns = result.get("vulnerabilities", [])
-            return f"Audited surface — {len(vulns)} high-impact finding(s)"
+            # _execute_hydra returns a flattened "high_impact_vulnerabilities"
+            # count (not a "vulnerabilities" list) -- this used to always
+            # read an absent key and report 0 regardless of what hydra found.
+            vulns = result.get("high_impact_vulnerabilities", result.get("vulnerabilities", []))
+            count = vulns if isinstance(vulns, int) else len(vulns)
+            return f"Audited surface — {count} high-impact finding(s)"
         elif tool_name == "cloudscout":
             assets = result.get("assets", [])
             return f"Identified {len(assets)} cloud asset(s)"
@@ -740,21 +741,54 @@ class ThinkingIndicator:
             findings = result.get("findings", [])
             return f"Audited TLS/transport — {len(findings)} security observation(s)"
         elif tool_name == "fuzz_hunter":
-            endpoints = result.get("discovered_endpoints", [])
+            # _execute_fuzz_hunter_internal's flattened key is "endpoints",
+            # not "discovered_endpoints" -- this always read 0 before.
+            endpoints = result.get("endpoints", result.get("discovered_endpoints", []))
             return f"Discovered {len(endpoints)} endpoint(s) via parameter fuzzing"
         elif tool_name == "wafbuster":
-            waf = result.get("waf", result.get("detected_waf", "None"))
+            # _execute_wafbuster wraps the module's raw output as
+            # {"url":..., "result": {"intel": {"waf": [...]}}} -- this used
+            # to read a top-level "waf"/"detected_waf" key that never
+            # existed on that shape, so it always fell back to "None".
+            inner = (result.get("result") or {}) if isinstance(result.get("result"), dict) else {}
+            waf = (inner.get("intel") or {}).get("waf") or result.get("waf") or result.get("detected_waf") or "None"
+            if isinstance(waf, list):
+                waf = ", ".join(waf) if waf else "None"
             return f"Fingerprinted WAF: {waf}"
         elif tool_name == "cors_checker":
-            vulns = result.get("cors_issues", [])
+            # _execute_cors_checker wraps CORSbuster's output as
+            # {"url":..., "result": {"intel": {"cors_vulnerabilities": [...]}}}.
+            # Reading a top-level "cors_issues" key here always returned
+            # [], so this line reported "0 misconfiguration(s) found" even
+            # when the module had just logged a dozen of them above it.
+            inner = (result.get("result") or {}) if isinstance(result.get("result"), dict) else {}
+            vulns = (inner.get("intel") or {}).get("cors_vulnerabilities") or result.get("cors_issues") or []
             return f"Audited CORS — {len(vulns)} misconfiguration(s) found"
         elif tool_name == "graphql_probe":
-            schema = result.get("schema_exposed", False)
+            # Same wrapping issue: the real list lives at
+            # result.result.intel.endpoints, not a top-level "schema_exposed".
+            inner = (result.get("result") or {}) if isinstance(result.get("result"), dict) else {}
+            endpoints = (inner.get("intel") or {}).get("endpoints") or []
+            schema = bool(endpoints) or result.get("schema_exposed", False)
             return f"Probed GraphQL — schema {'exposed' if schema else 'secured'}"
         elif tool_name == "surface_auditor":
-            surfaces = result.get("surfaces", [])
+            # Same wrapping issue: the real list lives at
+            # result.result.intel.findings, not a top-level "surfaces".
+            inner = (result.get("result") or {}) if isinstance(result.get("result"), dict) else {}
+            surfaces = (inner.get("intel") or {}).get("findings") or result.get("surfaces") or []
             return f"Audited API attack surfaces — {len(surfaces)} surface(s) analyzed"
         elif tool_name == "jwt_forge":
+            # When no JWT was present to begin with, _execute_jwt_forge
+            # returns {"status": "error", "error": "No JWT token provided..."}
+            # with no "forged_tokens" key at all. Falling through to the
+            # success-shaped line below used to read that as "Forged JWT
+            # (0 variant(s)...) — target session updated", which claims a
+            # test ran and updated state when actually nothing was tested.
+            # That's exactly the kind of "confirmed clean" overclaim a
+            # downstream summary (or the researcher asking what was
+            # checked) can't tell apart from a real negative result.
+            if result.get("status") == "error" or "forged_tokens" not in result:
+                return f"JWT forge skipped — {result.get('error', 'no JWT token found in target session to test')}"
             role = result.get("forged_payload", {}).get("role", "admin")
             tokens = result.get("forged_tokens", [])
             return f"Forged JWT ({len(tokens)} variant(s), role={role}) — target session updated"

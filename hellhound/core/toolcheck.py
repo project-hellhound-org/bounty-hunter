@@ -234,6 +234,188 @@ def ensure_tool(tool_name: str, emit=None, auto_install: bool = False) -> Dict[s
     }
 
 
+def update_all_tools(emit=None) -> Dict[str, Any]:
+    """
+    Updates every ALREADY-INSTALLED binary tool to its latest version —
+    the update-side counterpart to try_install()/check_all_tools(), which
+    only ever install a MISSING tool and never touch one that's already
+    there. Two different users running the same Hellhound checkout can
+    silently drift onto different tool versions (one picked up a nuclei
+    template-format change, the other didn't) with no single command to
+    reconcile that — this is it.
+
+    Returns {"pdtm": {...}, "other": {<tool>: bool}, "skipped": [...]}.
+    """
+    result: Dict[str, Any] = {"pdtm": None, "other": {}, "skipped": []}
+
+    # ── ProjectDiscovery suite: pdtm's own bulk-update flag updates every
+    # PD tool it has installed in one shot, in place — no need to loop
+    # per-tool like try_install() does for first-time installs.
+    if is_available("pdtm"):
+        if emit and hasattr(emit, "info"):
+            emit.info("[*] Updating ProjectDiscovery tool suite via `pdtm -ua`...")
+        try:
+            proc = subprocess.run(
+                ["pdtm", "-ua"], capture_output=True, text=True, timeout=300, check=False
+            )
+            out = (proc.stdout or "") + (proc.stderr or "")
+            result["pdtm"] = {"ok": proc.returncode == 0, "output": out.strip()[-2000:]}
+            if emit and hasattr(emit, "success") and proc.returncode == 0:
+                emit.success("[✓] ProjectDiscovery tools updated.")
+            elif emit and hasattr(emit, "warn"):
+                emit.warn(f"[!] `pdtm -ua` exited {proc.returncode} — some PD tools may not have updated.")
+        except Exception as e:
+            result["pdtm"] = {"ok": False, "output": str(e)}
+            if emit and hasattr(emit, "warn"):
+                emit.warn(f"[!] Could not run `pdtm -ua`: {e}")
+    else:
+        result["skipped"].append("pdtm (not installed — PD tools can't be bulk-updated; run /setup tools install-all first)")
+
+    # ── Standalone Go/pip tools: only touch ones already installed.
+    # `go install X@latest` always re-fetches the current latest release
+    # even if one is already present, so re-running the same install
+    # command IS the update for every go-based entry here. pip entries
+    # get an explicit --upgrade. Hint-only entries (nmap, feroxbuster,
+    # sqlmap's apt/git-clone variants) have no single safe command to
+    # run unattended, same restriction try_install() already respects.
+    for tool_name, cmd in sorted(OTHER_TOOLS.items()):
+        if not is_available(tool_name):
+            continue  # not installed — that's an install, not an update
+        if cmd.startswith("(no known") or "(" in cmd:
+            result["skipped"].append(f"{tool_name} (no single update command — {cmd})")
+            continue
+
+        if emit and hasattr(emit, "info"):
+            emit.info(f"[*] Updating {tool_name}...")
+
+        if cmd.startswith("pip install "):
+            package = cmd[len("pip install "):].strip()
+            attempts = [
+                [sys.executable, "-m", "pip", "install", "--upgrade", "--break-system-packages", package],
+                [sys.executable, "-m", "pip", "install", "--upgrade", "--user", package],
+                [sys.executable, "-m", "pip", "install", "--upgrade", package],
+            ]
+        else:
+            attempts = [cmd.split()]
+
+        ok = False
+        last_error = ""
+        for attempt_cmd in attempts:
+            try:
+                proc = subprocess.run(attempt_cmd, capture_output=True, text=True, timeout=180, check=False)
+                if proc.returncode == 0:
+                    ok = True
+                    break
+                out = (proc.stderr or "") + (proc.stdout or "")
+                last_error = out.strip().splitlines()[-1] if out.strip() else f"exit code {proc.returncode}"
+            except Exception as e:
+                last_error = str(e)
+        result["other"][tool_name] = ok
+        if emit:
+            if ok and hasattr(emit, "success"):
+                emit.success(f"[✓] {tool_name} up to date.")
+            elif not ok and hasattr(emit, "warn"):
+                emit.warn(f"[!] {tool_name} update failed: {last_error}")
+
+    return result
+
+
+def sync_python_dependencies(project_root: Optional[str] = None, emit=None) -> Dict[str, Any]:
+    """
+    Re-syncs Hellhound's own Python dependencies against requirements.txt.
+
+    This exists because setup.py's install_requires and requirements.txt
+    can drift apart — install.sh only ever runs `pip install -e .`
+    (setup.py's list), never `pip install -r requirements.txt`, so a
+    package present in requirements.txt but missing from install_requires
+    (lxml and cryptography, historically) is silently never installed on
+    a fresh machine even though install.sh "succeeds." Re-running this
+    against requirements.txt directly is what actually catches and fixes
+    that drift for an existing install, regardless of whether setup.py
+    has since been corrected.
+    """
+    root = project_root or str(Path(__file__).resolve().parents[2])
+    req_file = Path(root) / "requirements.txt"
+    if not req_file.is_file():
+        return {"ok": False, "error": f"requirements.txt not found at {req_file}"}
+
+    if emit and hasattr(emit, "info"):
+        emit.info("[*] Syncing Python dependencies from requirements.txt...")
+
+    attempts = [
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--break-system-packages", "-r", str(req_file)],
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--user", "-r", str(req_file)],
+        [sys.executable, "-m", "pip", "install", "--upgrade", "-r", str(req_file)],
+    ]
+    last_out = ""
+    for attempt_cmd in attempts:
+        try:
+            proc = subprocess.run(attempt_cmd, capture_output=True, text=True, timeout=300, check=False)
+        except Exception as e:
+            last_out = str(e)
+            continue
+        last_out = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode == 0:
+            if emit and hasattr(emit, "success"):
+                emit.success("[✓] Python dependencies up to date.")
+            return {"ok": True, "output": last_out.strip()[-2000:]}
+    if emit and hasattr(emit, "warn"):
+        emit.warn(f"[!] Dependency sync failed: {last_out.strip().splitlines()[-1] if last_out.strip() else 'unknown error'}")
+    return {"ok": False, "output": last_out.strip()[-2000:]}
+
+
+def update_hellhound_source(project_root: Optional[str] = None, emit=None) -> Dict[str, Any]:
+    """
+    git-pulls the Hellhound source itself, mirroring update.sh's logic
+    (stash local changes if dirty, pull, restore the stash) so `/update`
+    inside a running session can do everything update.sh does without
+    the researcher having to exit and find a terminal.
+    """
+    root = project_root or str(Path(__file__).resolve().parents[2])
+    git_dir = Path(root) / ".git"
+    if not git_dir.is_dir():
+        return {"ok": False, "skipped": True, "reason": "not a git checkout — installed from a release archive, not `git clone`"}
+
+    def _run(args: List[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", root] + args, capture_output=True, text=True, timeout=60, check=False)
+
+    status = _run(["status", "--porcelain"])
+    dirty = bool(status.stdout.strip())
+    if dirty:
+        if emit and hasattr(emit, "warn"):
+            emit.warn("[!] Local changes detected — stashing them to pull cleanly...")
+        _run(["stash"])
+
+    branch_proc = _run(["rev-parse", "--abbrev-ref", "HEAD"])
+    branch = branch_proc.stdout.strip() or "main"
+
+    if emit and hasattr(emit, "info"):
+        emit.info(f"[*] Pulling latest changes on branch '{branch}'...")
+    pull = _run(["pull", "origin", branch])
+    ok = pull.returncode == 0
+    out = (pull.stdout or "") + (pull.stderr or "")
+    if not ok:
+        if emit and hasattr(emit, "warn"):
+            emit.warn("[!] Standard pull failed — attempting fetch + hard reset to origin...")
+        _run(["fetch", "--all"])
+        reset = _run(["reset", "--hard", f"origin/{branch}"])
+        ok = reset.returncode == 0
+        out += "\n" + (reset.stdout or "") + (reset.stderr or "")
+
+    if dirty:
+        pop = _run(["stash", "pop"])
+        if pop.returncode != 0 and emit and hasattr(emit, "warn"):
+            emit.warn("[!] Could not auto-restore your local changes — they're still in `git stash list`.")
+
+    already_up_to_date = "Already up to date" in out or "Already up-to-date" in out
+    if ok and emit and hasattr(emit, "success"):
+        emit.success("[✓] Already on the latest version." if already_up_to_date else "[✓] Hellhound source updated.")
+    elif not ok and emit and hasattr(emit, "warn"):
+        emit.warn(f"[!] Source update failed: {out.strip().splitlines()[-1] if out.strip() else 'unknown error'}")
+
+    return {"ok": ok, "branch": branch, "already_up_to_date": already_up_to_date, "output": out.strip()[-2000:]}
+
+
 def check_all_tools() -> Dict[str, Any]:
     """
     Checks all known PD and standalone tools.

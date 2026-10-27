@@ -30,7 +30,10 @@ from hellhound.core.agent import handle_message as agent_handle_message, get_age
 from hellhound.core.emit import PlainEmit
 from hellhound.core.http_utils import merge_global_context
 from hellhound.core.nodes import build_graph
-from hellhound.core.toolcheck import check_all_tools, try_install, check_wordlists
+from hellhound.core.toolcheck import (
+    check_all_tools, try_install, check_wordlists,
+    update_all_tools, sync_python_dependencies, update_hellhound_source,
+)
 
 # Recon/OSINT tool API keys — separate namespace from the LLM provider
 # keys /model set-key handles (those are validated against a fixed
@@ -1750,6 +1753,92 @@ def handle_report(args: List[str], session_context: Dict[str, Any], emit: Any) -
     }
 
 
+def handle_update(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """
+    /update [source|deps|tools]
+
+    One unified command that updates EVERYTHING Hellhound depends on, in
+    one call, instead of a researcher needing to separately remember
+    `git pull`, re-run install.sh, and re-run `pdtm -i` for each binary.
+    Three independent stages — a bare `/update` runs all three; passing
+    one of `source`, `deps`, or `tools` runs only that stage:
+
+      source  — git-pulls the Hellhound checkout itself (skipped with a
+                clear note if this isn't a git clone)
+      deps    — re-syncs this install's Python packages against
+                requirements.txt (catches drift like a package that's in
+                requirements.txt but was never in setup.py's own list —
+                lxml and cryptography, historically — which is exactly
+                why one researcher's spider crawl can fail with missing
+                parser errors while another's doesn't, on the same code)
+      tools   — updates every ALREADY-INSTALLED external binary (PD
+                suite via `pdtm -ua`, plus the standalone Go/pip tools)
+                to its latest version; tools with no single safe
+                update command (nmap, feroxbuster, sqlmap via apt) are
+                listed, not silently skipped
+
+    This never installs a tool that isn't already present — that's
+    `/setup tools install-all`. This only updates what's already there.
+    """
+    is_json = "--json" in args or getattr(emit, "json_mode", False)
+    clean_args = [a for a in args if a not in ("--json", "-j")]
+    stage = clean_args[0].lower() if clean_args else "all"
+    valid_stages = {"all", "source", "deps", "tools"}
+    if stage not in valid_stages:
+        msg = f"Unknown stage '{stage}'. Usage: /update [source|deps|tools]"
+        if not is_json:
+            emit.warn(msg)
+        return {"status": "error", "error": "invalid_stage", "message": msg}
+
+    if not is_json:
+        emit.banner("HELLHOUND UNIFIED UPDATE")
+
+    result: Dict[str, Any] = {}
+
+    if stage in ("all", "source"):
+        if not is_json:
+            emit("\n[bold red]─── SOURCE ───[/bold red]")
+        result["source"] = update_hellhound_source(emit=(None if is_json else emit))
+        if is_json is False and result["source"].get("skipped"):
+            emit.info(f"[*] Skipped: {result['source']['reason']}")
+
+    if stage in ("all", "deps"):
+        if not is_json:
+            emit("\n[bold red]─── PYTHON DEPENDENCIES ───[/bold red]")
+        result["deps"] = sync_python_dependencies(emit=(None if is_json else emit))
+
+    if stage in ("all", "tools"):
+        if not is_json:
+            emit("\n[bold red]─── EXTERNAL TOOLS ───[/bold red]")
+        result["tools"] = update_all_tools(emit=(None if is_json else emit))
+
+    if not is_json:
+        emit("")
+        src = result.get("source")
+        if src is not None:
+            if src.get("skipped"):
+                emit.info(f"Source:  not a git checkout — {src.get('reason', '')}")
+            elif src.get("ok"):
+                emit.success("Source:  up to date" if src.get("already_up_to_date") else "Source:  updated")
+            else:
+                emit.warn("Source:  update failed — see above")
+        deps = result.get("deps")
+        if deps is not None:
+            emit.success("Deps:    synced") if deps.get("ok") else emit.warn("Deps:    sync failed — see above")
+        tools = result.get("tools")
+        if tools is not None:
+            updated_other = sum(1 for v in tools.get("other", {}).values() if v)
+            total_other = len(tools.get("other", {}))
+            pdtm_info = tools.get("pdtm")
+            pdtm_str = "updated" if (pdtm_info and pdtm_info.get("ok")) else ("not run — pdtm missing" if pdtm_info is None else "failed")
+            emit.success(f"Tools:   PD suite {pdtm_str}; {updated_other}/{total_other} standalone tool(s) updated")
+            if tools.get("skipped"):
+                emit.info(f"         Skipped (no single update command): {', '.join(s.split(' ')[0] for s in tools['skipped'])}")
+        emit.success("\nUpdate complete.")
+
+    return {"status": "success", **result}
+
+
 def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
     /setup [tools [auto-install on|off]]
@@ -1912,9 +2001,9 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
     if not is_json:
         emit.banner("HELLHOUND ENVIRONMENT & TOOL STATUS")
         emit(f"  Local Ollama: {'[bold green][✓] Connected[/bold green]' if ollama_ok else '[bold red][✗] Offline[/bold red]'}")
-        emit(f"  Researcher Handle: {status['researcher_handle'] or '(not set)'}")
-        emit(f"  Active Model: {status['active_model'] or '(dynamic default)'} (Provider: {status['active_provider']})")
-        emit(f"  Configured AI Providers:")
+        emit(f"  Researcher Handle: {status['researcher_handle'] or '(not set)'} [dim](Set with: /handle <name>)[/dim]")
+        emit(f"  Active Model: {status['active_model'] or '(dynamic default)'} (Provider: {status['active_provider']}) [dim](Set with: /model [orchestrator|synthesizer|both] <provider> <model-id>)[/dim]")
+        emit(f"  Configured AI Providers: [dim](Set with: /model set-key <provider> <key>)[/dim]")
         for prov, has_key in status["providers"].items():
             state_str = "[bold green]Configured[/bold green]" if has_key else "[dim]Not Set[/dim]"
             emit(f"    - {prov.upper()}: {state_str}")
@@ -1966,6 +2055,38 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
 
         recap_state = "[bold green]ON[/bold green]" if cfg.get("show_recaps", True) else "[dim]OFF[/dim]"
         emit(f"  Multi-tool Recap Footers:   {recap_state} (Toggle: `/setup recaps on|off`)")
+
+        max_iter = int(cfg.get("max_agent_iterations", 60))
+        emit(f"  Max Tool-Call Iterations:   {max_iter} (Set: `/setup max-iterations <n>`)")
+
+        # ── Everything-in-one-place reference. The researcher shouldn't
+        # have to already know /handle, /model, or /apikey exist (or
+        # separately run /help) just to find out HOW to configure
+        # Hellhound — every knob and the command that sets it is listed
+        # here, in the one command people naturally reach for first.
+        emit("\n[bold red]─── QUICK SETUP REFERENCE ───[/bold red]")
+        emit("  Researcher identity:")
+        emit("    /handle <name>                        — set the name used in reports & the X-Bugbounty header")
+        emit("  AI model & provider:")
+        emit("    /model [orchestrator|synthesizer|both] <provider> <model-id>")
+        emit("    /model set-key <provider> <key>        — save an LLM provider key (ollama/nvidia/gemini/openai/anthropic)")
+        emit("  External tool API keys:")
+        emit("    /apikey <tool> <value>                 — save a key for a scanning tool (wpscan, urlscan, virustotal, ...)")
+        emit("    /apikey                                — list every tool key this system knows about")
+        emit("    /setup set-key <tool> <api_key>         — same store, recon-tool shortcut (urlscan/virustotal)")
+        emit("  Binary tool dependencies:")
+        emit("    /setup tools install-all               — install every missing recon/exploit binary now")
+        emit("    /setup tools auto-install on|off        — auto-install missing tools the moment a run needs them")
+        emit("    /update                                 — update Hellhound itself + every installed tool/dependency")
+        emit("  Target scope:")
+        emit("    /scope in <host...>                     — add host(s)/wildcards to in-scope")
+        emit("    /scope out <host...>                    — add host(s) to out-of-scope (wins over any in-scope wildcard)")
+        emit("    /scope show                             — show current in-scope / out-of-scope / disallowed lists")
+        emit("    /program <paste program text>           — parse scope straight from a bug-bounty program page")
+        emit("  Behavior tuning:")
+        emit("    /setup recaps on|off                    — toggle multi-tool recap footers")
+        emit("    /setup max-iterations <n>               — cap tool-call iterations per turn")
+        emit("  Run /help for the full command catalog, or /help skills for the methodology library.")
 
         if (tool_status["missing_pd"] or tool_status["missing_other"]) and not is_json and sys.stdin.isatty():
             ans = _interactive_prompt("Some binary tools are missing. Would you like to install them now? (y/n)")
@@ -2339,10 +2460,19 @@ register_command(Command(
 ))
 
 register_command(Command(
+    name="/update",
+    aliases=["/upgrade"],
+    description="Update Hellhound itself (git pull), resync Python dependencies, and update every already-installed external tool to its latest version — all in one command",
+    usage="/update  (runs all three stages)\n/update source   — git-pull the Hellhound checkout only\n/update deps     — resync Python packages against requirements.txt only\n/update tools    — update already-installed external binaries only",
+    category="general",
+    handler=handle_update
+))
+
+register_command(Command(
     name="/setup",
     aliases=["/health", "/doctor"],
-    description="Verify AI connectivity, external tool dependencies, and auto-install settings",
-    usage="/setup [tools [auto-install on|off]]\n/setup tools install-all\n/setup max-iterations <n>",
+    description="The one-stop setup hub — AI connectivity, tool dependencies, and a quick-reference list of every configuration command (handle, model, API keys, scope, auto-install, recaps)",
+    usage="/setup  (shows full status + quick setup reference)\n/setup tools [auto-install on|off | install-all]\n/setup set-key <recon_tool> <api_key>\n/setup recaps on|off\n/setup max-iterations <n>",
     category="config",
     handler=handle_setup
 ))

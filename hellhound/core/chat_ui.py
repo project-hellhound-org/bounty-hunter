@@ -1113,42 +1113,65 @@ def start_chat_session(initial_target: Optional[str] = None):
 
             # Natural Language Query → Route to Agent reasoning loop with live thinking indicator and streaming
             from hellhound.core.ai_utils import ThinkingIndicator
-            indicator = ThinkingIndicator("Let me think")
-            indicator.start()
 
-            streamer = StreamRenderer(title="HELLHOUND")
+            # AUTO-CONTINUE: the researcher's own message starts this, then
+            # the agent may keep itself going across several turns WITHOUT
+            # another message being typed — only while this REPL is live
+            # and the researcher is right here watching/able to Ctrl+C. It
+            # stops itself the moment agent.handle_message() reports
+            # _last_turn_auto_continue=False: a real DONE, a new finding
+            # recorded (surfaced for review, not buried), something that
+            # reads like a question needing the researcher's input, or a
+            # Ctrl+C. See the AUTO-CONTINUE DECISION block in
+            # Agent.handle_message for the exact conditions. This is NOT a
+            # background/unattended loop — it never runs when nobody sent
+            # the first message, and it never keeps running after the
+            # researcher leaves this REPL.
+            next_input = user_input
+            is_auto_continued_turn = False
+            while True:
+                indicator = ThinkingIndicator("Continuing automatically" if is_auto_continued_turn else "Let me think")
+                indicator.start()
 
-            def on_token_callback(token: str):
-                if indicator.thread and indicator.thread.is_alive():
+                streamer = StreamRenderer(title="HELLHOUND")
+
+                def on_token_callback(token: str):
+                    if indicator.thread and indicator.thread.is_alive():
+                        indicator.stop()
+                    streamer.on_token(token)
+
+                session_ctx = {
+                    "target": agent.target.name,
+                    "scope_rules": agent.target.scope_rules
+                }
+                ai_response = None
+                t0 = time.monotonic()
+                try:
+                    with _InterruptGuard() as cancel_event:
+                        ai_response = agent.handle_message(
+                            next_input,
+                            session_context=session_ctx,
+                            emit=indicator,
+                            on_token=on_token_callback,
+                            cancel_check=cancel_event.is_set
+                        )
+                    if session_ctx.get("target") and session_ctx["target"] != "default":
+                        agent.set_target(session_ctx["target"])
+                finally:
                     indicator.stop()
-                streamer.on_token(token)
 
-            session_ctx = {
-                "target": agent.target.name,
-                "scope_rules": agent.target.scope_rules
-            }
-            ai_response = None
-            t0 = time.monotonic()
-            try:
-                with _InterruptGuard() as cancel_event:
-                    ai_response = agent.handle_message(
-                        user_input,
-                        session_context=session_ctx,
-                        emit=indicator,
-                        on_token=on_token_callback,
-                        cancel_check=cancel_event.is_set
-                    )
-                if session_ctx.get("target") and session_ctx["target"] != "default":
-                    agent.set_target(session_ctx["target"])
-            finally:
-                indicator.stop()
-                
-                streamer.finish(ai_response)
-                
-                t1 = time.monotonic()
-                elapsed = t1 - t0
-                elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
-                print_formatted_text(HTML(f"<ansigray>{format_completion_phrase(elapsed_str)}</ansigray>"))
+                    streamer.finish(ai_response)
+
+                    t1 = time.monotonic()
+                    elapsed = t1 - t0
+                    elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
+                    print_formatted_text(HTML(f"<ansigray>{format_completion_phrase(elapsed_str)}</ansigray>"))
+
+                if not getattr(agent, "_last_turn_auto_continue", False):
+                    break
+                next_input = "continue"
+                is_auto_continued_turn = True
+                print_formatted_text(HTML("<ansigray>[*] Still mid-investigation and time's not up — continuing on its own...</ansigray>"))
 
             print_turn_separator()
 

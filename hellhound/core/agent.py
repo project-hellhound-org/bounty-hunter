@@ -1434,7 +1434,25 @@ def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
                     proc.wait(timeout=5)
                 except Exception:
                     pass
-                raise subprocess.TimeoutExpired(cmd, timeout)
+                # CAUGHT IN THE WILD (sqlmap on result.gujaratuniversity.ac.in):
+                # a long-running tool that confirms injectability and
+                # enumerates DB names BEFORE hitting the wall clock still had
+                # all of that sitting in stdout_lines/stderr_lines at the
+                # moment of kill -- but a bare TimeoutExpired(cmd, timeout)
+                # carries no output, so every caller's `except
+                # subprocess.TimeoutExpired:` handler had nothing to parse
+                # and had to report "timed out" with zero signal, discarding
+                # real confirmed findings and forcing a full noisy re-run
+                # from scratch. Give the reader threads a moment to drain
+                # what's already buffered and attach it to the exception so
+                # callers (see _execute_sqlmap_scan) can salvage partial
+                # results instead of throwing them away.
+                t_out.join(timeout=2)
+                t_err.join(timeout=2)
+                with _lock:
+                    partial_stdout = ''.join(stdout_lines)
+                    partial_stderr = ''.join(stderr_lines)
+                raise subprocess.TimeoutExpired(cmd, timeout, output=partial_stdout, stderr=partial_stderr)
             try:
                 proc.wait(timeout=min(heartbeat_interval, remaining))
                 # Process finished — give the reader threads a brief moment
@@ -1826,6 +1844,72 @@ def _execute_resolve_candidates(args: Dict[str, Any], target: Target, emit: Any)
         "resolved": resolved[:100],
         "total_resolved": len(resolved),
         "method": used_method,
+    }
+
+
+def _execute_subdomain_sweep(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    One call instead of three: subfinder (passive OSINT) -> alterx
+    (permutation mutations) -> dnsx (bulk resolve), chained automatically.
+    This was explicitly flagged as a session friction point: "give me all
+    live subdomains" currently takes the model three separate tool calls,
+    manually passing each stage's output into the next. Each stage still
+    degrades gracefully on its own (same behavior as calling them
+    individually) -- a missing alterx just skips permutation with a note,
+    rather than failing the whole sweep, since subfinder's own findings are
+    still worth resolving on their own.
+    """
+    domain = args.get("domain") or target.name
+    permute = bool(args.get("permute", True))
+    permute_limit = args.get("permute_limit", 300)
+
+    stages: Dict[str, Any] = {}
+
+    subfinder_res = _execute_subfinder({"domain": domain}, target, emit)
+    stages["subfinder"] = subfinder_res
+    if subfinder_res.get("error"):
+        return {
+            "domain": domain,
+            "stages": stages,
+            "error": f"Passive subdomain discovery failed, nothing to permute/resolve: {subfinder_res['error']}",
+        }
+
+    passive = list(target.state.get("subdomains") or subfinder_res.get("subdomains") or [])
+
+    permutation_candidates: List[str] = []
+    if permute and passive:
+        perm_res = _execute_permute_subdomains(
+            {"subdomains": passive[:50], "limit": permute_limit}, target, emit
+        )
+        stages["permute_subdomains"] = perm_res
+        if not perm_res.get("error"):
+            permutation_candidates = perm_res.get("candidates", [])
+    elif permute and not passive:
+        stages["permute_subdomains"] = {"skipped": "no passive subdomains found to permute from"}
+
+    to_resolve = sorted(set(passive) | set(permutation_candidates))
+    if not to_resolve:
+        return {
+            "domain": domain,
+            "stages": stages,
+            "passive_subdomains_found": len(passive),
+            "permutation_candidates_generated": len(permutation_candidates),
+            "live_hosts_resolved": 0,
+            "live_hosts": [],
+            "note": "No candidates to resolve.",
+        }
+
+    resolve_res = _execute_resolve_candidates({"candidates": to_resolve}, target, emit)
+    stages["resolve_candidates"] = resolve_res
+
+    return {
+        "domain": domain,
+        "stages": stages,
+        "passive_subdomains_found": len(passive),
+        "permutation_candidates_generated": len(permutation_candidates),
+        "live_hosts_resolved": resolve_res.get("total_resolved", 0),
+        "live_hosts": resolve_res.get("resolved", [])[:100],
+        "resolution_method": resolve_res.get("method"),
     }
 
 
@@ -3591,6 +3675,29 @@ def _is_actionable_artifact(art: Dict[str, Any]) -> bool:
     if val.lower() in ("true", "false", "null", "none", "undefined", "{}", "[]"):
         return False
     if field in ("status", "status_code", "content_type", "allow_credentials", "is_admin", "admin", "session_status"):
+        return False
+    # CAUGHT IN THE WILD (auth-meli.adminml.com / www.me.agov.admin.ch):
+    # fields straight out of a .well-known/openid-configuration discovery
+    # document -- id_token_signing_alg_values_supported, response_types_
+    # supported, token_endpoint_auth_methods_supported, etc. -- matched the
+    # bare "token"/"auth" substring patterns below despite being PUBLIC
+    # protocol-capability metadata every OIDC server publishes unauthenticated,
+    # not anything harvested from a session. Their values are algorithm/
+    # capability enum names (RS256, RSA-OAEP-256, none, client_secret_post),
+    # never credentials, so they could never meaningfully be "tested" --
+    # same false-positive shape as the two cases above, just a field-name
+    # family instead of one specific name. Excluded by field-name suffix
+    # (the "_supported" convention every OIDC discovery doc uses) and,
+    # defense-in-depth, by value: a short single-token known algorithm name.
+    if field.endswith("_supported") or field.endswith("_values_supported"):
+        return False
+    _KNOWN_ALG_VALUES = {
+        "none", "hs256", "hs384", "hs512", "rs256", "rs384", "rs512",
+        "es256", "es384", "es512", "ps256", "ps384", "ps512",
+        "rsa-oaep", "rsa-oaep-256", "rsa1_5", "a128kw", "a192kw", "a256kw",
+        "a128gcm", "a192gcm", "a256gcm", "dir", "ecdh-es",
+    }
+    if val.lower() in _KNOWN_ALG_VALUES:
         return False
     # Defense-in-depth against the same class of bug as the extraction-time
     # fix above (field name substring-matching a pattern like "auth" despite
@@ -5947,6 +6054,38 @@ def _target_auth_options(target: Target) -> Dict[str, Any]:
     return out
 
 
+def _effective_spider_intel(target: Target, explicit: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    CAUGHT IN THE WILD (www.mercadolibre.com): cors_checker/wafbuster/
+    surface_auditor/graphql_probe all read ONLY target.state["spider_intel"]
+    for the endpoint list to sweep -- and that key is written ONLY by the
+    full 'spider' tool. When the researcher (or the model) uses 'katana'
+    instead -- faster, and explicitly offered as spider's lighter-weight
+    alternative -- or endpoints come from content_discovery/js_static_
+    analysis/manual record, spider_intel stays empty and these checks
+    silently degrade to "test ONE url" with no signal that anything was
+    skipped. This merges in target.state["endpoints"] -- the canonical
+    combined bucket every discovery tool (spider, katana, content_discovery,
+    js_static_analysis) actually feeds -- regardless of which specific
+    crawler produced them, so a CORS/WAF/surface/GraphQL sweep covers
+    whatever the agent has actually found so far, not just spider's output.
+    """
+    intel = dict(explicit or target.state.get("spider_intel", {}) or {})
+    known_eps = {
+        (e.get("url") if isinstance(e, dict) else str(e))
+        for e in (intel.get("endpoints") or [])
+        if e
+    }
+    merged = list(intel.get("endpoints") or [])
+    for ep in (target.state.get("endpoints") or []):
+        ep_url = ep.get("url") if isinstance(ep, dict) else str(ep)
+        if ep_url and ep_url not in known_eps:
+            merged.append({"url": ep_url} if not isinstance(ep, dict) else ep)
+            known_eps.add(ep_url)
+    intel["endpoints"] = merged
+    return intel
+
+
 def _execute_wafbuster(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     from hellhound.core.engine import HellhoundEngine
     url = args.get("url") or target.name
@@ -5963,7 +6102,7 @@ def _execute_wafbuster(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     # through here, not a hypothetical. Passing a real opts dict (even an
     # empty one) fixes that outright; it also now carries the captured
     # session same as the other four wrappers below.
-    opts = {"spider_intel": target.state.get("spider_intel", {})}
+    opts = {"spider_intel": _effective_spider_intel(target)}
     opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
@@ -5982,7 +6121,7 @@ def _execute_surface_auditor(args: Dict[str, Any], target: Target, emit: Any) ->
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
-    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    spider_intel = _effective_spider_intel(target, args.get("spider_intel"))
     opts = {"spider_intel": spider_intel}
     opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
@@ -6002,12 +6141,13 @@ def _execute_cors_checker(args: Dict[str, Any], target: Target, emit: Any) -> Di
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
-    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    spider_intel = _effective_spider_intel(target, args.get("spider_intel"))
     opts = {"spider_intel": spider_intel}
     opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
         res = engine.run_single("corsbuster", url, options=opts, emit=emit)
+        _mirror_cors_evidence(res, target)
         return {
             "url": url,
             "result": res
@@ -6016,13 +6156,64 @@ def _execute_cors_checker(args: Dict[str, Any], target: Target, emit: Any) -> Di
         return {"url": url, "error": f"CORS check error: {e}"}
 
 
+def _mirror_cors_evidence(res: Dict[str, Any], target: Target) -> None:
+    """
+    CORSbuster makes its own HTTP requests via a raw requests.Session(),
+    bypassing _execute_curl/run_terminal_command entirely -- so its probes
+    never reached target.state['curl_evidence_log'], and record_finding's
+    evidence lookup (_lookup_curl_evidence, URL-substring match only) would
+    instead silently attach whatever UNRELATED earlier curl happened to hit
+    the same URL. That's worse than no evidence: a real finding ends up
+    backed by a request/response that doesn't actually demonstrate it (e.g.
+    a plain authenticated GET with no Origin header standing in as "proof"
+    of an origin-reflection bypass). Mirroring each confirmed finding's own
+    captured request/response here, timestamped at probe time, makes it the
+    newest entry for that URL -- which _lookup_curl_evidence's recency-first
+    match then picks correctly.
+    """
+    try:
+        if not hasattr(target, "state") or not isinstance(target.state, dict):
+            return
+        findings = ((res or {}).get("intel") or {}).get("cors_vulnerabilities") or []
+        if not findings:
+            return
+        evidence_log = target.state.setdefault("curl_evidence_log", [])
+        for f in findings:
+            url = f.get("url")
+            payload = f.get("payload")
+            if not url or not payload:
+                continue
+            status = f.get("status_code")
+            resp_headers = f.get("response_headers") or {}
+            method = (f.get("repro_data") or {}).get("method", "OPTIONS")
+            status_line = f"HTTP/1.1 {status} " + ("OK" if status and status < 400 else "") if status else "(no response captured)"
+            headers_block = "\n".join(f"{k}: {v}" for k, v in resp_headers.items())
+            raw_evidence = (
+                f"$ curl -s -X {method} \"{url}\" -H \"Origin: {payload}\"\n\n"
+                f"{status_line}\n{headers_block}"
+            )
+            evidence_log.append({
+                "url": url,
+                "method": method,
+                "origin_sent": payload,
+                "status": status,
+                "raw": raw_evidence,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "source": "cors_checker",
+            })
+        if len(evidence_log) > 40:
+            del evidence_log[: len(evidence_log) - 40]
+    except Exception:
+        pass
+
+
 def _execute_graphql_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     from hellhound.core.engine import HellhoundEngine
     url = args.get("url") or target.name
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
-    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    spider_intel = _effective_spider_intel(target, args.get("spider_intel"))
     opts = {"spider_intel": spider_intel}
     opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
@@ -6134,11 +6325,32 @@ def _execute_sqlmap_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dic
             cmd += ["-T", str(table_name)]
         cmd += ["--dump", "--limit", f"0-{sample_limit - 1}"]
 
+    # CAUGHT IN THE WILD (result.gujaratuniversity.ac.in): sqlmap had
+    # already confirmed injectability AND enumerated database names before
+    # hitting the wall clock -- especially likely once --dump is added on
+    # top of --dbs, since dumping needs real extra time beyond a bare
+    # confirm. The old flat 240s applied even to a dump_sample_rows call
+    # that structurally needs longer. Let the caller raise it (e.g. for a
+    # sample dump), default higher than before, capped so this tool stays
+    # "confirm + light proof," never an hours-long unattended run.
+    default_timeout = 360 if dump_sample else 240
     try:
-        proc = _run_cmd_with_heartbeat(cmd, timeout=240, emit=emit, label=f"sqlmap ({url})")
+        timeout_s = max(60, min(int(args.get("timeout", default_timeout) or default_timeout), 600))
+    except (TypeError, ValueError):
+        timeout_s = default_timeout
+
+    timed_out = False
+    try:
+        proc = _run_cmd_with_heartbeat(cmd, timeout=timeout_s, emit=emit, label=f"sqlmap ({url})")
         output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    except subprocess.TimeoutExpired:
-        return {"url": url, "error": "sqlmap timed out after 240 seconds — try a narrower level/risk or a specific --param."}
+    except subprocess.TimeoutExpired as e:
+        # Salvage whatever sqlmap had already confirmed before the kill
+        # (see the matching fix in _run_cmd_with_heartbeat) instead of
+        # discarding it and forcing a full, noisy re-run from scratch.
+        timed_out = True
+        output = (getattr(e, "stdout", None) or getattr(e, "output", None) or "") + "\n" + (getattr(e, "stderr", None) or "")
+        if not output.strip():
+            return {"url": url, "error": f"sqlmap timed out after {timeout_s}s with no output captured yet — try a narrower level/risk, a specific --param, or pass a higher 'timeout'."}
     except Exception as e:
         return {"url": url, "error": f"sqlmap execution failed: {e}"}
 
@@ -6163,6 +6375,16 @@ def _execute_sqlmap_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dic
         "is_dba": (is_dba_match.group(1).lower() == "true") if is_dba_match else None,
         "raw_tail": "\n".join(tail_lines),
     }
+    if timed_out:
+        result["timed_out"] = True
+        result["note"] = (
+            f"sqlmap hit the {timeout_s}s wall clock before finishing, but partial output was captured and "
+            f"parsed above (injectable/dbms/databases reflect whatever sqlmap had already confirmed at that "
+            f"point, if anything) -- don't assume a blank field means it wasn't found, it may just not have "
+            f"gotten there yet. Re-running from scratch isn't usually necessary; if dump_sample_rows was the "
+            f"goal and it's not in the result below, re-call with a higher 'timeout' or narrower level/risk "
+            f"rather than repeating the same call."
+        )
 
     if dump_sample:
         # sqlmap's dump table render looks like:
@@ -8004,6 +8226,69 @@ def _html_escape(s: Any) -> str:
     return _html_mod.escape(str(s if s is not None else ""), quote=True)
 
 
+_EVIDENCE_STATUS_RE = re.compile(r"^HTTP/[\d.]+\s+(\d+)\s*(.*)$", re.M)
+
+
+def _parse_evidence_text(raw: str) -> Dict[str, Optional[str]]:
+    """
+    Splits ONE captured evidence string into its request/response parts for
+    report-grade rendering, instead of the undifferentiated blob every
+    report used to dump ("$ curl ... \\n\\n HTTP/1.1 200 OK \\n <headers> \\n
+    <body>" all run together in one code block, no PoC command the
+    researcher could just copy-paste, no status code called out). Both
+    evidence producers (_execute_curl and _mirror_http_evidence_from_
+    terminal) write the SAME "$ <command>\\n\\n<response/output>" shape, so
+    this one parser covers evidence captured either way, including
+    anything already saved to disk before this existed — it's a read-time
+    parse of existing text, the stored format itself never changed.
+
+    Returns {"command", "status_label", "body"} — command/status_label are
+    None when nothing matched (e.g. a non-HTTP terminal command's output
+    has no status line, or a legacy/minimal evidence string has no "$ "
+    prefix at all); callers render around that gracefully rather than
+    showing an empty section.
+    """
+    raw = raw or ""
+    command = None
+    body = raw
+    if raw.startswith("$ "):
+        cmd_part, sep, rest = raw.partition("\n\n")
+        if sep:
+            command = cmd_part[2:].strip()
+            body = rest
+    status_label = None
+    m = _EVIDENCE_STATUS_RE.search(body)
+    if m:
+        code, reason = m.group(1), m.group(2).strip()
+        status_label = f"HTTP {code}" + (f" {reason}" if reason else "")
+    return {"command": command, "status_label": status_label, "body": body.strip()}
+
+
+def _evidence_markdown_block(raw: str) -> str:
+    """One captured evidence entry, rendered as a Request/Response pair in
+    Markdown — copy-pasteable PoC command separated from the actual proof
+    of impact, with the status code called out where one was captured."""
+    parsed = _parse_evidence_text(raw)
+    parts: List[str] = []
+    if parsed["command"]:
+        parts += ["**Request**", "", "```bash", parsed["command"], "```", ""]
+    resp_label = f"**Response** ({parsed['status_label']})" if parsed["status_label"] else "**Response**"
+    parts += [resp_label, "", "```", parsed["body"], "```", ""]
+    return "\n".join(parts)
+
+
+def _evidence_html_block(raw: str) -> str:
+    """Same split as _evidence_markdown_block, rendered as HTML for the
+    report page itself."""
+    parsed = _parse_evidence_text(raw)
+    html = ""
+    if parsed["command"]:
+        html += f'<div class="section-label">Request</div><pre class="code-block">{_html_escape(parsed["command"])}</pre>'
+    resp_label = f"Response ({_html_escape(parsed['status_label'])})" if parsed["status_label"] else "Response"
+    html += f'<div class="section-label">{resp_label}</div><pre class="code-block">{_html_escape(parsed["body"])}</pre>'
+    return html
+
+
 # Findings at these severities count as "a vulnerability was found" for
 # the purposes of auto-saving a report. "low"/"info" are recon notes
 # (interesting endpoints, directory listings, etc.) rather than confirmed
@@ -8032,7 +8317,7 @@ def _finding_markdown(title: str, kind: str, severity: str, request_ref: str, no
         parts.append(label)
         parts.append("")
         for r in raw_evidence:
-            parts += ["```", r, "```", ""]
+            parts.append(_evidence_markdown_block(r))
     return "\n".join(parts).rstrip() + "\n"
 
 
@@ -8085,7 +8370,7 @@ def _auto_save_finding_report(
         # what _execute_curl saw on the wire for this endpoint.
         raw_evidence_html = ""
         if raw_evidence:
-            blocks = "".join(f'<pre class="code-block">{_html_escape(r)}</pre>' for r in raw_evidence)
+            blocks = "".join(_evidence_html_block(r) for r in raw_evidence)
             raw_evidence_html = f'<div class="section-label">Proof — Captured Request/Response</div>{blocks}'
 
         md_text = _finding_markdown(title, kind, severity, request_ref, note, raw_evidence, updated_note)
@@ -8440,7 +8725,7 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
         if real_evidence_list:
             proof_label = "Proof — Captured Request/Response" if len(real_evidence_list) == 1 else "Proof — Captured Requests/Responses"
             evidence_block += f'<div class="section-label">{proof_label}</div>' + "".join(
-                f'<pre class="code-block">{_html_escape(r)}</pre>' for r in real_evidence_list
+                _evidence_html_block(r) for r in real_evidence_list
             )
 
         # Markdown version of this finding, for both its own per-finding
@@ -8473,7 +8758,7 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
             finding_md_parts.append(proof_label_md)
             finding_md_parts.append("")
             for r in real_evidence_list:
-                finding_md_parts += ["```", r, "```", ""]
+                finding_md_parts.append(_evidence_markdown_block(r))
         finding_md_text = "\n".join(finding_md_parts).rstrip() + "\n"
         findings_markdown_parts.append(finding_md_text)
 
@@ -8871,6 +9156,88 @@ def _execute_update_plan(args: Dict[str, Any], target: Target, emit: Any) -> Dic
     return {"status": "success", "plan": plan}
 
 
+_RECALL_CATEGORIES = {
+    "endpoints": "state",
+    "subdomains": "state",
+    "live_hosts": "state",
+    "js_routes": "state",
+    "parameter_sensitive": "state",
+    "takeover_candidates": "state",
+    "technologies": "state",
+    "credentials": "state",
+    "secrets": "state",
+    "failed_credentials": "state",
+    "cookies": "state",
+    "dismissed_false_positives": "state",
+    "curl_evidence_log": "state",
+    "campaign_plan": "state",
+    "findings": "findings",  # lives on target.findings, not target.state
+}
+
+
+def _execute_recall_data(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Lets the model actively LOOK UP its own gathered data for this target,
+    rather than being limited to whatever the orchestrator prompt's
+    capped summary injects automatically (endpoints capped at 35,
+    parameters at 15, curl evidence lookups matched by URL only, etc.).
+    The injected summary is a rolling digest meant to fit in a prompt —
+    this is the full, queryable version underneath it, for when the model
+    needs to actually check "what did I already find here" instead of
+    re-running recon that's already been done, especially useful right
+    after a set_target (fresh turn, nothing in the trimmed chat history
+    yet) or a same_target_as migration.
+
+    Not a free-text search engine — a plain category lookup with an
+    optional substring filter, same spirit as /output's "pull the full
+    thing, not just what got streamed" but for structured state instead
+    of raw tool output.
+    """
+    category = str(args.get("category", "")).strip().lower()
+    if category not in _RECALL_CATEGORIES:
+        return {
+            "error": f"Unknown category '{category}'. Valid categories: {', '.join(sorted(_RECALL_CATEGORIES))}.",
+        }
+    source = _RECALL_CATEGORIES[category]
+    if source == "findings":
+        raw_items = target.findings if isinstance(target.findings, list) else []
+    else:
+        raw_items = target.state.get(category) if isinstance(target.state, dict) else None
+        if isinstance(raw_items, dict):
+            # e.g. campaign_plan, cookies -- not a list; return as-is, no filtering.
+            return {"status": "success", "category": category, "data": raw_items}
+        raw_items = raw_items if isinstance(raw_items, list) else []
+
+    total = len(raw_items)
+    filt = str(args.get("filter", "") or "").strip().lower()
+    if filt:
+        raw_items = [it for it in raw_items if filt in json.dumps(it, default=str).lower()]
+    limit = min(int(args.get("limit", 50) or 50), 200)
+    matched = len(raw_items)
+    items = raw_items[-limit:] if matched > limit else raw_items
+
+    # curl_evidence_log entries store their proof as one raw blended
+    # string ("$ <command>\n\n<response>") — add the same Request/Response
+    # split used in reports here too, so recalling evidence before writing
+    # a finding shows it the same clean way it'll actually appear in the
+    # report, not a harder-to-read raw dump.
+    if category == "curl_evidence_log":
+        items = [
+            {**it, "formatted": _parse_evidence_text(it.get("raw", ""))} if isinstance(it, dict) else it
+            for it in items
+        ]
+
+    return {
+        "status": "success",
+        "category": category,
+        "total_stored": total,
+        "matched": matched,
+        "returned": len(items),
+        "truncated": matched > len(items),
+        "items": items,
+    }
+
+
 def _execute_set_target_stub(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Placeholder to satisfy ToolSpec's executor signature (args, target, emit)
@@ -9062,6 +9429,30 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_update_plan
     ),
+    "recall_data": ToolSpec(
+        name="recall_data",
+        description=(
+            "Look up the FULL set of a specific kind of data already gathered on the active target — not "
+            "just the capped preview the orchestrator prompt injects automatically (e.g. only 35 endpoints, "
+            "15 parameters are shown there). Use this before re-running recon that may have already been "
+            "done, especially right after switching to this target (set_target, including a same_target_as "
+            "IP migration) when the turn's history is fresh and the full picture isn't in front of you yet. "
+            "Categories: endpoints, subdomains, live_hosts, js_routes, parameter_sensitive, "
+            "takeover_candidates, technologies, credentials, secrets, failed_credentials, cookies, "
+            "dismissed_false_positives, curl_evidence_log (captured request/response proof), campaign_plan, "
+            "findings (confirmed findings on this target)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "One of the categories listed above."},
+                "filter": {"type": "string", "description": "Optional substring to filter results by (case-insensitive, matched against each item's full content)."},
+                "limit": {"type": "integer", "description": "Max items to return (default 50, hard-capped at 200). The result also reports total_stored/matched so you know if this is everything or a slice."}
+            },
+            "required": ["category"]
+        },
+        executor=_execute_recall_data
+    ),
     "export_report": ToolSpec(
         name="export_report",
         description="Assemble every recorded finding and piece of evidence for this target into a single, self-contained, professional HTML report — headline, executive summary, per-finding impact statements and steps to reproduce, real captured request/response proof for each finding, and every referenced screenshot embedded directly in the file (base64, no linked images that break once the file leaves this machine — e.g. attached to a HackerOne/Bugcrowd submission). It ALSO auto-attaches a matching gowitness screenshot for a finding even when you didn't pass screenshot_refs, if one was captured earlier for that same endpoint — explicit screenshot_refs still wins when you give them. This writes TWO files from the exact same data: the HTML report, and a matching .md file (markdown_path in the result) — a GitHub-flavored Markdown version of the whole report, so you never need to retype/paste the report a second time into your chat reply when the researcher wants Markdown; just point them at both file paths. Use this at the end of a hunting session when the researcher asks for a report, a writeup, or to export/save findings — and call it again any time the researcher asks to update/add to the report; by default this OVERWRITES the target's one report file in place rather than creating a new one (see new_file). YOU write the narrative (title, executive summary, impact statement, steps to reproduce per finding) — follow the report-writing skill's methodology first (impact-first tone, CVSS 3.1 scoring, never 'could potentially' — prove it or don't claim it). Never fabricate example/placeholder evidence (made-up cookies, made-up response bodies, etc.) — this tool assembles and embeds what you give it faithfully, checks your work (every finding_ref must match something actually recorded via record_finding or logged as evidence during this session; fabricated/unmatched refs are rejected, any recorded finding you leave out gets flagged back to you), AND automatically attaches the real request/response captured during this session for each finding — you do not need to, and should not try to, retype that from memory.",
@@ -9123,6 +9514,29 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["domain"]
         },
         executor=_execute_subfinder
+    ),
+    "subdomain_sweep": ToolSpec(
+        name="subdomain_sweep",
+        description=(
+            "\"Give me all live subdomains\" in ONE call instead of three: chains subfinder (passive OSINT) "
+            "-> alterx (permutation mutations, e.g. dev-/staging-/api- prefixes) -> dnsx (bulk resolve), "
+            "automatically feeding each stage's output into the next. Use this instead of calling subfinder, "
+            "permute_subdomains, and resolve_candidates separately when the goal is simply the broadest live "
+            "attack surface for a domain. Each stage still degrades gracefully on its own (a missing alterx "
+            "just skips permutation with a note; subfinder's own findings still get resolved). Call subfinder/"
+            "permute_subdomains/resolve_candidates individually instead when you specifically need to inspect "
+            "or filter an intermediate stage's output before the next one runs."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Target root domain to sweep. Defaults to the active target."},
+                "permute": {"type": "boolean", "description": "Generate and resolve permutation mutations (dev-, staging-, api-, etc.) on top of subfinder's passive results. Default true.", "default": True},
+                "permute_limit": {"type": "integer", "description": "Max permutation candidates alterx generates before resolving. Default 300.", "default": 300},
+            },
+            "required": []
+        },
+        executor=_execute_subdomain_sweep
     ),
     "httpx": ToolSpec(
         name="httpx",
@@ -9625,7 +10039,8 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "is_dba": {"type": "boolean", "description": "Also report whether the injected user has DBA privileges."},
                 "dump_sample_rows": {"type": "integer", "description": "Opt-in: pull a small sample dump of real row data as mass-PII-leak proof (1-5 rows, hard-capped at 5). Pairs well with 'table'/'db' if you already know which table matters (e.g. a users table); otherwise sqlmap picks one itself."},
                 "db": {"type": "string", "description": "Database name to target the sample dump at, when known (used only with dump_sample_rows)."},
-                "table": {"type": "string", "description": "Table name to target the sample dump at, when known (used only with dump_sample_rows)."}
+                "table": {"type": "string", "description": "Table name to target the sample dump at, when known (used only with dump_sample_rows)."},
+                "timeout": {"type": "integer", "description": "Wall-clock seconds before this call is killed (60-600). Default 240, or 360 when dump_sample_rows is set (dumping needs real extra time beyond a bare confirm). Raise this instead of re-calling after a timeout -- a timed-out run still salvages and reports whatever it confirmed before the kill."}
             },
             "required": ["url"]
         },
@@ -11965,7 +12380,7 @@ RULES:
      * Gaining access to a stepping-stone account (e.g. standard user, support account) is an intermediate step to learn mechanics.
      * When authenticated as a stepping-stone user, probe for IDOR or parameter escalation on profile/setting endpoints (`curl` GET `/api/user/<target_id>`, `/profile/<target_id>`) and inspect client-side JavaScript state (`window.__INITIAL_STATE__`, embedded objects) to harvest the target's credentials or tokens.
      * Before constructing a request accepting tokens or keys, cross-check every entry in the HARVESTED ARTIFACT INVENTORY.
-   - PLANNING AHEAD, NOT JUST REACTING: the moment recon or an initial finding surfaces a genuinely multi-step path to the objective (confirm a vuln -> escalate it -> pivot to another host/account -> reach the real goal), call `update_plan` with action='set' to write that path down as steps, BEFORE executing the first of them — don't wait to be told each next step one at a time. Mark each step done/blocked with `update_step` as you actually complete or hit a wall on it, not all at once at the end. If an ACTIVE CAMPAIGN PLAN is already shown above (set on an earlier turn, possibly before a target-IP migration), treat it as still in force — continue the next pending step rather than re-deriving a plan from scratch or waiting for the researcher to restate the objective.
+   - PLANNING AHEAD, NOT JUST REACTING: the moment recon or an initial finding surfaces a genuinely multi-step path to the objective (confirm a vuln -> escalate it -> pivot to another host/account -> reach the real goal), call `update_plan` with action='set' to write that path down as steps, BEFORE executing the first of them — don't wait to be told each next step one at a time. Mark each step done/blocked with `update_step` as you actually complete or hit a wall on it, not all at once at the end. If an ACTIVE CAMPAIGN PLAN is already shown above (set on an earlier turn, possibly before a target-IP migration), treat it as still in force — continue the next pending step rather than re-deriving a plan from scratch or waiting for the researcher to restate the objective. Before assuming something hasn't been checked yet, use `recall_data` to look at the FULL stored picture (not just the capped preview above) — this is how you check your own past work instead of asking the researcher or re-running recon that's already done.
 
 3. Low-Noise Surgical Reconnaissance First (HTML & JavaScript Inspection Over Blind Fuzzing):
    - Always start reconnaissance by using `curl` to fetch the landing page HTML, comments, embedded `<script src="...">` tags, forms, and HTTP response headers.
@@ -12042,6 +12457,7 @@ RULES:
    - In modern Single-Page Applications (SPAs), HTTP 200 merely returns the frontend shell. Inspect the response body or screenshot for error states: "403", "Owner access required", "Access Denied", "Forbidden", or login prompts.
    - A privilege escalation or bypass is ONLY confirmed when privileged data (billing secrets, API keys, member directories, configuration settings) of the TARGET role/account is genuinely returned or unlocked.
    - GUARD / HUMAN APPROVAL & ERROR HONESTY: If a tool returns an error indicating that a request was blocked, required approval, or was rejected by the user (e.g. 'requires human approval', 'Action rejected by user', 'blocked'), the requested action DID NOT HAPPEN. You must NEVER claim that an action was executed, completed, or initiated if the underlying tool call was blocked or rejected.
+   - "COULDN'T TEST" IS NOT "TESTED AND CLEAN": a tool call that returned `"status": "error"` or had nothing to act on (e.g. jwt_forge with no JWT present in session state, a probe with no target to hit) means that check never ran. Never fold that into language like "confirmed none are forgeable" or "X was audited and found clean" — say plainly that it wasn't applicable or couldn't be tested, and why. This applies doubly when the researcher asks you to summarize session limitations/blockers: before claiming something "never happened" (e.g. "we never hit a hard WAF block"), check it against what this session's own tool calls actually showed (recall_data, or the investigation summary) rather than asserting a plausible-sounding narrative from memory — a self-assessment that contradicts the session's own history is exactly as bad as contradicting a recorded finding.
    - PROOF OF PRIMARY TARGET ONLY: Capture `gowitness` screenshots and record findings for the PRIMARY target account once compromised. Screenshot the authenticated administrative dashboard (`/admin`), user list, or target view, rather than re-requesting destructive action URLs. Do NOT capture a screenshot of an allowed stepping-stone user and treat it as proof of the primary goal's completion.
    - record_finding with a `request_ref` is BLOCKED unless a real request/response for that exact endpoint was actually captured this session — see the tool's own description. This is not "always use the curl tool": run_terminal_command also captures HTTP evidence automatically now, so a sqlmap/python-requests/raw-curl PoC run that way still counts, as long as it actually ran against that URL.
    - NEVER state or imply that a vulnerability "doesn't exist," "isn't reproducible," or "isn't there anymore" for anything listed under CONFIRMED FINDINGS ALREADY RECORDED ON THIS TARGET above, including after a target/IP switch — call `dismiss_finding` with a specific reason first if you've genuinely disproven it, otherwise keep treating it as live.
