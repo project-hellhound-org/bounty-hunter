@@ -685,7 +685,7 @@ def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) ->
 
 def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
-    /program [show [name] | list | create <name> [domain1,domain2,...] | add <domain...> | scope <policy text>]
+    /program [show [name] | list | create <name> [domain1,domain2,...] | add <domain...> | attach <domain...> | scope <policy text>]
 
     For a bug-bounty PROGRAM/engagement with several in-scope domains
     (e.g. "AGOV" shipping a.gov.sg, b.gov.sg, c.gov.sg) — groups them
@@ -710,6 +710,15 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
                                 program (comma-separated or space-separated) — the
                                 current target must already belong to one; run
                                 'create' first if not
+    attach <domain...>       — alias for 'add': attaches an existing (or brand-new)
+                                target to the CURRENT target's program by domain
+                                name. Each attached target keeps its own real recon
+                                data at ~/.hellhound/targets/<domain>/ AND gets a
+                                browsable directory for it under
+                                ~/.hellhound/programs/<program>/targets/<domain>/ —
+                                so every in-scope subdomain of the program shows up
+                                as its own separate directory inside the program's
+                                directory, instead of scattered flat sibling folders.
     scope <policy text>      — set/REPLACE the whole program's scope (in-scope,
                                 out-of-scope, disallowed), parsed the same free-form
                                 way /scope accepts a pasted program policy page —
@@ -775,7 +784,43 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
             msg = "Usage: /program create <name> [domain1,domain2,...]"
             emit.warn(msg)
             return {"status": "error", "error": "missing_name", "message": msg}
-        prog_name = clean_args[1]
+
+        # CAUGHT IN THE WILD (2026-10): '/program create mercado libre'
+        # (name genuinely has a space, typed without quotes) silently took
+        # clean_args[1] ("mercado") as the whole name and clean_args[2:]
+        # ("libre") as an EXTRA DOMAIN TO ATTACH — "libre" got
+        # create_or_load_target()'d as if it were a real in-scope host,
+        # which it plainly isn't (no dot, not a domain at all). A domain
+        # is syntactically distinguishable from a name word (it has a
+        # dot, or the documented comma-separated list syntax is used), so
+        # walk the tokens after the verb and only start treating them as
+        # domains once one of them actually looks like one — everything
+        # before that point is the (possibly multi-word) program name.
+        # '/program create "mercado libre"' already worked correctly
+        # before this fix (shlex.split keeps the quoted phrase as one
+        # token) and still does — this only fixes the unquoted case.
+        def _looks_like_domain_token(tok: str) -> bool:
+            t = tok.strip().strip(",")
+            if "," in tok:
+                return True  # the documented domain-list separator -- unambiguous either way
+            return bool(re.match(r'^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+$', t))
+
+        rest = list(clean_args[1:])
+        name_tokens = []
+        idx = 0
+        while idx < len(rest) and not _looks_like_domain_token(rest[idx]):
+            name_tokens.append(rest[idx])
+            idx += 1
+        if not name_tokens:
+            # The very first token already looked like a domain (e.g. the
+            # researcher deliberately named the program "example.com") --
+            # fall back to the original single-token-name behavior rather
+            # than ending up with an empty name.
+            name_tokens = [rest[0]]
+            idx = 1
+        prog_name = " ".join(name_tokens)
+        domain_tokens = rest[idx:]
+
         if target_name == "default" or target_obj is None:
             msg = "No active target to attach — set one first with /target <domain>, or pass it as the first in-scope domain."
             emit.warn(msg)
@@ -783,7 +828,7 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
         attach_target_to_program(target_obj, prog_name)
         attached = [target_obj.name]
         extra_domains = []
-        for raw_entry in clean_args[2:]:
+        for raw_entry in domain_tokens:
             extra_domains.extend(raw_entry.split(","))
         for d in extra_domains:
             d = d.strip().strip(",").lower()
@@ -797,7 +842,7 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
             emit.info(f"Next: /program scope <policy text>  to set the program's shared in-scope/out-of-scope rules.")
         return {"status": "success", "action": "created", "program": sanitize_program_name(prog_name), "targets": attached}
 
-    if verb == "add":
+    if verb in ("add", "attach"):
         prog_name = getattr(target_obj, "program", "") if target_obj else ""
         if not prog_name:
             msg = "The active target isn't attached to a program yet — run /program create <name> first."
@@ -811,16 +856,25 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
             d = d.strip().strip(",").lower()
             if not d:
                 continue
+            # create_or_load_target() LOADS the target's existing recon
+            # data if that domain was already worked as a standalone
+            # target before (its own findings/session/state) rather than
+            # wiping it — attaching it to a program doesn't lose anything
+            # already gathered, and attach_target_to_program() below links
+            # that same real data directory in under the program's own
+            # directory tree (see _ensure_program_target_link).
             d_target = create_or_load_target(d)
             attach_target_to_program(d_target, prog_name)
             added.append(d_target.name)
         if not added:
-            msg = "Usage: /program add <domain1,domain2,...>"
+            msg = f"Usage: /program {verb} <domain1,domain2,...>"
             emit.warn(msg)
             return {"status": "error", "error": "no_domains_given", "message": msg}
         if not is_json:
-            emit.success(f"Added {len(added)} domain(s) to program '{prog_name}': {', '.join(added)}")
-        return {"status": "success", "action": "added", "program": prog_name, "domains_added": added}
+            verb_past = "Attached" if verb == "attach" else "Added"
+            emit.success(f"{verb_past} {len(added)} domain(s) to program '{prog_name}': {', '.join(added)}")
+            emit.info(f"  Each now has its own directory under ~/.hellhound/programs/{prog_name}/targets/")
+        return {"status": "success", "action": "attached", "program": prog_name, "domains_added": added}
 
     if verb == "scope":
         prog_name = getattr(target_obj, "program", "") if target_obj else ""
@@ -842,7 +896,7 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
             emit.info(f"  Disallowed: {rules.get('disallowed', [])}")
         return {"status": "success", "action": "scope_updated", **result}
 
-    msg = f"Unknown /program subcommand '{verb}'. Usage: /program [show [name] | list | create <name> [domains] | add <domain...> | scope <policy text>]"
+    msg = f"Unknown /program subcommand '{verb}'. Usage: /program [show [name] | list | create <name> [domains] | add <domain...> | attach <domain...> | scope <policy text>]"
     emit.warn(msg)
     return {"status": "error", "error": "unknown_subcommand", "message": msg}
 
@@ -2409,7 +2463,7 @@ register_command(Command(
     name="/program",
     aliases=["/programs", "/engagement"],
     description="Group several in-scope domains of one bug-bounty program/engagement under a shared scope (each domain keeps its own findings/session) — entirely optional, never triggered automatically by /target",
-    usage="/program [show [name] | list | create <name> [domain1,domain2,...] | add <domain...> | scope <policy text>]",
+    usage="/program [show [name] | list | create <name> [domain1,domain2,...] | add <domain...> | attach <domain...> | scope <policy text>]",
     category="config",
     handler=handle_program
 ))

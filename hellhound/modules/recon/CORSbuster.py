@@ -1,5 +1,7 @@
+import time
 import requests
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from hellhound.core import http_utils
 
 NAME = "cors_buster"
@@ -48,17 +50,17 @@ def test_cors(url, origin, session=None):
         acao = r.headers.get("Access-Control-Allow-Origin")
         if not acao:
             return None
-            
+
         acac = r.headers.get("Access-Control-Allow-Credentials", "false").lower() == "true"
         acam = r.headers.get("Access-Control-Allow-Methods", "")
         acah = r.headers.get("Access-Control-Allow-Headers", "")
         aceh = r.headers.get("Access-Control-Expose-Headers", "")
-        
+
         # Risk multipliers for dangerous methods/headers
         dangerous_methods = [m.strip().upper() for m in acam.split(",") if m.strip().upper() in ("PUT", "DELETE", "PATCH")]
         sensitive_headers = [h.strip().lower() for h in acah.split(",") if h.strip().lower() in ("authorization", "x-api-key", "cookie")]
         exposed_headers = [h.strip().lower() for h in aceh.split(",") if h.strip().lower() in ("authorization", "set-cookie", "x-auth-token")]
-        
+
         return {
             "origin": origin,
             "acao": acao,
@@ -68,6 +70,13 @@ def test_cors(url, origin, session=None):
             "dangerous_methods": dangerous_methods,
             "sensitive_headers": sensitive_headers,
             "exposed_headers": exposed_headers,
+            # Kept so a confirmed finding can carry its OWN real
+            # request/response as evidence instead of a report later
+            # grabbing some unrelated earlier curl to the same URL (see
+            # the evidence-mirroring in agent.py's _execute_cors_checker).
+            "status_code": r.status_code,
+            "method": r.request.method if getattr(r, "request", None) else "OPTIONS",
+            "response_headers": dict(r.headers),
         }
     except Exception:
         pass
@@ -143,9 +152,56 @@ def run(target, emit, options=None):
     signals = []
     risk_score = 0
 
-    for url in urls_to_test:
-        for payload in payloads:
-            result = test_cors(url, payload, session=session)
+    # CAUGHT IN THE WILD (2026-10): this was a plain serial double loop --
+    # up to 100 URLs x ~12 payloads x up to 2 requests each (OPTIONS, then
+    # a GET fallback), one at a time, with NO progress output between the
+    # single "[*] Analyzing Origins..." line at the top and the final
+    # result. Against a target with a large discovered-endpoint set (a
+    # real-world recon haul easily has 200+), that's 1000+ sequential
+    # HTTP round-trips -- a researcher watching this had no way to tell
+    # "still working" from "hung," and it genuinely took 10+ minutes wall
+    # clock on one real engagement. Fixed two ways: run the probes
+    # concurrently (bounded worker pool -- Session handles concurrent use
+    # fine, this is the same pattern requests-based tools commonly use),
+    # and cap the whole sweep to a wall-clock budget so a slow/unreachable
+    # target can't turn into an unbounded hang -- whatever's been tested
+    # by the deadline is reported, same "partial beats nothing" principle
+    # as the sqlmap/run_terminal_command timeout fixes elsewhere in this
+    # codebase.
+    tasks = [(url, payload) for url in urls_to_test for payload in payloads]
+    total_tasks = len(tasks)
+    _BUDGET_SECONDS = 90
+    _MAX_WORKERS = 12
+    deadline = time.time() + _BUDGET_SECONDS
+    completed = 0
+    timed_out_early = False
+
+    if total_tasks > 20:
+        emit.info(f"    [*] Testing {total_tasks} (url, origin) combinations across {len(urls_to_test)} URL(s), up to {_BUDGET_SECONDS}s budget...")
+
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        future_map = {pool.submit(test_cors, url, payload, session): (url, payload) for url, payload in tasks}
+        for future in as_completed(future_map, timeout=_BUDGET_SECONDS + 10):
+            url, payload = future_map[future]
+            completed += 1
+            if total_tasks > 20 and completed % 50 == 0:
+                emit.info(f"    [*] CORS sweep: {completed}/{total_tasks} probes tested...")
+            if time.time() > deadline:
+                timed_out_early = True
+                # Let already-finished futures be processed below (the
+                # for-loop over as_completed still yields them), just stop
+                # waiting on anything still pending -- cancel() is a no-op
+                # for futures already running, but cleanly drops queued-
+                # but-not-started ones instead of waiting out their timeout.
+                for f in future_map:
+                    if not f.done():
+                        f.cancel()
+                break
+
+            try:
+                result = future.result()
+            except Exception:
+                result = None
             if not result:
                 continue
 
@@ -197,8 +253,13 @@ def run(target, emit, options=None):
                         "payload": payload,
                         "credentials_allowed": acac,
                         "poc_html": generate_poc(url, payload, acac),
+                        # Real captured response for THIS exact probe (the
+                        # one that actually produced the reflected/trusted
+                        # ACAO value) — not reconstructed, not guessed.
+                        "status_code": result.get("status_code"),
+                        "response_headers": result.get("response_headers") or {},
                         "repro_data": {
-                            "method": "OPTIONS",
+                            "method": result.get("method", "OPTIONS"),
                             "url": url,
                             "headers": {"Origin": payload}
                         }
@@ -207,14 +268,17 @@ def run(target, emit, options=None):
                     risk_score += risk_val
                     emit.warn(f"    [!] {vuln_type}: {url} matches Origin: {payload}")
 
+    if timed_out_early:
+        emit.warn(f"    [!] CORS sweep hit its {_BUDGET_SECONDS}s budget after {completed}/{total_tasks} probes — reporting what was found so far rather than hanging further; re-run with fewer discovered endpoints in spider_intel for full coverage.")
+
     if findings:
         signals.append("CORS_MISCONFIGURATION")
         emit.success(f"[+] Found {len(findings)} CORS misconfigurations.")
     else:
         emit.info("[-] No CORS misconfigurations detected.")
-        
+
     return {
         "raw": f"CORS Misconfigs: {len(findings)}",
-        "intel": {"cors_vulnerabilities": findings, "risk_score": risk_score},
+        "intel": {"cors_vulnerabilities": findings, "risk_score": risk_score, "probes_completed": completed, "probes_total": total_tasks, "timed_out_early": timed_out_early},
         "signals": signals
     }

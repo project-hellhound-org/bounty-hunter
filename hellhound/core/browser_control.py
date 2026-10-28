@@ -82,7 +82,23 @@ class _BrowserSession:
 
     async def ensure_started(self):
         if self.page is not None:
-            return
+            # CAUGHT IN THE WILD (2026-10): this used to just trust a
+            # non-None page reference and return immediately -- if the
+            # underlying Chromium process had died (crash, OOM kill, a
+            # sandboxing issue in the container), self.page/self.browser
+            # stayed non-None forever, so every single action on this
+            # session failed with the identical "Connection closed while
+            # reading from the driver" error for the rest of the
+            # engagement, with nothing ever relaunching a fresh browser.
+            # Checking is_connected() here catches that proactively,
+            # before wasting a call on a browser that's already dead.
+            try:
+                still_alive = self.browser is not None and self.browser.is_connected()
+            except Exception:
+                still_alive = False
+            if still_alive:
+                return
+            await self.close()
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(
             headless=True,
@@ -151,10 +167,18 @@ class _BrowserSession:
 
 
 class _SessionRegistry:
-    """Keyed by target key (e.g. target.name). Only ever touched from the
-    background loop thread's coroutines (via run_coro), so no extra lock
-    is needed around the dict itself -- asyncio on a single loop is
-    cooperative, not preemptive."""
+    """Keyed by "<target>::<session_id>" (session_id defaults to "default").
+    Only ever touched from the background loop thread's coroutines (via
+    run_coro), so no extra lock is needed around the dict itself -- asyncio
+    on a single loop is cooperative, not preemptive.
+
+    Multiple session_ids under the same target give independent browser
+    CONTEXTS (own cookie jar, own storage, own page) -- what cross-user
+    IDOR/BAC testing actually needs: a "victim" session logged in as one
+    account and an "attacker" session logged in as another, open and
+    interactive at the same time, instead of one shared context where
+    logging in as the second user destroys the first user's session.
+    """
 
     def __init__(self):
         self.sessions: Dict[str, _BrowserSession] = {}
@@ -166,13 +190,64 @@ class _SessionRegistry:
             self.sessions[key] = sess
         return sess
 
+    def keys_for_target(self, target_prefix: str) -> List[str]:
+        prefix = f"{target_prefix}::"
+        return [k for k in self.sessions.keys() if k.startswith(prefix)]
+
 
 _registry = _SessionRegistry()
+
+
+async def _list_sessions_coro(target_prefix: str) -> Dict[str, Any]:
+    keys = _registry.keys_for_target(target_prefix)
+    sessions = []
+    for k in keys:
+        sess = _registry.sessions.get(k)
+        if sess is None:
+            continue
+        session_id = k.split("::", 1)[1] if "::" in k else k
+        sessions.append({
+            "session_id": session_id,
+            "active": sess.page is not None,
+            "url": sess.page.url if sess.page is not None else None,
+            "last_used": sess.last_used,
+        })
+    return {"status": "success", "action": "list_sessions", "sessions": sessions, "count": len(sessions)}
+
+
+async def _close_all_coro(target_prefix: str) -> Dict[str, Any]:
+    keys = _registry.keys_for_target(target_prefix)
+    closed = []
+    for k in keys:
+        sess = _registry.sessions.get(k)
+        if sess is not None:
+            await sess.close()
+        _registry.sessions.pop(k, None)
+        closed.append(k.split("::", 1)[1] if "::" in k else k)
+    return {"status": "success", "action": "close", "closed_sessions": closed, "count": len(closed)}
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Async action implementations
 # ──────────────────────────────────────────────────────────────────────────
+
+# Substrings of the Playwright exceptions a genuinely-dead browser
+# process raises -- as opposed to an ordinary action failure (a selector
+# that doesn't exist, a navigation timeout), which should surface as-is,
+# not trigger a relaunch.
+_DEAD_BROWSER_MARKERS = (
+    "connection closed",
+    "target closed",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "has been closed",
+)
+
+
+def _looks_like_dead_browser(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _DEAD_BROWSER_MARKERS)
+
 
 async def _do_action(key: str, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
     sess = _registry.get_or_create(key)
@@ -185,9 +260,51 @@ async def _do_action(key: str, action: str, params: Dict[str, Any]) -> Dict[str,
 
     await sess.ensure_started()
     sess.last_used = time.time()
-    page = sess.page
-
     timeout_ms = int(float(params.get("timeout", 15)) * 1000)
+
+    try:
+        return await _run_page_action(sess, action, params, timeout_ms)
+    except Exception as e:
+        if not _looks_like_dead_browser(e):
+            raise
+        # CAUGHT IN THE WILD (2026-10): a browser that died mid-action
+        # (not just between calls -- ensure_started()'s health check
+        # above only catches the between-calls case) used to just bubble
+        # up as a bare "Connection closed" error with the stale session
+        # left in place, so the NEXT call failed identically, and the
+        # one after that, for the rest of the engagement -- a researcher
+        # watching this saw browser_control as simply broken, with no
+        # indication a relaunch would have fixed it. Tear the dead
+        # session down, start a completely fresh one, and retry the SAME
+        # action exactly once before giving up -- this is a recovery
+        # from infrastructure flakiness, not a loop (one retry, then a
+        # real error if it's still broken).
+        try:
+            await sess.close()
+        except Exception:
+            pass
+        _registry.sessions.pop(key, None)
+        sess = _registry.get_or_create(key)
+        await sess.ensure_started()
+        sess.last_used = time.time()
+        try:
+            result = await _run_page_action(sess, action, params, timeout_ms)
+            result["auto_recovered_from_crashed_browser"] = True
+            return result
+        except Exception as e2:
+            return {
+                "status": "error",
+                "error": (
+                    f"Browser action '{action}' failed: {type(e2).__name__}: {e2} "
+                    f"(the browser session had crashed and was automatically relaunched, "
+                    f"but the retry failed too -- this looks like a persistent environment "
+                    f"issue, e.g. the sandbox can't keep Chromium alive at all, not a one-off crash)."
+                ),
+            }
+
+
+async def _run_page_action(sess: "_BrowserSession", action: str, params: Dict[str, Any], timeout_ms: int) -> Dict[str, Any]:
+    page = sess.page
 
     if action == "goto":
         url = params.get("url")
@@ -290,3 +407,29 @@ def run_browser_action(key: str, action: str, params: Optional[Dict[str, Any]] =
         return {"status": "error", "error": f"Browser action '{action}' timed out after {timeout}s"}
     except Exception as e:
         return {"status": "error", "error": f"Browser action '{action}' failed: {type(e).__name__}: {e}"}
+
+
+def list_sessions(target_prefix: str, timeout: float = 15.0) -> Dict[str, Any]:
+    """Lists every open session_id for this target (across every browser
+    context, not just 'default') -- what's actually open right now, each
+    with its own cookie jar/storage, for multi-context cross-user testing."""
+    if not PLAYWRIGHT_AVAILABLE:
+        return {"status": "success", "action": "list_sessions", "sessions": [], "count": 0}
+    loop_thread = _LoopThread.get()
+    try:
+        return loop_thread.run_coro(_list_sessions_coro(target_prefix), timeout=timeout)
+    except Exception as e:
+        return {"status": "error", "error": f"list_sessions failed: {type(e).__name__}: {e}"}
+
+
+def close_all_sessions(target_prefix: str, timeout: float = 30.0) -> Dict[str, Any]:
+    """Tears down EVERY open session_id for this target at once (vs. a
+    plain 'close', which only ever closes the single session_id it was
+    called with)."""
+    if not PLAYWRIGHT_AVAILABLE:
+        return {"status": "success", "action": "close", "closed_sessions": [], "count": 0}
+    loop_thread = _LoopThread.get()
+    try:
+        return loop_thread.run_coro(_close_all_coro(target_prefix), timeout=timeout)
+    except Exception as e:
+        return {"status": "error", "error": f"close_all_sessions failed: {type(e).__name__}: {e}"}

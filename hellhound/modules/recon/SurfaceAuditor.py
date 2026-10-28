@@ -125,23 +125,57 @@ def check_default_pages(base_url: str, session) -> list:
             pass
     return findings
 
+def _soft_404_baseline(base_url: str, session) -> dict | None:
+    """
+    Probes a guaranteed-nonexistent path and records its status+length, so
+    check_data_exposure's hits can be checked against it before being
+    reported. Without this, an app that answers every unknown path with
+    HTTP 200 and the same catch-all body (SPA router, PHP front
+    controller) can trip a "Sensitive File Exposed" finding on nothing
+    more than the catch-all page happening to contain one matching word
+    (e.g. a dashboard with "Secret Questions" in its markup matching the
+    .env signature's bare `SECRET` pattern) -- exactly what produced a
+    false ".env exposed" finding against a soft-404 app that was, per the
+    session's own later investigation, serving the regular dashboard HTML
+    at that path, not an actual .env file. Returns None if the probe
+    itself fails (caller must not filter in that case -- no baseline to
+    compare against beats a wrong one).
+    """
+    import random
+    import string
+    probe_path = "zzz-hellhound-404-check-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    try:
+        r = session.get(base_url.rstrip("/") + "/" + probe_path, timeout=6, allow_redirects=False)
+        return {"status": r.status_code, "length": len(r.content)}
+    except Exception:
+        return None
+
+
 def check_data_exposure(base_url: str, session) -> list:
     """High-fidelity sensitive file exposure audit."""
     findings = []
+    baseline = _soft_404_baseline(base_url, session)
     for path, patterns in _EXPOSURE_SIGNATURES.items():
         url = base_url.rstrip("/") + "/" + path
         try:
             r = session.get(url, timeout=5, allow_redirects=False)
             if r.status_code == 200:
                 body = r.text
+                # Soft-404 filter -- same status+length as the known-bogus
+                # baseline path means this is the app's catch-all response,
+                # not a real file, regardless of what the signature check
+                # below matches on its text.
+                if baseline and r.status_code == baseline["status"] and len(r.content) == baseline["length"]:
+                    continue
+
                 # Signature Check
                 matched = any(re.search(p, body, re.M | re.I) for p in patterns)
                 if not matched: continue
-                
+
                 # Boilerplate Filter
                 if any(x in body.lower()[:500] for x in ["404", "not found", "cannot find"]):
                     continue
-                
+
                 severity = 9 if ".git" in path or ".env" in path else 4
                 findings.append({
                     "id": "SA-201", "severity": severity,
@@ -207,7 +241,31 @@ def check_cdn(base_url: str, session) -> list:
 # PORT SCANNER (Firewall Rule Check)
 # ══════════════════════════════════════════════════════════════════════
 
-def check_ports(host: str, custom_ports: str = None) -> list:
+def check_ports(host: str, custom_ports: str = None, known_open_ports: list = None) -> list:
+    # Reuse a real port_scan (naabu) result from earlier in the same
+    # session instead of re-probing with a raw socket connect to a small
+    # hardcoded port list -- port_scan already did a proper scan (and the
+    # researcher can see both ran, back to back, reporting the same ports
+    # twice with no new information either time). Only falls through to
+    # the raw socket check below when nothing from port_scan is available
+    # (surface_auditor run standalone, with no prior port_scan this
+    # session) or the caller explicitly asked for a custom port list.
+    if known_open_ports and not custom_ports:
+        findings = []
+        for p in known_open_ports:
+            port = p.get("port") if isinstance(p, dict) else None
+            if not port:
+                continue
+            service = next((svc for pnum, svc in _INTERESTING_PORTS if pnum == port), p.get("protocol", "tcp").upper() if isinstance(p, dict) else "unknown")
+            findings.append({"id": "SA-110", "severity": 4,
+                "name": f"Open Port: {port}/{service}",
+                "port": port, "service": service,
+                "banner": "",
+                "source": "port_scan (reused, not re-probed)",
+                "description": f"Port {port} ({service}) was found open by this session's port_scan. "
+                               f"Verify firewall rules restrict external access."})
+        return findings
+
     findings = []
     port_list = _INTERESTING_PORTS
     if custom_ports:
@@ -425,8 +483,12 @@ def run(target, emit, options=None):
     # ── 3. Port Scanner / Firewall Check ────────────────────────────
     if options.get("check_ports", True):
         custom_ports = options.get("ports")
-        emit.info(f"    [Ports] Scanning {host} for exposed services...")
-        port_f = check_ports(host, custom_ports)
+        known_open_ports = options.get("known_open_ports")
+        if known_open_ports and not custom_ports:
+            emit.info(f"    [Ports] Reusing this session's port_scan results for {host} (not re-probing)...")
+        else:
+            emit.info(f"    [Ports] Scanning {host} for exposed services...")
+        port_f = check_ports(host, custom_ports, known_open_ports)
         for f in port_f:
             all_findings.append(f)
             risk_score += f["severity"]

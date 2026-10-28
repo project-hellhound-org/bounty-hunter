@@ -11,6 +11,8 @@ setup(
         "beautifulsoup4",
         "click",
         "colorama",
+        "cryptography",
+        "lxml",
         "playwright==1.56.0",
         "pyyaml",
         "requests",

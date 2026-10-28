@@ -6245,6 +6245,13 @@ def _execute_surface_auditor(args: Dict[str, Any], target: Target, emit: Any) ->
 
     spider_intel = _effective_spider_intel(target, args.get("spider_intel"))
     opts = {"spider_intel": spider_intel}
+    # Hand over this session's own port_scan (naabu) results, if any --
+    # SurfaceAuditor's port check reuses them instead of re-probing the
+    # same small port list with a raw socket connect right after a real
+    # scanner already covered it.
+    known_open_ports = target.state.get("open_ports") if hasattr(target, "state") and isinstance(target.state, dict) else None
+    if known_open_ports:
+        opts["known_open_ports"] = known_open_ports
     opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
@@ -7365,6 +7372,74 @@ def _execute_jsluice(args: Dict[str, Any], target: Target, emit: Any) -> Dict[st
             "read manually; the field-name guesses here (data.key/secret/value/token) cover the "
             "common cases but haven't been verified against every jsluice release."
         ) if all_secrets else None,
+    }
+
+
+def _execute_js_miner(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    CAUGHT IN THE WILD (2026-10): the researcher asked for a tool that
+    "goes to the target, gets the API/JS files, and extracts each of the
+    endpoints from APIs or whatever endpoints he's getting from the JS
+    file" — and pointed out that js_static_analysis (BlobUnpacker under
+    the hood) is the wrong tool for that: BlobUnpacker exists to unpack
+    exposed .map SOURCEMAP files, and only mines endpoints out of raw JS
+    as a side effect of looking for a sourcemap reference — which (before
+    a separate fix to BlobUnpacker.py this same round) got thrown away
+    entirely whenever no sourcemap/secret happened to be present, which is
+    the common case. js_miner is a genuinely separate, endpoint-focused
+    tool: find every reachable JS file (script tags, SPA/webpack/Next.js
+    chunks), fetch each one, and extract the API endpoint/route strings
+    called from it. It does NOT touch sourcemaps or hunt for secrets —
+    that's deliberately left to js_static_analysis/BlobUnpacker so the two
+    tools keep answering different questions instead of duplicating each
+    other.
+    """
+    from hellhound.core.engine import HellhoundEngine
+    url = args.get("url") or target.name
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+
+    spider_intel = args.get("spider_intel") or target.state.get("spider_intel", {})
+    js_urls = args.get("js_urls")
+    if isinstance(js_urls, str):
+        js_urls = [u.strip() for u in js_urls.split(",") if u.strip()]
+
+    opts = {"spider_intel": spider_intel, "js_urls": js_urls}
+    opts.update(_target_auth_options(target))
+
+    engine = HellhoundEngine()
+    try:
+        res = engine.run_single("js_miner", url, options=opts, emit=emit)
+    except Exception as e:
+        return {"url": url, "error": f"JSMiner error: {e}"}
+
+    intel = res.get("intel", {}) if isinstance(res, dict) else {}
+    endpoints = intel.get("endpoints", [])
+
+    # Feed discovered endpoints into the same spider-intel store every
+    # other discovery tool writes to, so content_discovery/fuzz_hunter/
+    # cors_buster etc. pick these up automatically on their next pass
+    # instead of the researcher having to hand-copy the list across.
+    endpoint_urls = [e.get("url") for e in endpoints if isinstance(e, dict) and e.get("url")]
+    if endpoint_urls and hasattr(target, "state"):
+        try:
+            update_from_spider(target, endpoints=endpoint_urls)
+            save_target(target)
+        except Exception:
+            pass
+
+    return {
+        "url": url,
+        "js_files_found": intel.get("js_files_found", 0),
+        "js_files_scanned": intel.get("js_files_scanned", 0),
+        "fetch_errors": intel.get("fetch_errors", 0),
+        "endpoints_found": len(endpoints),
+        "endpoints": endpoints[:100],
+        "graphql_operations": intel.get("graphql_operations", []),
+        "note": (
+            "No JS files were reachable to mine — if JS is known to exist, try passing 'js_urls' "
+            "explicitly, or run spider/katana first so this can pick up already-discovered .js URLs."
+        ) if not endpoints and not intel.get("js_files_scanned") else None,
     }
 
 
@@ -10534,11 +10609,12 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "the way), then runs the recovered source through signature-based sink detection — "
             "eval()/dangerouslySetInnerHTML, hardcoded admin/role checks, localStorage misuse, "
             "hardcoded credentials, internal/dev URLs, client-side SQL string concatenation, insecure "
-            "ws://http:// endpoints, and hidden admin/debug routes. Use this when a target is a "
-            "JS-heavy SPA/bundle app and you want to see what the client-side code itself reveals, "
-            "not just what the server returns — this is a different signal from spider's live-crawl "
-            "endpoint discovery. Reuses this target's captured session automatically, same as every "
-            "other tool here, so it can reach bundles/sourcemaps gated behind login."
+            "ws://http:// endpoints, and hidden admin/debug routes. Use this when sourcemaps might be "
+            "exposed and you want to recover real source + run sink detection on it. If you just want "
+            "the list of API endpoints a target's JS calls (no sourcemap involved), use 'js_miner' "
+            "instead — it's a separate, endpoint-focused tool, not a mode of this one. Reuses this "
+            "target's captured session automatically, same as every other tool here, so it can reach "
+            "bundles/sourcemaps gated behind login."
         ),
         parameters={
             "type": "object",
@@ -10549,6 +10625,30 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["url"]
         },
         executor=_execute_js_static_analysis
+    ),
+    "js_miner": ToolSpec(
+        name="js_miner",
+        description=(
+            "Finds every reachable JS file on a target (regular <script src>, SPA/webpack/Next.js "
+            "chunks) and extracts the API endpoints/routes actually called from them — fetch()/axios "
+            "calls, XMLHttpRequest.open(), ajax config 'url:' keys, template-literal routes, and "
+            "GraphQL operation names. This is a DIFFERENT tool from js_static_analysis/BlobUnpacker: "
+            "it does not touch sourcemaps (.map files) and does not hunt for secrets — it exists "
+            "purely to answer 'what API endpoints does this target's client-side JS call'. Use this "
+            "as the default when the goal is endpoint discovery from JS; use js_static_analysis "
+            "instead when sourcemaps might be exposed and source recovery/sink detection is the goal. "
+            "Reuses this target's captured session automatically so it can reach JS gated behind "
+            "login, and feeds anything found into this target's discovered-endpoints list."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target base URL to discover and mine JS from."},
+                "js_urls": {"type": "array", "items": {"type": "string"}, "description": "Specific JS file URL(s) to mine, if already known — skips auto-discovery for these and mines them directly (still auto-discovers more unless this is exhaustive)."},
+            },
+            "required": ["url"]
+        },
+        executor=_execute_js_miner
     ),
     "jsluice": ToolSpec(
         name="jsluice",
@@ -10839,6 +10939,42 @@ def extract_path_scope(user_text: str) -> Optional[str]:
             return "/" + segments[0]
 
     return None
+
+
+_RELEASE_PATH_SCOPE_RE = re.compile(
+    r'\b(whole (site|domain|target|app)|entire (site|domain|target|app)|'
+    r'not (just|only)|any endpoint|all endpoints|every endpoint|'
+    r'do your testing|full scope|remove (the )?(path )?(restriction|scope)|'
+    r'(lift|drop|clear|widen) the (path )?(restriction|scope)|stop restrict(ing)?)\b',
+    re.IGNORECASE,
+)
+
+# Phrases that explicitly authorize wandering across OTHER in-scope
+# domains under the active PROGRAM, not just the currently-focused one —
+# see the host-focus pin in _execute_tool_call / handle_message below.
+# Deliberately broader than _RELEASE_PATH_SCOPE_RE's path-only phrasing
+# (e.g. "do your testing" alone doesn't name a host and shouldn't by
+# itself open every sibling domain in a multi-domain program — but an
+# explicit "all/every domain/subdomain/host" or "switch/pivot/move to"
+# should).
+_PIVOT_HOST_RE = re.compile(
+    r'\b(all (in-?scope )?(domains|subdomains|hosts|targets)|every (domain|subdomain|host|target)|'
+    r'across (the )?(whole |entire )?program|whole program|entire program|all program targets|'
+    r'switch (focus )?to|pivot to|move (on )?to|also (test|check|look at|try)|'
+    r'check (out )?(all|every)|work on (all|every|the other))\b',
+    re.IGNORECASE,
+)
+
+# Phrases that explicitly re-narrow focus back down after a pivot was
+# opened — e.g. "just test X", "stick to X", "only focus on X". Doesn't
+# try to parse WHICH host to re-lock onto (set_target / the active
+# target already defines that); it just closes pivoting back off so
+# later turns are pinned again.
+_RELOCK_HOST_RE = re.compile(
+    r'\b(only (test|check|focus)|just (test|check|focus)|focus (only )?on|'
+    r'stick to|stay on|back to just)\b',
+    re.IGNORECASE,
+)
 
 
 def _url_in_path_scope(url: str, path_scope: str) -> bool:
@@ -11209,6 +11345,7 @@ class Agent:
             safe_methods_only=True
         )
         self._turn_path_scope: Optional[str] = None  # e.g. "/app" — set per-turn in handle_message
+        self._turn_host_pivot_open: bool = False  # see _PIVOT_HOST_RE / host-focus pin in handle_message & _execute_tool_call
         self._forced_skill: Optional[str] = None  # set by /skill-name slash command — one-shot, consumed next turn
         self._active_session_context: Optional[Dict[str, Any]] = None  # this turn's session_context, if any — see set_target()
         self._auto_continue_streak: int = 0  # consecutive auto-continued turns this process, in-memory only — see the AUTO-CONTINUE DECISION block in handle_message
@@ -11483,6 +11620,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # previous target's.
         self.session_digest = self.target.state.get("session_digest") or ""
         self._turn_path_scope = None  # Reset path scope to prevent bleeding from previous target
+        self._turn_host_pivot_open = False  # Every target switch starts freshly focus-locked onto itself — a "pivot freely" stance from the PREVIOUS program/target must not silently carry over onto this one
         self._auto_continue_streak = 0  # a target switch is a fresh context — don't carry an auto-continue streak over from whatever was happening on the previous target
         self.guard = AutopilotGuard(  # Reset circuit breaker and rate limiters for the new target
             circuit_threshold=5,
@@ -11935,11 +12073,79 @@ If there is nothing worth generalizing, return an empty array: []"""
                     "blocked": True
                 }
 
+        # 1a. Host-focus pin for PROGRAM-scoped targets.
+        #
+        # CAUGHT IN THE WILD (2026-10): a target attached to a bug-bounty
+        # PROGRAM (/program) inherits the WHOLE program's in-scope list —
+        # e.g. sellers.mercadolibre.com's scope_rules.in_scope legitimately
+        # includes www.mercadolibre.com, api.mercadolibre.com, and
+        # auth-meli.adminml.com too, since all of them are genuinely
+        # in-scope under the same Mercado Libre program. The scope gate
+        # above (step 1) only blocks hosts OUTSIDE scope, so it let the
+        # model freely wander across every sibling domain mid-engagement
+        # even though the researcher explicitly said to work on
+        # sellers.mercadolibre.com specifically — each one individually a
+        # legitimate in-scope host, just not what was asked for right now.
+        # Default to pinned on the active target's own host (and its own
+        # subdomains — ordinary single-target recon, e.g. discovering
+        # api.<active-host> FROM <active-host>, is unaffected); opened by
+        # _PIVOT_HOST_RE / closed by _RELOCK_HOST_RE in handle_message.
+        if (
+            self.target and self.target.program and target_candidate
+            and tool_name != "run_terminal_command"
+            and not self._turn_host_pivot_open
+        ):
+            active_reference = self.target.host or self.target.name
+            active_host, _ = normalize_host(active_reference)
+            cand_host, _ = normalize_host(target_candidate)
+            same_host_family = (
+                not active_host or not cand_host or active_host == cand_host
+                or cand_host.endswith("." + active_host) or active_host.endswith("." + cand_host)
+            )
+            if not same_host_family:
+                msg = (
+                    f"[!] not doing that — '{cand_host}' is a different in-scope domain under this program, "
+                    f"but the current focus is '{active_host}'. Say e.g. \"also check {cand_host}\" or "
+                    f"\"switch focus to {cand_host}\" to allow it, or \"all program domains\" to open every "
+                    f"sibling domain for this engagement."
+                )
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(msg)
+                return {
+                    "error": (
+                        f"HOST_FOCUS_VIOLATION: '{cand_host}' is in-scope under the active program, but focus is "
+                        f"currently pinned to '{active_host}'. Stay on '{active_host}' unless the researcher's "
+                        f"message explicitly asked to also test, switch to, or pivot to '{cand_host}' (or asked "
+                        f"for all program domains) — if they did, tell them you need that confirmed in a message "
+                        f"rather than assuming it."
+                    ),
+                    "target": target_candidate,
+                    "blocked": True
+                }
+
         # 1b. Enforce per-turn path scope (when a task is scoped to a specific
         # base path, tool calls must not wander into sibling applications on the same host).
+        #
+        # CAUGHT IN THE WILD (2026-10): this check applied to EVERY URL
+        # regardless of host -- a path scope locked to
+        # 'sellers.example.com/selling-preferences' was also blocking
+        # requests to a completely different host (api.example.com) with
+        # "outside the active path scope" as if they were sibling apps on
+        # the SAME host, which is what this feature is actually for (a
+        # multi-tenant lab box with several challenges at different top-
+        # level paths on ONE host). A different host is already governed
+        # by the real scope_rules check (1./2. above and below) -- gate
+        # this one to same-host requests only, so a cross-host request
+        # never gets blocked for a reason that doesn't apply to it.
         if self._turn_path_scope and tool_name not in ("run_terminal_command", "record_finding", "export_report"):
             url_candidate = args.get("url") or args.get("request_ref")
-            if url_candidate and str(url_candidate).startswith(("http://", "https://", "/")):
+            _candidate_netloc = urlparse(str(url_candidate)).netloc if url_candidate else ""
+            _same_host = (
+                not _candidate_netloc  # relative path -- implicitly the active host
+                or self._display_host in _candidate_netloc
+                or _candidate_netloc in self._display_host
+            )
+            if url_candidate and _same_host and str(url_candidate).startswith(("http://", "https://", "/")):
                 if not _url_in_path_scope(str(url_candidate), self._turn_path_scope):
                     # Auto-correct URL if it targeted the active host but omitted the path scope prefix
                     parsed = urlparse(str(url_candidate))
@@ -13085,6 +13291,18 @@ INSTRUCTIONS:
   spider are NOT redundant — reach for katana specifically when the
   researcher wants a faster, narrower crawl rather than spider's slower,
   deeper pass with full credential/secret extraction.
+- JS ENDPOINT MINING vs SOURCEMAP RECOVERY ARE DIFFERENT JOBS: when the
+  goal is "what API endpoints does this target's JS call", use js_miner —
+  NOT js_static_analysis. js_static_analysis (BlobUnpacker) exists to
+  unpack exposed .map sourcemap files; it only finds endpoints as a side
+  effect of looking for a sourcemap, so it can legitimately come back thin
+  on a target with no exposed sourcemaps even though the JS itself is full
+  of real endpoints. js_miner fetches every reachable JS file (script
+  tags, SPA/webpack/Next.js chunks) and extracts endpoint strings
+  directly — reach for it first for endpoint discovery, and reach for
+  js_static_analysis separately when sourcemaps specifically might be
+  exposed (or when secrets/sink-detection in recovered source is the
+  goal).
 - EDUCATIONAL & TECHNIQUE QUERIES: When the researcher asks about offensive security techniques (e.g. 403 bypass, IDOR, SQLi, XSS, SSRF, JWT attacks, auth bypass, privilege escalation, parameter pollution), provide comprehensive, detailed technical explanations with concrete examples, payloads, headers, and methodology. This is educational content essential to bug bounty work — NEVER refuse to explain a technique. You are a bug bounty assistant, not a content filter.
 - OUTPUT FORMAT: Respond in plain natural-language prose with clean markdown structure (headings, bullet points, and code blocks for evidence/PoC). NEVER output a raw tool-call object. Default to a short, flowing explanation (a few paragraphs, not a numbered section per tool call) — reach for headings/sections only when the researcher actually asked for a report or the content genuinely needs that structure to stay readable (e.g. comparing several distinct findings).
 - The conversation history above may end with one or more raw {{"tool": ...}} JSON objects — these are the orchestrator's own failed or stuck tool-call attempts from earlier this turn (malformed JSON, a repeated call, or it simply ran out of attempts), not a real result and not anything the researcher has seen. NEVER copy, quote, or reproduce that JSON — not even inside a code block — as your answer. Treat it as if it weren't there: summarize strictly from the real tool results that actually came back (visible as [TOOL RESULT: ...] entries), and if nothing useful came back at all, say so plainly instead of echoing the stuck attempt.
@@ -13182,9 +13400,48 @@ INSTRUCTIONS:
         # messages ("go for it", "try exploiting that flaw") won't repeat the
         # URL, but the restriction to that application's path should still hold.
         # Only overwrite it when this message names a new path explicitly.
+        #
+        # CAUGHT IN THE WILD (2026-10): once set, this had no way back --
+        # a path scope locked onto one page early in a multi-day
+        # engagement (e.g. a researcher saying "check out
+        # .../selling-preferences") silently kept EVERY later request
+        # restricted to that one path, including on a day when the
+        # researcher explicitly said "this is a target website, do your
+        # testing" (i.e. the opposite of a narrow scope) -- with no
+        # feedback that a restriction was even active until something got
+        # blocked by it. Two fixes: a plain-language escape phrase clears
+        # it outright, and setting/clearing it is now announced instead of
+        # silent.
+        if self._turn_path_scope and user_text and _RELEASE_PATH_SCOPE_RE.search(user_text):
+            if emit and hasattr(emit, "info"):
+                emit.info(f"[*] Path scope ('{self._turn_path_scope}') lifted — testing the whole target again.")
+            self._turn_path_scope = None
+
         _new_scope = extract_path_scope(user_text)
-        if _new_scope:
+        if _new_scope and _new_scope != self._turn_path_scope:
             self._turn_path_scope = _new_scope
+            if emit and hasattr(emit, "info"):
+                emit.info(f"[*] Path scope locked to '{_new_scope}' based on the URL in your message — other paths on this host will be blocked until you say e.g. \"test the whole site\" to lift it.")
+
+        # Host-focus pin (see _PIVOT_HOST_RE / the host-focus check in
+        # _execute_tool_call): a target attached to a multi-domain PROGRAM
+        # inherits the whole program's in-scope list, so the ordinary
+        # scope gate alone doesn't stop the model from wandering onto
+        # OTHER in-scope sibling domains mid-task just because they also
+        # happen to be allowed. Default is locked to the active target's
+        # own host; these phrases explicitly open or re-close that pivot.
+        if self.target and self.target.program and user_text:
+            if not self._turn_host_pivot_open and _PIVOT_HOST_RE.search(user_text):
+                self._turn_host_pivot_open = True
+                if emit and hasattr(emit, "info"):
+                    emit.info(
+                        f"[*] Host focus opened — tool calls may now reach other in-scope domains under "
+                        f"this program (not just '{self._display_host}') until you say to focus back down."
+                    )
+            elif self._turn_host_pivot_open and _RELOCK_HOST_RE.search(user_text):
+                self._turn_host_pivot_open = False
+                if emit and hasattr(emit, "info"):
+                    emit.info(f"[*] Host focus locked back to '{self._display_host}' — other in-scope program domains are blocked again until you say otherwise.")
 
         # ── 3. Orchestrator Iteration Loop ──
         # Only enter the tool loop when there's a real target AND this turn

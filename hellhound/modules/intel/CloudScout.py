@@ -90,16 +90,31 @@ def run(target: str, emit: Any, options: Optional[Dict[str, Any]] = None):
         emit.warn("No spider intelligence found. Cloud discovery will be limited.")
         all_text = target
     else:
+        # spider_intel's endpoints/comments/secrets lists aren't guaranteed
+        # to be dicts element-for-element -- some producers append plain
+        # strings (a bare URL, a bare secret value) instead of the
+        # {"url":...}/{"content":...} shape this used to assume
+        # unconditionally, which crashed the whole module with
+        # "'str' object has no attribute 'get'" the moment one showed up.
+        # Handle both shapes defensively instead of trusting every caller
+        # to normalize first.
+        def _text_of(item: Any, *keys: str) -> List[str]:
+            if isinstance(item, dict):
+                return [str(item.get(k, "")) for k in keys if item.get(k)]
+            if item:
+                return [str(item)]
+            return []
+
         text_chunks = []
         for ep in spider_intel.get("endpoints", []):
-            text_chunks.append(ep.get("url", ""))
-            for k, v in ep.get("headers", {}).items():
-                text_chunks.append(f"{k}: {v}")
+            text_chunks.extend(_text_of(ep, "url"))
+            if isinstance(ep, dict):
+                for k, v in (ep.get("headers") or {}).items():
+                    text_chunks.append(f"{k}: {v}")
         for c in spider_intel.get("comments", []):
-            text_chunks.append(c.get("content", ""))
+            text_chunks.extend(_text_of(c, "content"))
         for s in spider_intel.get("secrets", []):
-            text_chunks.append(s.get("source", ""))
-            text_chunks.append(s.get("content", ""))
+            text_chunks.extend(_text_of(s, "source", "content"))
         all_text = "\n".join(text_chunks)
 
     emit.info(f"CloudScout: Scanning for cloud assets on {target}")

@@ -114,13 +114,47 @@ stop_animation
 success "Virtual environment ready at $VENV_DIR"
 
 # ── 3. Core Engine ────────────────────────────────────
+# pip's default read-timeout is 15s -- plenty on a fast campus/office
+# connection, nowhere near enough on a slow/congested one (mobile
+# hotspot, shared hostel wifi, a VPS with throttled egress), where a
+# single slow chunk from pypi.org trips "ReadTimeoutError" mid-download
+# and, since install.sh runs under `set -e`, kills the WHOLE install
+# with a bare pip traceback instead of a clear Hellhound-style error.
+# --timeout 100 --retries 5 gives a slow connection room to actually
+# finish instead of just failing faster and more often; wrapped in an
+# explicit retry loop of its own so a single dropped connection doesn't
+# still take the whole install down with it.
+PIP_NET_ARGS=(--timeout 100 --retries 5)
+
+_pip_install_with_retry() {
+    # Up to 3 attempts, short backoff between them -- transient network
+    # blips (not a real missing-package error) are exactly what this is
+    # for; a genuinely broken install (bad package name, syntax error in
+    # setup.py) will fail identically on every attempt and still surface
+    # pip's real error message on the final one.
+    local attempt
+    for attempt in 1 2 3; do
+        if "$VENV_DIR/bin/pip" install --quiet "${PIP_NET_ARGS[@]}" "$@"; then
+            return 0
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            warn "pip install attempt $attempt/3 failed (likely a slow/unstable connection) — retrying in 5s..."
+            sleep 5
+        fi
+    done
+    return 1
+}
+
 start_animation "DECRYPTING DEPENDENCIES"
-"$VENV_DIR/bin/pip" install --quiet --upgrade pip
+_pip_install_with_retry --upgrade pip || warn "Could not upgrade pip itself after 3 attempts — continuing with whatever pip version is already in the venv."
 # Clean any stale editable artifacts or old version metadata to avoid site-packages loader conflicts
 rm -rf "$VENV_DIR"/lib/python*/site-packages/__editable__* 2>/dev/null || true
 rm -rf "$VENV_DIR"/lib/python*/site-packages/hellhound*.dist-info 2>/dev/null || true
 "$VENV_DIR/bin/pip" uninstall -y hellhound --quiet 2>/dev/null || true
-"$VENV_DIR/bin/pip" install --quiet -e "$PROJECT_ROOT"
+if ! _pip_install_with_retry -e "$PROJECT_ROOT"; then
+    stop_animation
+    error "Could not install HELLHOUND's core dependencies after 3 attempts, even with an extended network timeout. This usually means the connection to pypi.org is too unstable/slow to complete a package download at all (not just slow enough to need a longer timeout) — check your network connection and re-run ./install.sh, or install.sh/update.sh later via \`/update deps\` once Hellhound itself is running."
+fi
 stop_animation
 success "HELLHOUND core engine installed"
 

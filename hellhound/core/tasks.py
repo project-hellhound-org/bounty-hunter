@@ -288,6 +288,59 @@ def get_program_path(program_name: str) -> str:
     return os.path.join(program_dir, "program.json")
 
 
+def _ensure_program_target_link(program_safe_name: str, target_name: str) -> None:
+    """
+    CAUGHT IN THE WILD (2026-10): every target attached to a program still
+    lived ONLY at the flat ~/.hellhound/targets/<name>/ path — /program
+    tagged a Target's `.program` field and listed it in program.json, but
+    nothing ever gave the program its own directory tree with each
+    in-scope subdomain visibly organized underneath it, which is what the
+    researcher actually asked for ("each subdomains should get a separate
+    directory inside that program directory" instead of recon data for a
+    whole engagement being scattered across unrelated-looking sibling
+    folders under targets/).
+
+    Rather than physically moving (and thereby duplicating / risking
+    divergence of) each target's task.json + any sibling files every tool
+    in the codebase already reads/writes via get_target_path() /
+    _get_targets_dir(), this creates a symlink:
+
+        ~/.hellhound/programs/<program>/targets/<target> -> ~/.hellhound/targets/<target>
+
+    so `ls ~/.hellhound/programs/<program>/targets/` shows exactly the
+    "separate directory inside the program directory" per subdomain the
+    researcher wants, always reflecting that target's live data (no stale
+    copies to keep in sync), while every existing create_or_load_target/
+    save_target call site elsewhere in the codebase keeps working
+    unmodified against the real path. Best-effort: if the filesystem
+    doesn't support symlinks (unlikely on Linux, but not impossible in
+    unusual sandboxes), this silently no-ops rather than failing the
+    attach itself -- the program<->target relationship itself is still
+    correctly recorded in program.json regardless.
+    """
+    try:
+        program_dir = os.path.dirname(get_program_path(program_safe_name))
+        links_dir = os.path.join(program_dir, "targets")
+        os.makedirs(links_dir, exist_ok=True)
+        link_path = os.path.join(links_dir, target_name)
+        real_target_dir = os.path.join(_get_targets_dir(), target_name)
+        if os.path.islink(link_path):
+            # Already linked (possibly to a different real path if the
+            # target was ever renamed) -- refresh it to point at the
+            # current real directory.
+            if os.readlink(link_path) != real_target_dir:
+                os.unlink(link_path)
+                os.symlink(real_target_dir, link_path, target_is_directory=True)
+        elif os.path.exists(link_path):
+            # A real (non-symlink) file/dir already sits here -- leave it
+            # alone rather than clobbering something unexpected.
+            pass
+        else:
+            os.symlink(real_target_dir, link_path, target_is_directory=True)
+    except Exception as e:
+        print(f"[!] Warning: Could not create per-target directory link for '{target_name}' under program '{program_safe_name}': {e}")
+
+
 def load_program(program_name: str) -> Optional[Dict[str, Any]]:
     """Returns the program's stored record, or None if it hasn't been
     created yet (e.g. referenced by name but never set up)."""
@@ -352,6 +405,8 @@ def attach_target_to_program(target: Target, program_name: str) -> Target:
     if target.name not in record["targets"]:
         record["targets"].append(target.name)
         _save_program(record)
+
+    _ensure_program_target_link(safe_program, target.name)
 
     target.program = safe_program
     # Only overwrite this target's scope if the PROGRAM actually has scope

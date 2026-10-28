@@ -372,8 +372,25 @@ def run(target, emit, options=None):
     unpacked_count = len(unpacker.loot["reconstructed_files"])
     new_eps_count = len(unpacker.loot["new_endpoints"])
 
-    if unpacked_count == 0 and not unpacker.loot["secrets"]:
-        return {"raw": "No valid source maps recovered.", "intel": {}, "risk_score": 0}
+    # CAUGHT IN THE WILD (2026-10): this only checked unpacked_count
+    # (sourcemap files actually reconstructed) and secrets — if
+    # scan_js_for_maps() fetched real JS files, mined real endpoints out
+    # of them via _mine_content() (which it does on every JS file BEFORE
+    # it even looks for a sourcemap), but the target simply had no exposed
+    # sourcemaps and no string matched a secret pattern, this early-return
+    # discarded ALL of it (new_endpoints, minified_content, wordlist
+    # hints) and reported an empty result — "JS analysis literally gave
+    # zero" on a target where curling the JS by hand moments earlier
+    # clearly showed real content. A target with no .map files is the
+    # COMMON case (production builds usually strip them), not a failure —
+    # don't let "no sourcemap" erase everything else this already found.
+    if (
+        unpacked_count == 0
+        and not unpacker.loot["secrets"]
+        and not unpacker.loot["new_endpoints"]
+        and not unpacker.loot.get("minified_content")
+    ):
+        return {"raw": "No valid source maps, secrets, or endpoints recovered.", "intel": {}, "risk_score": 0}
 
     # Cleanup animation
     emit.progress_stop()

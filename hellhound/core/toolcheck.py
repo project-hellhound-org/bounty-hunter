@@ -44,6 +44,15 @@ OTHER_TOOLS: Dict[str, str] = {
 }
 
 
+# pip's default read-timeout (15s) is fine on a fast connection and too
+# short on a slow/unstable one (mobile hotspot, congested campus wifi) --
+# a single slow chunk from pypi.org trips "ReadTimeoutError" mid-download
+# and the install/update just fails, with nothing to show for it but a
+# generic error. Appended to every pip invocation in this file, same fix
+# install.sh applies to its own pip calls.
+PIP_NET_ARGS: List[str] = ["--timeout", "100", "--retries", "5"]
+
+
 def pick_available(candidates: List[str]) -> Optional[str]:
     """
     Given an ordered list of binary names that all satisfy the same
@@ -150,9 +159,9 @@ def try_install(tool_name: str, emit=None) -> bool:
     if cmd.startswith("pip install "):
         package = cmd[len("pip install "):].strip()
         attempts = [
-            [sys.executable, "-m", "pip", "install", "--break-system-packages", package],
-            [sys.executable, "-m", "pip", "install", "--user", package],
-            [sys.executable, "-m", "pip", "install", package],
+            [sys.executable, "-m", "pip", "install", *PIP_NET_ARGS, "--break-system-packages", package],
+            [sys.executable, "-m", "pip", "install", *PIP_NET_ARGS, "--user", package],
+            [sys.executable, "-m", "pip", "install", *PIP_NET_ARGS, package],
         ]
     else:
         attempts = [cmd.split()]
@@ -190,7 +199,7 @@ def try_install(tool_name: str, emit=None) -> bool:
         for flag_set in (["--break-system-packages"], ["--user"], []):
             try:
                 proc = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", *flag_set, package],
+                    [sys.executable, "-m", "pip", "install", *PIP_NET_ARGS, "--force-reinstall", "--no-deps", *flag_set, package],
                     capture_output=True, text=True, timeout=180, check=False,
                 )
             except Exception as e:
@@ -291,9 +300,9 @@ def update_all_tools(emit=None) -> Dict[str, Any]:
         if cmd.startswith("pip install "):
             package = cmd[len("pip install "):].strip()
             attempts = [
-                [sys.executable, "-m", "pip", "install", "--upgrade", "--break-system-packages", package],
-                [sys.executable, "-m", "pip", "install", "--upgrade", "--user", package],
-                [sys.executable, "-m", "pip", "install", "--upgrade", package],
+                [sys.executable, "-m", "pip", "install", *PIP_NET_ARGS, "--upgrade", "--break-system-packages", package],
+                [sys.executable, "-m", "pip", "install", *PIP_NET_ARGS, "--upgrade", "--user", package],
+                [sys.executable, "-m", "pip", "install", *PIP_NET_ARGS, "--upgrade", package],
             ]
         else:
             attempts = [cmd.split()]
@@ -343,9 +352,9 @@ def sync_python_dependencies(project_root: Optional[str] = None, emit=None) -> D
         emit.info("[*] Syncing Python dependencies from requirements.txt...")
 
     attempts = [
-        [sys.executable, "-m", "pip", "install", "--upgrade", "--break-system-packages", "-r", str(req_file)],
-        [sys.executable, "-m", "pip", "install", "--upgrade", "--user", "-r", str(req_file)],
-        [sys.executable, "-m", "pip", "install", "--upgrade", "-r", str(req_file)],
+        [sys.executable, "-m", "pip", "install", *PIP_NET_ARGS, "--upgrade", "--break-system-packages", "-r", str(req_file)],
+        [sys.executable, "-m", "pip", "install", *PIP_NET_ARGS, "--upgrade", "--user", "-r", str(req_file)],
+        [sys.executable, "-m", "pip", "install", *PIP_NET_ARGS, "--upgrade", "-r", str(req_file)],
     ]
     last_out = ""
     for attempt_cmd in attempts:
