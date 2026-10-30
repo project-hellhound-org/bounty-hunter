@@ -3306,6 +3306,68 @@ _MCP_RELEVANT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# CAUGHT IN THE WILD (2026-10): registering BOTH Burp and Caido's tools
+# together whenever the message mentioned either one (via _MCP_RELEVANT_RE
+# above) was correct for registration (connecting is cheap, one-time, and
+# the researcher might want either later) but wrong for WHICH tools the
+# model was then allowed to actually call that turn — "pull the request
+# from caido" named Caido specifically, not "either proxy I have," yet
+# both tool sets sat in front of the model with nothing stopping it from
+# reaching for a Burp tool instead. These two regexes detect when the
+# researcher's OWN wording names one product specifically (not a generic
+# "the proxy"/"mcp tools" mention, which stays unrestricted — see
+# _resolve_turn_vendor_lock below) so that turn's tool list/execution can
+# be locked to just that vendor.
+_CAIDO_MENTION_RE = re.compile(r"\bcaido\b", re.IGNORECASE)
+_BURP_MENTION_RE = re.compile(r"\bburp(?:\s?suite)?\b", re.IGNORECASE)
+
+
+def _resolve_turn_vendor_lock(user_text: str) -> Optional[str]:
+    """
+    Returns 'caido', 'burp', or None for this turn's wording.
+
+    None means unrestricted (both or neither product named by name — a
+    generic "the proxy"/"mcp tools"/"intercepting proxy" mention hasn't
+    said WHICH one, so nothing is guessed/restricted). Only an unambiguous
+    single-product mention locks the turn to that vendor's tools alone.
+    """
+    if not user_text:
+        return None
+    mentions_caido = bool(_CAIDO_MENTION_RE.search(user_text))
+    mentions_burp = bool(_BURP_MENTION_RE.search(user_text))
+    if mentions_caido and not mentions_burp:
+        return "caido"
+    if mentions_burp and not mentions_caido:
+        return "burp"
+    return None
+
+
+def _tool_belongs_to_vendor(tool_name: str, vendor: str) -> bool:
+    if vendor == "caido":
+        return tool_name.startswith("caido_")
+    if vendor == "burp":
+        # register_mcp_servers() names tools 'mcp_<server_name>_<tool>' —
+        # the server name is whatever key the researcher used in
+        # config.json's mcp_servers block, but this codebase's own /mcp
+        # burp setup flow and docstring example both use "burp" (and
+        # "burpsuite" is a plausible alternate spelling), so match either
+        # rather than assuming every researcher's config key is literally
+        # "burp".
+        return tool_name.startswith("mcp_burp_") or tool_name.startswith("mcp_burpsuite_")
+    return False
+
+
+def _vendor_excluded_tool_names(vendor_lock: Optional[str]) -> set:
+    """Given this turn's vendor lock ('caido'/'burp'/None), returns the
+    set of tool names to hide from the model and refuse execution of this
+    turn — the OTHER vendor's tools — so naming one product by name never
+    lets the model silently reach for the other's identically-shaped
+    tools instead."""
+    if not vendor_lock:
+        return set()
+    other = "burp" if vendor_lock == "caido" else "caido"
+    return {name for name in TOOL_REGISTRY if _tool_belongs_to_vendor(name, other)}
+
 
 def _format_last_turn_diagnostics(diag: Optional[Dict[str, Any]]) -> Optional[str]:
     """Render the previous turn's control-flow telemetry as plain, factual
@@ -4526,7 +4588,16 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
         body_str = body.strip()
         if (body_str.startswith("{") and body_str.endswith("}")) or (body_str.startswith("[") and body_str.endswith("]")):
             try:
-                import json
+                # NOTE: do NOT shadow the module-level `import json` with a
+                # local one here -- a local `import json` anywhere in this
+                # function makes `json` a local name for the ENTIRE function
+                # body (Python scoping), which breaks every other `json.`
+                # use above this point in the call (e.g. the evidence-capture
+                # block's `json.dumps(json_payload)`) with an UnboundLocalError
+                # whenever this branch hasn't run yet -- silently swallowed by
+                # a broad `except Exception: pass`, so curl_evidence_log quietly
+                # never got populated for any JSON-body POST/PUT/PATCH/DELETE
+                # request. The module-level import already covers this.
                 json_payload = json.loads(body_str)
             except Exception:
                 data_payload = body
@@ -4636,6 +4707,16 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                     "status": r.status_code,
                     "raw": raw_evidence,
                     "ts": datetime.now(timezone.utc).isoformat(),
+                    # Structured copies of exactly what was sent (not just the
+                    # human-readable curl_repro baked into "raw") -- this is
+                    # what replay_request reads back out to rebuild the call
+                    # with one field overridden, instead of making the model
+                    # re-parse its own curl command string or retype the
+                    # whole request from scratch to tweak a single header.
+                    "req_headers": dict(headers) if isinstance(headers, dict) else {},
+                    "req_cookies": dict(req_cookies) if isinstance(req_cookies, dict) else {},
+                    "req_json": json_payload if isinstance(json_payload, (dict, list)) else None,
+                    "req_data": data_payload if isinstance(data_payload, str) else None,
                 })
                 # Rolling cap — keep the most recent 40 requests. A long
                 # recon session shouldn't grow this unboundedly in target
@@ -5163,6 +5244,116 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
         }
 
 
+def _find_evidence_log_entry(target: Target, ref: Any) -> Any:
+    """
+    Resolves a replay 'ref' to one curl_evidence_log entry. Accepts: an int
+    (or numeric string) index into the log, including negative indices and
+    0 meaning "oldest kept" per normal Python list indexing; the literal
+    strings "latest"/"last" for the most recent entry; or any other string,
+    treated as a case-insensitive substring match against logged URLs,
+    returning the MOST RECENT match (so "replay the profile request" finds
+    the latest /api/user/profile call, not the first one from 20 turns
+    ago). Returns None if nothing matches.
+    """
+    if not (hasattr(target, "state") and isinstance(target.state, dict)):
+        return None
+    log = target.state.get("curl_evidence_log")
+    if not isinstance(log, list) or not log:
+        return None
+
+    if ref is None or str(ref).strip() == "":
+        return log[-1]
+
+    ref_str = str(ref).strip()
+    if ref_str.lower() in ("latest", "last"):
+        return log[-1]
+
+    try:
+        idx = int(ref_str)
+        return log[idx]
+    except (ValueError, IndexError):
+        pass
+
+    needle = ref_str.lower()
+    for entry in reversed(log):
+        if isinstance(entry, dict) and needle in str(entry.get("url", "")).lower():
+            return entry
+    return None
+
+
+def _execute_replay_request(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Re-sends a previously-captured curl request (from curl_evidence_log)
+    with one or more fields overridden, instead of making the model
+    reconstruct the whole call from scratch to tweak a single header or
+    cookie. The field complaint this fixes: "To tweak one header on a
+    previous request, you rebuild the whole curl call from scratch."
+
+    Overrides are shallow-merged onto the original request: headers/cookies
+    given here are merged ON TOP of (not replacing) what the original
+    request sent, so e.g. {"headers": {"X-Debug": "1"}} keeps every other
+    original header and just adds/overwrites that one. method/json/body
+    fully replace the original value when given.
+    """
+    ref = args.get("ref")
+    entry = _find_evidence_log_entry(target, ref)
+    if entry is None:
+        return {
+            "error": (
+                f"No matching curl_evidence_log entry for ref={ref!r}. 'ref' can be an index "
+                "(0, -1, ...), 'latest', or a substring of a previously-requested URL. Use "
+                "recall_data(category='curl_evidence_log') to see what's available."
+            )
+        }
+
+    new_args: Dict[str, Any] = {
+        "url": entry.get("url"),
+        "method": entry.get("method", "GET"),
+    }
+
+    orig_headers = dict(entry.get("req_headers") or {})
+    override_headers = args.get("headers")
+    if isinstance(override_headers, dict):
+        orig_headers.update(override_headers)
+    # Don't replay a stale Content-Length / auto-computed header from the
+    # original call -- _execute_curl recomputes what it needs.
+    orig_headers.pop("Content-Length", None)
+    if orig_headers:
+        new_args["headers"] = orig_headers
+
+    orig_cookies = dict(entry.get("req_cookies") or {})
+    override_cookies = args.get("cookies")
+    if isinstance(override_cookies, dict):
+        orig_cookies.update(override_cookies)
+    if orig_cookies:
+        new_args["cookies"] = orig_cookies
+
+    if "method" in args and args.get("method"):
+        new_args["method"] = str(args["method"]).upper()
+
+    if "json" in args and args["json"] is not None:
+        new_args["json"] = args["json"]
+    elif "body" in args and args["body"] is not None:
+        new_args["body"] = args["body"]
+    elif entry.get("req_json") is not None:
+        new_args["json"] = entry["req_json"]
+    elif entry.get("req_data") is not None:
+        new_args["body"] = entry["req_data"]
+
+    if emit and hasattr(emit, "info"):
+        emit.info(f"[replay_request] Replaying {entry.get('method')} {entry.get('url')} (originally {entry.get('ts', 'unknown time')}) with overrides applied")
+
+    result = _execute_curl(new_args, target, emit)
+    if isinstance(result, dict):
+        result["replayed_from"] = {
+            "url": entry.get("url"),
+            "method": entry.get("method"),
+            "original_status": entry.get("status"),
+            "original_ts": entry.get("ts"),
+        }
+    return result
+
+
 COMMON_JWT_SECRETS = (
     "secret", "Secret", "SECRET", "your-256-bit-secret", "your-secret-key", "secretkey",
     "jwtsecret", "jwt_secret", "jwt-secret", "jwt-secret-key", "supersecret", "super-secret",
@@ -5243,6 +5434,72 @@ def _execute_listener(args: Dict[str, Any], target: Target, emit: Any) -> Dict[s
     return {"status": "error", "error": f"Unknown action '{action}'. Use 'start', 'poll', or 'stop'."}
 
 
+def _session_fingerprint(target: Optional[Target]) -> str:
+    """
+    Cheap hash of a target's current mutable session identity (cookies,
+    session_cookie, auth_token) — used by the orchestrator loop's exact-
+    duplicate-call dedup to tell "literally repeating the same probe"
+    apart from "same call shape, but the session underneath it changed
+    since the last identical call" (a re-login, a cleared/reset session,
+    a rotated token). Two calls with an identical signature AND an
+    identical fingerprint are a real duplicate; identical signature with
+    a DIFFERENT fingerprint means the request will actually hit the wire
+    differently this time even though its literal args didn't change.
+    """
+    if not target or not hasattr(target, "state") or not isinstance(target.state, dict):
+        return ""
+    try:
+        raw = json.dumps({
+            "cookies": target.state.get("cookies"),
+            "session_cookie": target.state.get("session_cookie"),
+            "auth_token": target.state.get("auth_token"),
+        }, sort_keys=True, default=str)
+    except Exception:
+        return ""
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _cookies_for_browser_seed(target: Target) -> List[Dict[str, Any]]:
+    """
+    Builds Playwright-shaped cookie records (name/value/domain/path) from
+    whatever session curl (or any other tool) has already captured into
+    target.state — the other half of the browser<->curl cookie sync (see
+    browser_control.seed_session_cookies). Returns [] when there's
+    nothing to seed (no captured cookies, or no real host to attach them
+    to) rather than guessing — Playwright rejects a cookie with no
+    domain/url, so a bad guess here would just silently fail the add.
+    """
+    if not target or not hasattr(target, "state") or not isinstance(target.state, dict):
+        return []
+    raw = target.state.get("cookies") or target.state.get("session_cookie")
+    flat = normalize_cookies(raw)
+    if not flat:
+        return []
+
+    host = (target.host or target.name or "").split(":")[0].strip()
+    if not host:
+        return []
+
+    # No leading-dot domain trick here even for real hostnames — modern
+    # Chromium (what Playwright drives) treats "example.com" and
+    # ".example.com" as equivalent for exact-host cookies anyway, and a
+    # leading dot on a bare IP target (common for internal/lab targets,
+    # e.g. "10.49.155.137") is invalid and would make add_cookies reject
+    # every single cookie — not worth the special-casing to get a cosmetic
+    # win on real domains.
+    records = []
+    for name, value in flat.items():
+        if not name or value is None:
+            continue
+        records.append({
+            "name": str(name),
+            "value": str(value),
+            "domain": host,
+            "path": "/",
+        })
+    return records
+
+
 def _execute_browser_control(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Generic interactive browser control, backed by a PERSISTENT per-target
@@ -5286,6 +5543,26 @@ def _execute_browser_control(args: Dict[str, Any], target: Target, emit: Any) ->
         return browser_control.close_all_sessions(target_prefix)
 
     key = f"{target_prefix}::{session_id}"
+
+    # The other half of the browser<->curl cookie sync (see
+    # _cookies_for_browser_seed's docstring): before a "goto" on the
+    # "default" session, push in whatever session curl/other tools have
+    # already captured into target.state, so a researcher who logged in
+    # via curl doesn't land in a logged-out browser and have to copy
+    # cookies over by hand. Scoped to "goto" + "default" for the same
+    # reasons the reverse sync below is scoped that way — a navigation is
+    # the natural moment to walk in with the right cookie jar already set
+    # (Playwright applies context cookies to the NEXT request, not
+    # retroactively), and a named second session (e.g. "attacker") has
+    # its own deliberately separate identity that this must never clobber.
+    if action == "goto" and session_id == "default":
+        try:
+            seed_cookies = _cookies_for_browser_seed(target)
+            if seed_cookies:
+                browser_control.seed_session_cookies(key, seed_cookies, timeout=15)
+        except Exception:
+            pass  # best-effort, same contract as the reverse sync below — never block the actual goto over this
+
     result = browser_control.run_browser_action(key, action, args)
     if isinstance(result, dict):
         result["session"] = session_id
@@ -9369,7 +9646,112 @@ _RECALL_CATEGORIES = {
     "curl_evidence_log": "state",
     "campaign_plan": "state",
     "findings": "findings",  # lives on target.findings, not target.state
+    "raw_artifacts": "raw_search",  # full-text search over ~/.hellhound/targets/<target>/raw/*.txt
 }
+
+# How much context (chars) to keep on each side of a match when returning a
+# raw_artifacts search hit -- enough to read the surrounding line without
+# dumping the whole (often huge) saved file back into context, which would
+# defeat the entire point of searching instead of read_artifact-ing blindly.
+_RAW_SEARCH_CONTEXT_CHARS = 200
+_RAW_SEARCH_MAX_FILES = 500
+_RAW_SEARCH_MAX_MATCHES_PER_FILE = 10
+
+
+def _search_raw_artifacts(target: Target, query: str, limit: int = 50, regex: bool = False) -> Dict[str, Any]:
+    """
+    Full-text search across every raw artifact file saved for this target
+    (~/.hellhound/targets/<target>/raw/*.txt -- the same files read_artifact
+    reads line-ranges from). Fixes the "find that one curl from 20 turns
+    ago" complaint: recall_data's other categories only cover predefined,
+    structured state; this is the free-text fallback for everything that
+    only exists as a saved raw tool-output file (full response bodies, full
+    JS bundles, full HTML, etc.) once truncation moved it out of live
+    context. Grep-like: returns matching file + line number + a short
+    context snippet per hit, newest files first, so the model can then
+    read_artifact the exact offset instead of guessing.
+    """
+    target_name = target.name if (target and hasattr(target, "name") and target.name) else "default"
+    raw_dir = os.path.realpath(os.path.expanduser(f"~/.hellhound/targets/{target_name}/raw"))
+    if not os.path.isdir(raw_dir):
+        return {
+            "status": "success",
+            "category": "raw_artifacts",
+            "query": query,
+            "files_searched": 0,
+            "matched": 0,
+            "returned": 0,
+            "truncated": False,
+            "items": [],
+            "note": "No raw artifacts saved for this target yet (nothing has been truncated/saved so far).",
+        }
+
+    try:
+        if regex:
+            pattern = re.compile(query, re.IGNORECASE)
+        else:
+            pattern = re.compile(re.escape(query), re.IGNORECASE)
+    except re.error as e:
+        return {"error": f"Invalid regex '{query}': {e}"}
+
+    try:
+        filenames = sorted(
+            (f for f in os.listdir(raw_dir) if f.endswith(".txt")),
+            key=lambda f: os.path.getmtime(os.path.join(raw_dir, f)),
+            reverse=True,
+        )
+    except Exception as e:
+        return {"error": f"Failed to list raw artifact directory: {e}"}
+
+    files_searched = 0
+    matches: List[Dict[str, Any]] = []
+    for fname in filenames[:_RAW_SEARCH_MAX_FILES]:
+        fpath = os.path.join(raw_dir, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except Exception:
+            continue
+        files_searched += 1
+        hits_this_file = 0
+        for idx, line in enumerate(lines):
+            if hits_this_file >= _RAW_SEARCH_MAX_MATCHES_PER_FILE:
+                break
+            m = pattern.search(line)
+            if not m:
+                continue
+            hits_this_file += 1
+            snippet = line.strip()
+            if len(snippet) > _RAW_SEARCH_CONTEXT_CHARS:
+                start = max(0, m.start() - _RAW_SEARCH_CONTEXT_CHARS // 2)
+                end = min(len(line), m.end() + _RAW_SEARCH_CONTEXT_CHARS // 2)
+                snippet = ("..." if start > 0 else "") + line[start:end].strip() + ("..." if end < len(line) else "")
+            matches.append({
+                "path": fpath,
+                "filename": fname,
+                "line": idx,
+                "snippet": snippet,
+            })
+        if len(matches) >= limit * 4:
+            # Enough candidates collected across files already -- stop
+            # scanning further (older) files once we're well past what's
+            # needed, so one huge raw directory doesn't become a slow scan
+            # on every search call.
+            break
+
+    matched = len(matches)
+    items = matches[:limit]
+    return {
+        "status": "success",
+        "category": "raw_artifacts",
+        "query": query,
+        "files_searched": files_searched,
+        "matched": matched,
+        "returned": len(items),
+        "truncated": matched > len(items),
+        "items": items,
+        "tip": "Use read_artifact(path=..., offset=<line - a few>, length=...) on a hit's path/line to see full surrounding context.",
+    }
 
 
 def _execute_recall_data(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -9396,6 +9778,13 @@ def _execute_recall_data(args: Dict[str, Any], target: Target, emit: Any) -> Dic
             "error": f"Unknown category '{category}'. Valid categories: {', '.join(sorted(_RECALL_CATEGORIES))}.",
         }
     source = _RECALL_CATEGORIES[category]
+    if source == "raw_search":
+        query = str(args.get("filter", "") or "").strip()
+        if not query:
+            return {"error": "category='raw_artifacts' requires 'filter' to be set to your search text (the substring or regex to look for across all saved raw tool output)."}
+        limit = min(int(args.get("limit", 50) or 50), 200)
+        regex = bool(args.get("regex", False))
+        return _search_raw_artifacts(target, query, limit=limit, regex=regex)
     if source == "findings":
         raw_items = target.findings if isinstance(target.findings, list) else []
     else:
@@ -9637,14 +10026,21 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "Categories: endpoints, subdomains, live_hosts, js_routes, parameter_sensitive, "
             "takeover_candidates, technologies, credentials, secrets, failed_credentials, cookies, "
             "dismissed_false_positives, curl_evidence_log (captured request/response proof), campaign_plan, "
-            "findings (confirmed findings on this target)."
+            "findings (confirmed findings on this target), raw_artifacts (FULL-TEXT SEARCH across every "
+            "saved raw tool-output file for this target — use this when you need to find something that "
+            "isn't one of the structured categories above, e.g. 'that one curl response from 20 turns ago' "
+            "or a specific string somewhere inside a huge saved JS bundle/HTML page. For raw_artifacts, "
+            "'filter' is REQUIRED and is your search text (substring by default, or a regex if 'regex' is "
+            "true); results are matching file path + line number + a short snippet, newest files first — "
+            "follow up with read_artifact on the returned path/line for full context)."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "category": {"type": "string", "description": "One of the categories listed above."},
-                "filter": {"type": "string", "description": "Optional substring to filter results by (case-insensitive, matched against each item's full content)."},
-                "limit": {"type": "integer", "description": "Max items to return (default 50, hard-capped at 200). The result also reports total_stored/matched so you know if this is everything or a slice."}
+                "filter": {"type": "string", "description": "Optional substring to filter results by (case-insensitive, matched against each item's full content). REQUIRED (used as the search query) when category='raw_artifacts'."},
+                "limit": {"type": "integer", "description": "Max items to return (default 50, hard-capped at 200). The result also reports total_stored/matched so you know if this is everything or a slice."},
+                "regex": {"type": "boolean", "description": "Only used with category='raw_artifacts'. If true, treat 'filter' as a regex instead of a plain substring. Default false.", "default": False}
             },
             "required": ["category"]
         },
@@ -9984,7 +10380,10 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "'retry_body_preview' when that happens; 'session_auto_relogged_in' says whether it worked). Rate-"
             "limited to one attempt per 30s per target so a fuzzing loop can't hammer the login endpoint. If no "
             "login has been observed yet, or re-login fails (credentials may have changed), 'session_status' "
-            "says so plainly — re-run the login flow yourself in that case."
+            "says so plainly — re-run the login flow yourself in that case. EVERY tool result that looks "
+            "HTTP-shaped (this tool, Caido/Burp tools, browser_control) also gets a 'normalized_response' "
+            "field ({status_code, headers, cookies, body}) added automatically — use that instead of hand-"
+            "translating each tool's own field names when comparing results across tools."
         ),
         parameters={
             "type": "object",
@@ -9999,6 +10398,32 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["url"]
         },
         executor=_execute_curl
+    ),
+    "replay_request": ToolSpec(
+        name="replay_request",
+        description=(
+            "Re-send a previously-captured request from curl_evidence_log with one or more fields "
+            "changed, instead of rebuilding the whole curl call from scratch to tweak a single header, "
+            "cookie, or the body. Use this whenever you want to test 'same request, but with X changed' "
+            "-- a different Origin header for a CORS check, a cleared/swapped cookie, a different role "
+            "claim in the body, etc. headers/cookies you pass here are MERGED on top of the original "
+            "request's headers/cookies (everything else from the original is kept); method/json/body "
+            "fully REPLACE the original's value when given. Look up what's available first with "
+            "recall_data(category='curl_evidence_log') if you're not sure what to reference."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ref": {"description": "Which prior request to replay: an index into curl_evidence_log (0, -1, ...), the string 'latest', or a substring of a previously-requested URL (matches the most recent one)."},
+                "method": {"type": "string", "description": "Optional. Overrides the original HTTP method."},
+                "headers": {"type": "object", "description": "Optional. Headers to merge on top of the original request's headers (add new ones or overwrite existing ones by name)."},
+                "cookies": {"type": "object", "description": "Optional. Cookies to merge on top of the original request's cookies."},
+                "json": {"type": "object", "description": "Optional. Replaces the original request's JSON body entirely."},
+                "body": {"type": "string", "description": "Optional. Replaces the original request's raw/string body entirely."}
+            },
+            "required": ["ref"]
+        },
+        executor=_execute_replay_request
     ),
     "cookie_inspector": ToolSpec(
         name="cookie_inspector",
@@ -11203,11 +11628,52 @@ def extract_target_from_text(user_text: str) -> Optional[str]:
     return None
 
 
+# Security-relevant HTTP response header names worth preserving verbatim
+# even when they'd otherwise land in the cut middle of a large response —
+# see _extract_preserved_artifacts. CSP/HSTS/CORS/cookie-flag headers are
+# exactly the kind of thing a researcher asks about after the fact
+# ("what was the CSP on that response?") and are cheap to pull out in
+# full regardless of where in the response body they happened to sit.
+_PRESERVED_HEADER_NAMES = (
+    "content-security-policy", "content-security-policy-report-only",
+    "strict-transport-security", "x-frame-options", "x-content-type-options",
+    "access-control-allow-origin", "access-control-allow-credentials",
+    "access-control-allow-methods", "access-control-allow-headers",
+    "set-cookie", "www-authenticate", "x-powered-by", "server",
+    "location", "referrer-policy", "permissions-policy",
+)
+_PRESERVED_HEADER_RE = re.compile(
+    r"^(" + "|".join(re.escape(h) for h in _PRESERVED_HEADER_NAMES) + r")\s*:\s*(.+)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# JS/sourcemap signal worth surfacing verbatim too — these are exactly
+# what a researcher means by "the JS bundle/sourcemap reference got cut":
+# knowing a chunk/sourcemap exists is often enough to go fetch it
+# directly, even without the full bundle body in context.
+_SCRIPT_SRC_RE = re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+_SOURCEMAP_COMMENT_RE = re.compile(r'sourceMappingURL=(\S+)')
+
+
 def _extract_preserved_artifacts(content: str) -> str:
     """
-    Scans untruncated tool output content for high-value security artifacts
-    (JWTs, Bearer tokens, Session/API keys, URLs, Emails) and returns a formatted
-    [PRESERVED ARTIFACTS ...] header block, or empty string if none found.
+    Scans untruncated tool output content for high-value artifacts (JWTs,
+    Bearer tokens, Session/API keys, URLs, Emails, security-relevant
+    response headers, script/sourcemap references) and returns a
+    formatted [PRESERVED ARTIFACTS ...] header block, or empty string if
+    none found.
+
+    CAUGHT IN THE WILD (2026-10): this originally only pulled out auth
+    material (tokens/keys) — a researcher asking "what was the CSP on
+    that response" or wanting the JS bundle paths from a page whose full
+    body got truncated to a head/tail slice had to make a SEPARATE
+    read_artifact(...) call just to see something that was often sitting
+    in the cut middle section the whole time. Headers and script/
+    sourcemap references are cheap to extract in full regardless of
+    position — pulling them out here means the common cases (what
+    security headers came back, what JS files does this page load) never
+    need that extra round trip at all, even when the raw body itself is
+    too large to show in full.
     """
     if not content:
         return ""
@@ -11218,6 +11684,19 @@ def _extract_preserved_artifacts(content: str) -> str:
     urls = sorted(set(re.findall(r"https?://[^\s\"'<>]+", content)))
     emails = sorted(set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", content)))
 
+    # Dedup headers by NAME (keep first occurrence's value) — the same
+    # header can legitimately appear more than once in a response, but
+    # for this preview a researcher wants "what was it", not every repeat.
+    seen_headers = {}
+    for m in _PRESERVED_HEADER_RE.finditer(content):
+        name = m.group(1).strip()
+        key = name.lower()
+        if key not in seen_headers:
+            seen_headers[key] = f"{name}: {m.group(2).strip()[:500]}"
+
+    script_srcs = sorted(set(_SCRIPT_SRC_RE.findall(content)))[:30]
+    sourcemaps = sorted(set(_SOURCEMAP_COMMENT_RE.findall(content)))[:10]
+
     lines = []
     if jwts:
         lines.append(f"JWTs: {', '.join(jwts)}")
@@ -11225,6 +11704,12 @@ def _extract_preserved_artifacts(content: str) -> str:
         lines.append(f"Bearer tokens: {', '.join(bearer_tokens)}")
     if session_keys:
         lines.append(f"Session/API keys: {', '.join(session_keys)}")
+    if seen_headers:
+        lines.append("Security-relevant headers:\n  " + "\n  ".join(seen_headers.values()))
+    if script_srcs:
+        lines.append(f"Script src references ({len(script_srcs)}): {', '.join(script_srcs)}")
+    if sourcemaps:
+        lines.append(f"Sourcemap references: {', '.join(sourcemaps)}")
     if urls:
         lines.append(f"URLs: {', '.join(urls)}")
     if emails:
@@ -11296,6 +11781,215 @@ def _confidently_conversational(text: str) -> bool:
     return bool(_CONVERSATIONAL_STARTERS.match(t))
 
 
+# ── Pinned-evidence protection for context condensation ─────────────────
+# Field complaint this fixes: "Older turns get summarized into 'condensed
+# memory' bullets. The successful 200 on /api/user/profile is only known
+# because it survived condensation; the actual request/response that
+# produced it is gone from live context."
+#
+# The raw request/response was never actually DELETED -- curl's own
+# evidence capture writes it to target.state["curl_evidence_log"]
+# permanently (see _execute_curl), and record_finding writes the finding
+# itself to target.findings permanently -- neither of those lives inside
+# self.history or session_digest, and compaction never touches them. What
+# WAS true: the digest (the only thing that rides along in the prompt
+# after compaction) is produced by an LLM summarizer call that can
+# legitimately compress away a specific finding/ref, or fail outright and
+# fall back to a bare "details not preserved" note -- at which point the
+# model has no textual reminder that the original evidence is still one
+# recall_data call away. These helpers pull a small, DETERMINISTIC list of
+# "a finding was recorded, here's its title/ref" lines out of the turns
+# about to be folded, independent of summarizer quality, and keep them in
+# a dedicated section of session_digest that is never the part trimmed
+# when the digest is over its character cap -- the free-text narrative is
+# trimmed first.
+_PINNED_SECTION_HEADER = "PINNED CONFIRMED FINDINGS (full evidence lives in recall_data(category='findings'/'curl_evidence_log') or export_report -- never lost by condensation):"
+_PINNED_MAX_LINES = 30
+_PINNED_LINE_CHAR_CAP = 220
+_PINNED_FINDING_CALL_RE = re.compile(
+    r'"tool"\s*:\s*"record_finding"\s*,\s*"args"\s*:\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})',
+    re.DOTALL,
+)
+
+
+def _extract_pinned_facts_from_turns(turns: List[Dict[str, str]]) -> List[str]:
+    """
+    Scans turns about to be folded out of raw history for record_finding
+    tool calls, and returns one short "- Recorded finding: ..." line per
+    distinct title. Purely mechanical (regex + json.loads on the call's own
+    args), not an LLM call -- this never fails to find something that's
+    plainly there just because a summarizer call timed out or degraded.
+    """
+    pinned: List[str] = []
+    seen_titles = set()
+    for h in turns:
+        if h.get("role") != "assistant":
+            continue
+        content = str(h.get("content", ""))
+        if "record_finding" not in content:
+            continue
+        for m in _PINNED_FINDING_CALL_RE.finditer(content):
+            try:
+                call_args = json.loads(m.group(1))
+            except Exception:
+                continue
+            if not isinstance(call_args, dict):
+                continue
+            title = str(call_args.get("title", "")).strip()
+            if not title or title.lower() in seen_titles:
+                continue
+            seen_titles.add(title.lower())
+            ref = call_args.get("request_ref")
+            line = f"- Recorded finding: \"{title}\"" + (f" ({ref})" if ref else "")
+            pinned.append(line[:_PINNED_LINE_CHAR_CAP])
+    return pinned
+
+
+def _split_pinned_section(digest_text: str) -> "tuple[str, List[str]]":
+    """Splits a session_digest string into (free-text narrative, pinned lines)."""
+    if not digest_text or _PINNED_SECTION_HEADER not in digest_text:
+        return (digest_text or "").strip(), []
+    narrative, _, pinned_block = digest_text.partition(_PINNED_SECTION_HEADER)
+    lines = [ln.strip() for ln in pinned_block.splitlines() if ln.strip().startswith("- ")]
+    return narrative.strip(), lines
+
+
+def _merge_pinned_lines(existing: List[str], new: List[str]) -> List[str]:
+    """Dedups (case-insensitive, by full line) and caps the pinned list, keeping the most recent entries."""
+    seen = set()
+    merged = []
+    for ln in existing + new:
+        ln = ln.strip()
+        if not ln:
+            continue
+        key = ln.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(ln[:_PINNED_LINE_CHAR_CAP])
+    return merged[-_PINNED_MAX_LINES:]
+
+
+def _compose_digest(narrative: str, pinned_lines: List[str], char_cap: int) -> str:
+    """
+    Rebuilds session_digest from its two parts, reserving room for the
+    pinned section FIRST so that a digest over its character budget trims
+    the free-text narrative, never the pinned findings -- the exact
+    inversion of the old behavior (a flat [:char_cap] slice on whatever
+    the summarizer happened to return, which could just as easily cut a
+    pinned reference as idle narration).
+    """
+    pinned_block = ""
+    if pinned_lines:
+        pinned_block = "\n\n" + _PINNED_SECTION_HEADER + "\n" + "\n".join(pinned_lines)
+    narrative_budget = max(0, char_cap - len(pinned_block))
+    combined = narrative.strip()[:narrative_budget] + pinned_block
+    return combined.strip()[:char_cap]
+
+
+# ── Cross-tool HTTP response shape normalization ─────────────────────────
+# Field complaint this fixes: "curl returns {status_code, headers, cookies,
+# body_preview}; mcp_caido_caido_send_request returns {statusCode, headers,
+# body, fingerprint}; browser_control returns DOM/cookies differently.
+# Normalizing them for comparison is manual." Rather than rewrite every
+# individual tool (including ones bounty-hunter doesn't control the shape
+# of at all -- an externally-discovered MCP tool like Burp's own server
+# returns whatever field names IT chose), this adds one generic,
+# best-effort post-processing pass (see execute_tool_call, right after
+# spec.executor runs) that recognizes common HTTP-response-shaped field
+# names across tools and surfaces them under one canonical key.
+_HTTP_STATUS_KEYS = ("status_code", "statusCode", "http_status", "code", "status")
+_HTTP_HEADERS_KEYS = ("headers", "response_headers", "resp_headers", "respHeaders")
+_HTTP_BODY_KEYS = ("body_preview", "body", "response_body", "respBody", "text", "html", "content", "retry_body_preview")
+_HTTP_COOKIES_KEYS = ("cookies", "response_cookies", "set_cookie", "setCookie")
+
+
+def _normalize_http_like_result(result: Any) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort extraction of a canonical {status_code, headers, cookies,
+    body} shape from ANY tool result dict that looks like it's carrying an
+    HTTP response. Returns None when nothing recognizable as an HTTP
+    response is present (port_scan, subdomain enum, record_finding, ...),
+    so this never adds noise to unrelated tool results. Purely additive —
+    original fields are never touched or removed.
+    """
+    if not isinstance(result, dict):
+        return None
+
+    def _first(keys):
+        for k in keys:
+            v = result.get(k)
+            if v is not None:
+                return v
+        return None
+
+    status = _first(_HTTP_STATUS_KEYS)
+    headers = _first(_HTTP_HEADERS_KEYS)
+    body = _first(_HTTP_BODY_KEYS)
+    cookies = _first(_HTTP_COOKIES_KEYS)
+
+    # Status alone (e.g. a bare int) isn't strong enough signal by itself --
+    # "code" and "status" collide with lots of non-HTTP tool results (exit
+    # codes, generic status strings like "success"/"error"). Require EITHER
+    # a genuinely numeric-looking status AND at least one of headers/body/
+    # cookies, OR headers/body/cookies alone (which are far less ambiguous).
+    status_int: Optional[int] = None
+    if status is not None:
+        try:
+            status_int = int(status)
+        except (ValueError, TypeError):
+            status_int = None
+
+    has_other_signal = headers is not None or body is not None or cookies is not None
+    if status_int is None and not has_other_signal:
+        return None
+    if status_int is not None and not (100 <= status_int <= 599) and not has_other_signal:
+        return None  # a numeric "status"/"code" that isn't HTTP-shaped and nothing else backs it up
+    if not has_other_signal and status_int is None:
+        return None
+
+    norm_headers: Dict[str, str] = {}
+    if isinstance(headers, dict):
+        norm_headers = {str(k): str(v) for k, v in headers.items()}
+    elif isinstance(headers, list):
+        for h in headers:
+            if isinstance(h, dict):
+                name = h.get("name") or h.get("key")
+                if name is not None:
+                    norm_headers[str(name)] = str(h.get("value", ""))
+            elif isinstance(h, (list, tuple)) and len(h) == 2:
+                norm_headers[str(h[0])] = str(h[1])
+    elif isinstance(headers, str):
+        norm_headers = normalize_headers(headers)
+
+    norm_cookies: Dict[str, str] = {}
+    if isinstance(cookies, dict):
+        norm_cookies = {str(k): str(v) for k, v in cookies.items()}
+    elif isinstance(cookies, str):
+        norm_cookies = normalize_cookies(cookies)
+    elif isinstance(cookies, list):
+        for c in cookies:
+            if isinstance(c, dict) and c.get("name") is not None:
+                norm_cookies[str(c["name"])] = str(c.get("value", ""))
+
+    if isinstance(body, str):
+        body_str = body
+    elif body is not None:
+        try:
+            body_str = json.dumps(body, default=str)
+        except Exception:
+            body_str = str(body)
+    else:
+        body_str = ""
+
+    return {
+        "status_code": status_int,
+        "headers": norm_headers,
+        "cookies": norm_cookies,
+        "body": body_str[:5000],
+    }
+
+
 class Agent:
     # ── Rolling memory digest thresholds ────────────────────────────────
     # Raw self.history entries carry full-fidelity content (tool results up
@@ -11346,6 +12040,7 @@ class Agent:
         )
         self._turn_path_scope: Optional[str] = None  # e.g. "/app" — set per-turn in handle_message
         self._turn_host_pivot_open: bool = False  # see _PIVOT_HOST_RE / host-focus pin in handle_message & _execute_tool_call
+        self._turn_vendor_lock: Optional[str] = None  # 'caido'/'burp'/None — recomputed fresh every turn in handle_message, see _resolve_turn_vendor_lock
         self._forced_skill: Optional[str] = None  # set by /skill-name slash command — one-shot, consumed next turn
         self._active_session_context: Optional[Dict[str, Any]] = None  # this turn's session_context, if any — see set_target()
         self._auto_continue_streak: int = 0  # consecutive auto-continued turns this process, in-memory only — see the AUTO-CONTINUE DECISION block in handle_message
@@ -11392,7 +12087,8 @@ class Agent:
         def _worker():
             try:
                 fold_text = self._render_turns_for_summary(to_fold)
-                self._digest_from_text(fold_text, len(to_fold))
+                pinned_facts = _extract_pinned_facts_from_turns(to_fold)
+                self._digest_from_text(fold_text, len(to_fold), pinned_facts=pinned_facts)
                 target.state["session_digest"] = self.session_digest
                 self._mine_lessons_from_text(fold_text, target=target)
                 save_target(target)
@@ -11444,8 +12140,22 @@ class Agent:
             lines.append(line)
         return "\n".join(lines)
 
-    def _digest_from_text(self, fold_text: str, folded_count: int) -> None:
-        """Updates self.session_digest from a block of older turns being folded out of raw history."""
+    def _digest_from_text(self, fold_text: str, folded_count: int, pinned_facts: Optional[List[str]] = None) -> None:
+        """
+        Updates self.session_digest from a block of older turns being
+        folded out of raw history. `pinned_facts` (see
+        _extract_pinned_facts_from_turns) are kept in a dedicated section
+        that this call NEVER trims away, whether the LLM summarization
+        below succeeds, degrades, or fails outright — only the free-text
+        narrative portion is subject to the summarizer and the character
+        cap. The existing digest's own pinned section (if any) is parsed
+        back out and merged with the new ones rather than being handed to
+        the summarizer as plain text, where an off-model local LLM could
+        easily paraphrase a title/ref into something recall_data can no
+        longer match.
+        """
+        existing_narrative, existing_pinned = _split_pinned_section(self.session_digest or "")
+
         summarizer_prompt = f"""\
 Condense these older turns from an ongoing bug-bounty session into an \
 updated rolling memory digest. Merge with the EXISTING DIGEST below rather \
@@ -11459,10 +12169,12 @@ Keep, tersely (a few short bullet points, not a report):
 NOT be retried.
 - Any outstanding leads not yet resolved.
 
-Drop small talk, greetings, and anything not useful to remember later.
+Drop small talk, greetings, and anything not useful to remember later. Do \
+NOT restate individual recorded findings by title here — those are tracked \
+separately and kept automatically; focus on everything else.
 
 EXISTING DIGEST:
-{self.session_digest or "(none yet)"}
+{existing_narrative or "(none yet)"}
 
 OLDER TURNS TO FOLD IN:
 {fold_text}
@@ -11483,10 +12195,13 @@ Return ONLY the updated digest text — no preamble, no headers."""
             updated = None
 
         if updated and isinstance(updated, str) and not updated.startswith("Error:"):
-            self.session_digest = updated.strip()[: self._DIGEST_CHAR_CAP]
+            narrative = updated.strip()
         else:
-            fallback_note = f"[{folded_count} earlier turns condensed — summarization unavailable this pass, details not preserved]"
-            self.session_digest = ((self.session_digest or "").strip() + "\n" + fallback_note).strip()[: self._DIGEST_CHAR_CAP]
+            fallback_note = f"[{folded_count} earlier turns condensed — summarization unavailable this pass, narrative details not preserved (confirmed findings below are unaffected)]"
+            narrative = ((existing_narrative or "").strip() + "\n" + fallback_note).strip()
+
+        merged_pinned = _merge_pinned_lines(existing_pinned, pinned_facts or [])
+        self.session_digest = _compose_digest(narrative, merged_pinned, self._DIGEST_CHAR_CAP)
 
     def _mine_lessons_from_text(self, turns_text: str, target: Optional[Target] = None, tech_signature: Optional[List[str]] = None) -> None:
         """
@@ -11595,10 +12310,19 @@ If there is nothing worth generalizing, return an empty array: []"""
             )
 
     @staticmethod
-    def _build_native_tools() -> List[Dict[str, Any]]:
-        """Convert TOOL_REGISTRY specs into OpenAI-compatible tool definitions for native API tool calling."""
+    def _build_native_tools(exclude: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
+        """Convert TOOL_REGISTRY specs into OpenAI-compatible tool definitions for native API tool calling.
+
+        `exclude` drops specific tool names from what the model is even
+        shown this turn — used for the per-turn Caido/Burp vendor lock
+        (see _vendor_excluded_tool_names) so the model can't reach for a
+        tool it was never offered, not just rely on it choosing not to.
+        """
+        exclude = exclude or set()
         tools = []
         for name, spec in TOOL_REGISTRY.items():
+            if name in exclude:
+                continue
             tools.append({
                 "type": "function",
                 "function": {
@@ -12000,6 +12724,35 @@ If there is nothing worth generalizing, return an empty array: []"""
         if not spec:
             return {"error": f"Tool '{tool_name}' not found in registry."}
 
+        # Vendor tool lock hard backstop — the system prompt's tool listing
+        # (tools_summary) and native function-calling schema
+        # (_build_native_tools(exclude=...)) already hide the OTHER
+        # proxy's tools this turn when the researcher named one
+        # specifically, but this is the actual enforcement point in case
+        # the model calls one anyway (a stale/cached tool-use plan from
+        # earlier in its own reasoning, a provider that doesn't honor the
+        # trimmed schema, etc.) — "should not call Burp when I said
+        # Caido" needs to hold even if something upstream slips.
+        if self._turn_vendor_lock and _tool_belongs_to_vendor(tool_name, "burp" if self._turn_vendor_lock == "caido" else "caido"):
+            _locked_display = "Caido" if self._turn_vendor_lock == "caido" else "Burp"
+            _blocked_display = "Burp" if self._turn_vendor_lock == "caido" else "Caido"
+            msg = (
+                f"[!] not doing that — '{tool_name}' is a {_blocked_display} tool, but this turn is locked to "
+                f"{_locked_display} (you named it specifically). Name {_blocked_display} explicitly if you actually "
+                f"want it used too."
+            )
+            if emit and hasattr(emit, "warn"):
+                emit.warn(msg)
+            return {
+                "error": (
+                    f"VENDOR_TOOL_LOCKED: '{tool_name}' is a {_blocked_display} tool; this turn is locked to "
+                    f"{_locked_display} only because the researcher's message named it specifically, not {_blocked_display}. "
+                    f"Use the {_locked_display} equivalent instead, or tell the researcher you'd need them to also "
+                    f"mention {_blocked_display} to use it."
+                ),
+                "blocked": True,
+            }
+
         # set_target switches the Agent's OWN active target (self.target),
         # not something the current target object can do to itself — needs
         # `self` in scope, so it's special-cased here rather than going
@@ -12333,6 +13086,24 @@ If there is nothing worth generalizing, return an empty array: []"""
             except Exception:
                 pass
 
+            # Normalize cross-tool HTTP response shapes. Field complaint
+            # this fixes: "curl returns {status_code, headers, cookies,
+            # body_preview}; mcp_caido_caido_send_request returns
+            # {statusCode, headers, body, fingerprint}; browser_control
+            # returns DOM/cookies differently. Normalizing them for
+            # comparison is manual." Best-effort and purely additive --
+            # the tool's own original fields are never touched, this just
+            # adds one more "normalized_response" key (when the result
+            # looks HTTP-shaped at all) so the model can compare two
+            # results from different tools without hand-translating field
+            # names first.
+            try:
+                normalized = _normalize_http_like_result(result)
+                if normalized is not None and isinstance(result, dict):
+                    result["normalized_response"] = normalized
+            except Exception:
+                pass
+
             return result
         except Exception as e:
             self.guard.record_failure(host)
@@ -12404,6 +13175,17 @@ If there is nothing worth generalizing, return an empty array: []"""
                     if emit and hasattr(emit, "warn"):
                         emit.warn(f"[!] Caido tool registration failed: {_caido_reg_err}")
 
+        # Vendor tool lock: recomputed fresh every turn (not sticky) from
+        # THIS message's own wording — naming Caido specifically ("pull
+        # the request from caido") must not leave Burp's tools reachable
+        # just because both happened to get registered earlier in the
+        # session (or on this same turn, right above). See
+        # _resolve_turn_vendor_lock / _vendor_excluded_tool_names.
+        self._turn_vendor_lock = _resolve_turn_vendor_lock(user_text or "")
+        if self._turn_vendor_lock and emit and hasattr(emit, "info"):
+            _locked_display = "Caido" if self._turn_vendor_lock == "caido" else "Burp"
+            emit.info(f"[*] Tool access locked to {_locked_display} this turn — the other proxy's tools won't be called unless you name it too.")
+
         # ── Self-diagnostic short-circuit ──
         # The researcher asking "why did you just dump JSON" / "why do I
         # have to say continue so much" / "why'd that time out" is a
@@ -12442,7 +13224,7 @@ If there is nothing worth generalizing, return an empty array: []"""
                     on_token=on_token,
                     return_usage=True,
                     cancel_check=cancel_check,
-                    tools=Agent._build_native_tools(),
+                    tools=Agent._build_native_tools(exclude=_vendor_excluded_tool_names(self._turn_vendor_lock)),
                     tool_choice="none",
                 )
                 if answer and not (isinstance(answer, str) and answer.startswith("Error:")):
@@ -12504,9 +13286,20 @@ If there is nothing worth generalizing, return an empty array: []"""
         _skip_orchestrator_loop = has_real_target and _confidently_conversational(original_user_text)
 
         # Build System Prompt with registered tools and current target scope
+        #
+        # _vendor_excluded_tool_names drops the OTHER proxy's tools from
+        # the list entirely when this turn's wording named one specifically
+        # (see _resolve_turn_vendor_lock) — the local orchestrator model
+        # reads tool availability from this text listing (not native
+        # function-calling schemas) on the ollama path, so filtering here
+        # is what actually keeps a Burp tool out of its hands when the
+        # researcher said "caido", not just a prompt instruction asking it
+        # not to call one it can still see.
+        _vendor_excluded_this_turn = _vendor_excluded_tool_names(self._turn_vendor_lock)
         tools_summary = "\n".join([
             f"- {name}: {spec.description} | Params: {json.dumps(spec.parameters)}"
             for name, spec in TOOL_REGISTRY.items()
+            if name not in _vendor_excluded_this_turn
         ])
 
         scope_summary = "None (Default local allow)"
@@ -13345,7 +14138,23 @@ INSTRUCTIONS:
                          # it in the final-answer fallback chain crashes with
                          # UnboundLocalError on any target-less conversation.
         _prev_ai_resp = None
-        _executed_signatures = set()  # every (tool, args) run this turn — not just the last one
+        # (tool, args) -> session fingerprint AT THE TIME it ran, not just
+        # a bare set of signatures run this turn.
+        #
+        # CAUGHT IN THE WILD (2026-10): "re-run /api/user/profile with a
+        # clean cookie set" got skipped as an exact duplicate even though
+        # the researcher's intent (and the actual HTTP request that would
+        # go out) genuinely differed — curl auto-attaches whatever
+        # session is currently captured in target.state rather than
+        # requiring it as an explicit arg (see curl's own tool
+        # description), so "same url, same method, no explicit cookies
+        # arg" is literally the same (tool, args) tuple before AND after
+        # a session reset/re-login, even though it now produces a
+        # DIFFERENT real request. A signature match alone can't tell
+        # "genuinely repeating the same probe" apart from "same call
+        # shape, but the session underneath it just changed" — comparing
+        # a session fingerprint at the time of each match does.
+        _executed_signatures: Dict[tuple, str] = {}
         _dup_skip_count = 0
         _narration_retry_count = 0
         _premature_done_retry_count = 0
@@ -13486,7 +14295,7 @@ INSTRUCTIONS:
                         history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
                         return_usage=True,
                         cancel_check=cancel_check,
-                        tools=Agent._build_native_tools()
+                        tools=Agent._build_native_tools(exclude=_vendor_excluded_tool_names(self._turn_vendor_lock))
                     )
 
                 ai_resp, tokens = _call_orchestrator()
@@ -13655,15 +14464,26 @@ INSTRUCTIONS:
 
                         # Already ran this exact tool+args earlier THIS turn (not
                         # just last iteration) -> skip it, don't re-dispatch.
+                        #
+                        # Signature match alone isn't enough, though — see
+                        # _session_fingerprint's docstring. A call that looks
+                        # textually identical to one already run can still
+                        # be a genuinely different request if the target's
+                        # session (cookies/session_cookie/auth_token) has
+                        # since changed, e.g. a cleared/reset session or a
+                        # fresh login between the two calls. Only skip when
+                        # BOTH the call shape AND the session are unchanged.
                         _sig = (t_name, json.dumps(t_args, sort_keys=True, default=str))
-                        if _sig in _executed_signatures:
+                        _current_fp = _session_fingerprint(self.target)
+                        _prior_fp = _executed_signatures.get(_sig)
+                        if _sig in _executed_signatures and _prior_fp == _current_fp:
                             _dup_skip_count += 1
                             self.history.append({
                                 "role": "user",
                                 "content": f"[TOOL SKIPPED] '{t_name}' with these exact args already ran earlier this turn — reuse those results instead of repeating it."
                             })
                             continue
-                        _executed_signatures.add(_sig)
+                        _executed_signatures[_sig] = _current_fp
 
                         # Hard cap: record_finding specifically, enforced before
                         # execution — see _RECORD_FINDING_CAP_PER_TURN comment above.
@@ -14010,7 +14830,7 @@ INSTRUCTIONS:
             further defense-in-depth if a provider ever doesn't honor
             tool_choice="none".
             """
-            _synth_tools = Agent._build_native_tools()
+            _synth_tools = Agent._build_native_tools(exclude=_vendor_excluded_tool_names(self._turn_vendor_lock))
             answer, tok = ask_neural_core(
                 prompt=prompt,
                 system_prompt=synthesizer_system_prompt,

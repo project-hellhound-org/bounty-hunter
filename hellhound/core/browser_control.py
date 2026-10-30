@@ -409,6 +409,51 @@ def run_browser_action(key: str, action: str, params: Optional[Dict[str, Any]] =
         return {"status": "error", "error": f"Browser action '{action}' failed: {type(e).__name__}: {e}"}
 
 
+async def _seed_cookies_coro(key: str, cookies: List[Dict[str, Any]]) -> Dict[str, Any]:
+    sess = _registry.get_or_create(key)
+    await sess.ensure_started()
+    sess.last_used = time.time()
+    added = 0
+    errors = []
+    for c in cookies:
+        try:
+            await sess.context.add_cookies([c])
+            added += 1
+        except Exception as e:
+            errors.append(f"{c.get('name', '?')}: {e}")
+    return {"status": "success", "action": "seed_cookies", "added": added, "attempted": len(cookies), "errors": errors or None}
+
+
+def seed_session_cookies(key: str, cookies: List[Dict[str, Any]], timeout: float = 15.0) -> Dict[str, Any]:
+    """
+    CAUGHT IN THE WILD (2026-10): cookie sync only ever flowed browser ->
+    curl (see agent.py's _execute_browser_control, which folds whatever
+    cookies the browser is holding into target.state after goto/click/
+    fill/get_cookies) -- the reverse never happened. A researcher who
+    logged in via curl (or any other tool that captures a session into
+    target.state) and THEN opened browser_control got a brand-new,
+    logged-out browser context with no idea the curl session existed,
+    forcing a manual cookie copy-paste to actually use the browser
+    authenticated. This is the other half: seed a FRESH (or already-
+    running) browser session's cookie jar from cookies captured elsewhere,
+    so "I already have a session, go drive the browser with it" just
+    works. Each cookie dict needs Playwright's expected shape -- at least
+    name/value and either 'url' or both 'domain'+'path'; build these with
+    agent.py's _cookies_for_browser_seed() rather than hand-rolling them
+    here, which also decides whether seeding is worth doing at all (empty
+    cookie jar, no domain to attach them to, etc).
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return {"status": "success", "action": "seed_cookies", "added": 0, "attempted": len(cookies), "note": "Playwright not available"}
+    if not cookies:
+        return {"status": "success", "action": "seed_cookies", "added": 0, "attempted": 0}
+    loop_thread = _LoopThread.get()
+    try:
+        return loop_thread.run_coro(_seed_cookies_coro(key, cookies), timeout=timeout)
+    except Exception as e:
+        return {"status": "error", "error": f"seed_session_cookies failed: {type(e).__name__}: {e}"}
+
+
 def list_sessions(target_prefix: str, timeout: float = 15.0) -> Dict[str, Any]:
     """Lists every open session_id for this target (across every browser
     context, not just 'default') -- what's actually open right now, each
