@@ -1,0 +1,66 @@
+HELLHOUND BOUNTY HUNTER — NOTICE
+
+This file is separate from, and in addition to, the GNU General Public
+License v3 (GPLv3) that covers the source code in this repository (see
+LICENSE). It does not alter, narrow, or add conditions to your rights
+under the GPLv3 — it only states facts about trademark that the GPLv3
+itself is silent on.
+
+1. COPYRIGHT & SOURCE CODE LICENSE
+
+   Hellhound Bounty Hunter is Copyright (C) Project Hellhound and its
+   contributors, and is licensed to you under the GNU General Public
+   License v3 (GPLv3). Under that license you may use, study, modify,
+   and redistribute this software — including commercially, and
+   including forks — provided you comply with GPLv3's terms: keep the
+   work (and any modified version of it) licensed under GPLv3, preserve
+   existing copyright notices, include a copy of the license, state
+   what you changed, and make source available to anyone you distribute
+   the software to. That's it — GPLv3 is deliberately permissive about
+   forking, modifying, and redistributing. This NOTICE does not restrict
+   any of that.
+
+2. TRADEMARK — NOT COVERED BY THE GPLv3 GRANT
+
+   "Hellhound," "Project Hellhound," "Bounty Hunter," "Hellhound Bounty
+   Hunter," and the associated logo/branding (collectively, the "Marks")
+   are trademarks of Project Hellhound. The GPLv3 license grants rights
+   to the SOURCE CODE; it does not grant, and has never granted,
+   permission to use the Marks.
+
+   Concretely:
+   - You may fork, modify, and redistribute this code under GPLv3 under
+     a DIFFERENT name and different branding, with full attribution
+     preserved as GPLv3 requires. This is normal, welcome, and exactly
+     what open source is for.
+   - You may NOT use the Marks (the project name, "Hellhound"/"Bounty
+     Hunter" branding, or the logo) to describe, title, or promote a
+     modified or redistributed version of this software, or any other
+     software, in a way that states or implies it is the official
+     Project Hellhound release, without prior written permission.
+   - You may truthfully say your project is "a fork of Hellhound Bounty
+     Hunter" or "based on Hellhound Bounty Hunter" (that's accurate
+     attribution, which GPLv3 encourages) — that is different from
+     naming your fork "Hellhound Bounty Hunter," "Bounty Hunter," or a
+     confusingly similar name, or using the logo as your own project's
+     identity.
+
+3. INTENDED USE — AUTHORIZED SECURITY TESTING ONLY
+
+   Hellhound Bounty Hunter is built strictly for authorized security
+   assessments, bug bounty programs operating under a published scope
+   and policy, and educational CTF/training environments where you have
+   explicit permission to test. It is not intended, and must not be
+   used, for unauthorized access, scanning, or testing of any system
+   without the owner's explicit authorization. See the "Scope Policy &
+   Legal Compliance" section of README.md, and CONTRIBUTING.md and
+   AGENTS.md for the specific technical safeguards (the Scope Security
+   Gate, evidence/verification gates) that exist to uphold this and
+   must not be weakened or bypassed by any contribution, fork, or
+   integration.
+
+4. QUESTIONS
+
+   For permission to use the Marks, or questions about this notice,
+   reach the maintainers via the official repository:
+   https://github.com/project-hellhound-org/bounty-hunter

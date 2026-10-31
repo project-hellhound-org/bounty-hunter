@@ -873,7 +873,25 @@ def _execute_feroxbuster_content(args: Dict[str, Any], target: Target, emit: Any
     }
 
 
-_HTTP_CLIENT_CMD_RE = re.compile(r"\b(curl|wget|http|httpie)\b")
+# CAUGHT IN THE WILD (2026-10): a real sqlmap finding's auto-saved report
+# showed nothing but the sqlmap startup banner/legal disclaimer as its
+# "captured evidence" instead of the actual dumped data. Root cause: this
+# regex was `\b(curl|wget|http|httpie)\b` with NO anchoring, so it matched
+# the word "http" inside the URL SCHEME of ANY command that took a URL
+# argument — `sqlmap -u 'http://host/login.php' ...` matches `\bhttp\b`
+# at the "http" in "http://", nowhere near the actual invoked binary
+# (sqlmap). That misrouted the whole command through
+# _mirror_http_evidence_from_terminal, which captured sqlmap's raw
+# stdout/stderr (mostly banner, since sqlmap's real dumped output often
+# comes later / after the captured excerpt's head-only cap) and filed it
+# as "curl evidence" under the login.php URL -- exactly the garbage the
+# researcher flagged. Same false-positive would've fired for hydra, nmap,
+# ffuf, gobuster, or literally any CLI tool invoked with a URL argument.
+# Fixed by anchoring the match to actual COMMAND position (start of the
+# command, or right after a shell separator/sudo/env prefix) instead of
+# searching the whole string — "http://" appearing mid-argument no longer
+# qualifies, only the invoked program name itself does.
+_HTTP_CLIENT_CMD_RE = re.compile(r"(?:^|[;&|]+\s*)(?:(?:sudo|env)\s+)*(?:\S*/)?(curl|wget|httpie|http)\b")
 _TERMINAL_URL_RE = re.compile(r"https?://[^\s\"'`|><\\]+")
 
 
@@ -950,6 +968,87 @@ def _mirror_http_evidence_from_terminal(command: str, proc: Any, target: Target,
             })
             if len(evidence_log) > 40:
                 del evidence_log[: len(evidence_log) - 40]
+    except Exception:
+        pass
+
+
+def _smart_output_excerpt(output: str, head_chars: int = 1500, tail_chars: int = 4500) -> str:
+    """
+    For long CLI tool output (sqlmap, hydra, nmap, ...), the useful part —
+    confirmed injection details, a dumped table, cracked credentials — is
+    usually further into the output than a flat head-only slice reaches:
+    banners, legal disclaimers, and progress-bar noise dominate the first
+    chunk (exactly what made a real SQLi finding's auto-saved report show
+    nothing but sqlmap's ASCII-art banner as its "evidence"). Keeping both
+    ends, weighted toward the tail, means a long run's actual payoff
+    survives being capped instead of getting silently discarded.
+    """
+    output = output or ""
+    total = len(output)
+    budget = head_chars + tail_chars
+    if total <= budget:
+        return output
+    omitted = total - budget
+    return f"{output[:head_chars]}\n...[{omitted} chars omitted]...\n{output[-tail_chars:]}"
+
+
+def _mirror_terminal_evidence_generic(command: str, proc: Any, target: Target, target_host: str) -> None:
+    """
+    Captures EVERY run_terminal_command invocation that targets the active
+    host into a dedicated, general-purpose evidence log — separate from
+    curl_evidence_log (which is reserved for genuine HTTP-client commands,
+    see _mirror_http_evidence_from_terminal and _HTTP_CLIENT_CMD_RE's own
+    comment on why that match has to be narrow). This covers everything
+    else a PoC might run through the terminal instead of the dedicated
+    curl tool: sqlmap, hydra, nmap, a hand-rolled python/requests script,
+    a custom exploit chain. record_finding falls back to searching this
+    (_lookup_terminal_evidence) when curl_evidence_log has no match for a
+    given request_ref, so a finding backed by a non-HTTP-client PoC still
+    gets real captured output attached instead of hitting the no-evidence
+    gate with nothing to show.
+
+    Deliberately permissive about WHAT counts as "touching the target"
+    (the host string appearing anywhere in the command is enough, since
+    these tools reference it in all kinds of shapes — a bare host, a full
+    URL, a connection string); deliberately conservative about HOW MUCH
+    gets stored (see _smart_output_excerpt) and how many entries are kept.
+    Never raises — evidence capture must never break the actual command
+    result.
+    """
+    try:
+        if not command or not command.strip():
+            return
+        host_for_match = (target_host or (target.host if target and target.host else "") or (target.name if target else "")).strip().lower()
+        if not host_for_match:
+            return  # nothing to match against — don't file evidence with no host context at all
+        bare_host = host_for_match.split(":")[0]
+        cmd_lower = command.lower()
+        if host_for_match not in cmd_lower and (not bare_host or bare_host not in cmd_lower):
+            return
+
+        output = proc.stdout or ""
+        stderr = proc.stderr or ""
+        if stderr.strip() and len(stderr) > len(output) * 0.2:
+            # Stitch stderr in too when it's substantial — some tools
+            # (sqlmap included, depending on verbosity) send real
+            # progress/results to stderr, not stdout.
+            output = f"{output}\n{stderr}" if output.strip() else stderr
+        if not output.strip():
+            return
+
+        raw_evidence = f"$ {command}\n\n{_smart_output_excerpt(output)}"
+
+        if hasattr(target, "state") and isinstance(target.state, dict):
+            log = target.state.setdefault("terminal_evidence_log", [])
+            log.append({
+                "command": command,
+                "host": target_host or host_for_match,
+                "exit_code": getattr(proc, "returncode", None),
+                "raw": raw_evidence,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+            if len(log) > 40:
+                del log[: len(log) - 40]
     except Exception:
         pass
 
@@ -1061,6 +1160,7 @@ def _execute_terminal_command(args: Dict[str, Any], target: Target, emit: Any) -
             pass  # credential-failure capture is best-effort and must never break the actual command result
 
         _mirror_http_evidence_from_terminal(command, proc, target, target_host)
+        _mirror_terminal_evidence_generic(command, proc, target, target_host)
 
         return {
             "command": command,
@@ -5459,6 +5559,59 @@ def _session_fingerprint(target: Optional[Target]) -> str:
     return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+# ── Dead-end / pivot reflex ──────────────────────────────────────────────
+# Generalizes the js_miner/js_static_analysis cross-turn cache (which only
+# catches a LITERAL repeat call) to the broader pattern: the model kept
+# trying VARIATIONS of the same tool against the same target — different
+# args each time — and every single one came back with nothing. A literal-
+# duplicate cache can't catch that at all, since the args genuinely differ
+# call to call. This is advisory, not a hard block (unlike the exact-
+# duplicate dedup or the evidence/verification gates on record_finding) —
+# it escalates a note into the tool's own result so the model sees it
+# inline, rather than silently letting a session burn its whole turn
+# budget retrying one dead avenue in slightly different clothes.
+_PIVOT_EXEMPT_TOOLS = frozenset((
+    "record_finding", "dismiss_finding", "export_report", "read_artifact",
+    "set_target", "remember_lesson", "manage_scope", "manage_program",
+    "save_file", "delete_file", "cookie_inspector", "update_plan",
+    "recall_data", "load_skill", "listener",
+))
+_PIVOT_LOW_SIGNAL_THRESHOLD = 3
+_PIVOT_DEAD_END_THRESHOLD = 5
+_COUNTABLE_FIELD_NAME_RE = re.compile(r"(count|found|hits?|total|num)", re.IGNORECASE)
+_PIVOT_IGNORED_RESULT_KEYS = frozenset((
+    "status", "note", "_cache_note", "_pivot_note", "harvested_security_artifacts", "LEAK_ALERT",
+    "normalized_response", "caution", "report_path", "raw_evidence_attached", "error", "blocked",
+))
+
+
+def _result_is_low_signal(result: Any) -> bool:
+    """
+    Best-effort, deliberately conservative heuristic: did this tool result
+    carry any real discovered-something signal, or did it come back
+    essentially empty? Only trips on a result shape we can actually judge
+    (has at least one list/dict-valued field, or a count-ish-named numeric
+    field) — an unfamiliar result shape is left alone rather than guessed
+    at, and an outright error/blocked result is never counted here (that's
+    a different failure mode, already surfaced via its own path).
+    """
+    if not isinstance(result, dict) or result.get("error") or result.get("blocked"):
+        return False
+    had_countable_field = False
+    for k, v in result.items():
+        if k in _PIVOT_IGNORED_RESULT_KEYS:
+            continue
+        if isinstance(v, (list, dict, set, tuple)):
+            had_countable_field = True
+            if len(v) > 0:
+                return False
+        elif isinstance(v, (int, float)) and not isinstance(v, bool) and _COUNTABLE_FIELD_NAME_RE.search(k):
+            had_countable_field = True
+            if v > 0:
+                return False
+    return had_countable_field
+
+
 def _cookies_for_browser_seed(target: Target) -> List[Dict[str, Any]]:
     """
     Builds Playwright-shaped cookie records (name/value/domain/path) from
@@ -8255,6 +8408,224 @@ def _lookup_curl_evidence(target: Target, request_ref: str, limit: int = 2) -> L
     return [m["raw"] for m in matches[:limit] if m.get("raw")]
 
 
+def _lookup_terminal_evidence(target: Target, request_ref: str, limit: int = 2) -> List[str]:
+    """
+    Fallback evidence source for record_finding when curl_evidence_log has
+    no match for request_ref — searches terminal_evidence_log (see
+    _mirror_terminal_evidence_generic) by substring match against the
+    COMMAND text itself, not a URL field, since a sqlmap/hydra/nmap PoC's
+    request_ref is usually a bare endpoint/host that appears somewhere
+    INSIDE the command line (a -u flag value, a connection string), not a
+    URL the log is keyed on the way curl's is.
+    """
+    if not request_ref or not hasattr(target, "state") or not isinstance(target.state, dict):
+        return []
+    ref_lower = request_ref.strip().lower()
+    if not ref_lower:
+        return []
+    ref_bare = ref_lower.split("?", 1)[0]  # match the endpoint even if request_ref carries query params the command doesn't repeat verbatim
+    log = target.state.get("terminal_evidence_log") or []
+    matches = [
+        e for e in reversed(log)
+        if isinstance(e, dict) and e.get("command")
+        and (ref_lower in e["command"].lower() or (ref_bare and ref_bare in e["command"].lower()))
+    ]
+    return [m["raw"] for m in matches[:limit] if m.get("raw")]
+
+
+# ── Validation-over-detection gate ──────────────────────────────────────
+# The generalized fix for the exact pattern that produced a garbage SQLi
+# report (nothing but a sqlmap banner) and an LFI finding that turned out
+# to be a honeypot: a captured request/response alone ("the request went
+# through, got a 200/delay") was being treated as equivalent to "this is
+# a confirmed, exploitable bug." It isn't — it's proof a request was
+# SENT, not proof the vulnerability is real. The EVIDENCE GUARDRAIL above
+# already requires SOME captured request/response to exist; this is a
+# second, narrower gate on top of it for the handful of vuln classes
+# where genuine exploitation proof is realistically obtainable, applied
+# only at the severities (critical/high) that actually get trusted,
+# escalated, or submitted — a low/medium "worth tracking as a lead"
+# finding isn't gated here, only the ones claiming to be the real thing.
+# Each entry: (trigger substrings matched against the lowercased `kind`
+# string, guidance on what "proof" actually looks like for that class).
+_VERIFICATION_REQUIRED_CLASSES = [
+    (("sqli", "sql_injection", "sql injection"),
+     "Show the actual extracted proof — a dumped row, a confirmed DB/table name pulled out via the "
+     "injection, or a measurable time-based/boolean delta you can point to — not just that the "
+     "payload was sent and the app responded 200 or delayed."),
+    (("xss", "cross_site_scripting", "cross-site scripting"),
+     "Confirm the payload actually executed — a listener/callback hit, or a headless-browser render "
+     "showing it firing (console log, DOM mutation, alert) — not just that it reflected back "
+     "unencoded in the response body."),
+    (("ssrf", "server_side_request_forgery", "server-side request forgery"),
+     "Confirm the request actually reached the internal/attacker-controlled target — an out-of-band "
+     "listener hit carrying the unique token/marker you embedded — not just that the app accepted "
+     "the URL parameter without erroring."),
+    (("idor", "insecure_direct_object", "broken_object_level", "bola"),
+     "Show the cross-account difference directly — evidence that a DIFFERENT account's data/object "
+     "was actually reached using this session/identity, not just that the request returned 200."),
+    (("access_control", "authz_bypass", "privilege_escalation", "broken_access_control", "auth_bypass", "account_takeover"),
+     "Show the cross-privilege/cross-identity difference directly — evidence that a lower-privileged "
+     "or different identity actually reached something it should not have, not just that the request "
+     "went through."),
+]
+# Boilerplate that technically satisfies "non-empty verification_note" but
+# carries zero actual evidence — rejected the same as leaving it blank,
+# so a model can't satisfy this gate by just echoing the word back.
+_VERIFICATION_NOTE_BOILERPLATE = {
+    "verified", "confirmed", "yes", "it works", "it is verified", "it is confirmed",
+    "this is verified", "this is confirmed", "verified true", "true", "it was verified",
+}
+
+
+def _verification_requirement_for_kind(kind: str) -> Optional[str]:
+    for triggers, guidance in _VERIFICATION_REQUIRED_CLASSES:
+        if any(t in kind for t in triggers):
+            return guidance
+    return None
+
+
+# ── Signal-chaining ──────────────────────────────────────────────────────
+# A pro hunter doesn't report "open redirect" and "OAuth callback" as two
+# unrelated low-severity blips — they notice the open redirect sits on the
+# OAuth flow and chains them into an account takeover. Nothing upstream of
+# this looked across findings for that kind of combination; it was purely
+# additive. This is the generalized, advisory fix: whenever a finding is
+# recorded, it's checked against every OTHER finding already on this
+# target for known combination patterns, and a note is surfaced (never
+# blocking, never auto-escalating severity on its own — that stays the
+# model's judgment call once it looks at the actual pair).
+# Each pattern: a label, two keyword sets ("triggers_a"/"triggers_b")
+# matched against a finding's combined type+kind+note text, and guidance
+# on what the combination could mean. A combo fires when one finding hits
+# triggers_a and the OTHER hits triggers_b (checked both directions).
+_CHAIN_PATTERNS = [
+    {
+        "label": "Open redirect + OAuth/SSO flow -> possible account takeover",
+        "triggers_a": ("open_redirect", "open redirect", "unvalidated redirect"),
+        "triggers_b": ("oauth", "sso", "saml", "redirect_uri", "callback"),
+        "guidance": (
+            "An open redirect that can be pointed at an OAuth/SSO redirect_uri can leak the auth "
+            "code/token to an attacker-controlled host. Check whether the identity provider's "
+            "redirect_uri validation accepts this endpoint, and whether the leaked code/token is "
+            "usable to complete login as the victim."
+        ),
+    },
+    {
+        "label": "SSRF + cloud metadata exposure -> possible cloud credential leak",
+        "triggers_a": ("ssrf",),
+        "triggers_b": ("169.254.169.254", "metadata", "iam role", "cloud credential", "instance credential"),
+        "guidance": (
+            "An SSRF that can reach the cloud metadata service (169.254.169.254 on AWS/GCP/Azure) can "
+            "leak the instance's IAM credentials. Try pivoting the SSRF at the metadata endpoint for "
+            "temporary cloud credentials — usually a far higher-impact finding than the SSRF alone."
+        ),
+    },
+    {
+        "label": "XSS + session/admin-facing surface -> possible privileged session hijack",
+        "triggers_a": ("xss", "cross_site_scripting", "cross-site scripting"),
+        "triggers_b": ("admin", "httponly", "session cookie", "privileged"),
+        "guidance": (
+            "An XSS alongside a finding that touches session/cookie handling or an admin-facing surface "
+            "can chain into hijacking a privileged session. Check whether the XSS fires in a context a "
+            "higher-privileged user actually visits, and whether session cookies lack HttpOnly so the "
+            "XSS can read them directly."
+        ),
+    },
+    {
+        "label": "Exposed secret/source + authentication endpoint -> possible direct auth bypass",
+        "triggers_a": ("exposed_source", "hardcoded secret", "leaked credential", "api key leak", "secret leak"),
+        "triggers_b": ("auth", "login", "jwt", "signing key", "api_key"),
+        "guidance": (
+            "A leaked secret/credential is far more impactful when there's a concrete authentication/"
+            "signing endpoint it can be used against. Check whether the exposed secret (API key, JWT "
+            "signing key, hardcoded credential) can be used directly to authenticate, forge tokens, or "
+            "reach another finding's endpoint."
+        ),
+    },
+    {
+        "label": "IDOR + mass assignment -> possible unauthorized write, not just read",
+        "triggers_a": ("idor", "insecure_direct_object"),
+        "triggers_b": ("mass_assignment", "mass assignment"),
+        "guidance": (
+            "An IDOR combined with mass assignment on the same or a related endpoint can mean not just "
+            "READING another user's object via ID manipulation, but also WRITING/modifying fields on it "
+            "that shouldn't be attacker-controlled (role, balance, ownership). Check whether the mass-"
+            "assignment-vulnerable fields are reachable through the IDOR'd object."
+        ),
+    },
+    {
+        "label": "Subdomain takeover + any other finding on the SAME host -> trusted-domain hosting",
+        "triggers_a": ("takeover", "subdomain_takeover", "dangling"),
+        "triggers_b": (),  # special-cased below: matches ANY other finding on the same host
+        "same_host_special": True,
+        "guidance": (
+            "A subdomain takeover means attacker-controlled content can be hosted under this "
+            "organization's trusted domain. Any other finding tied to the SAME host (or a sibling host "
+            "that trusts it, e.g. via cookies scoped to the parent domain) becomes more severe, since "
+            "phishing/malware served from a takeover looks fully legitimate."
+        ),
+    },
+]
+
+
+def _finding_host(finding: Dict[str, Any]) -> str:
+    try:
+        return (urlparse(str(finding.get("target", ""))).netloc or "").split(":")[0].strip().lower()
+    except Exception:
+        return ""
+
+
+def _detect_finding_chains(target: Target, new_finding: Dict[str, Any]) -> List[str]:
+    """
+    Best-effort cross-finding correlation (see _CHAIN_PATTERNS above).
+    Looks at the finding just recorded against every OTHER finding already
+    on this target. Advisory only — returns human-readable notes, never
+    mutates severity or blocks anything.
+    """
+    existing = [f for f in (getattr(target, "findings", None) or []) if isinstance(f, dict) and f is not new_finding]
+    if not existing:
+        return []
+
+    def _blob(f: Dict[str, Any]) -> str:
+        return f"{f.get('type', '')} {f.get('kind', '')} {f.get('note', '')}".lower()
+
+    new_blob = _blob(new_finding)
+    notes: List[str] = []
+    seen = set()
+
+    for pattern in _CHAIN_PATTERNS:
+        triggers_a = pattern["triggers_a"]
+        triggers_b = pattern.get("triggers_b") or ()
+        a_hit_new = any(t in new_blob for t in triggers_a)
+
+        for other in existing:
+            other_blob = _blob(other)
+
+            if pattern.get("same_host_special"):
+                a_hit_other = any(t in other_blob for t in triggers_a)
+                if not (a_hit_new or a_hit_other):
+                    continue
+                takeover_f, partner_f = (new_finding, other) if a_hit_new else (other, new_finding)
+                if _finding_host(takeover_f) and _finding_host(takeover_f) == _finding_host(partner_f):
+                    key = (pattern["label"], id(other))
+                    if key not in seen:
+                        seen.add(key)
+                        notes.append(f"{pattern['label']} — paired with existing finding '{other.get('type', '?')}'. {pattern['guidance']}")
+                continue
+
+            b_hit_other = any(t in other_blob for t in triggers_b)
+            b_hit_new = any(t in new_blob for t in triggers_b)
+            a_hit_other = any(t in other_blob for t in triggers_a)
+            if (a_hit_new and b_hit_other) or (b_hit_new and a_hit_other):
+                key = (pattern["label"], id(other))
+                if key not in seen:
+                    seen.add(key)
+                    notes.append(f"{pattern['label']} — paired with existing finding '{other.get('type', '?')}'. {pattern['guidance']}")
+
+    return notes
+
+
 def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Logs a finding YOU have already confirmed (not a guess or a plan) into
@@ -8299,6 +8670,14 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         }
 
     raw_evidence_matches = _lookup_curl_evidence(target, request_ref)
+    if not raw_evidence_matches and request_ref:
+        # Fallback to terminal_evidence_log -- a PoC run via sqlmap, hydra,
+        # nmap, or a hand-rolled script through run_terminal_command never
+        # lands in curl_evidence_log (that log is reserved for genuine HTTP-
+        # client commands, see _mirror_http_evidence_from_terminal), so
+        # without this a sqlmap-confirmed SQLi finding would hit the
+        # no-evidence gate below despite real captured output existing.
+        raw_evidence_matches = _lookup_terminal_evidence(target, request_ref)
 
     # EVIDENCE GUARDRAIL — the actual fix for the "LFI report had no PoC"
     # bug: a finding that names a SPECIFIC endpoint (request_ref given) but
@@ -8330,6 +8709,36 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
                 f"HTTP request), pass 'no_http_evidence_reason' explaining why, and this will record normally."
             ),
         }
+
+    # VERIFICATION GATE — see _VERIFICATION_REQUIRED_CLASSES above. Real
+    # evidence exists at this point (the guardrail above already enforced
+    # that) — this checks whether that evidence actually PROVES exploitation,
+    # for the vuln classes where that's realistically obtainable, at the
+    # severities that get trusted/escalated/submitted.
+    _verification_guidance = _verification_requirement_for_kind(kind)
+    if _verification_guidance and severity in ("critical", "high"):
+        _verified_flag = args.get("verified")
+        _verified_ok = _verified_flag in (True, "true", "True", "yes", "Yes", 1)
+        _verification_note = str(args.get("verification_note", "")).strip()
+        _note_substantive = (
+            len(_verification_note) >= 15
+            and _verification_note.lower().strip(".! ") not in _VERIFICATION_NOTE_BOILERPLATE
+        )
+        if not (_verified_ok and _note_substantive):
+            return {
+                "status": "blocked_unverified",
+                "note": (
+                    f"Not recording this as {severity} yet — '{kind}' at {severity} severity needs real "
+                    f"exploitation proof, not just a captured request/response (that only proves a request "
+                    f"was sent, not that the vulnerability is real). {_verification_guidance} Once you "
+                    f"actually have that proof: call record_finding again with verified=true and "
+                    f"verification_note describing exactly what you observed as proof — not a restatement "
+                    f"like 'verified' or 'confirmed'. If you can't get that proof right now, either keep "
+                    f"working the exploitation step, or record this at 'medium' or lower severity as a "
+                    f"lead/candidate instead of {severity} — downgrade the SEVERITY to reflect what's "
+                    f"actually confirmed, don't relabel the vuln class to dodge this gate."
+                ),
+            }
 
     # Dedup: the storage layer's own dedup keys on the WHOLE finding dict,
     # which differs any time the title is reworded even slightly — this let
@@ -8429,6 +8838,16 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     if raw_evidence_matches:
         finding["raw_evidence"] = raw_evidence_matches
 
+    # Carry the verification proof itself onto the finding (when given,
+    # even for kinds/severities that weren't gated on it) so export_report
+    # can show "how this was confirmed" instead of just "it was confirmed."
+    _incoming_verified = args.get("verified")
+    if _incoming_verified in (True, "true", "True", "yes", "Yes", 1):
+        finding["verified"] = True
+        _vnote = str(args.get("verification_note", "")).strip()
+        if _vnote:
+            finding["verification_note"] = _vnote
+
     # Save the auto-report BEFORE persisting the finding, so the path can
     # be stored ON the finding — that's what lets a later re-confirmation
     # of this same finding (see _merge_into_existing_finding above) update
@@ -8443,6 +8862,17 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         save_target(target)
     except Exception as e:
         return {"error": f"Failed to record finding: {e}"}
+
+    # Signal-chaining — see _detect_finding_chains above. Best-effort and
+    # purely advisory; never blocks or mutates the finding just recorded.
+    chain_notes: List[str] = []
+    try:
+        chain_notes = _detect_finding_chains(target, finding)
+        if chain_notes and emit and hasattr(emit, "warn"):
+            for _cn in chain_notes:
+                emit.warn(f"[⛓] Possible chain: {_cn}")
+    except Exception:
+        pass
 
     # Immediate cross-target "worked" lesson — the confirmed-finding
     # counterpart to dismiss_finding's immediate "failed" lesson above.
@@ -8477,6 +8907,8 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         result["raw_evidence_attached"] = len(raw_evidence_matches)
     if auto_report_path:
         result["report_path"] = auto_report_path
+    if chain_notes:
+        result["chain_candidates"] = chain_notes
     if caution:
         result["caution"] = caution
 
@@ -9839,6 +10271,16 @@ def _execute_set_target_stub(args: Dict[str, Any], target: Target, emit: Any) ->
     return {"error": "set_target must be routed through Agent.execute_tool_call, not called directly."}
 
 
+def _execute_remember_lesson_stub(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Placeholder to satisfy ToolSpec's executor signature — same reasoning
+    as _execute_set_target_stub: the real implementation (Agent._execute_
+    remember_lesson) needs `self.session_digest`, so it's special-cased in
+    Agent.execute_tool_call. This stub should never actually be reached.
+    """
+    return {"error": "remember_lesson must be routed through Agent.execute_tool_call, not called directly."}
+
+
 def _execute_load_skill(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Loads a skill's full methodology content on demand, by name, from the skill menu."""
     name = str(args.get("name", "")).strip()
@@ -9957,7 +10399,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "record_finding": ToolSpec(
         name="record_finding",
-        description="Log a finding you have ALREADY CONFIRMED (via curl/spider/other tools — not a plan or a guess) into the investigation's structured memory, so it persists across turns and feeds the running investigation summary. Use this once you've verified something real: a confirmed IDOR, a role you successfully escalated to, a token leak, etc. Do not use this to record intentions or untested hypotheses. CRITICAL: completing a normal, successful login/authentication with credentials you were legitimately given is NEVER itself a finding, no matter how technically involved the flow was (OAuth, SAML, SSO) — e.g. logging in as 'wiener' using the wiener:peter credentials the researcher gave you is just step one of the task, not a vulnerability. Only call this once you've demonstrated actual unauthorized impact: access to a DIFFERENT identity/account's data or privileges than the one whose credentials you used, an authorization check that should have blocked you but didn't, or similar. If what you have is 'I completed the intended login flow' and the researcher's actual objective (e.g. 'log in as carlos without his password') is still unmet, do not record a finding — keep working toward the real objective, or say plainly what's blocking you.",
+        description="Log a finding you have ALREADY CONFIRMED (via curl/spider/other tools — not a plan or a guess) into the investigation's structured memory, so it persists across turns and feeds the running investigation summary. Use this once you've verified something real: a confirmed IDOR, a role you successfully escalated to, a token leak, etc. Do not use this to record intentions or untested hypotheses. CRITICAL: completing a normal, successful login/authentication with credentials you were legitimately given is NEVER itself a finding, no matter how technically involved the flow was (OAuth, SAML, SSO) — e.g. logging in as 'wiener' using the wiener:peter credentials the researcher gave you is just step one of the task, not a vulnerability. Only call this once you've demonstrated actual unauthorized impact: access to a DIFFERENT identity/account's data or privileges than the one whose credentials you used, an authorization check that should have blocked you but didn't, or similar. If what you have is 'I completed the intended login flow' and the researcher's actual objective (e.g. 'log in as carlos without his password') is still unmet, do not record a finding — keep working toward the real objective, or say plainly what's blocking you. VALIDATION GATE: for sqli/xss/ssrf/idor/access-control-category kinds filed at 'critical' or 'high' severity, a captured request/response alone is not enough — pass verified=true and a real verification_note (what you actually observed as proof: a dumped row, a listener hit, a cross-account diff), or the call is blocked with guidance on what proof is needed for that class. A request that merely went through and returned 200 is not proof of exploitation.",
         parameters={
             "type": "object",
             "properties": {
@@ -9966,7 +10408,9 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "severity": {"type": "string", "description": "Your assessed severity: critical, high, medium, or low.", "default": "medium"},
                 "request_ref": {"type": "string", "description": "The URL/endpoint the finding applies to. If given, this call is BLOCKED unless a real request/response for this exact endpoint was actually captured this session (via the curl tool, or run_terminal_command running an HTTP-shaped command) — a finding with no real PoC attached is exactly what makes a report look like a false positive at triage. Omit only for a finding with no single endpoint (e.g. a weak SSH credential)."},
                 "note": {"type": "string", "description": "Your own short analysis of why this confirms the finding. You do NOT need to retype raw request/response data here — the real request/response for this exact request_ref is captured automatically from requests already made this session and attached to the report; this field is for your interpretation, not for reconstructing evidence from memory."},
-                "no_http_evidence_reason": {"type": "string", "description": "Only needed if request_ref is given but there's genuinely no HTTP request/response to show (a local privesc, a cracked SSH credential, something confirmed by direct observation). Explain why — this overrides the evidence gate. Never use this as a shortcut to skip actually re-running an HTTP PoC that's missing only because it was never tried through curl/run_terminal_command."}
+                "no_http_evidence_reason": {"type": "string", "description": "Only needed if request_ref is given but there's genuinely no HTTP request/response to show (a local privesc, a cracked SSH credential, something confirmed by direct observation). Explain why — this overrides the evidence gate. Never use this as a shortcut to skip actually re-running an HTTP PoC that's missing only because it was never tried through curl/run_terminal_command."},
+                "verified": {"type": "boolean", "description": "Set true when you have REAL exploitation proof, not just a captured request/response — required (along with verification_note) for sqli/xss/ssrf/idor/access-control-category kinds filed at critical/high severity. Leaving this false/omitted is fine for a lead you're still chasing; file it at medium or lower severity instead."},
+                "verification_note": {"type": "string", "description": "What you actually observed as proof of exploitation — a dumped row and its value, the exact listener token that hit, the specific cross-account data you reached. Required alongside verified=true for the gated kinds/severities above. A restatement like 'verified' or 'confirmed' does not count and will be rejected."}
             },
             "required": ["title"]
         },
@@ -11169,6 +11613,41 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["host"]
         },
         executor=_execute_set_target_stub
+    ),
+    "remember_lesson": ToolSpec(
+        name="remember_lesson",
+        description=(
+            "Save a lesson for real, not just in this reply — call this the MOMENT the researcher says "
+            "something like 'remember this', 'don't make that mistake again', 'save that to memory', or "
+            "corrects a mistake and asks you to retain it. Saying 'noted' / 'lesson logged' in plain text "
+            "without calling this tool saves NOTHING — the researcher cannot tell the difference from the "
+            "outside, and the lesson is gone the moment this session ends. This writes to the cross-target "
+            "lessons store (so a DIFFERENT target with a similar stack benefits later) AND pins a note into "
+            "THIS session's own memory immediately (so it's visible for the rest of this investigation too). "
+            "Use this for ANY researcher-stated lesson, not just ones tied to a dismissed finding — "
+            "dismiss_finding already saves its own lesson automatically when a finding is retracted; this "
+            "tool is for everything else the researcher wants remembered (a mistake you made, a technique "
+            "that worked well, a pattern to watch for)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "lesson": {
+                    "type": "string",
+                    "description": "The lesson itself, in one or two sentences, specific enough to change behavior next time — not a vague 'be more careful'. State what to DO differently, e.g. 'when a file-traversal response is 200 but the body literally says Mock/placeholder content, it's a honeypot — stop chasing LFI and pivot to testing the same parameter for SSRF instead'.",
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": ["worked", "failed"],
+                    "description": "'failed' for a mistake/dead-end to avoid repeating (the common case), 'worked' for a technique that succeeded and is worth trying again elsewhere. Defaults to 'failed'.",
+                },
+                "tech_signature": {
+                    "description": "Optional list (or comma/space-separated string) of tags describing the tech stack this lesson applies to (e.g. ['php', 'codiad', 'jquery']) so it surfaces again on a similarly-stacked target. Omit to fall back to this target's own fingerprinted technologies, if any.",
+                },
+            },
+            "required": ["lesson"]
+        },
+        executor=_execute_remember_lesson_stub
     ),
 }
 
@@ -12502,6 +12981,100 @@ If there is nothing worth generalizing, return an empty array: []"""
             result["migrated_from"] = migrated_from
         return result
 
+    def _execute_remember_lesson(self, args: Dict[str, Any], emit: Any = None) -> Dict[str, Any]:
+        """
+        Explicit, researcher-triggered persistence of a lesson. Call this
+        the MOMENT the researcher says something like "remember this",
+        "don't make that mistake again", "save that to memory", or
+        corrects a mistake and asks you to retain it — not just
+        acknowledging it in your reply text. A reply that says "lesson
+        logged" without actually calling this tool hasn't logged
+        anything; the researcher has no way to tell the difference from
+        the outside, which is exactly the gap this closes.
+
+        This is DIFFERENT from the automatic lesson dismiss_finding
+        writes (which only fires when a recorded finding gets retracted)
+        — this is the general-purpose version for ANY lesson the
+        researcher wants kept, whether or not a finding was ever
+        recorded. It writes to TWO places at once:
+          1. The cross-target lessons store (~/.hellhound/lessons.json,
+             via add_lesson) — so a DIFFERENT target with a similar tech
+             signature benefits from this later, same as dismiss_finding's
+             automatic write.
+          2. This target's own session digest's pinned section (via
+             self.session_digest, the live in-memory copy — not just
+             target.state, which could still be stale until the next
+             save) — so it's visible for the REST OF THIS SESSION too,
+             immediately, without waiting for a cross-target match that
+             may never come if this same target is what matters right now.
+        """
+        lesson_text = str(args.get("lesson", "")).strip()
+        if not lesson_text:
+            return {
+                "error": (
+                    "lesson is required — state what to remember in one or two sentences, specific "
+                    "enough to act on next time (e.g. 'when file-traversal responses return 200 but the "
+                    "body says Mock/placeholder content, it's a honeypot — pivot to testing the same "
+                    "parameter for SSRF instead'), not just 'be more careful'."
+                ),
+            }
+
+        outcome = str(args.get("outcome", "failed")).strip().lower()
+        if outcome not in ("worked", "failed"):
+            outcome = "failed"
+
+        tech_signature = args.get("tech_signature")
+        sig_tags: List[str] = []
+        if isinstance(tech_signature, list):
+            sig_tags = [str(t).strip().lower() for t in tech_signature if t]
+        elif isinstance(tech_signature, str) and tech_signature.strip():
+            sig_tags = [t for t in re.split(r"[,\s]+", tech_signature.strip().lower()) if t]
+        if not sig_tags and self.target and isinstance(self.target.state, dict):
+            # Fall back to whatever tech this target's own fingerprinting
+            # already found, so the lesson is still retrievable against a
+            # similar stack later even if the model didn't think to pass
+            # tech_signature explicitly.
+            techs = self.target.state.get("technologies")
+            if isinstance(techs, list):
+                sig_tags = [str(t).strip().lower() for t in techs[:8] if t]
+
+        try:
+            add_lesson(
+                technique=lesson_text[:200],
+                outcome=outcome,
+                tech_signature=sig_tags,
+                note=f"Researcher asked to remember this: {lesson_text}",
+                target_name=self.target.name if self.target else "",
+            )
+        except Exception as e:
+            return {"error": f"Failed to save lesson: {e}"}
+
+        # Pin it into THIS session's own digest immediately (self.session_digest
+        # is the live copy the orchestrator prompt reads every turn — see
+        # handle_message) so the researcher doesn't have to trust a bare
+        # "I'll remember that" with nothing to show for it.
+        try:
+            pin_line = f'- Lesson (researcher-saved): "{lesson_text}"'[:_PINNED_LINE_CHAR_CAP]
+            narrative, pinned = _split_pinned_section(self.session_digest or "")
+            merged = _merge_pinned_lines(pinned, [pin_line])
+            self.session_digest = _compose_digest(narrative, merged, self._DIGEST_CHAR_CAP)
+            if self.target and isinstance(self.target.state, dict):
+                self.target.state["session_digest"] = self.session_digest
+                save_target(self.target)
+        except Exception:
+            pass  # the cross-target lesson write above already succeeded; this pin is a bonus, not load-bearing
+
+        if emit and hasattr(emit, "success"):
+            emit.success(f"[✓] Lesson saved: {lesson_text}")
+
+        return {
+            "status": "saved",
+            "lesson": lesson_text,
+            "outcome": outcome,
+            "tech_signature": sig_tags,
+            "note": "Saved to the cross-target lessons store AND pinned into this session's own digest — both are now durable, not just acknowledged in this reply.",
+        }
+
     @property
     def _display_host(self) -> str:
         """
@@ -12760,6 +13333,14 @@ If there is nothing worth generalizing, return an empty array: []"""
         # other tool uses.
         if tool_name == "set_target":
             return self._execute_set_target(args, emit)
+
+        # remember_lesson needs `self` for the same reason set_target
+        # does — it pins a note into self.session_digest (the live,
+        # in-memory copy), not just target.state, so it's visible for the
+        # REST OF THIS SESSION immediately, not only after the next
+        # compaction pass reloads it from disk.
+        if tool_name == "remember_lesson":
+            return self._execute_remember_lesson(args, emit)
 
         # Internal memory & finding recording tools operate locally on target state.
         # manage_scope/save_file/delete_file join this list for the same reason: they
@@ -13056,6 +13637,53 @@ If there is nothing worth generalizing, return an empty array: []"""
                     "blocked": True
                 }
 
+        # 3.5 Deterministic recon-tool result cache — some recon tools
+        # (js_miner, js_static_analysis) are pure parsers: their output is
+        # a function of (page content + args), not of anything session-
+        # dependent, so re-running the identical call can never produce
+        # new data unless the underlying content or session changed.
+        # Seen in the wild (2026-10, Codiad engagement): the model re-ran
+        # js_miner on the exact same URL 6+ times across consecutive
+        # "continue" turns after it came back empty, instead of trying a
+        # different approach — the orchestrator loop's exact-duplicate
+        # dedup (_executed_signatures) only covers ONE handle_message call
+        # and resets every turn, so it does nothing across turn
+        # boundaries. This is a small, curated CROSS-TURN cache scoped to
+        # target.state (so it survives across turns and even process
+        # restarts via save_target), limited to tools with no side effects
+        # and no session dependency, so caching them can never hide a
+        # result that would legitimately differ on retry. Gated on
+        # _session_fingerprint so a re-login/rotated token still busts it.
+        _CACHEABLE_DETERMINISTIC_TOOLS = ("js_miner", "js_static_analysis")
+        _cache_key = None
+        if tool_name in _CACHEABLE_DETERMINISTIC_TOOLS and self.target and hasattr(self.target, "state") and isinstance(self.target.state, dict):
+            try:
+                _cache_sig = json.dumps(args, sort_keys=True, default=str)
+            except Exception:
+                _cache_sig = str(args)
+            _cache_key = f"{tool_name}:{_cache_sig}"
+            _recon_cache = self.target.state.setdefault("_recon_result_cache", {})
+            _current_fp = _session_fingerprint(self.target)
+            _cached_entry = _recon_cache.get(_cache_key)
+            if _cached_entry and _cached_entry.get("fingerprint") == _current_fp:
+                _cached_entry["hit_count"] = _cached_entry.get("hit_count", 1) + 1
+                _hits = _cached_entry["hit_count"]
+                try:
+                    cached_result = json.loads(json.dumps(_cached_entry.get("result")))
+                except Exception:
+                    cached_result = _cached_entry.get("result")
+                if isinstance(cached_result, dict):
+                    stop_note = " Stop retrying this exact call — try a different tool, different args, or pivot to another approach instead." if _hits >= 2 else ""
+                    cached_result["_cache_note"] = (
+                        f"CACHED RESULT — this exact {tool_name} call (identical args, unchanged session) already "
+                        f"ran {_hits} time(s) before and returned this same output. Re-running it again will not "
+                        f"surface new data; nothing about the target or these args has changed since the last call."
+                        f"{stop_note}"
+                    )
+                if emit and hasattr(emit, "info"):
+                    emit.info(f"{tool_name}: served from cache (identical call already ran this session, {_hits}x)")
+                return cached_result
+
         # 4. Rate Limiter (Pacing)
         is_recon = tool_name in ("subfinder", "dns_bruteforce", "httpx", "dig", "subzy", "vhost_fuzz", "gowitness")
         host = self.guard._extract_host(url)
@@ -13103,6 +13731,70 @@ If there is nothing worth generalizing, return an empty array: []"""
                     result["normalized_response"] = normalized
             except Exception:
                 pass
+
+            # Populate the deterministic recon-tool cache (see 3.5 above)
+            # so the NEXT identical call — even in a later turn — short-
+            # circuits instead of hitting the executor again. Only cache
+            # real results, not errors/blocks, so a transient failure
+            # (network hiccup, page temporarily down) doesn't get stuck
+            # as a permanent cached dead-end.
+            if _cache_key and isinstance(result, dict) and not result.get("error") and not result.get("blocked"):
+                try:
+                    _recon_cache = self.target.state.setdefault("_recon_result_cache", {})
+                    _recon_cache[_cache_key] = {
+                        "result": json.loads(json.dumps(result)),
+                        "fingerprint": _session_fingerprint(self.target),
+                        "hit_count": 1,
+                    }
+                    # Keep the cache from growing unbounded over a long
+                    # session — oldest entries (by insertion order, which
+                    # dict preserves) are dropped first.
+                    if len(_recon_cache) > 60:
+                        for _k in list(_recon_cache.keys())[:len(_recon_cache) - 60]:
+                            _recon_cache.pop(_k, None)
+                    save_target(self.target)
+                except Exception:
+                    pass
+
+            # Dead-end / pivot reflex (see definitions above) — tracks
+            # consecutive LOW-SIGNAL calls to this tool against this
+            # target, regardless of whether the args were identical call
+            # to call (that's what makes this different from, and
+            # complementary to, the exact-duplicate dedup and the js_miner/
+            # js_static_analysis cache above). A real/useful result resets
+            # the streak back to zero; a low-signal one bumps it and, past
+            # threshold, stamps an escalating note onto the result itself
+            # so the model sees it inline without needing a separate tool
+            # call to discover it.
+            if tool_name not in _PIVOT_EXEMPT_TOOLS and self.target and hasattr(self.target, "state") and isinstance(self.target.state, dict):
+                try:
+                    streaks = self.target.state.setdefault("_dead_end_streaks", {})
+                    if _result_is_low_signal(result):
+                        streaks[tool_name] = streaks.get(tool_name, 0) + 1
+                        _streak = streaks[tool_name]
+                        if _streak >= _PIVOT_LOW_SIGNAL_THRESHOLD and isinstance(result, dict):
+                            if _streak >= _PIVOT_DEAD_END_THRESHOLD:
+                                result["_pivot_note"] = (
+                                    f"DEAD END — '{tool_name}' has come back with nothing useful {_streak} times in a "
+                                    f"row against this target, even across different args. This approach is not "
+                                    f"working here. STOP calling {tool_name} and do one of: switch to a genuinely "
+                                    f"different tool, read/reason about the target manually instead of running "
+                                    f"another scripted scan, or tell the researcher this avenue is dry and ask how "
+                                    f"they'd like to proceed. Trying another variation of the same call is not a plan."
+                                )
+                            else:
+                                result["_pivot_note"] = (
+                                    f"'{tool_name}' has returned nothing useful {_streak} times in a row against this "
+                                    f"target. Before calling it again: is there a concrete reason to expect a "
+                                    f"DIFFERENT result this time (args that genuinely target something new, a "
+                                    f"session/auth state that actually changed), or is this just hoping a repeat "
+                                    f"works? If there's no concrete reason, switch tools or approach instead."
+                                )
+                    elif tool_name in streaks and streaks[tool_name]:
+                        streaks[tool_name] = 0
+                    save_target(self.target)
+                except Exception:
+                    pass
 
             return result
         except Exception as e:
@@ -13491,12 +14183,17 @@ RULES:
    - Once TARGET is no longer "default", do not call `set_target` again for the same host on every subsequent turn — only when the researcher clearly shifts to a genuinely different host.
 
 1. DECISION & TOOL SELECTION (CRITICAL):
-   - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network/recon tools (curl, spider, subfinder, httpx, etc.) — call `set_target` per rule 0 first if the message actually warrants it, otherwise there is nothing to point them at. This does NOT apply to target-independent tools that touch no network and don't need a scoped host: export_report, record_finding, dismiss_finding, read_artifact. If the researcher asks for a sample/demo/example report or output from one of those, CALL the tool for real (with clearly-labeled sample/placeholder data if no real findings exist yet) — do not output "DONE" and describe what you would generate instead, and do not print a fake tool-call JSON object as prose. Only fall back to "DONE" with a plain-language answer when nothing in the tool list, local or network, actually applies.
+   - TARGET VALIDITY & LOCAL QUERIES: If TARGET is "default" or no valid resolvable domain is scoped, NEVER generate network/recon tools (curl, spider, subfinder, httpx, etc.) — call `set_target` per rule 0 first if the message actually warrants it, otherwise there is nothing to point them at. This does NOT apply to target-independent tools that touch no network and don't need a scoped host: export_report, record_finding, dismiss_finding, read_artifact, remember_lesson. If the researcher asks for a sample/demo/example report or output from one of those, CALL the tool for real (with clearly-labeled sample/placeholder data if no real findings exist yet) — do not output "DONE" and describe what you would generate instead, and do not print a fake tool-call JSON object as prose. Only fall back to "DONE" with a plain-language answer when nothing in the tool list, local or network, actually applies.
+   - "REMEMBER THIS" / "SAVE TO MEMORY": the instant the researcher says something like "remember this", "don't make that mistake again", "save that to memory", or corrects a mistake and asks you to retain it — call `remember_lesson` with that lesson, THEN reply. Never just say "noted" / "lesson logged" / "I'll remember that" in plain text without the tool call — that saves nothing and silently disappears the moment this session ends; the researcher has no way to tell a real save from an empty promise except by checking whether the tool actually ran.
    - CONVERSATIONAL & EDUCATIONAL QUERIES — DECIDE BY THIS TEST, NOT BY MATCHING EXAMPLE PHRASES: Before considering any tool, ask yourself: "Can I fully and correctly answer THIS message using only what's already in ALREADY GATHERED THIS SESSION / conversation history, with zero new information from the target?" If yes — it's a question, a request to explain/recap something already done, an identity/capability/greeting question, a methodology question, anything answerable from existing context — output "DONE" immediately with a normal conversational reply. Only emit a tool call if answering genuinely requires NEW data or a NEW action against the target that isn't already sitting in front of you. Illustrative (not exhaustive) examples of the "no new data needed" case: "explain...", "how does...", "what is...", "why did...", "hi", "hello", "what can you do", "who are you", "who am i", "what's my name", "how does this work", "why did that fail", "what did you find". This test applies EVEN IF a target is already active and tools were run earlier in the session — an ongoing mission does not mean every subsequent message is part of it; judge THIS message on its own, by whether IT needs new data, not by session momentum. Being the first message in a session, or a target already being scoped, is NOT on its own a reason to start testing — the message itself has to actually require new information.
    - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a valid, in-scope target endpoint is required right now.
    - SCOPED TARGET & GOAL — SKIP UNNEEDED DISCOVERY: If the researcher already gave a specific, fully-qualified target (a single host/URL) AND a specific goal that doesn't call for discovering additional hosts/subdomains, do NOT run subfinder, dns_bruteforce, or other subdomain/asset-discovery tools before going at the given target — those are for when the attack surface itself is the unknown, not a habitual first step. Go straight at the given URL/endpoint with curl/spider/whatever the goal actually needs. Only reach for discovery tools if the goal explicitly requires finding more hosts, or the direct approach against the given target genuinely dead-ends and broadening scope is the only path left.
    - DO NOT re-run `spider` (a full crawl) more than once per meaningfully-different session state. A fresh unauthenticated crawl, then ONE re-crawl after obtaining an authenticated session, is normal and enough — re-crawling again on a specific sub-path you already have covered (e.g. crawling `/letters/new` right after already crawling the whole site authenticated) adds nothing and burns time. If you already have the endpoints you need from an earlier crawl in ALREADY GATHERED THIS SESSION, use `curl`/`content_discovery` directly against known endpoints instead of re-crawling. If the researcher has told you to stop re-running a tool, that instruction holds for the rest of the session, not just the message it was given in.
+   - `js_miner` / `js_static_analysis` RETURNED EMPTY/UNHELPFUL — DO NOT JUST RE-CALL IT: these are pure parsers (their output is a function of page content + args, not of anything that changes turn to turn), so calling either one again with the exact same `url`/`js_urls` against the same session will return the exact same result — it is mechanically incapable of finding more the second time. (Caught in the wild: js_miner re-run 6+ times across consecutive turns against the same target, every time coming back empty, because the model kept hoping a retry would help.) An identical repeat is now short-circuited automatically with a cached result and an explicit "stop retrying this" note — but don't wait for that; if the first call came back empty or thin, that's the signal to pivot: try `js_static_analysis` if you only ran `js_miner` (or vice versa), manually `curl`/`spider` the JS files and read them yourself for ajax/fetch calls the miner's patterns might not cover, or move on to a different recon avenue entirely. A second identical call is never the fix.
+   - ANY TOOL THAT KEEPS COMING BACK EMPTY — WATCH FOR `_pivot_note` IN THE RESULT: this isn't just a js_miner thing. Any recon/exploitation tool called repeatedly against the same target with nothing to show for it — even with DIFFERENT args each time — gets an escalating `_pivot_note` stamped onto its own result after 3 consecutive low-signal calls, and a hard "stop, this avenue is dead" note after 5. Treat that note as a direct instruction, not background noise: when you see one, the honest move is to actually change approach — a different tool, reading/reasoning about the target by hand instead of another scripted scan, or telling the researcher this avenue is dry — not to quietly try yet another variation of the same call and hope the next one lands. Before EVER re-calling a tool that just came back empty/thin, ask yourself: is there a concrete reason this specific retry will behave differently (a session/auth state that actually changed, args that target something genuinely new), or am I just hoping? If it's just hoping, don't.
    - DO NOT call `record_finding` in response to a message that isn't reporting NEW evidence. Explaining a bug you already found, recapping what happened, or the researcher reacting/complimenting/joking about a result already in ALREADY GATHERED THIS SESSION are conversational — they need zero tool calls, `record_finding` included. Re-recording something already confirmed doesn't make it "more confirmed"; it's noise, not evidence.
+   - "THE REQUEST WENT THROUGH" IS NOT "IT'S CONFIRMED" — a captured request/response proves a request was SENT, not that the vulnerability is real. Before filing sqli/xss/ssrf/idor/access-control-category findings at critical/high severity, actually get exploitation proof first: dump a real row for sqli (don't just send the payload and note a 200/delay), confirm the XSS payload actually fires (listener hit or headless render), confirm SSRF reaches the out-of-band listener with your token, show the literal cross-account/cross-privilege data difference for idor/BAC. `record_finding` enforces this — it will block with `status: blocked_unverified` and tell you exactly what proof is missing for that class if you try to file one of these at critical/high without `verified=true` and a real `verification_note`. Don't treat that block as a formality to talk your way past — go get the actual proof, or file it at medium/lower severity as a lead if you can't get it yet. This is the difference between a report that survives triage and one that doesn't.
+   - WATCH FOR `chain_candidates` ON `record_finding`'S RESULT — don't just file findings as isolated blips. When two separate findings combine into something bigger (an open redirect sitting on an OAuth callback = account takeover; an SSRF that reaches cloud metadata = credential leak; an XSS alongside weak session-cookie handling = session hijack; a subdomain takeover alongside anything else on that host = trusted-domain phishing), `record_finding` surfaces that pairing automatically as `chain_candidates` in its result. Treat that as a real lead, not a footnote: go verify whether the chain actually works (same rigor as any other finding — don't claim it's confirmed until you've actually demonstrated it), and if it does, that's very likely the higher-severity, higher-impact finding worth leading the report with, not the two smaller findings separately.
 
 2. MISSION OBJECTIVE FIDELITY & AUTONOMOUS EXPLOIT PROGRESSION (CRITICAL):
    - TARGET ACCOUNT / ROLE: Focus strictly on the primary requested target (e.g. Administrator or specified high-privilege role/user).

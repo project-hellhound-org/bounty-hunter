@@ -60,6 +60,29 @@ _GRAPHQL_OP_RE = re.compile(
     r'\b(?:query|mutation|subscription)\s+([A-Za-z0-9_]+)\s*(?:\(|\{)',
 )
 
+# CAUGHT IN THE WILD (2026-10): run against a real Codiad instance (classic
+# PHP-MVC web app, jQuery 1.7.2-era frontend) with 14 live JS files fetched
+# successfully, js_miner still reported "found no endpoint-shaped strings"
+# every single time. Root cause: every pattern above assumes a modern
+# REST/SPA convention — fetch()/axios(), or a path starting with "/api/",
+# "/v1/", etc. Codiad's actual JS calls $.ajax({url: "components/user/
+# controller.php?action=authenticate", ...}) and similar — a RELATIVE path
+# (no leading "/") to a classic backend script, which the old _record()
+# rejected outright (it only accepted paths starting with "/", "http", or
+# "{param}"). This isn't a Codiad-specific quirk — it's the default shape
+# for most pre-SPA PHP/ASP/JSP apps (WordPress admin-ajax.php, osCommerce,
+# phpBB, classic ASP sites), which this tool had zero coverage for despite
+# claiming to be a general endpoint miner. Fixed two ways: (1) a dedicated
+# pattern for bare backend-script references regardless of surrounding
+# context (not just inside a url:/endpoint: config key or fetch() call),
+# and (2) _record()'s own accept/reject gate no longer requires a leading
+# "/" when the path looks like a real backend script (ends in a known
+# server-side extension, optionally with a query string).
+_SCRIPT_EXT_RE = re.compile(r'\.(?:php\d?|aspx?|jsp|cgi|do|ashx)(?:\?[^\'"`]*)?$', re.IGNORECASE)
+_BARE_SCRIPT_REF_RE = re.compile(
+    r'[\'"`](/?[a-zA-Z0-9_][a-zA-Z0-9_\-./]*\.(?:php\d?|aspx?|jsp|cgi|do|ashx)(?:\?[a-zA-Z0-9_=&%.\-{}\$]*)?)[\'"`]',
+)
+
 # Noise to strip out — file extensions / asset paths that technically
 # match "starts with /" but are never an API endpoint worth reporting.
 _ASSET_EXT_RE = re.compile(
@@ -99,7 +122,11 @@ def _extract_endpoints(content: str, source_url: str) -> list:
             path = re.sub(r'\$\{[^}]+\}', '{param}', path)
         if len(path) < 2:
             return
-        if not (path.startswith("/") or path.startswith("http") or path.startswith("{param}")):
+        _looks_like_endpoint = (
+            path.startswith("/") or path.startswith("http") or path.startswith("{param}")
+            or bool(_SCRIPT_EXT_RE.search(path))  # relative classic-backend-script ref, e.g. "components/user/controller.php?action=X"
+        )
+        if not _looks_like_endpoint:
             return
         if _ASSET_EXT_RE.search(path):
             return
@@ -124,6 +151,9 @@ def _extract_endpoints(content: str, source_url: str) -> list:
         _record(m.group(1))
 
     for m in _TEMPLATE_LITERAL_RE.finditer(content):
+        _record(m.group(1))
+
+    for m in _BARE_SCRIPT_REF_RE.finditer(content):
         _record(m.group(1))
 
     graphql_ops = sorted(set(m.group(1) for m in _GRAPHQL_OP_RE.finditer(content)))

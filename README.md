@@ -35,7 +35,7 @@
 
 > [!WARNING]
 > ### ⚠️ Project Status & Active Development Notice
-> **Hellhound Bounty Hunter is currently under active development.** While it features automated multi-stage exploit chaining, two-tier neural routing, non-prunable artifact memory, and visual PoC verification, it is **not yet fully battle-tested on live production bug bounty targets**. Extensive testing and validation are actively ongoing across intentionally vulnerable CTF ranges (HackTheBox, CTFHub, PortSwigger Web Security Academy) and hardened local test environments. Use responsibly and strictly on authorized targets.
+> **Hellhound Bounty Hunter is currently under active development.** It's no longer purely a lab exercise — it's being run against real, authorized bug bounty programs alongside intentionally vulnerable CTF ranges (HackTheBox, CTFHub, PortSwigger Web Security Academy) and hardened local test environments, and that live-program testing is ongoing. **Recon is the strong suit** — asset discovery, crawling, JS/endpoint mining, and visual evidence capture consistently hold up well. The current weak point is further down the pipeline: **exploitation validation and vulnerability-identification accuracy** — confidently telling a real, confirmed bug apart from a false positive, and capturing solid enough evidence to prove it — is still being actively hardened. It is **not yet "fire and forget" on production targets**: review every finding before relying on it or submitting it. Use responsibly and strictly on authorized targets.
 
 ---
 
@@ -296,18 +296,18 @@ All actions can be triggered via slash commands or natural language:
 
 ## The Recon & Triage Arsenal
 
-Bounty Hunter coordinates **57 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
+Bounty Hunter coordinates **64 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
 
 | Category | Tools |
 | :--- | :--- |
-| **Passive & Active Recon** | `subfinder` `permute_subdomains` `resolve_candidates` `dns_bruteforce` `dig` `port_scan` `tls_cert_scan` `httpx` `nmap_service_scan` `wayback_urls` `gau_nuclei_sweep` `urlscan_recon` `google_dork` `otx_urls` `virustotal_lookup` `cloudscout` |
-| **Crawling & Content Discovery** | `spider` `katana` `content_discovery` `fuzz_hunter` `vhost_fuzz` `403_bypass` `wafbuster` |
+| **Passive & Active Recon** | `subfinder` `subdomain_sweep` `permute_subdomains` `resolve_candidates` `dns_bruteforce` `dig` `port_scan` `tls_cert_scan` `httpx` `nmap_service_scan` `wayback_urls` `gau_nuclei_sweep` `urlscan_recon` `google_dork` `otx_urls` `virustotal_lookup` `cloudscout` |
+| **Crawling & Content Discovery** | `spider` `katana` `content_discovery` `fuzz_hunter` `vhost_fuzz` `403_bypass` `wafbuster` `js_miner` |
 | **Visual & Browser** | `browser_control` `gowitness` |
-| **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` |
+| **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `wpscan_scan` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` `replay_request` |
 | **Takeover & Subdomain Health** | `takeover_scanner` `subzy` |
-| **Session, Scope & Workspace** | `cookie_inspector` `curl` `run_terminal_command` `set_target` `manage_scope` `manage_program` `listener` |
+| **Session, Scope & Workspace** | `cookie_inspector` `curl` `run_terminal_command` `set_target` `manage_scope` `manage_program` `listener` `recall_data` `update_plan` |
 | **HackerOne Program Intel** | `hackerone_policy` `hackerone_search` `hackerone_stats` |
-| **Findings, Artifacts & Reporting** | `record_finding` `dismiss_finding` `export_report` `read_artifact` `save_file` `delete_file` `load_skill` |
+| **Findings, Artifacts & Reporting** | `record_finding` `dismiss_finding` `remember_lesson` `export_report` `read_artifact` `save_file` `delete_file` `load_skill` |
 
 Ask the agent itself ("what tools do you have for X?") for what any one of these actually does — asking beats a wall of description text here, and the answer always reflects the real, current tool list instead of a snapshot that can drift out of date.
 
@@ -361,6 +361,13 @@ A few things landed recently that materially change how the agent feels to run:
 - **Cleaner `/help`** — no longer dumps all 30 skill descriptions into the main command listing; that lives at `/skills` (or `/help skills`) instead.
 - **`katana` + `jsluice`** added to the arsenal, for faster crawling and JS secret/endpoint extraction.
 - **Correctness fixes** — no more duplicated "still running" spinner lines; a successful login with valid, given credentials is no longer auto-recorded as a finding; related hosts named up front (e.g. an OAuth/IdP server needed for legitimate auth testing) can be pre-authorized into scope in one shot instead of tripping the scope gate mid-flow.
+- **`remember_lesson`** — a real "remember this" tool, called the instant a researcher asks the agent to retain something, instead of the agent just replying "noted" and forgetting it the moment the session ends. Writes to a durable cross-target lessons store and pins straight into the live session digest.
+- **Real evidence for non-curl findings** — `sqlmap`/`hydra`/`nmap`/custom-script findings (anything run via `run_terminal_command`) now capture and attach actual command output as evidence, fixing reports that used to come back with just a tool banner and no real proof; long output is excerpted from both the start and the end so the actual payoff doesn't get cut off by progress noise in the middle.
+- **`js_miner` now covers classic server-rendered apps** — it only recognized modern `fetch`/`axios`/absolute-path API calls before; it now also picks up relative, extension-based backend script references (`components/user/controller.php?action=...`-style), the dominant shape in PHP/ASP/JSP-era apps, which it previously found nothing on.
+- **No more blind repeat recon calls** — `js_miner`/`js_static_analysis` now cache their result per target; an identical repeat call (same URL, same session) is served from cache with a "stop retrying this" note instead of silently re-running and wasting a turn on a call that's mechanically guaranteed to return the same thing.
+- **Validation gate on `record_finding`** — for sqli/xss/ssrf/idor/access-control-category findings filed at critical/high severity, a captured request/response is no longer enough on its own; the agent has to assert `verified=true` with a real `verification_note` (a dumped row, a listener hit, a cross-account diff) or the call is blocked with class-specific guidance on what proof is actually needed. Low/medium "worth tracking as a lead" findings aren't gated.
+- **Dead-end / pivot reflex (all tools, not just js_miner)** — any recon/exploitation tool that keeps coming back with nothing useful against a target, even across *different* args each call, now gets an escalating note stamped onto its own result after 3 consecutive low-signal calls, and a hard "stop, this avenue is dead — change approach" after 5. A genuinely useful result resets the streak.
+- **Signal-chaining on `record_finding`** — a new finding is automatically cross-checked against every other finding already on the target for known high-impact combinations (open redirect + OAuth callback, SSRF + cloud metadata, XSS + weak session handling, subdomain takeover + anything on that host, exposed secret + auth endpoint, IDOR + mass assignment) and surfaced as `chain_candidates` — the agent stops reporting two separate low-severity blips when they actually combine into one account-takeover-grade chain.
 
 ---
 
@@ -372,14 +379,14 @@ The honest gap between "runs tools well" and "hunts like a pro" is architecture,
 2. **Unified session state** — one cookie jar shared by the browser, `curl`, `fuzz_hunter`, `sqlmap_scan`, `hydra`, and Burp/Caido, so logging in once is inherited everywhere instead of manually copying headers across tools. *(Smallest, highest-leverage piece of this — see below.)*
 3. **Intelligent request/response correlation** — spider output auto-parameterized and fed to the fuzzer by param type (ID, email, file, JSON); built-in response diffing against a baseline; endpoints auto-grouped by function (auth, payments, admin).
 4. **Real race/logic testing** — single-packet / last-byte synced requests across endpoints with configurable jitter, automatic state-mutation detection, multi-context coordinated race attacks.
-5. **Cross-session campaign memory** — target profiles (tech stack, WAF behavior, rate limits, quirks) and structured finding templates that survive past one context window, not just chat history.
+5. ~~**Cross-session campaign memory**~~ **(first slice landed)** — `remember_lesson` now writes a real, durable lesson the moment a researcher asks the agent to remember something: saved to a cross-target lessons store (keyed by tech signature, so e.g. a PHP/Codiad lesson resurfaces on the next PHP/Codiad-shaped target) *and* pinned straight into the live session digest, instead of just an acknowledged-in-the-reply, gone-when-the-session-ends promise. Still open: full target profiles (tech stack, WAF behavior, rate limits, quirks) beyond just lessons-learned.
 6. **Stealth/evasion as a first-class profile** — UA/TLS-fingerprint/IP rotation, WAF-fingerprint-driven bypass selection, distributed scan coordination with deduped results.
-7. **Validation over detection** — auto-extract one row on a confirmed SQLi, render XSS in a headless browser to confirm it actually executes, verify SSRF reaches an internal endpoint, confirm BOLA actually crosses accounts — not just "the request went through."
-8. **Report-ready evidence capture** — request/response pairs, screenshots, and curl repros auto-assembled per finding; finding-chaining (e.g. "XSS on /profile + IDOR on /api/user/{id} = account takeover").
+7. **Validation over detection** — *(this is the current top priority — see the status notice at the top: recon is solid, confidently separating a real confirmed bug from a false positive is the active gap)* — auto-extract one row on a confirmed SQLi, render XSS in a headless browser to confirm it actually executes, verify SSRF reaches an internal endpoint, confirm BOLA actually crosses accounts — not just "the request went through."
+8. **Report-ready evidence capture** — **(partially landed)** findings sourced from non-HTTP-client tools (sqlmap, hydra, nmap, custom scripts via `run_terminal_command`) now get real captured command output attached automatically instead of a blank or banner-only snapshot, and long tool output is excerpted from both ends (not just the head) so the actual payoff — a dumped row, a cracked credential — survives instead of getting cut by a progress-noise banner. Finding-chaining also landed in a first form: `record_finding` now cross-checks a new finding against every other finding already on the target for known combination patterns (open redirect + OAuth callback → account takeover, SSRF + cloud metadata → credential leak, XSS + weak session handling → session hijack, subdomain takeover + anything else on that host, exposed secret + auth endpoint, IDOR + mass assignment) and surfaces the pairing as `chain_candidates` — advisory, never auto-escalates severity on its own. Still open: screenshots auto-attached per finding, and widening the chain-pattern set beyond this first curated list.
 9. **Passive → active intel fusion** — CT logs + Wayback + gau + OTX deduped straight into `httpx`/fuzzing; JS sourcemap recovery → secret extraction → endpoint mapping, fed straight back into the fuzzer.
 10. **A real playbook engine** — conditional branching workflows ("new subdomain → screenshot → tech-detect → if WordPress, run X"), not just sequential tool chaining.
 
-**Next concrete step:** item 2's easy win — a single `CookieJar` per target, shared between `browser_control` and `curl` (~50 lines of backend glue) — turns "browser for auth, curl for the API" into one continuous session instead of manual cookie hand-offs between tools.
+**Next concrete step:** item 7, validation over detection — it's the one gap actively costing real engagements right now (see the status notice above), so it's ahead of item 2's cookie-jar unification in practice even though item 2 is still the smaller/easier build.
 
 ---
 
@@ -394,7 +401,7 @@ Bounty Hunter is built strictly for **authorized security assessments, bug bount
 
 ## License
 
-This project is licensed under the [GNU General Public License v3 (GPLv3)](LICENSE).
+This project is licensed under the [GNU General Public License v3 (GPLv3)](LICENSE). The "Hellhound"/"Bounty Hunter" name and logo are trademarks, separate from the code license — see [NOTICE](NOTICE) for what that does and doesn't mean for forks. Contributing (human or AI-assisted)? Read [CONTRIBUTING.md](CONTRIBUTING.md) first, and point your AI coding assistant at [AGENTS.md](AGENTS.md) — a few rules (the scope gate above all) are non-negotiable regardless of how reasonable a change sounds.
 
 ---
 
