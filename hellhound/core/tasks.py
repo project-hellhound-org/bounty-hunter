@@ -358,6 +358,36 @@ def load_program(program_name: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def create_program(program_name: str) -> Dict[str, Any]:
+    """
+    Creates a program record with ZERO targets attached — standalone, with
+    no requirement that any target be active/set first. This is the fix
+    for "manage_program(action='create') used to force-attach whatever
+    target happened to be active (including the bare 'default' placeholder
+    Target every session starts with before set_target is ever called) —
+    forcing a researcher to set_target first just to create a program, and
+    in the no-target-yet case silently polluting the new program's target
+    list with a junk 'default' entry that was never a real domain."
+
+    Idempotent — calling this on an already-existing program just returns
+    its current record unchanged (never resets its targets/scope).
+    """
+    safe_name = sanitize_program_name(program_name)
+    existing = load_program(safe_name)
+    if existing is not None:
+        return existing
+    record = {
+        "name": safe_name,
+        "display_name": program_name.strip(),
+        "scope_raw": "",
+        "scope_rules": ScopeRules().to_dict(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "targets": [],
+    }
+    _save_program(record)
+    return record
+
+
 def _save_program(record: Dict[str, Any]) -> None:
     path = get_program_path(record["name"])
     with open(path, "w", encoding="utf-8") as f:

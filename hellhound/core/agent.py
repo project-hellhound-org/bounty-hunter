@@ -40,7 +40,7 @@ from hellhound.core.scope import is_in_scope, check_module_against_rules, normal
 from hellhound.core.tasks import (
     Target, create_or_load_target, save_target, sanitize_target_name,
     attach_target_to_program, set_program_scope, list_program_targets,
-    load_program, sanitize_program_name, extract_raw_host,
+    load_program, sanitize_program_name, extract_raw_host, create_program,
 )
 from hellhound.core.guard import AutopilotGuard
 from hellhound.core.ai_utils import (
@@ -68,12 +68,17 @@ from hellhound.memory import (
     dismiss_false_positive,
     is_dismissed_as_false_positive,
 )
+from hellhound.memory.investigation import merge_state_list as _merge_state_list, record_timeline as _record_timeline
 from hellhound.core.skills import (
     get_relevant_skills_prompt,
     discover_skills,
     load_skill_body,
 )
 from hellhound.core.toolcheck import ensure_tool, get_binary_path, install_hint, is_available, pick_available
+from hellhound.core import verify_engine as _verify_engine
+from hellhound.core import hypothesis_engine as _hypothesis_engine
+from hellhound.memory.pattern_db import PatternDB
+from hellhound.memory.schemas import make_pattern_entry, SchemaError as _PatternSchemaError
 
 
 def _load_baseline_rules() -> str:
@@ -1359,24 +1364,61 @@ def _execute_manage_program(args: Dict[str, Any], target: Target, emit: Any) -> 
     if action == "create":
         if not program_name:
             return {"status": "error", "error": "program_name is required to create a program."}
-        attach_target_to_program(target, program_name)
+
+        # Deliberately does NOT require a target to be set first, and does
+        # NOT auto-attach whatever target happens to be currently active.
+        # Every session starts on the bare "default" placeholder Target
+        # until set_target is called -- auto-attaching it here used to
+        # silently add a "default" junk entry to a brand-new program's
+        # target list the moment create was called with no real target set
+        # yet, which is exactly backwards: creating a program/engagement
+        # record is a standalone action, and set_target is for actively
+        # working ON a specific in-scope domain, not a prerequisite for
+        # creating the program that domain will later be attached to.
+        create_program(program_name)
+
         domains_arg = args.get("domains")
         if isinstance(domains_arg, str):
             domains_arg = [domains_arg]
-        attached = [target.name]
-        for d in (domains_arg or []):
-            d = str(d).strip().lower()
-            if not d or d == target.name:
-                continue
+        domains_arg = [str(d).strip().lower() for d in (domains_arg or []) if str(d).strip()]
+
+        # The ONE case the current target still gets attached automatically:
+        # the researcher is already actively working a real domain
+        # (set_target was genuinely called — target.name isn't the
+        # unset placeholder) AND they explicitly listed it in `domains`,
+        # or passed include_current_target=true. Otherwise "create" stays
+        # a pure, standalone program-creation action.
+        attached = []
+        if target and target.name and target.name != "default":
+            if target.name in domains_arg or bool(args.get("include_current_target")):
+                attach_target_to_program(target, program_name)
+                attached.append(target.name)
+
+        for d in domains_arg:
+            if d == target.name and d in attached:
+                continue  # already attached above, don't double-process
             d_target = create_or_load_target(d)
             attach_target_to_program(d_target, program_name)
-            attached.append(d_target.name)
+            if d_target.name not in attached:
+                attached.append(d_target.name)
+
         if emit and hasattr(emit, "success"):
-            emit.success(f"[+] Program '{program_name}' created with {len(attached)} target(s): {', '.join(attached)}")
+            if attached:
+                emit.success(f"[+] Program '{program_name}' created with {len(attached)} target(s): {', '.join(attached)}")
+            else:
+                emit.success(f"[+] Program '{program_name}' created with no targets attached yet — use action='add_domain' or set_target then manage_program(action='create', include_current_target=true).")
         return {
             "status": "success", "action": "create", "program": sanitize_program_name(program_name),
             "targets": attached,
-            "note": "Each domain listed is its own real target (own findings/session) tagged with this program — switch to one with set_target(name=<domain>) to actually work on it.",
+            "note": (
+                "Program created standalone — no target needs to be set first. Attach in-scope domains "
+                "with action='add_domain' (domains=[...]), or pass 'domains' here next time. Each attached "
+                "domain is its own real target (own findings/session) tagged with this program — switch to "
+                "one with set_target(name=<domain>) to actually work on it."
+                if not attached else
+                "Each domain listed is its own real target (own findings/session) tagged with this program "
+                "— switch to one with set_target(name=<domain>) to actually work on it."
+            ),
         }
 
     if action == "add_domain":
@@ -3469,6 +3511,31 @@ def _vendor_excluded_tool_names(vendor_lock: Optional[str]) -> set:
     return {name for name in TOOL_REGISTRY if _tool_belongs_to_vendor(name, other)}
 
 
+def _summarize_tool_calls(names: Optional[List[str]]) -> str:
+    """Render a list of executed tool names as a compact, honest summary
+    instead of repeating a name once per call.
+
+    CAUGHT IN THE WILD (2026-10): every "here's what ran this turn"
+    message did `', '.join(tools_executed)` on the raw per-call list, so
+    four curl calls in a row rendered as "Ran curl, curl, curl, curl" --
+    technically accurate, unreadable, and it reads like a stutter rather
+    than a status report. This collapses consecutive/repeated names into
+    a "name x N" count while preserving first-seen order of distinct
+    tools, e.g. ["curl","curl","spider","curl"] -> "curl x3, spider x1".
+    A single occurrence of a name is rendered bare (no "x1" noise).
+    """
+    if not names:
+        return ""
+    counts: Dict[str, int] = {}
+    order: List[str] = []
+    for n in names:
+        if n not in counts:
+            order.append(n)
+            counts[n] = 0
+        counts[n] += 1
+    return ", ".join(f"{n} x{counts[n]}" if counts[n] > 1 else n for n in order)
+
+
 def _format_last_turn_diagnostics(diag: Optional[Dict[str, Any]]) -> Optional[str]:
     """Render the previous turn's control-flow telemetry as plain, factual
     bullet points.
@@ -3530,7 +3597,7 @@ def _format_last_turn_diagnostics(diag: Optional[Dict[str, Any]]) -> Optional[st
             f"retry succeeded, so the turn continued normally."
         )
     if diag.get("tools_executed"):
-        lines.append(f"Tools that actually executed: {', '.join(diag['tools_executed'])}.")
+        lines.append(f"Tools that actually executed: {_summarize_tool_calls(diag['tools_executed'])}.")
     else:
         lines.append("No tool actually executed that turn.")
     return "\n".join(f"- {l}" for l in lines) if lines else None
@@ -3754,13 +3821,16 @@ def _clean_synthesizer_output(text: str, tools_executed: Optional[List[str]] = N
             # happen, so say what's actually true: most of it ran, one more
             # call got cut off at the end.
             return (
-                f"Ran {', '.join(tools_executed)} already this turn — see the results above. "
-                f"One more queued call ({tool_name}{_plural}) didn't fire before the turn ended. "
-                f"Say \"continue\" or \"go ahead\" to run that last one."
+                f"Ran {_summarize_tool_calls(tools_executed)} already this turn — see the results above. "
+                f"One more queued call ({tool_name}{_plural}) didn't fire: the response got cut off mid-JSON "
+                f"while queuing it (a generation-length limit on this reply, not a deliberate stop — the "
+                f"turn's time budget wasn't the cause). Say \"continue\" or \"go ahead\" to run that last one, "
+                f"or ask \"why did you stop\" for the full breakdown."
             )
         return (
-            f"Started to run {tool_name}{_plural} but the turn ended before any of it actually fired — "
-            f"nothing ran, no results to show. Just say \"continue\" or \"go ahead\" and it'll run properly."
+            f"Started to run {tool_name}{_plural} but the response got cut off mid-JSON before any of it "
+            f"actually fired — a generation-length limit on this reply, not a deliberate stop. Nothing ran, "
+            f"no results to show. Just say \"continue\" or \"go ahead\" and it'll run properly."
         )
 
     # Any other stray tool-call JSON (an unregistered/hallucinated tool
@@ -4663,17 +4733,47 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
 
     req_cookies = normalize_cookies(args.get("cookies") or args.get("cookie"))
 
+    # CAUGHT IN THE WILD (2026-10): a researcher disputed a recorded auth-
+    # bypass finding and the agent "re-tested in isolation" by calling curl
+    # with ONLY headers={"Authorization": "Bearer <key>"} and no cookies arg
+    # -- but the auto-attach below used to fire regardless, silently also
+    # sending the target's stored PHPSESSID session cookie on that same
+    # request. The 200 OK that came back was actually the SESSION COOKIE
+    # authenticating the request, not the Bearer token -- a materially
+    # different (and in that case false) claim than "the API key alone
+    # works," and it directly contradicted the researcher's own genuinely
+    # cookie-free manual curl, which correctly returned 401. An explicitly
+    # supplied Authorization header is a strong, deliberate signal that the
+    # caller wants to test THAT credential's own authority -- auto-helping
+    # it along with a second, unrequested credential (the session cookie)
+    # defeats the entire point of the test. Same reasoning for an explicit
+    # `isolate`/`no_auto_cookies` flag, which forces this off even with no
+    # auth header at all. Calls with no auth material of their own keep the
+    # old behavior unchanged (auto-attaching the session cookie is exactly
+    # what "just browse as the logged-in session" calls are meant to do).
+    _explicit_auth_header = any(k.lower() == "authorization" for k in custom_headers.keys())
+    _has_explicit_cookie = bool(req_cookies) or any(k.lower() == "cookie" for k in custom_headers.keys())
+    _force_isolated = bool(args.get("isolate") or args.get("no_auto_cookies"))
+    _auto_cookie_skipped_for_isolation = False
+    _auto_cookie_attached = False
+    _auto_auth_header_skipped_for_isolation = False
+
     # If no Cookie header or cookies provided, auto-attach session cookies from target state if available
-    if not req_cookies and not any(k.lower() == "cookie" for k in custom_headers.keys()) and hasattr(target, "state") and isinstance(target.state, dict):
+    if not _has_explicit_cookie and not _explicit_auth_header and not _force_isolated and hasattr(target, "state") and isinstance(target.state, dict):
         saved_cookies = normalize_cookies(target.state.get("cookies") or target.state.get("session_cookie"))
         if saved_cookies:
             req_cookies = saved_cookies
+            _auto_cookie_attached = True
+    elif not _has_explicit_cookie and (_explicit_auth_header or _force_isolated):
+        _auto_cookie_skipped_for_isolation = True
 
     # If auth header not provided, auto-attach from target state
-    if not any(k.lower() == "authorization" for k in custom_headers.keys()) and hasattr(target, "state") and isinstance(target.state, dict):
+    if not _explicit_auth_header and not _force_isolated and hasattr(target, "state") and isinstance(target.state, dict):
         saved_token = target.state.get("auth_token") or target.state.get("forged_token")
         if saved_token:
             custom_headers["Authorization"] = f"Bearer {saved_token}"
+    elif not _explicit_auth_header and _force_isolated:
+        _auto_auth_header_skipped_for_isolation = True
 
     headers = merge_global_context({"global_headers": custom_headers})
     
@@ -5020,6 +5120,32 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
             "body_preview": body_text[:35000]
         }
 
+        # Disclose what actually went out, not just what the caller typed in
+        # the args -- a call's args can say "headers only" while the real
+        # request on the wire still carried an auto-attached session cookie
+        # (see the isolation fix above this function). Any finding/claim
+        # built on this result must be able to tell the difference between
+        # "this credential alone got me in" and "the session cookie did."
+        if _auto_cookie_attached:
+            resp_dict["isolation_note"] = (
+                "This request ALSO carried the target's stored session cookie, auto-attached "
+                "because no cookies/Authorization were explicitly specified -- if you were trying "
+                "to test an auth header in isolation, this request was NOT isolated. Re-run with "
+                "isolate=true (or pass an explicit empty cookies={}) to suppress that auto-attach."
+            )
+        if _auto_cookie_skipped_for_isolation:
+            resp_dict["isolation_note"] = (
+                "The stored session cookie was deliberately NOT auto-attached to this request "
+                "(an explicit Authorization header was present, or isolate=true was set) -- this "
+                "result reflects that credential's own authority alone, not a cookie-assisted session."
+            )
+        if _auto_auth_header_skipped_for_isolation:
+            resp_dict["isolation_note"] = (
+                resp_dict.get("isolation_note", "")
+                + (" " if resp_dict.get("isolation_note") else "")
+                + "The stored Authorization token was also not auto-attached (isolate=true)."
+            )
+
         # Code-level detection of authentication leaks / sensitive parameters in payload
         detected_leaks = []
         try:
@@ -5344,6 +5470,285 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
         }
 
 
+_PATTERN_DB_SINGLETON: Optional[PatternDB] = None
+
+
+def _get_pattern_db() -> PatternDB:
+    """Lazily-constructed, process-wide PatternDB over ~/.hellhound/patterns.jsonl
+    — see hellhound/memory/pattern_db.py. One instance per process keeps its
+    in-memory dedup-key cache warm across calls instead of re-reading the
+    whole file on every save."""
+    global _PATTERN_DB_SINGLETON
+    if _PATTERN_DB_SINGLETON is None:
+        _PATTERN_DB_SINGLETON = PatternDB(os.path.expanduser("~/.hellhound/patterns.jsonl"))
+    return _PATTERN_DB_SINGLETON
+
+
+def _execute_recall_patterns(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Surfaces prior confirmed techniques from OTHER targets whose tech
+    stack and/or vuln class overlaps this one — "I found a JWT alg-
+    confusion bug on a similarly-stacked target before, check for it
+    here too." Read-only, local-only (the JSONL store), no network
+    traffic — this is why it's exempted from the network scope gate in
+    execute_tool_call alongside record_finding/dismiss_finding/etc.
+
+    Every confirmed `record_finding` call writes into this same store
+    (see the pattern_db.save() call there), so this grows automatically
+    as the researcher works more targets — nothing to configure.
+    """
+    vuln_class = args.get("vuln_class") or args.get("kind")
+    tech_stack = args.get("tech_stack")
+    if isinstance(tech_stack, str):
+        tech_stack = [t.strip() for t in re.split(r"[,\s]+", tech_stack) if t.strip()]
+    if not tech_stack and target and hasattr(target, "state") and isinstance(target.state, dict):
+        # Fall back to this target's own fingerprinted stack, same pattern
+        # _execute_remember_lesson uses for tech_signature.
+        techs = target.state.get("technologies")
+        if isinstance(techs, list):
+            tech_stack = [str(t) for t in techs[:12] if t]
+
+    if not vuln_class and not tech_stack:
+        return {
+            "status": "no_filter",
+            "note": "Pass vuln_class and/or tech_stack to narrow the search — recall_patterns with "
+                    "neither would return every pattern ever recorded across every target.",
+        }
+
+    try:
+        pdb = _get_pattern_db()
+        matches = pdb.match(vuln_class=vuln_class, tech_stack=tech_stack)
+    except Exception as e:
+        return {"error": f"Failed to read pattern store: {e}"}
+
+    if not matches:
+        return {
+            "status": "no_matches",
+            "vuln_class": vuln_class,
+            "tech_stack": tech_stack,
+            "note": "No prior confirmed technique matches this filter yet — not unusual on an early/unique "
+                    "target, or before many findings have been recorded across your programs.",
+        }
+
+    top = matches[:10]
+    return {
+        "status": "ok",
+        "vuln_class": vuln_class,
+        "tech_stack": tech_stack,
+        "match_count": len(matches),
+        "patterns": [
+            {
+                "target": m.get("target"),
+                "vuln_class": m.get("vuln_class"),
+                "technique": m.get("technique"),
+                "tech_stack": m.get("tech_stack"),
+                "endpoint": m.get("endpoint"),
+                "notes": m.get("notes"),
+                "ts": m.get("ts"),
+            }
+            for m in top
+        ],
+        "note": "These are techniques that WORKED on a different target with an overlapping tech stack and/"
+                "or the same vuln class — a lead worth trying here, not a guarantee this target has the "
+                "same bug. Still verify independently before recording anything.",
+    }
+
+
+def _execute_generate_hypotheses(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Turns a fingerprinted tech stack + discovered endpoints into a ranked
+    list of candidate vuln classes with concrete test sketches — the
+    "what SHOULD I try on a target that looks like this" reasoning step a
+    human researcher does before touching a single tool, which this agent
+    otherwise skips straight past in favor of enumerating the tool arsenal
+    in sequence. See hellhound/core/hypothesis_engine.py for the rule
+    table and exactly what each rule does and doesn't prove.
+
+    Local-only (reads target.state + the local pattern store), no network
+    traffic — exempt from the scope gate like recall_patterns/
+    capture_identity/swap_session.
+
+    Merges TWO signal sources, kept distinguishable in the result:
+    - static rules in hypothesis_engine.py ("this tech generally has this
+      vuln class"), general knowledge, works on the very first target of
+      a given stack ever seen;
+    - pattern_db.match() ("this SPECIFIC technique actually worked on a
+      different, similarly-stacked target before" — cumulative across
+      everything this researcher has confirmed), when any match exists.
+
+    Writes the result into target.state["hypotheses"] (a lead board the
+    orchestrator prompt surfaces every turn — see the "LEAD BOARD" intel
+    block) so hypotheses persist across turns instead of being generated
+    once and forgotten. Calling this again REGENERATES from current
+    state — any hypothesis whose status was updated via update_hypothesis
+    keeps that status if it's still present in the new ranked list
+    (matched by vuln_class), rather than resetting silently.
+    """
+    if not target or not hasattr(target, "state") or not isinstance(target.state, dict):
+        return {"error": "No active target to generate hypotheses against."}
+
+    tech_stack = args.get("tech_stack")
+    if isinstance(tech_stack, str):
+        tech_stack = [t.strip() for t in re.split(r"[,\s]+", tech_stack) if t.strip()]
+    if not tech_stack:
+        techs = target.state.get("technologies")
+        tech_stack = [str(t) for t in techs if t] if isinstance(techs, list) else []
+
+    endpoints = args.get("endpoints")
+    if not isinstance(endpoints, list):
+        endpoints = target.state.get("endpoints") or []
+
+    headers = args.get("headers") if isinstance(args.get("headers"), dict) else None
+    if not headers:
+        # Best-effort: pull headers off the most recent curl evidence log
+        # entry, if any was captured, so a prior CORS/security-header
+        # observation feeds hypothesis generation without the model
+        # having to re-paste it.
+        log = target.state.get("curl_evidence_log") or []
+        if log and isinstance(log[-1], dict):
+            headers = log[-1].get("headers") if isinstance(log[-1].get("headers"), dict) else None
+
+    if not tech_stack and not endpoints:
+        return {
+            "status": "nothing_to_work_with",
+            "note": "No fingerprinted technologies and no discovered endpoints yet on this target — "
+                    "run recon (httpx/subdomain_sweep/spider/etc.) first so there's something for "
+                    "hypothesis generation to actually reason from.",
+        }
+
+    param_names = args.get("parameters")
+    if not isinstance(param_names, list):
+        param_names = target.state.get("parameters") or []
+    waf_names = target.state.get("waf_detected") or []
+
+    try:
+        static_hyps = _hypothesis_engine.generate(
+            tech_stack=tech_stack, endpoints=endpoints, headers=headers,
+            context={"parameters": param_names, "waf_detected": waf_names},
+        )
+    except Exception as e:
+        return {"error": f"hypothesis_engine.generate failed: {e}"}
+
+    # Preserve existing status (open/testing/confirmed/refuted/deprioritized)
+    # for any vuln_class that was already on the board and got touched via
+    # update_hypothesis, so regenerating doesn't silently wipe researcher/
+    # model progress tracking.
+    existing = target.state.get("hypotheses") or []
+    existing_status = {
+        h.get("vuln_class"): h.get("status")
+        for h in existing if isinstance(h, dict) and h.get("status") and h.get("status") != "open"
+    }
+
+    now = datetime.now(timezone.utc).isoformat()
+    board = []
+    for h in static_hyps:
+        d = h.to_dict()
+        d["source"] = "stack_signature"
+        d["status"] = existing_status.get(d["vuln_class"], "open")
+        d["updated_at"] = now
+        board.append(d)
+
+    # Fold in pattern_db matches as extra, extra-high-confidence leads —
+    # a technique that actually WORKED before beats a general rule of
+    # thumb. Only added for vuln classes pattern_db actually has a hit
+    # for; doesn't overwrite a stack-signature hypothesis of the same
+    # class, just appends a distinctly-sourced sibling so both rationales
+    # stay visible.
+    try:
+        pdb = _get_pattern_db()
+        prior = pdb.match(tech_stack=tech_stack) if tech_stack else []
+    except Exception:
+        prior = []
+    seen_prior_classes = set()
+    for m in prior[:8]:
+        vc = m.get("vuln_class")
+        if not vc or vc in seen_prior_classes:
+            continue
+        seen_prior_classes.add(vc)
+        board.append({
+            "vuln_class": vc,
+            "confidence": "high",
+            "rationale": f"This exact technique was CONFIRMED on a different, similarly-stacked target before: {m.get('technique')}",
+            "test_sketch": "Reproduce the same technique here (call recall_patterns for the full record), then independently verify with verify_finding before recording.",
+            "signal": f"prior confirmed finding on {m.get('target')}",
+            "source": "pattern_db",
+            "status": existing_status.get(vc, "open"),
+            "updated_at": now,
+        })
+
+    board.sort(key=lambda h: -{"high": 3, "medium": 2, "low": 1}.get(h.get("confidence"), 0))
+
+    target.state["hypotheses"] = board
+    try:
+        save_target(target)
+    except Exception:
+        pass
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[✓] Generated {len(board)} hypotheses from tech stack ({', '.join(tech_stack[:6]) or 'none fingerprinted'}) + {len(seen_prior_classes)} prior-confirmed pattern(s).")
+
+    return {
+        "status": "ok",
+        "hypothesis_count": len(board),
+        "tech_stack_used": tech_stack,
+        "hypotheses": board,
+        "note": (
+            "These are LEADS ranked by confidence, not confirmed findings — go test the top ones with "
+            "the suggested tools, and call update_hypothesis as you confirm/refute each one so the lead "
+            "board stays accurate instead of static. Still goes through the normal record_finding "
+            "EVIDENCE GUARDRAIL and VERIFICATION GATE once you actually find something."
+        ),
+    }
+
+
+def _execute_update_hypothesis(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Updates the status of one entry on the lead board generate_hypotheses
+    produced (target.state["hypotheses"]) — so the orchestrator prompt's
+    LEAD BOARD block reflects what's actually been tried instead of
+    showing the same ranked list forever. Local-only, no network traffic.
+    """
+    vuln_class = str(args.get("vuln_class") or "").strip().lower()
+    if not vuln_class:
+        return {"error": "update_hypothesis needs 'vuln_class' — matching the entry's vuln_class on the lead board."}
+    status = str(args.get("status") or "").strip().lower()
+    valid_statuses = ("open", "testing", "confirmed", "refuted", "deprioritized")
+    if status not in valid_statuses:
+        return {"error": f"'status' must be one of {valid_statuses}, got {status!r}."}
+    if not target or not hasattr(target, "state") or not isinstance(target.state, dict):
+        return {"error": "No active target."}
+
+    board = target.state.get("hypotheses") or []
+    if not isinstance(board, list) or not board:
+        return {"error": "No hypotheses on the lead board yet — call generate_hypotheses first."}
+
+    matched = False
+    for h in board:
+        if isinstance(h, dict) and h.get("vuln_class") == vuln_class:
+            h["status"] = status
+            h["updated_at"] = datetime.now(timezone.utc).isoformat()
+            if args.get("note"):
+                h["status_note"] = str(args.get("note"))[:300]
+            matched = True
+
+    if not matched:
+        return {
+            "error": f"No hypothesis with vuln_class={vuln_class!r} on the lead board.",
+            "known_vuln_classes": sorted({h.get("vuln_class") for h in board if isinstance(h, dict) and h.get("vuln_class")}),
+        }
+
+    target.state["hypotheses"] = board
+    try:
+        save_target(target)
+    except Exception as e:
+        return {"error": f"Updated in memory but failed to persist: {e}"}
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[✓] Hypothesis '{vuln_class}' marked {status}.")
+
+    return {"status": "updated", "vuln_class": vuln_class, "new_status": status}
+
+
 def _find_evidence_log_entry(target: Target, ref: Any) -> Any:
     """
     Resolves a replay 'ref' to one curl_evidence_log entry. Accepts: an int
@@ -5574,7 +5979,8 @@ _PIVOT_EXEMPT_TOOLS = frozenset((
     "record_finding", "dismiss_finding", "export_report", "read_artifact",
     "set_target", "remember_lesson", "manage_scope", "manage_program",
     "save_file", "delete_file", "cookie_inspector", "update_plan",
-    "recall_data", "load_skill", "listener",
+    "recall_data", "load_skill", "listener", "recall_patterns",
+    "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis",
 ))
 _PIVOT_LOW_SIGNAL_THRESHOLD = 3
 _PIVOT_DEAD_END_THRESHOLD = 5
@@ -6354,12 +6760,27 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
     if headers_candidate:
         opts["headers"] = headers_candidate
 
+    # Snapshot what's already known about this target BEFORE this crawl adds
+    # to it, so the result can honestly say how much of this pass was new
+    # ground vs. a re-crawl that landed on the same handful of pages again.
+    # A researcher re-running spider at a deeper depth or with a fresh
+    # session cookie (legitimately different args each time, as recorded in
+    # `_executed_signatures`) still gets reported as "spider found 5
+    # endpoints" on every single pass if nothing distinguishes "5 found,
+    # same 5 as last time" from "5 found, all new" — which is exactly what
+    # made three genuinely-different spider calls over one engagement read
+    # as "spider called again and again for nothing."
+    _known_endpoints_before = set()
+    if hasattr(target, "state") and isinstance(target.state, dict):
+        _known_endpoints_before = set(target.state.get("endpoints") or [])
+
     try:
         res = engine.run_single("spider", url, options=opts, emit=emit)
         intel = res.get("intel", {}) if isinstance(res, dict) else {}
         if intel and hasattr(target, "state"):
             target.state["spider_intel"] = intel
         endpoints = [ep.get("url") for ep in intel.get("endpoints", []) if isinstance(ep, dict) and ep.get("url")]
+        new_endpoints_found = len([ep for ep in endpoints if ep not in _known_endpoints_before])
         if endpoints and hasattr(target, "state"):
             if "endpoints" not in target.state:
                 target.state["endpoints"] = []
@@ -6427,6 +6848,7 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
         return {
             "url": url,
             "endpoints_found": len(endpoints),
+            "new_endpoints_found": new_endpoints_found,
             "js_routes_found": len(js_routes),
             "parameters_found": len(parameters),
             "credentials_exposed": creds[:20],
@@ -6659,6 +7081,31 @@ def _execute_wafbuster(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     engine = HellhoundEngine()
     try:
         res = engine.run_single("wafbuster", url, options=opts, emit=emit)
+
+        # wafbuster's "data.waf"/"data.tech_stack" never got persisted
+        # anywhere before this -- every single call re-detected the same
+        # WAF/tech fingerprint from scratch and generate_hypotheses had no
+        # way to see it either (this target's "technologies" only ever got
+        # populated by httpx, never by this tool, even when wafbuster was
+        # the one that actually identified the stack). Mirror both into
+        # target.state the same way update_from_httpx already does for
+        # httpx's own tech detections.
+        try:
+            data = res.get("data") if isinstance(res, dict) else None
+            if isinstance(data, dict) and hasattr(target, "state") and isinstance(target.state, dict):
+                detected_waf = data.get("waf") or []
+                detected_tech = data.get("tech_stack") or []
+                if detected_tech:
+                    update_from_httpx(target, [], detected_tech)
+                if detected_waf:
+                    added = _merge_state_list(target, "waf_detected", detected_waf)
+                    if added:
+                        _record_timeline(target, f"WAFbuster detected {added} WAF/protection signature(s): {', '.join(detected_waf)}.")
+                if detected_tech or detected_waf:
+                    save_target(target)
+        except Exception:
+            pass  # best-effort persistence; never break the actual WAF check result over this
+
         return {
             "url": url,
             "result": res
@@ -8626,6 +9073,246 @@ def _detect_finding_chains(target: Target, new_finding: Dict[str, Any]) -> List[
     return notes
 
 
+def _execute_capture_identity(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Snapshots a named identity's session material (cookies + auth token)
+    into target.state["identities"][name] for later recall via
+    swap_session. This is the first half of the two-account primitive
+    IDOR/BAC testing needs — without it, the agent only ever has ONE
+    live session at a time (whatever curl/spider last auto-attached from
+    target.state["cookies"]/["auth_token"]), so there's no way to compare
+    "what the attacker sees" against "what the victim sees" without
+    manually juggling raw cookie strings in every tool call.
+
+    Typical flow: log in as one identity (via curl/browser_control, which
+    update target.state["cookies"]/["auth_token"] as a side effect the
+    normal way), THEN call capture_identity("victim") to snapshot that
+    into a named slot before logging in as someone else and overwriting
+    the active session. Explicit cookies/auth_token args let the model
+    capture an identity without it ever being the "active" session at
+    all (e.g. from a session already seen in curl_evidence_log).
+
+    Local-only (reads/writes target.state), no network traffic — exempt
+    from the network scope gate the same way record_finding/set_target/
+    manage_scope are (see execute_tool_call's bypass list).
+    """
+    name = str(args.get("name") or "").strip().lower()
+    if not name:
+        return {"error": "capture_identity needs 'name' (e.g. 'victim', 'attacker', 'anonymous', 'admin')."}
+    if not target or not hasattr(target, "state") or not isinstance(target.state, dict):
+        return {"error": "No active target to capture an identity against."}
+
+    cookies = args.get("cookies")
+    auth_token = args.get("auth_token")
+    if not cookies and not auth_token:
+        # No explicit material given -- snapshot whatever is CURRENTLY
+        # active (the normal "just logged in as X" case).
+        cookies = target.state.get("cookies") or target.state.get("session_cookie")
+        auth_token = target.state.get("auth_token")
+        if not cookies and not auth_token:
+            return {
+                "error": (
+                    "No active session to capture (no cookies/auth_token currently set on this target, "
+                    "and none passed explicitly). Log in as this identity first, or pass cookies/auth_token "
+                    "directly if you already have them from a captured login response."
+                )
+            }
+
+    identities = target.state.setdefault("identities", {})
+    identities[name] = {
+        "cookies": cookies,
+        "auth_token": auth_token,
+        "label": args.get("label") or "",
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        save_target(target)
+    except Exception as e:
+        return {"error": f"Captured identity but failed to persist it: {e}"}
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[✓] Identity '{name}' captured ({'cookies' if cookies else ''}{' + ' if cookies and auth_token else ''}{'auth token' if auth_token else ''}).")
+
+    return {
+        "status": "captured",
+        "name": name,
+        "has_cookies": bool(cookies),
+        "has_auth_token": bool(auth_token),
+        "known_identities": sorted(identities.keys()),
+        "note": "Call swap_session(name) to make this identity the active one for subsequent curl/spider/other tool calls.",
+    }
+
+
+def _execute_swap_session(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Makes a previously-captured identity (see capture_identity) the
+    ACTIVE session — curl/spider/etc. auto-attach target.state["cookies"]/
+    ["auth_token"] exactly like they already do for the normal single-
+    session case, so no other tool needs to change at all to support
+    multi-identity testing. name="anonymous" (or any identity captured
+    with explicitly empty cookies/auth_token) clears the active session
+    entirely, for testing unauthenticated access.
+
+    Local-only, no network traffic -- same scope-gate exemption as
+    capture_identity.
+    """
+    name = str(args.get("name") or "").strip().lower()
+    if not name:
+        return {"error": "swap_session needs 'name' — one of the identities captured via capture_identity."}
+    if not target or not hasattr(target, "state") or not isinstance(target.state, dict):
+        return {"error": "No active target to swap sessions on."}
+
+    identities = target.state.get("identities") or {}
+    if name == "anonymous" and name not in identities:
+        # Special-cased even without an explicit capture_identity("anonymous")
+        # call -- "test as nobody" is common enough to not require a priming step.
+        target.state["cookies"] = None
+        target.state["auth_token"] = None
+        target.state["active_identity"] = "anonymous"
+        try:
+            save_target(target)
+        except Exception as e:
+            return {"error": f"Failed to persist session swap: {e}"}
+        if emit and hasattr(emit, "success"):
+            emit.success("[✓] Swapped to 'anonymous' — no cookies/auth token will be auto-attached to subsequent requests.")
+        return {"status": "swapped", "name": "anonymous", "note": "Subsequent curl/spider calls carry no session material unless explicitly passed."}
+
+    identity = identities.get(name)
+    if not identity or not isinstance(identity, dict):
+        return {
+            "error": f"No identity named '{name}' has been captured on this target yet.",
+            "known_identities": sorted(k for k in identities.keys()) if isinstance(identities, dict) else [],
+            "note": "Call capture_identity(name) after logging in as that identity first, or pass name='anonymous' to test unauthenticated.",
+        }
+
+    target.state["cookies"] = identity.get("cookies")
+    target.state["auth_token"] = identity.get("auth_token")
+    target.state["active_identity"] = name
+    try:
+        save_target(target)
+    except Exception as e:
+        return {"error": f"Failed to persist session swap: {e}"}
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[✓] Swapped active session to identity '{name}' — curl/spider/etc. now auto-attach this identity's cookies/auth token.")
+
+    return {
+        "status": "swapped",
+        "name": name,
+        "has_cookies": bool(identity.get("cookies")),
+        "has_auth_token": bool(identity.get("auth_token")),
+    }
+
+
+def _execute_verify_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Runs an INDEPENDENT, code-level signal check for a disputed or about-
+    to-be-recorded finding — see hellhound/core/verify_engine.py for why
+    this exists and exactly what it does and doesn't prove. Replays the
+    request live (through this same tool-dispatch path, so it's scope-
+    gated/rate-limited/circuit-breakered automatically like every other
+    network tool) and, optionally, a negative-control request, then runs
+    the class-specific positive/differential assertion.
+
+    This does NOT set verified=true on anything and cannot record a
+    finding itself — `record_finding`'s VERIFICATION GATE still requires
+    an explicit verified=true plus a substantive verification_note from
+    you. What this gives you is a real, independently-checked basis for
+    writing that note (or for honestly walking a finding back) instead of
+    re-reading the same response and re-asserting the same conclusion —
+    exactly the failure mode from the VaultFi dry-run where a disputed
+    auth-bypass finding kept getting re-asserted from the same (non-
+    isolated) test instead of being genuinely re-checked.
+    """
+    kind = str(args.get("kind") or "").strip().lower()
+    if not kind:
+        return {"error": "verify_finding needs 'kind' (e.g. sqli, xss, ssrf, ssti, cors) to pick a verifier."}
+
+    url = args.get("url") or args.get("request_url")
+    if not url:
+        return {"error": "verify_finding needs 'url' — the exact request to replay and check."}
+
+    # The positive (vulnerable) replay. Reuses _execute_curl so this gets
+    # the exact same isolation/auto-attach/evidence-capture behavior as
+    # any other curl call -- including the isolation_note disclosure, so
+    # a verify_finding result honestly says if a stored cookie/token rode
+    # along on this replay too.
+    positive_args = {
+        "url": url,
+        "method": args.get("method", "GET"),
+        "headers": args.get("headers"),
+        "cookies": args.get("cookies"),
+        "json": args.get("json"),
+        "body": args.get("body"),
+        "isolate": bool(args.get("isolate")),
+    }
+    positive_resp = _execute_curl(positive_args, target, emit)
+    if isinstance(positive_resp, dict) and positive_resp.get("error"):
+        return {"error": f"Replaying the positive request failed: {positive_resp['error']}", "kind": kind}
+
+    negative_resp = None
+    control_url = args.get("control_url")
+    if control_url:
+        # Defense in depth: execute_tool_call's generic scope check only
+        # inspects the FIRST url-shaped key it finds in args (see
+        # _extract_target_from_args), which for this tool is 'url' — the
+        # positive request. A control request must stay on the exact same
+        # host as the positive one; this is never itself a researcher-
+        # supplied new target, so no separate scope check is bypassed by
+        # requiring that instead of re-deriving and re-validating a second
+        # host here.
+        try:
+            pos_host = urlparse(url if url.startswith(("http://", "https://")) else f"https://{target.name}").netloc
+            ctrl_host = urlparse(control_url if control_url.startswith(("http://", "https://")) else f"https://{target.name}").netloc
+            if pos_host and ctrl_host and pos_host != ctrl_host:
+                return {
+                    "error": (
+                        f"control_url host ('{ctrl_host}') differs from the positive request's host "
+                        f"('{pos_host}') — a negative control must hit the same host/endpoint, just with "
+                        f"the vulnerable input/credential removed. Refusing rather than silently testing "
+                        f"a second, unvalidated target."
+                    ),
+                    "kind": kind,
+                }
+        except Exception:
+            pass
+        negative_args = {
+            "url": control_url,
+            "method": args.get("control_method", args.get("method", "GET")),
+            "headers": args.get("control_headers"),
+            "cookies": args.get("control_cookies"),
+            "json": args.get("control_json"),
+            "body": args.get("control_body"),
+            "isolate": bool(args.get("isolate")),
+        }
+        negative_resp = _execute_curl(negative_args, target, emit)
+        if isinstance(negative_resp, dict) and negative_resp.get("error"):
+            if emit and hasattr(emit, "warn"):
+                emit.warn(f"[!] verify_finding: control request failed ({negative_resp['error']}), verifying without a negative control.")
+            negative_resp = None
+
+    verdict = _verify_engine.verify(kind, positive_resp, negative_resp, args)
+
+    if emit and hasattr(emit, "info"):
+        emit.info(f"[verify_finding] {kind}: {verdict.status} — {verdict.reason}")
+
+    return {
+        "kind": kind,
+        "url": url,
+        "control_url": control_url,
+        **verdict.to_dict(),
+        "positive_status_code": positive_resp.get("status_code") if isinstance(positive_resp, dict) else None,
+        "negative_status_code": negative_resp.get("status_code") if isinstance(negative_resp, dict) else None,
+        "positive_isolation_note": positive_resp.get("isolation_note") if isinstance(positive_resp, dict) else None,
+        "note": (
+            "This is an automated signal check, not a replacement for record_finding's VERIFICATION GATE — "
+            "you still need verified=true and a substantive verification_note to record a gated finding at "
+            "critical/high severity; cite this result in that note rather than re-describing the response "
+            "from scratch." if verdict.status != "no_verifier_for_class" else verdict.reason
+        ),
+    }
+
+
 def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Logs a finding YOU have already confirmed (not a guess or a plan) into
@@ -8898,6 +9585,27 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         )
     except Exception:
         pass  # lesson capture is best-effort and must never block a real recorded finding
+
+    # Cross-target PATTERN memory (hellhound/memory/pattern_db.py) — this
+    # module existed in the codebase already (dedup, rotation, tech-stack
+    # overlap matching, payout-ranked lookup) but was never actually wired
+    # into anything; every confirmed finding just evaporated instead of
+    # building a reusable "what's worked on stacks like this" index. Best-
+    # effort and additive only, same as the lesson capture right above —
+    # never blocks or mutates the finding that was actually recorded.
+    try:
+        pdb = _get_pattern_db()
+        pattern_entry = make_pattern_entry(
+            target=target.name if target else "",
+            vuln_class=kind or "unknown",
+            technique=f"{kind}: {title}" if kind and kind not in title.lower() else title,
+            tech_stack=sig_tags[:12],
+            endpoint=request_ref or None,
+            notes=(note or "")[:500] or None,
+        )
+        pdb.save(pattern_entry)
+    except (_PatternSchemaError, Exception):
+        pass  # pattern capture is best-effort and must never block a real recorded finding
 
     if emit and hasattr(emit, "success"):
         emit.success(f"[✓] Finding recorded: {title}")
@@ -10077,6 +10785,7 @@ _RECALL_CATEGORIES = {
     "dismissed_false_positives": "state",
     "curl_evidence_log": "state",
     "campaign_plan": "state",
+    "hypotheses": "state",
     "findings": "findings",  # lives on target.findings, not target.state
     "raw_artifacts": "raw_search",  # full-text search over ~/.hellhound/targets/<target>/raw/*.txt
 }
@@ -10416,6 +11125,164 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_record_finding
     ),
+    "capture_identity": ToolSpec(
+        name="capture_identity",
+        description=(
+            "Snapshot the current (or explicitly-given) session cookies/auth token under a NAME ('victim', "
+            "'attacker', 'admin', 'low_priv', whatever makes sense) so you can switch back to it later with "
+            "swap_session. This is the two-account primitive IDOR/BOLA/broken-access-control testing actually "
+            "needs — without it there's only ever one live session, so there's no way to genuinely compare "
+            "'what account A sees' vs 'what account B sees' instead of just re-reading the same response "
+            "twice. Typical flow: log in as account A (curl/browser_control updates the session the normal "
+            "way) -> capture_identity(name='victim') -> log in as account B -> capture_identity(name="
+            "'attacker') -> swap_session('attacker') -> curl the VICTIM's resource (their order/profile/"
+            "invoice id) while acting as the attacker -> verify_finding(kind='idor', victim_marker=...) on "
+            "that response."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Short identifier for this identity, e.g. 'victim', 'attacker', 'admin', 'anonymous'."},
+                "label": {"type": "string", "description": "Optional human-readable note, e.g. 'low-privilege user, account id 42'."},
+                "cookies": {"type": "object", "description": "Explicit cookies to store under this identity, instead of snapshotting the currently-active session."},
+                "auth_token": {"type": "string", "description": "Explicit bearer/auth token to store under this identity, instead of snapshotting the currently-active session."},
+            },
+            "required": ["name"]
+        },
+        executor=_execute_capture_identity
+    ),
+    "swap_session": ToolSpec(
+        name="swap_session",
+        description=(
+            "Make a previously-captured identity (see capture_identity) the ACTIVE session — curl/spider/"
+            "every other network tool auto-attaches whichever cookies/auth token are active, exactly like "
+            "they already do today, so nothing else changes. Pass name='anonymous' to clear the active "
+            "session entirely and test unauthenticated access, even without having called capture_identity "
+            "for it first."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The identity name to switch to — one captured via capture_identity, or 'anonymous' to go unauthenticated."},
+            },
+            "required": ["name"]
+        },
+        executor=_execute_swap_session
+    ),
+    "verify_finding": ToolSpec(
+        name="verify_finding",
+        description=(
+            "Independent, code-level signal check for sqli/xss/ssrf/ssti/cors/idor findings — replays the "
+            "request live and runs a class-specific assertion (a real SQL error string, a reflected-"
+            "unescaped payload, a cloud metadata marker, an evaluated template expression, an exploitable "
+            "CORS header combination, another account's data appearing under YOUR session), not just 'did "
+            "the request return 200'. Optionally replays a control_url too (same host, vulnerable input/"
+            "credential/session removed) for a differential check that rules out false positives like a "
+            "generic error page or an endpoint with no auth check at all. Use this BEFORE writing a "
+            "verification_note for record_finding's VERIFICATION GATE — cite this result instead of "
+            "re-describing the response from scratch. Use it AGAIN, with isolate=true, if a researcher "
+            "disputes a finding you already recorded — don't just re-read the same (possibly non-isolated) "
+            "response and re-assert the same conclusion. For idor/access-control/bac kinds: call this AFTER "
+            "swap_session to the attacker identity and requesting the victim's resource, with victim_marker "
+            "set to a string unique to the victim's own data."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "description": "Vuln class to check: sqli, xss, ssrf, ssti, cors, or idor. Other classes return no_verifier_for_class."},
+                "url": {"type": "string", "description": "The exact vulnerable request to replay (for idor: the victim's resource, requested under whatever session is currently active — see swap_session)."},
+                "method": {"type": "string", "description": "HTTP method for the positive request. Default GET."},
+                "headers": {"type": "object", "description": "Headers for the positive request."},
+                "cookies": {"type": "object", "description": "Cookies for the positive request."},
+                "body": {"type": "string", "description": "Raw body for the positive request."},
+                "json": {"type": "object", "description": "JSON body for the positive request."},
+                "isolate": {"type": "boolean", "description": "Suppress curl's auto-attached session cookie/auth token on this replay (and the control, if given) — use this when re-checking a disputed finding to get a genuinely isolated result. NOTE: for idor, don't set this — the active (attacker) identity's session is exactly what must ride along."},
+                "payload": {"type": "string", "description": "Required for xss/ssti: the exact injected string, so reflection/evaluation can be checked against it."},
+                "expected_marker": {"type": "string", "description": "For sqli (boolean/blind) or ssrf: a string that should appear in the response only when the vulnerability actually fired."},
+                "expected_result": {"type": "string", "description": "For ssti: the expected evaluated result if payload isn't one of the built-in math canaries (e.g. '{{7*7}}' -> '49' is automatic)."},
+                "origin_sent": {"type": "string", "description": "For cors: the attacker-controlled Origin header you sent, to check whether it was reflected back."},
+                "victim_marker": {"type": "string", "description": "Required for idor: a string unique to the victim's own data (their email, an order id, an account name) that should NOT appear if authorization is working correctly."},
+                "control_url": {"type": "string", "description": "Optional negative control. For sqli/xss/ssrf/ssti/cors: same host as url, vulnerable input removed. For idor: the SAME url requested as 'anonymous' (via swap_session) instead of as the attacker, to tell 'no auth required at all' apart from 'attacker's own auth was bypassed'."},
+                "control_method": {"type": "string", "description": "Method for the control request. Defaults to the same as method."},
+                "control_headers": {"type": "object", "description": "Headers for the control request."},
+                "control_cookies": {"type": "object", "description": "Cookies for the control request."},
+                "control_body": {"type": "string", "description": "Raw body for the control request."},
+                "control_json": {"type": "object", "description": "JSON body for the control request."},
+            },
+            "required": ["kind", "url"]
+        },
+        executor=_execute_verify_finding
+    ),
+    "recall_patterns": ToolSpec(
+        name="recall_patterns",
+        description=(
+            "Look up confirmed techniques from OTHER targets whose vuln class and/or tech stack overlaps "
+            "this one — 'I found a JWT alg-confusion bug on a similarly-stacked target before, check for it "
+            "here too.' Every finding recorded via record_finding automatically feeds this store, so it's "
+            "cumulative across every target/program you work, with zero setup. Call this early in recon once "
+            "the tech stack is fingerprinted, not just reactively — it's how prior experience on OTHER "
+            "targets actually informs THIS one instead of starting cold every time."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "vuln_class": {"type": "string", "description": "Filter to one vuln class, e.g. 'idor', 'ssrf'. Omit to match on tech_stack alone."},
+                "tech_stack": {"type": "array", "items": {"type": "string"}, "description": "Technologies to match against (partial overlap). Omit to fall back to this target's own fingerprinted stack, if any."},
+            },
+            "required": []
+        },
+        executor=_execute_recall_patterns
+    ),
+    "generate_hypotheses": ToolSpec(
+        name="generate_hypotheses",
+        description=(
+            "Turns this target's fingerprinted tech stack + discovered endpoints into a RANKED list of "
+            "candidate vuln classes with concrete test sketches — e.g. 'Laravel + APP_DEBUG likely leaks "
+            ".env via a stack trace; here's exactly how to check' — instead of defaulting to enumerating "
+            "every tool in sequence. Call this EARLY in recon, right after the stack is fingerprinted "
+            "(httpx/wappalyzer-style signals land in technologies) and a first pass of endpoints is known "
+            "(spider/katana/content_discovery), and again later if new tech or endpoints get discovered. "
+            "Also folds in any prior CONFIRMED technique from a similarly-stacked target via the pattern "
+            "store (recall_patterns' data) as an extra, higher-confidence lead, plus discovered PARAMETER "
+            "NAMES (a 'redirect'/'cmd'/'file' parameter hints at open_redirect/command_injection/lfi even "
+            "before the stack is fully known) and any WAF already fingerprinted (wafbuster) as a flag to "
+            "run waf_evasion_probe before writing a blocked payload off as a dead end. Writes to a "
+            "persistent lead board on this target (visible every turn) — use update_hypothesis as you test "
+            "each one so the board stays accurate. A hypothesis is a LEAD, never a finding — still "
+            "verify_finding and record_finding (full EVIDENCE GUARDRAIL/VERIFICATION GATE) once something "
+            "is actually confirmed."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "tech_stack": {"type": "array", "items": {"type": "string"}, "description": "Technologies to reason from. Omit to use this target's own fingerprinted stack."},
+                "endpoints": {"type": "array", "items": {"type": "string"}, "description": "Discovered endpoint paths/URLs to reason from. Omit to use this target's own discovered endpoints."},
+                "headers": {"type": "object", "description": "Response headers to reason from (e.g. for CORS hypotheses). Omit to use the most recently captured response's headers, if any."},
+                "parameters": {"type": "array", "items": {"type": "string"}, "description": "Discovered parameter NAMES to reason from (e.g. 'redirect_url', 'cmd', 'file'). Omit to use this target's own discovered parameters."},
+            },
+            "required": []
+        },
+        executor=_execute_generate_hypotheses
+    ),
+    "update_hypothesis": ToolSpec(
+        name="update_hypothesis",
+        description=(
+            "Marks a lead board entry from generate_hypotheses as 'testing', 'confirmed', 'refuted', or "
+            "'deprioritized' (or back to 'open'), so the board reflects real progress instead of showing "
+            "the same ranked list forever. Call this as you actually go test each hypothesis — don't let "
+            "the board go stale while you're working down it."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "vuln_class": {"type": "string", "description": "The vuln_class of the lead-board entry to update, exactly as generate_hypotheses returned it."},
+                "status": {"type": "string", "description": "One of: open, testing, confirmed, refuted, deprioritized."},
+                "note": {"type": "string", "description": "Optional short note on why (e.g. 'no debug page triggered after 5 attempts')."},
+            },
+            "required": ["vuln_class", "status"]
+        },
+        executor=_execute_update_hypothesis
+    ),
     "dismiss_finding": ToolSpec(
         name="dismiss_finding",
         description="Retract a finding the researcher has told you is NOT a real vulnerability — a false positive. Call this THE MOMENT the researcher says something you flagged isn't a bug, rather than just agreeing in your reply and leaving it sitting in findings. This removes it from recorded findings AND permanently stops record_finding from accepting the same kind+endpoint pair again on this target (citing your stated reason), AND writes a cross-target lesson so other targets with a similar stack benefit too. Match what you dismiss using the SAME title (or kind+request_ref) you originally used in record_finding.",
@@ -10470,7 +11337,8 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "Categories: endpoints, subdomains, live_hosts, js_routes, parameter_sensitive, "
             "takeover_candidates, technologies, credentials, secrets, failed_credentials, cookies, "
             "dismissed_false_positives, curl_evidence_log (captured request/response proof), campaign_plan, "
-            "findings (confirmed findings on this target), raw_artifacts (FULL-TEXT SEARCH across every "
+            "hypotheses (the full lead board from generate_hypotheses, not just the top 10 shown in the "
+            "prompt), findings (confirmed findings on this target), raw_artifacts (FULL-TEXT SEARCH across every "
             "saved raw tool-output file for this target — use this when you need to find something that "
             "isn't one of the structured categories above, e.g. 'that one curl response from 20 turns ago' "
             "or a specific string somewhere inside a huge saved JS bundle/HTML page. For raw_artifacts, "
@@ -11369,14 +12237,26 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "domain, each keeping its own findings/session) under a shared program name and a "
             "shared scope definition. Do NOT rename the current target to the program's name "
             "and dump every domain into its scope_rules — create a real target per domain "
-            "instead and attach each to the program. Actions: 'create' (start a new program, "
-            "optionally with an initial 'domains' list — also attaches the CURRENTLY ACTIVE "
-            "target to it), 'add_domain' (attach one or more additional in-scope domains/"
-            "targets to an existing program via 'domains'), 'set_scope' (define/replace the "
-            "program's overall scope — pass 'domains' or raw 'scope_text' — propagates to "
-            "every target already attached), 'show' or 'list' (list the program's targets and "
-            "scope). After creating/adding domains, switch to a specific one with the "
-            "set_target tool using that domain's name to actually work on it."
+            "instead and attach each to the program. CREATING A PROGRAM NEVER REQUIRES "
+            "set_target FIRST — 'create' is a standalone action and does NOT auto-attach "
+            "whatever target happens to be active (it used to silently pull in the unset "
+            "'default' placeholder target if set_target had never been called — fixed; now it "
+            "only attaches domains you actually list). Actions: 'create' (start a new program, "
+            "optionally with an initial 'domains' list to attach immediately — pass "
+            "'include_current_target': true if you specifically want the currently active, "
+            "already-set-target domain folded in too), 'add_domain' (attach one or more "
+            "additional in-scope domains/targets to an existing program via 'domains' — this is "
+            "the normal way to populate a program after creating it empty), 'set_scope' "
+            "(define/replace the program's overall scope — pass 'domains' or raw 'scope_text' "
+            "— propagates to every target already attached), 'show' or 'list' (list the "
+            "program's targets and scope). Each domain attached gets its own real target (own "
+            "findings/session) AND shows up as its own subdirectory under "
+            "~/.hellhound/programs/<program>/targets/ (a live symlink to its real target "
+            "directory) — so the program folder always reflects every in-scope domain attached "
+            "to it without any file-copying. After creating/adding domains, switch to a "
+            "specific one with the set_target tool using that domain's name to actually work on "
+            "it — set_target is only needed when you're about to actively hunt that one domain, "
+            "never as a prerequisite for program bookkeeping."
         ),
         parameters={
             "type": "object",
@@ -11393,6 +12273,10 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "domains": {
                     "type": "array", "items": {"type": "string"},
                     "description": "In-scope domain(s) to create/attach under this program (create, add_domain), or to use as the scope list (set_scope).",
+                },
+                "include_current_target": {
+                    "type": "boolean",
+                    "description": "action='create' only: also attach the CURRENTLY ACTIVE target to the new program (only takes effect if a real target is actually set — set_target was called, it's not the unset 'default' placeholder). Default false — 'create' otherwise never auto-attaches anything you didn't list in 'domains'.",
                 },
                 "scope_text": {
                     "type": "string",
@@ -13171,7 +14055,19 @@ If there is nothing worth generalizing, return an empty array: []"""
             # Cap the current-turn window itself: keep the most recent entries
             # that fit a total char budget, drop older ones with a note so the
             # synthesizer still knows work happened before the window.
-            CURRENT_TURN_CHAR_BUDGET = 60000
+            #
+            # CAUGHT IN THE WILD (2026-10/11): at 60,000 this was dropping
+            # EARLIER tool results from the same turn the moment a session
+            # had more than a few real calls (spider intel + a handful of
+            # curl bodies routinely blew past this) -- the model lost
+            # visibility into its own earlier findings mid-turn and, rather
+            # than reading them back via read_artifact (the drop-note's own
+            # suggestion), would just re-run the tool to get the data back
+            # again. That's the concrete mechanism behind "it's refetching
+            # results instead of using what it already has." Raised to give
+            # a typical multi-tool engagement real headroom before anything
+            # gets dropped.
+            CURRENT_TURN_CHAR_BUDGET = 150000
             if current_turn_history:
                 kept_rev = []
                 running_total = 0
@@ -13350,7 +14246,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # host — gating it on is_in_scope would make it unable to do the one thing it's
         # for; delete_file's only "target" is a bare filename, which _extract_target_
         # from_args would wrongly try to parse as a host/URL).
-        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector"):
+        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
@@ -13769,7 +14665,23 @@ If there is nothing worth generalizing, return an empty array: []"""
             if tool_name not in _PIVOT_EXEMPT_TOOLS and self.target and hasattr(self.target, "state") and isinstance(self.target.state, dict):
                 try:
                     streaks = self.target.state.setdefault("_dead_end_streaks", {})
-                    if _result_is_low_signal(result):
+                    # Spider special-case: the generic heuristic below judges
+                    # a result "low signal" only when its own count/list
+                    # fields are empty -- but spider's `sample_endpoints`/
+                    # `endpoints_found` reflect EVERYTHING found on this
+                    # crawl, old ground included, so a re-crawl that just
+                    # re-discovers the same 5 pages again (deeper depth, a
+                    # fresh session cookie, whatever changed the args) still
+                    # looks like a full, non-empty result every single time
+                    # and never trips the pivot reflex. `new_endpoints_found`
+                    # (added alongside this fix) tracks what's actually NEW
+                    # since the last spider pass against this target, so use
+                    # that instead of the generic heuristic for this one tool.
+                    if tool_name == "spider" and isinstance(result, dict) and "new_endpoints_found" in result:
+                        _is_low_signal = (result.get("new_endpoints_found") or 0) <= 0
+                    else:
+                        _is_low_signal = _result_is_low_signal(result)
+                    if _is_low_signal:
                         streaks[tool_name] = streaks.get(tool_name, 0) + 1
                         _streak = streaks[tool_name]
                         if _streak >= _PIVOT_LOW_SIGNAL_THRESHOLD and isinstance(result, dict):
@@ -14116,11 +15028,46 @@ If there is nothing worth generalizing, return an empty array: []"""
                 )
             if active_cookies or active_auth:
                 session_lines = []
+                _active_identity = self.target.state.get("active_identity")
+                if _active_identity:
+                    session_lines.append(f"  - Acting as identity: '{_active_identity}'")
                 if active_cookies:
                     session_lines.append(f"  - Cookies: {active_cookies}")
                 if active_auth:
                     session_lines.append(f"  - Auth Token / Bearer: {active_auth}")
                 intel_parts.append("ACTIVE SESSION STATE:\n" + "\n".join(session_lines))
+
+            known_identities = self.target.state.get("identities") or {}
+            if isinstance(known_identities, dict) and known_identities:
+                id_lines = []
+                for _name, _idv in known_identities.items():
+                    if not isinstance(_idv, dict):
+                        continue
+                    _label = _idv.get("label")
+                    id_lines.append(f"  - '{_name}'" + (f" ({_label})" if _label else "") + " — call swap_session to act as this identity")
+                if id_lines:
+                    intel_parts.append(
+                        "CAPTURED IDENTITIES (for IDOR/BAC testing — use swap_session(name) to switch which "
+                        "one curl/spider/etc. act as):\n" + "\n".join(id_lines)
+                    )
+
+            lead_board = self.target.state.get("hypotheses") or []
+            if isinstance(lead_board, list) and lead_board:
+                _active_leads = [h for h in lead_board if isinstance(h, dict) and h.get("status") not in ("refuted", "deprioritized")]
+                if _active_leads:
+                    lead_lines = []
+                    for h in _active_leads[:10]:
+                        _status = h.get("status", "open")
+                        _status_tag = f" [{_status}]" if _status != "open" else ""
+                        lead_lines.append(
+                            f"  - [{h.get('confidence', '?')}] {h.get('vuln_class')}{_status_tag}: {h.get('rationale')} "
+                            f"-> {h.get('test_sketch')}"
+                        )
+                    intel_parts.append(
+                        "LEAD BOARD (from generate_hypotheses — ranked candidate vuln classes for this "
+                        "target's stack, NOT confirmed findings; call update_hypothesis as you test each "
+                        "one):\n" + "\n".join(lead_lines)
+                    )
 
             if intel_parts:
                 intel_block = "\n\n".join(intel_parts)
@@ -14193,7 +15140,12 @@ RULES:
    - ANY TOOL THAT KEEPS COMING BACK EMPTY — WATCH FOR `_pivot_note` IN THE RESULT: this isn't just a js_miner thing. Any recon/exploitation tool called repeatedly against the same target with nothing to show for it — even with DIFFERENT args each time — gets an escalating `_pivot_note` stamped onto its own result after 3 consecutive low-signal calls, and a hard "stop, this avenue is dead" note after 5. Treat that note as a direct instruction, not background noise: when you see one, the honest move is to actually change approach — a different tool, reading/reasoning about the target by hand instead of another scripted scan, or telling the researcher this avenue is dry — not to quietly try yet another variation of the same call and hope the next one lands. Before EVER re-calling a tool that just came back empty/thin, ask yourself: is there a concrete reason this specific retry will behave differently (a session/auth state that actually changed, args that target something genuinely new), or am I just hoping? If it's just hoping, don't.
    - DO NOT call `record_finding` in response to a message that isn't reporting NEW evidence. Explaining a bug you already found, recapping what happened, or the researcher reacting/complimenting/joking about a result already in ALREADY GATHERED THIS SESSION are conversational — they need zero tool calls, `record_finding` included. Re-recording something already confirmed doesn't make it "more confirmed"; it's noise, not evidence.
    - "THE REQUEST WENT THROUGH" IS NOT "IT'S CONFIRMED" — a captured request/response proves a request was SENT, not that the vulnerability is real. Before filing sqli/xss/ssrf/idor/access-control-category findings at critical/high severity, actually get exploitation proof first: dump a real row for sqli (don't just send the payload and note a 200/delay), confirm the XSS payload actually fires (listener hit or headless render), confirm SSRF reaches the out-of-band listener with your token, show the literal cross-account/cross-privilege data difference for idor/BAC. `record_finding` enforces this — it will block with `status: blocked_unverified` and tell you exactly what proof is missing for that class if you try to file one of these at critical/high without `verified=true` and a real `verification_note`. Don't treat that block as a formality to talk your way past — go get the actual proof, or file it at medium/lower severity as a lead if you can't get it yet. This is the difference between a report that survives triage and one that doesn't.
+   - "ISOLATED" MEANS NO AUTO-ATTACHED EXTRAS — EITHER — `curl` auto-attaches the target's stored session cookie and/or stored auth token to fill in gaps you didn't specify, which is normally helpful (it keeps an authenticated crawl authenticated) but is EXACTLY WRONG when a researcher disputes a finding and you're re-testing whether ONE SPECIFIC credential works on its own. Check the `isolation_note` field on every curl result before claiming a test was isolated — if it says the stored session cookie rode along, your "Bearer-token-only" test wasn't actually isolated and its result says nothing about the Bearer token alone. Pass `isolate: true` (or `no_auto_cookies: true`) on the call to genuinely suppress all auto-attachment when that's what the test requires. If a researcher's own reproduction contradicts yours, re-run with `isolate: true` BEFORE re-asserting the finding — don't just repeat the same (possibly non-isolated) test and insist on the same answer.
    - WATCH FOR `chain_candidates` ON `record_finding`'S RESULT — don't just file findings as isolated blips. When two separate findings combine into something bigger (an open redirect sitting on an OAuth callback = account takeover; an SSRF that reaches cloud metadata = credential leak; an XSS alongside weak session-cookie handling = session hijack; a subdomain takeover alongside anything else on that host = trusted-domain phishing), `record_finding` surfaces that pairing automatically as `chain_candidates` in its result. Treat that as a real lead, not a footnote: go verify whether the chain actually works (same rigor as any other finding — don't claim it's confirmed until you've actually demonstrated it), and if it does, that's very likely the higher-severity, higher-impact finding worth leading the report with, not the two smaller findings separately.
+   - USE `verify_finding` FOR A REAL SIGNAL CHECK, NOT JUST ANOTHER CURL — for sqli/xss/ssrf/ssti/cors/idor, `verify_finding` replays the request live and runs an independent, class-specific assertion (a real SQL error string, verbatim-unescaped reflection, a cloud metadata marker, an evaluated template expression, an exploitable CORS combination, another account's data appearing under your session) — not "did it return 200." Call it before writing a `verification_note` and cite its result instead of re-describing the response yourself; pass `control_url` (same host, vulnerable input removed) when you can for a differential check that rules out a generic-error-page false positive. If a researcher disputes a finding you already recorded, call `verify_finding` again with `isolate: true` and actually look at what comes back — don't just repeat the same test and reassert the same conclusion. It returns `no_verifier_for_class` for any kind outside sqli/xss/ssrf/ssti/cors/idor; treat that response as "no automated help here," not as a pass.
+   - CALL `recall_patterns` EARLY IN RECON, ONCE THE STACK IS KNOWN — it surfaces confirmed techniques from OTHER targets whose vuln class and/or tech stack overlaps this one (fed automatically by every `record_finding` call, across every target you've worked). Use it as a lead generator once fingerprinting gives you something to match on, not only reactively when stuck — "what's worked before on a stack like this" is exactly the kind of prior experience a human researcher brings to a new target and you otherwise start without.
+   - CALL `generate_hypotheses` ONCE THE STACK IS FINGERPRINTED, BEFORE DEFAULTING TO TOOL ENUMERATION — once `technologies` and a first pass of `endpoints` exist (after httpx/recon and an initial spider/katana/content_discovery pass), call `generate_hypotheses` to turn that into a ranked list of candidate vuln classes with concrete test sketches, the way a human researcher (or a tool like XBOW/Horizon3) reasons from a tech-stack fingerprint instead of just running every tool in sequence and seeing what sticks. On a target where the vulnerability isn't already known (unlike a lab you've been told the answer for), this is how you go from "try everything" to "try the things this specific stack is actually likely to have, in order of likelihood" — work the LEAD BOARD it produces top-down, call `update_hypothesis` as you test each one (testing/confirmed/refuted/deprioritized), and call it again whenever new tech or endpoints surface so the board stays current. A hypothesis is a lead, never a finding — it still needs the normal verify_finding + record_finding path (EVIDENCE GUARDRAIL + VERIFICATION GATE unchanged) before anything gets recorded.
+   - FOR IDOR / BOLA / BROKEN ACCESS CONTROL, ACTUALLY SWITCH ACCOUNTS — DON'T JUST GUESS FROM ONE SESSION'S RESPONSES. A real IDOR claim needs TWO genuinely different accounts: (1) log in as account A (any normal login flow) and call `capture_identity(name="victim")` to snapshot that session; (2) log in as a second, different account and call `capture_identity(name="attacker")`; (3) call `swap_session(name="attacker")` so the attacker's session is what curl/spider auto-attach from here on; (4) request the VICTIM's own resource (their order id, profile id, invoice — whatever you captured while logged in as account A) while acting as the attacker; (5) call `verify_finding(kind="idor", url=<that request>, victim_marker=<something unique to the victim's data, e.g. their email or an invoice number>, control_url=<the same url, after swap_session(name="anonymous")>)` — the control tells you whether this is a genuine cross-account authorization bypass or just an endpoint with no auth check at all, which are different findings (the latter is still real, just not IDOR specifically). Never claim IDOR from a single session's response, from two requests you never actually diffed, or from assuming a sequential ID "must" belong to someone else without a marker that proves it.
 
 2. MISSION OBJECTIVE FIDELITY & AUTONOMOUS EXPLOIT PROGRESSION (CRITICAL):
    - TARGET ACCOUNT / ROLE: Focus strictly on the primary requested target (e.g. Administrator or specified high-privilege role/user).
@@ -14896,9 +15848,17 @@ INSTRUCTIONS:
         # calls) is never starved. But "rolling, with no upper bound" is
         # itself a risk (a turn that keeps making SLOW but real progress
         # forever never ends) — this is the backstop: no single turn runs
-        # past 20 minutes of wall clock, full stop, regardless of how much
-        # of that was legitimate tool work.
-        _hard_ceiling = time.time() + 1200  # 20 minutes
+        # past this wall clock, full stop, regardless of how much of that
+        # was legitimate tool work.
+        #
+        # CAUGHT IN THE WILD (2026-10/11): 20 minutes sounds generous until
+        # a single spider pass legitimately takes 87-460s and a researcher
+        # runs three of those plus several sqlmap/curl calls in one turn —
+        # that routinely ate the whole ceiling and forced "continue" mid-
+        # engagement even though every second was real, productive work.
+        # Raised to 40 minutes for more headroom on slow-tool-heavy turns;
+        # still a hard stop, not unbounded.
+        _hard_ceiling = time.time() + 2400  # 40 minutes
         _timed_out = False
 
         # A path scope set in an earlier turn (e.g. "...from this endpoint
@@ -15015,21 +15975,52 @@ INSTRUCTIONS:
                     # on anything longer than a single bad moment. Give it a
                     # few more full attempts, each with its own growing
                     # backoff, before actually giving up.
-                    _provider_backoff = 2.0
-                    for _provider_attempt in range(_PROVIDER_RETRY_ATTEMPTS):
-                        _diag_provider_retries += 1
-                        if emit and hasattr(emit, "set_label"):
-                            emit.set_label(
-                                f"Wait a minute.. some issue on my end. Let me cook again "
-                                f"({_provider_attempt + 1}/{_PROVIDER_RETRY_ATTEMPTS})..."
-                            )
-                        time.sleep(_provider_backoff)
-                        _provider_backoff = min(_provider_backoff * 2, 15.0)
-                        ai_resp, tokens = _call_orchestrator()
-                        if tokens is not None and emit and hasattr(emit, "set_token_count"):
-                            emit.set_token_count(tokens)
-                        if not _orch_failed(ai_resp):
-                            break
+                    #
+                    # CAUGHT IN THE WILD (2026-10): a researcher hit Ctrl+C
+                    # mid-run_terminal_command (an sqlmap call) and watched
+                    # this retry loop fire anyway — "Wait a minute.. some
+                    # issue on my end. Let me cook again (3/3)......" — then
+                    # give up with a generic write-up error, as if the
+                    # interrupt itself were a flaky provider error. It
+                    # wasn't: the interrupted subprocess legitimately
+                    # returned exit code -2 and its raw output was already
+                    # captured, but THIS loop had no idea a cancellation was
+                    # in flight and just kept retrying the orchestrator call
+                    # against a run the researcher had already asked to
+                    # stop. A real provider failure still gets its full
+                    # retry budget; a deliberate cancellation now aborts
+                    # the retries immediately instead of burning ~30s of
+                    # growing backoff on a call nobody wants finished.
+                    if cancel_check and cancel_check():
+                        ai_resp = None
+                    else:
+                        _provider_backoff = 2.0
+                        for _provider_attempt in range(_PROVIDER_RETRY_ATTEMPTS):
+                            if cancel_check and cancel_check():
+                                ai_resp = None
+                                break
+                            _diag_provider_retries += 1
+                            if emit and hasattr(emit, "set_label"):
+                                emit.set_label(
+                                    f"Wait a minute.. some issue on my end. Let me cook again "
+                                    f"({_provider_attempt + 1}/{_PROVIDER_RETRY_ATTEMPTS})..."
+                                )
+                            time.sleep(_provider_backoff)
+                            _provider_backoff = min(_provider_backoff * 2, 15.0)
+                            if cancel_check and cancel_check():
+                                ai_resp = None
+                                break
+                            ai_resp, tokens = _call_orchestrator()
+                            if tokens is not None and emit and hasattr(emit, "set_token_count"):
+                                emit.set_token_count(tokens)
+                            if not _orch_failed(ai_resp):
+                                break
+                    if cancel_check and cancel_check():
+                        # Cancelled during the retry window -- stop cleanly,
+                        # same as the top-of-iteration cancel check does; the
+                        # already-executed tools/results this turn are kept
+                        # and reported normally below, nothing is discarded.
+                        break
                     if _orch_failed(ai_resp):
                         # Still failing after every retry — do NOT let this raw
                         # error string ride along as `ai_resp` into the final
@@ -15456,7 +16447,7 @@ INSTRUCTIONS:
                             "role": "user",
                             "content": (
                                 f"SYSTEM: You keep describing the next step instead of doing it. "
-                                f"You already ran: {', '.join(tools_executed)}. "
+                                f"You already ran: {_summarize_tool_calls(tools_executed)}. "
                                 f"The mission is still: '{original_user_text}'. "
                                 f"Emit ONLY the next tool-call JSON that actually attempts it — "
                                 f"no narration, no plan, no explanation."
@@ -15540,10 +16531,23 @@ INSTRUCTIONS:
                 tools=_synth_tools,
                 tool_choice="none",
             )
+            if _is_provider_failure(answer) and cancel_check and cancel_check():
+                # A cancelled call (Ctrl+C) looks exactly like a provider
+                # failure to _is_provider_failure (empty/None completion) --
+                # see the matching fix on the orchestrator's own retry loop
+                # above for the full story. Retrying a synthesis call for
+                # a run the researcher already cancelled wastes ~30s of
+                # backoff and produces the misleading "some issue on my
+                # end... (3/3)" message for what was actually a deliberate
+                # stop. Skip the retries; the caller surfaces the already-
+                # captured tool output/results instead of this write-up.
+                return None, tok
             if _is_provider_failure(answer):
                 logger.debug(f"Synthesizer call failed ({answer!r}), retrying.")
                 _synth_backoff = 1.5
                 for _synth_attempt in range(_PROVIDER_RETRY_ATTEMPTS):
+                    if cancel_check and cancel_check():
+                        break
                     if emit and hasattr(emit, "set_label"):
                         emit.set_label(
                             f"Wait a minute.. some issue on my end. Let me cook again "
@@ -15551,6 +16555,8 @@ INSTRUCTIONS:
                         )
                     time.sleep(_synth_backoff)
                     _synth_backoff = min(_synth_backoff * 2, 15.0)
+                    if cancel_check and cancel_check():
+                        break
                     answer2, tok2 = ask_neural_core(
                         prompt=prompt,
                         system_prompt=synthesizer_system_prompt,
@@ -15589,7 +16595,7 @@ INSTRUCTIONS:
                 synth_prompt = (
                     f"The researcher interrupted this analysis (Ctrl+C) before it "
                     f"reached a conclusion.\n\n"
-                    f"Tools executed before the interrupt: {', '.join(tools_executed)}.\n\n"
+                    f"Tools executed before the interrupt: {_summarize_tool_calls(tools_executed)}.\n\n"
                     f"Summarize plainly what was gathered from those tool results so "
                     f"far — what was tried, what was observed, anything found. State "
                     f"clearly at the start that this analysis was interrupted and is "
@@ -15630,7 +16636,7 @@ INSTRUCTIONS:
             if tools_executed:
                 synth_prompt = (
                     f"The researcher asked: \"{original_user_text}\"\n\n"
-                    f"Tools executed before this turn's time budget ran out: {', '.join(tools_executed)}.\n\n"
+                    f"Tools executed before this turn's time budget ran out: {_summarize_tool_calls(tools_executed)}.\n\n"
                     f"This turn hit its time limit mid-investigation — it did NOT fail and did NOT "
                     f"run nothing. Summarize factually what was actually tried and found from the "
                     f"real [TOOL RESULT: ...] entries above (confirmed findings, what came back "
@@ -15683,7 +16689,7 @@ INSTRUCTIONS:
                 # conversation. Just confirm what was written and where.
                 synth_prompt = (
                     f"The researcher requested: \"{original_user_text}\"\n\n"
-                    f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
+                    f"Tools executed this turn: {_summarize_tool_calls(tools_executed)}.\n\n"
                     f"export_report already wrote the actual report file(s) this turn (HTML report, plus a "
                     f"matching .md file written from the exact same data — see that tool's result for both "
                     f"paths). Do NOT regenerate or retype the report content, findings write-up, or a "
@@ -15696,13 +16702,13 @@ INSTRUCTIONS:
             elif report_requested and has_critical_findings:
                 synth_prompt = (
                     f"The researcher requested: \"{original_user_text}\"\n\n"
-                    f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
+                    f"Tools executed this turn: {_summarize_tool_calls(tools_executed)}.\n\n"
                     f"Generate a complete, professional HackerOne vulnerability report based strictly on the verified findings and actual evidence gathered."
                 )
             else:
                 synth_prompt = (
                     f"The researcher asked/instructed: \"{original_user_text}\"\n\n"
-                    f"Tools executed this turn: {', '.join(tools_executed)}.\n\n"
+                    f"Tools executed this turn: {_summarize_tool_calls(tools_executed)}.\n\n"
                     f"Synthesize the investigation results factually, clearly, and concisely based strictly on real tool outputs.\n"
                     f"- Check: What was the primary requested target account/role? Did tool outputs prove compromise of THAT exact account, or only an intermediate stepping-stone account?\n"
                     f"- Explain what was tested and what was observed in the tool outputs (status codes, returned HTML/JSON, cookies, credentials/comments).\n"
@@ -15743,7 +16749,7 @@ INSTRUCTIONS:
                 f"raw orchestrator response was {ai_resp!r}."
             )
             final_response = (
-                "I ran " + ", ".join(tools_executed) + " and got results, but hit an error "
+                "I ran " + _summarize_tool_calls(tools_executed) + " and got results, but hit an error "
                 "generating the write-up just now. The raw tool output is still in this "
                 "session — ask me to summarize what was found, or try again."
             )

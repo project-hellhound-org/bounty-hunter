@@ -120,7 +120,18 @@ def load_config() -> Dict[str, Any]:
         "synthesizer_model": NVIDIA_DEFAULT_MODEL,
         "api_key": "ollama",
         "researcher_handle": "",
-        "max_response_tokens": 8192,
+        # Output-token ceiling for every single orchestrator/synthesizer
+        # call. CAUGHT IN THE WILD (2026-10/11): this used to default to
+        # 8192, and it's an OUTPUT cap, not a context-window limit -- but
+        # it was the actual cause of an orchestrator response queuing
+        # several tool calls (a multi-curl batch) getting cut off mid-JSON
+        # after only 3-4 of them, which then surfaced to the researcher as
+        # a vague "turn ended" with no real explanation. Raised to give a
+        # typical batch (4-6 tool calls) or a multi-finding synthesizer
+        # write-up real headroom to finish in one response instead of
+        # getting truncated and needing "continue". Still overridable via
+        # ~/.hellhound/config.json if a provider/budget needs it tighter.
+        "max_response_tokens": 16384,
         # Ceiling on tool calls per user turn in Agent.handle_message()'s
         # orchestrator loop. Kept generous (Claude-Code-CLI style — run
         # until DONE, not until an arbitrary shallow cap) because multi-stage
