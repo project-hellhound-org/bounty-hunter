@@ -36,7 +36,7 @@ def get_wordlist_path():
         return None
 
 class FuzzWorker:
-    def __init__(self, base_url, emit, max_depth=2, threads=30):
+    def __init__(self, base_url, emit, max_depth=2, threads=30, cookies=None, headers=None):
         self.base_url = base_url.rstrip("/")
         self.emit = emit
         self.max_depth = max_depth
@@ -44,7 +44,14 @@ class FuzzWorker:
         self.results = []
         self.found_dirs = set([""]) # Initial root
         self.lock = threading.Lock()
-        
+        # Identity model: the target's already-captured session
+        # (cookies/auth_token via capture_identity/swap_session), passed
+        # in from run()'s auth_cookies/auth_headers options. Fuzzing an
+        # auth-gated path tree as an anonymous visitor used to be the
+        # only option this fallback engine had.
+        self.cookies = cookies or None
+        self.headers = headers or None
+
         # Heuristics
         self.not_found_size = 0
         self.not_found_status = 0
@@ -53,7 +60,11 @@ class FuzzWorker:
     def check_baseline(self):
         """Check how the server handles a definitely non-existent page"""
         try:
-            r = requests.get(f"{self.base_url}/hh-baseline-{os.urandom(4).hex()}", timeout=5, allow_redirects=False)
+            r = requests.get(
+                f"{self.base_url}/hh-baseline-{os.urandom(4).hex()}",
+                timeout=5, allow_redirects=False,
+                cookies=self.cookies, headers=self.headers,
+            )
             self.not_found_size = len(r.content)
             self.not_found_status = r.status_code
             self.not_found_content = r.text[:1000]
@@ -79,7 +90,7 @@ class FuzzWorker:
         rel_path = f"{base_path}/{word}".lstrip("/")
         url = f"{self.base_url}/{rel_path}"
         try:
-            r = requests.get(url, timeout=3, allow_redirects=False)
+            r = requests.get(url, timeout=3, allow_redirects=False, cookies=self.cookies, headers=self.headers)
             size = len(r.content)
             is_interesting = False
             
@@ -149,7 +160,18 @@ def run(target, emit, options=None):
     else: words = INTERNAL_WORDLIST
 
     if tech_exts: words = list(set(words + tech_exts))
-    scanner = FuzzWorker(url, emit, max_depth=max_depth, threads=threads)
+    # Identity model: auth_cookies/auth_headers is the same options shape
+    # http_utils.apply_session_config() reads everywhere else in this
+    # codebase (set via agent.py's _target_auth_options()) — this module
+    # doesn't use a requests.Session()/apply_session_config at all (plain
+    # per-request requests.get calls), so it reads the dicts directly.
+    auth_cookies = options.get("auth_cookies") if options else None
+    auth_headers = options.get("auth_headers") if options else None
+    scanner = FuzzWorker(
+        url, emit, max_depth=max_depth, threads=threads,
+        cookies=auth_cookies if isinstance(auth_cookies, dict) else None,
+        headers=auth_headers if isinstance(auth_headers, dict) else None,
+    )
     baseline = scanner.check_baseline()
     emit.info(f"    [i] Baseline: {baseline} (Size: {scanner.not_found_size})")
 

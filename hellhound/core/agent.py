@@ -587,6 +587,7 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
     req_headers = normalize_headers(args.get("headers"))
     if not req_headers and hasattr(target, "state") and isinstance(target.state, dict):
         req_headers = normalize_headers(target.state.get("headers"))
+    req_headers = _with_identity_bearer_header(req_headers, target)
 
     req_cookies = normalize_cookies(args.get("cookies") or args.get("cookie"))
     if not req_cookies and hasattr(target, "state") and isinstance(target.state, dict):
@@ -810,6 +811,7 @@ def _execute_feroxbuster_content(args: Dict[str, Any], target: Target, emit: Any
     req_headers = normalize_headers(args.get("headers"))
     if not req_headers and hasattr(target, "state") and isinstance(target.state, dict):
         req_headers = normalize_headers(target.state.get("headers"))
+    req_headers = _with_identity_bearer_header(req_headers, target)
     for hk, hv in req_headers.items():
         if isinstance(hv, str) and hv.strip():
             cmd.extend(["-H", f"{hk}: {hv.strip()}"])
@@ -6018,7 +6020,7 @@ def _result_is_low_signal(result: Any) -> bool:
     return had_countable_field
 
 
-def _cookies_for_browser_seed(target: Target) -> List[Dict[str, Any]]:
+def _cookies_for_browser_seed(target: Target, cookies_override: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
     Builds Playwright-shaped cookie records (name/value/domain/path) from
     whatever session curl (or any other tool) has already captured into
@@ -6027,10 +6029,16 @@ def _cookies_for_browser_seed(target: Target) -> List[Dict[str, Any]]:
     nothing to seed (no captured cookies, or no real host to attach them
     to) rather than guessing — Playwright rejects a cookie with no
     domain/url, so a bad guess here would just silently fail the add.
+
+    `cookies_override`, when given, is used INSTEAD of target.state's
+    currently-ACTIVE cookies — this is what lets swap_session seed a
+    browser_control session with a specific captured identity's cookies
+    (target.state["identities"][name]["cookies"]) regardless of whether
+    that identity happens to be the active one right now.
     """
     if not target or not hasattr(target, "state") or not isinstance(target.state, dict):
         return []
-    raw = target.state.get("cookies") or target.state.get("session_cookie")
+    raw = cookies_override if cookies_override is not None else (target.state.get("cookies") or target.state.get("session_cookie"))
     flat = normalize_cookies(raw)
     if not flat:
         return []
@@ -6121,6 +6129,29 @@ def _execute_browser_control(args: Dict[str, Any], target: Target, emit: Any) ->
                 browser_control.seed_session_cookies(key, seed_cookies, timeout=15)
         except Exception:
             pass  # best-effort, same contract as the reverse sync below — never block the actual goto over this
+    elif action == "goto" and hasattr(target, "state") and isinstance(target.state, dict):
+        # BRIDGE to capture_identity/swap_session: a NAMED session whose
+        # name exactly matches a captured identity (session="victim" and
+        # target.state["identities"]["victim"] exists) auto-seeds from
+        # THAT identity's own cookies on its first goto — regardless of
+        # which identity happens to be "active" via swap_session right
+        # now. This is what makes "capture two identities, then open a
+        # browser session per identity" work without manually copying
+        # cookies: the session name IS the identity name. Still scoped to
+        # "goto" only (Playwright applies context cookies to the NEXT
+        # request, not retroactively) and still never touches a session
+        # whose name ISN'T a known identity, so an ad-hoc named session
+        # with no matching identity behaves exactly as before (empty,
+        # logged-out, same as always).
+        try:
+            known_identities = target.state.get("identities") or {}
+            identity = known_identities.get(session_id) if isinstance(known_identities, dict) else None
+            if isinstance(identity, dict) and identity.get("cookies"):
+                seed_cookies = _cookies_for_browser_seed(target, cookies_override=identity.get("cookies"))
+                if seed_cookies:
+                    browser_control.seed_session_cookies(key, seed_cookies, timeout=15)
+        except Exception:
+            pass  # best-effort, same contract as every other sync here
 
     result = browser_control.run_browser_action(key, action, args)
     if isinstance(result, dict):
@@ -7001,18 +7032,50 @@ def _is_likely_lab_target(target: Target) -> bool:
         return False
 
 
+def _with_identity_bearer_header(headers: Dict[str, Any], target: Target) -> Dict[str, Any]:
+    """
+    Returns `headers` with an `Authorization: Bearer <token>` entry added
+    from the target's active identity (`target.state["auth_token"]` /
+    `["forged_token"]`, set by capture_identity/swap_session/jwt_forge) —
+    but ONLY when `headers` doesn't already carry its own explicit
+    Authorization value, same "don't double up on two different
+    credentials" rule curl's own auto-attach uses. A no-op when there's
+    no bearer token captured yet (returns `headers` unchanged). Used by
+    every direct-binary tool (ffuf/feroxbuster executors underneath
+    fuzz_hunter/content_discovery/vhost_fuzz, sqlmap_scan) that builds its
+    own headers list instead of going through apply_session_config.
+    """
+    headers = dict(headers or {})
+    if any(k.lower() == "authorization" for k in headers.keys()):
+        return headers
+    state = target.state if (target and hasattr(target, "state") and isinstance(target.state, dict)) else {}
+    bearer_token = state.get("auth_token") or state.get("forged_token")
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+    return headers
+
+
 def _target_auth_options(target: Target) -> Dict[str, Any]:
     """
     Pulls this target's already-captured authenticated session (from a
-    login flow, cookie_inspector, or an imported Burp/Caido history) into
-    the `options` shape http_utils.apply_session_config() reads —
-    auth_cookies / auth_headers. Shared by every rule-based recon module
-    wrapper below (wafbuster, surface_auditor, cors_checker, graphql_probe,
-    transport_auditor) so each of them tests WITH the live session instead
-    of a bare unauthenticated requests.Session(), same auth source of
-    truth every other request-sending tool (curl, httpx, run_terminal_command)
-    already reads from. Returns {} (nothing to add) when no session has
-    been captured yet — harmless no-op for a pre-auth target.
+    login flow, cookie_inspector, swap_session, or an imported Burp/Caido
+    history) into the `options` shape http_utils.apply_session_config()
+    reads — auth_cookies / auth_headers. Shared by every rule-based recon
+    module wrapper below (wafbuster, surface_auditor, cors_checker,
+    graphql_probe, transport_auditor, hydra, fuzz_hunter's internal
+    fallback) so each of them tests WITH the live session instead of a
+    bare unauthenticated requests.Session(), same auth source of truth
+    every other request-sending tool (curl, httpx, run_terminal_command,
+    sqlmap_scan) already reads from. Returns {} (nothing to add) when no
+    session has been captured yet — harmless no-op for a pre-auth target.
+
+    Also folds in a bearer auth_token/forged_token (set by capture_identity/
+    swap_session or jwt_forge) as an Authorization header when the state
+    doesn't already carry its own explicit Authorization header — curl has
+    always done this bearer-token auto-attach on its own; this is the same
+    behavior extended to every tool that goes through this shared helper,
+    so an identity captured via a Bearer token (not just a cookie) actually
+    reaches them instead of silently only working for curl/spider.
     """
     state = target.state if (target and isinstance(target.state, dict)) else {}
     out: Dict[str, Any] = {}
@@ -7023,8 +7086,9 @@ def _target_auth_options(target: Target) -> Dict[str, Any]:
     elif session_cookie:
         out["auth_cookies"] = normalize_cookies(session_cookie)
     headers = state.get("headers")
-    if isinstance(headers, dict) and headers:
-        out["auth_headers"] = dict(headers)
+    auth_headers = _with_identity_bearer_header(headers if isinstance(headers, dict) else {}, target)
+    if auth_headers:
+        out["auth_headers"] = auth_headers
     return out
 
 
@@ -7296,6 +7360,12 @@ def _execute_sqlmap_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dic
     if session_cookie:
         cmd += ["--cookie", str(session_cookie)]
     headers = state.get("headers") if isinstance(state.get("headers"), dict) else {}
+    # Identity-model extension: previously only cookie-based sessions
+    # reached sqlmap — an identity captured/activated via a bearer token
+    # (auth_token/forged_token, e.g. a JWT-only API) never got attached,
+    # so a sqlmap run against a Bearer-auth endpoint silently ran
+    # unauthenticated. Same bearer auto-attach curl/fuzz_hunter/hydra use.
+    headers = _with_identity_bearer_header(headers, target)
     for hk, hv in headers.items():
         if hk.lower() == "cookie":
             continue
@@ -7953,6 +8023,13 @@ def _execute_hydra(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
         "concurrency": concurrency,
         "enable_probing": enable_probing,
     }
+    # Identity-model extension: this analysis used to run fully
+    # unauthenticated regardless of whatever session swap_session had
+    # active, so a logic-flaw/param-anomaly sweep against an auth-gated
+    # endpoint silently tested as an anonymous visitor. Same auth source
+    # of truth (target.state cookies/auth_token/headers) every other
+    # request-sending tool already reads from.
+    opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
         res = engine.run_single("hydra", url, options=opts, emit=emit)
@@ -8394,6 +8471,15 @@ def _execute_fuzz_hunter_internal(args: Dict[str, Any], target: Target, emit: An
         "mode": "quick" if args.get("quick", False) else "deep",
         "threads": args.get("threads", 10),
     }
+    # Identity-model extension: this fallback engine (no feroxbuster/ffuf
+    # installed) used bare, unauthenticated requests.get() with no cookies
+    # or headers at all — an auth-gated path tree (e.g. everything under
+    # /admin/ once logged in) was invisible to it even with an active
+    # swap_session identity. Same auth_cookies/auth_headers shape every
+    # other HellhoundEngine-wrapped module already reads via
+    # apply_session_config(); FUZZhunter.run() now applies both to its
+    # requests.
+    opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
         res = engine.run_single("fuzz_hunter", url, options=opts, emit=emit)
@@ -9092,7 +9178,18 @@ def _execute_capture_identity(args: Dict[str, Any], target: Target, emit: Any) -
     capture an identity without it ever being the "active" session at
     all (e.g. from a session already seen in curl_evidence_log).
 
-    Local-only (reads/writes target.state), no network traffic — exempt
+    BROWSER BRIDGE: pass `from_browser_session` (a browser_control
+    `session` name, e.g. "victim") to pull cookies straight from that
+    LIVE Playwright context instead — for when a login only ever
+    happened through browser_control (a JS-driven multi-step flow curl
+    can't follow) and never touched curl/target.state["cookies"] at all.
+    This is the other half of the bridge swap_session completes (see its
+    docstring): capture_identity can PULL FROM a named browser session,
+    and swap_session can PUSH INTO one, so the same captured identity is
+    usable from curl, spider, AND the browser without logging in twice.
+
+    Local-only (reads/writes target.state + optionally an already-running
+    local browser context), no network traffic to the TARGET — exempt
     from the network scope gate the same way record_finding/set_target/
     manage_scope are (see execute_tool_call's bypass list).
     """
@@ -9104,6 +9201,28 @@ def _execute_capture_identity(args: Dict[str, Any], target: Target, emit: Any) -
 
     cookies = args.get("cookies")
     auth_token = args.get("auth_token")
+    from_browser_session = str(args.get("from_browser_session") or "").strip()
+
+    if not cookies and not auth_token and from_browser_session:
+        try:
+            from hellhound.core import browser_control
+            target_prefix = target.name if (target and target.name) else "default"
+            key = f"{target_prefix}::{from_browser_session}"
+            browser_result = browser_control.run_browser_action(key, "get_cookies", {}, timeout=15)
+        except Exception as e:
+            return {"error": f"Failed to read cookies from browser_control session '{from_browser_session}': {e}"}
+        if browser_result.get("status") != "success":
+            return {"error": f"Could not read browser session '{from_browser_session}': {browser_result.get('error', 'unknown error')}"}
+        raw_cookies = browser_result.get("cookies") or []
+        cookies = {c.get("name"): c.get("value") for c in raw_cookies if isinstance(c, dict) and c.get("name") and c.get("value") is not None} or None
+        if not cookies:
+            return {
+                "error": (
+                    f"browser_control session '{from_browser_session}' has no cookies yet — log in through "
+                    f"that session first (browser_control(session='{from_browser_session}', action='goto'/'fill'/'click', ...))."
+                )
+            }
+
     if not cookies and not auth_token:
         # No explicit material given -- snapshot whatever is CURRENTLY
         # active (the normal "just logged in as X" case).
@@ -9114,7 +9233,8 @@ def _execute_capture_identity(args: Dict[str, Any], target: Target, emit: Any) -
                 "error": (
                     "No active session to capture (no cookies/auth_token currently set on this target, "
                     "and none passed explicitly). Log in as this identity first, or pass cookies/auth_token "
-                    "directly if you already have them from a captured login response."
+                    "directly if you already have them from a captured login response, or "
+                    "from_browser_session=<name> to pull from a live browser_control session."
                 )
             }
 
@@ -9153,8 +9273,29 @@ def _execute_swap_session(args: Dict[str, Any], target: Target, emit: Any) -> Di
     with explicitly empty cookies/auth_token) clears the active session
     entirely, for testing unauthenticated access.
 
-    Local-only, no network traffic -- same scope-gate exemption as
-    capture_identity.
+    BROWSER BRIDGE: if a browser_control session with THE SAME NAME is
+    already open for this target (e.g. the model already ran
+    browser_control(session="victim", action="goto", ...) earlier),
+    this also seeds that live browser context's cookie jar with the
+    identity's cookies — best-effort, and deliberately only for a
+    session that's ALREADY open. It never launches a new browser
+    context just because swap_session was called (swap_session is a
+    fast, local, no-network state write; spinning up a real Playwright
+    browser as a silent side effect of every call would change that
+    cost profile). A FRESH, not-yet-open browser session doesn't need
+    this bridge at all — swap_session already updates
+    target.state["cookies"] to this identity's cookies, and
+    _execute_browser_control's existing default-session goto-time seed
+    (_cookies_for_browser_seed(target) with no override) reads exactly
+    that, so a plain browser_control(action="goto") right after
+    swap_session already opens pre-authenticated as the right identity.
+    This bridge covers the other order: a NAMED browser session was
+    opened and logged into FIRST, and swap_session is now bringing it
+    back in sync after curl/spider sent requests under a different
+    identity in between.
+
+    Local-only, no network traffic to the TARGET -- same scope-gate
+    exemption as capture_identity.
     """
     name = str(args.get("name") or "").strip().lower()
     if not name:
@@ -9193,14 +9334,40 @@ def _execute_swap_session(args: Dict[str, Any], target: Target, emit: Any) -> Di
     except Exception as e:
         return {"error": f"Failed to persist session swap: {e}"}
 
+    # Browser bridge, push half: if a browser_control session named
+    # EXACTLY `name` is already open for this target, refresh its cookie
+    # jar with this identity's current cookies too. Deliberately checked
+    # via list_sessions first and never creates a new browser context —
+    # see this function's docstring for why swap_session must stay a
+    # fast, local, no-new-process state write.
+    browser_session_synced = False
+    if identity.get("cookies"):
+        try:
+            from hellhound.core import browser_control
+            target_prefix = target.name if (target and target.name) else "default"
+            open_sessions = browser_control.list_sessions(target_prefix)
+            open_ids = {s.get("session_id") for s in (open_sessions.get("sessions") or []) if isinstance(s, dict)}
+            if name in open_ids:
+                seed_cookies = _cookies_for_browser_seed(target, cookies_override=identity.get("cookies"))
+                if seed_cookies:
+                    seed_result = browser_control.seed_session_cookies(f"{target_prefix}::{name}", seed_cookies, timeout=15)
+                    browser_session_synced = seed_result.get("status") == "success"
+        except Exception:
+            pass  # best-effort — never block the actual swap over this
+
     if emit and hasattr(emit, "success"):
-        emit.success(f"[✓] Swapped active session to identity '{name}' — curl/spider/etc. now auto-attach this identity's cookies/auth token.")
+        emit.success(f"[✓] Swapped active session to identity '{name}' — curl/spider/etc. now auto-attach this identity's cookies/auth token." + (" Also refreshed the matching open browser session." if browser_session_synced else ""))
 
     return {
         "status": "swapped",
         "name": name,
         "has_cookies": bool(identity.get("cookies")),
         "has_auth_token": bool(identity.get("auth_token")),
+        "browser_session_synced": browser_session_synced,
+        "note": (
+            f"To also drive this identity in the browser, call browser_control(session='{name}', action='goto', ...) "
+            f"— a session named exactly '{name}' auto-seeds from this identity's cookies on its first goto."
+        ),
     }
 
 
@@ -11137,7 +11304,11 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "way) -> capture_identity(name='victim') -> log in as account B -> capture_identity(name="
             "'attacker') -> swap_session('attacker') -> curl the VICTIM's resource (their order/profile/"
             "invoice id) while acting as the attacker -> verify_finding(kind='idor', victim_marker=...) on "
-            "that response."
+            "that response. If a login only ever happened through browser_control (a JS-driven flow curl "
+            "can't follow), pass from_browser_session=<that session's name> instead of logging in again — "
+            "pulls cookies straight from that live browser context. Once captured, a browser_control call "
+            "using session=<this identity's name> auto-logs-in as it on its first goto — same identity, "
+            "usable from curl, spider, AND the browser without ever capturing it twice."
         ),
         parameters={
             "type": "object",
@@ -11146,6 +11317,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "label": {"type": "string", "description": "Optional human-readable note, e.g. 'low-privilege user, account id 42'."},
                 "cookies": {"type": "object", "description": "Explicit cookies to store under this identity, instead of snapshotting the currently-active session."},
                 "auth_token": {"type": "string", "description": "Explicit bearer/auth token to store under this identity, instead of snapshotting the currently-active session."},
+                "from_browser_session": {"type": "string", "description": "Pull cookies from a LIVE browser_control session by its 'session' name (e.g. 'victim') instead of from curl/target.state — use when the login only happened through the browser."},
             },
             "required": ["name"]
         },
@@ -11158,7 +11330,10 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "every other network tool auto-attaches whichever cookies/auth token are active, exactly like "
             "they already do today, so nothing else changes. Pass name='anonymous' to clear the active "
             "session entirely and test unauthenticated access, even without having called capture_identity "
-            "for it first."
+            "for it first. Also refreshes a browser_control session of the SAME name if one is already "
+            "open (does not open a new one) — and a browser_control call using session=<this identity's "
+            "name> auto-logs-in as it on its own first goto regardless, so curl/spider and the browser stay "
+            "on the same identity without manual cookie copying either direction."
         ),
         parameters={
             "type": "object",

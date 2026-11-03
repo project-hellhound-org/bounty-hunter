@@ -153,6 +153,53 @@ def _rule_laravel(tech: Set[str], endpoints: List[str], headers: Dict[str, str],
     ]
 
 
+def _rule_rails(tech: Set[str], endpoints: List[str], headers: Dict[str, str], ctx: Dict[str, Any]) -> List[Hypothesis]:
+    hit = _any_token_contains(tech, "rails", "ruby on rails", "ruby")
+    if not hit:
+        return []
+    return [
+        Hypothesis("mass_assignment", "medium",
+            "Rails apps that skip or misconfigure strong parameters (permit!/attr_accessible-style "
+            "gaps) let a client set model attributes that were never meant to be client-writable "
+            "(role, admin flag, account_id) via an extra, unexpected form/JSON field.",
+            "On a create/update endpoint, add an unexpected field matching a likely sensitive column "
+            "name (admin, role, is_admin, account_id) to the request body and check whether it actually "
+            "took effect on the created/updated record.",
+            hit),
+        Hypothesis("insecure_deserialization", "low",
+            "Older Rails apps (or anything still calling YAML.load / Marshal.load on user-controlled "
+            "data, a recurring historical Rails CVE pattern) can hit remote code execution via a "
+            "crafted serialized payload.",
+            "Look for any endpoint that accepts a serialized blob (a 'state', 'data', or cookie-backed "
+            "value) and check the Rails/gem versions in use against known YAML/Marshal deserialization "
+            "CVEs before attempting a payload.",
+            hit),
+    ]
+
+
+def _rule_drupal(tech: Set[str], endpoints: List[str], headers: Dict[str, str], ctx: Dict[str, Any]) -> List[Hypothesis]:
+    hit = _any_token_contains(tech, "drupal")
+    if not hit:
+        return []
+    return [
+        Hypothesis("rce", "low",
+            "Drupal has a recurring history of unauthenticated RCE via its render/form API and REST/"
+            "JSON:API modules (the 'Drupalgeddon'-class issues) — version-dependent, but worth checking "
+            "before anything else on a fingerprinted Drupal target.",
+            "Identify the exact Drupal core/module versions (meta generator tag, CHANGELOG.txt, "
+            "/core/CHANGELOG.txt) and check them against known Drupal core/contrib RCE advisories before "
+            "attempting any payload.",
+            hit),
+        Hypothesis("broken_access_control", "low",
+            "Drupal's node access system is permission-matrix-driven and easy to misconfigure per "
+            "content type/view — a common source of content or user data reachable without the "
+            "intended role.",
+            "Enumerate node/entity IDs as an unauthenticated or low-privilege session and check whether "
+            "restricted content (unpublished nodes, admin-only views) is still reachable directly.",
+            hit),
+    ]
+
+
 def _rule_django(tech: Set[str], endpoints: List[str], headers: Dict[str, str], ctx: Dict[str, Any]) -> List[Hypothesis]:
     hit = _any_token_contains(tech, "django")
     if not hit:
@@ -402,6 +449,91 @@ def _rule_param_name_signals(tech: Set[str], endpoints: List[str], headers: Dict
     return out
 
 
+# Role -> (vuln_class, confidence, rationale template, test sketch template).
+# These roles come from hydra's actual per-parameter entropy/role analysis
+# (hellhound/modules/analysis/Hydra.py's Cerberus engine) — a real signal
+# about what a SPECIFIC discovered parameter looks like it does (admin
+# flag, path reference, auth-sensitive, GraphQL-introspectable, an OAuth
+# callback sink), not just a name-token guess the way _PARAM_SIGNAL_GROUPS
+# above works. {param}/{url}/{impact} are filled in per finding.
+_HYDRA_ROLE_VULN_MAP: Dict[str, tuple] = {
+    "ADMIN_FLAG": ("broken_access_control", "medium",
+        "hydra's parameter analysis flagged '{param}' on {url} as an admin/privilege-flag-shaped "
+        "parameter (impact {impact}/10) — if the backend trusts this value from the client instead of "
+        "the authenticated session's own role, flipping it is a direct privilege-escalation path.",
+        "Replay the request with '{param}' changed to an admin/true/1-shaped value under a LOW-privilege "
+        "session and check whether the response reflects elevated access instead of being rejected."),
+    "AUTH_PARAM": ("broken_access_control", "medium",
+        "hydra's parameter analysis flagged '{param}' on {url} as an auth-sensitive parameter (impact "
+        "{impact}/10) — commonly a role/permission/account-scope value that the server should be deriving "
+        "from the session, not trusting from the request.",
+        "Use capture_identity/swap_session to hold two accounts, then replay the request as the lower-"
+        "privileged one with '{param}' set to the higher-privileged value and check what comes back."),
+    "PATH_REFERENCE": ("lfi", "medium",
+        "hydra's parameter analysis flagged '{param}' on {url} as a filesystem-path-shaped parameter "
+        "(impact {impact}/10) — a real occurrence in a discovered request, not just a name guess.",
+        "Try a path-traversal payload (../../../../etc/passwd or the Windows equivalent) against this "
+        "exact parameter/URL and check the response for file content instead of an error."),
+    "GRAPHQL_INTROSPECTABLE": ("info_disclosure", "medium",
+        "hydra's parameter analysis flagged {url} as GraphQL-introspectable (impact {impact}/10) — an "
+        "open introspection query can disclose the full schema, including fields/mutations never meant "
+        "to be publicly documented.",
+        "Run graphql_probe against this endpoint and check whether a full introspection query succeeds "
+        "unauthenticated."),
+    "OAUTH_CALLBACK_SINK": ("open_redirect", "medium",
+        "hydra's parameter analysis flagged '{param}' on {url} as an OAuth/SSO callback sink (impact "
+        "{impact}/10) — the classic open-redirect-to-account-takeover chain if the callback/redirect "
+        "target isn't strictly allowlisted.",
+        "Check whether '{param}' accepts a value outside the registered redirect_uri allowlist, and "
+        "whether the resulting auth code/token is actually usable once redirected off-site."),
+}
+
+
+def _rule_hydra_param_roles(tech: Set[str], endpoints: List[str], headers: Dict[str, str], ctx: Dict[str, Any]) -> List[Hypothesis]:
+    """
+    Consumes hydra's per-parameter role/impact findings (persisted by
+    agent.py's _execute_hydra into target.state["param_signals"], passed
+    in here as ctx["param_signals"]) — richer than _rule_param_name_signals
+    above, which only ever sees bare discovered parameter NAMES. This rule
+    sees what hydra actually determined about a parameter's likely role
+    from where/how it showed up (admin flags, auth-sensitive values, path
+    references, GraphQL introspectability, OAuth callback sinks), each
+    anchored to the real url+parameter it was seen on, not a guess from
+    the name alone.
+    """
+    signals = ctx.get("param_signals") or []
+    if not isinstance(signals, list) or not signals:
+        return []
+    # Keep only the highest-impact finding per role so a target with many
+    # similarly-flagged parameters doesn't flood the board with near-
+    # duplicate hypotheses of the same class.
+    best_by_role: Dict[str, Dict[str, Any]] = {}
+    for sig in signals:
+        if not isinstance(sig, dict):
+            continue
+        roles = sig.get("roles") or []
+        impact = sig.get("impact_score", 0) or 0
+        for role in roles:
+            if role not in _HYDRA_ROLE_VULN_MAP:
+                continue
+            current = best_by_role.get(role)
+            if current is None or impact > (current.get("impact_score", 0) or 0):
+                best_by_role[role] = sig
+    out = []
+    for role, sig in best_by_role.items():
+        vuln_class, confidence, rationale_tpl, test_sketch_tpl = _HYDRA_ROLE_VULN_MAP[role]
+        param = sig.get("parameter", "?")
+        url = sig.get("url", "?")
+        impact = sig.get("impact_score", "?")
+        out.append(Hypothesis(
+            vuln_class, confidence,
+            rationale_tpl.format(param=param, url=url, impact=impact),
+            test_sketch_tpl.format(param=param, url=url, impact=impact),
+            f"hydra role {role} on {param}@{url}",
+        ))
+    return out
+
+
 def _rule_waf_detected(tech: Set[str], endpoints: List[str], headers: Dict[str, str], ctx: Dict[str, Any]) -> List[Hypothesis]:
     waf_names = ctx.get("waf_detected") or []
     if not waf_names:
@@ -479,7 +611,7 @@ _RULES = [
     _rule_spring_java, _rule_aspnet, _rule_graphql, _rule_jwt, _rule_numeric_id_paths,
     _rule_file_upload, _rule_ssrf_prone_features, _rule_cors, _rule_leaked_vcs_and_env,
     _rule_elastic_mongo_redis_exposed, _rule_oauth_sso, _rule_param_name_signals,
-    _rule_waf_detected,
+    _rule_waf_detected, _rule_rails, _rule_drupal, _rule_hydra_param_roles,
 ]
 
 
@@ -492,10 +624,14 @@ def generate(tech_stack: Optional[List[str]] = None, endpoints: Optional[List[st
     endpoints/headers shape: `context["parameters"]` (discovered parameter
     NAMES, e.g. from spider/fuzz_hunter — used for name-pattern rules like
     "a 'redirect' param suggests open_redirect/account-takeover chaining,
-    a 'cmd' param suggests command_injection") and `context["waf_detected"]`
+    a 'cmd' param suggests command_injection"), `context["waf_detected"]`
     (WAF/protection names already fingerprinted, e.g. by wafbuster — used
     to flag that payload-based hypotheses may need waf_evasion_probe before
-    being written off as dead ends).
+    being written off as dead ends), and `context["param_signals"]` (hydra's
+    real per-parameter role/impact findings — admin flags, auth-sensitive
+    params, path references, GraphQL introspectability, OAuth callback
+    sinks — each anchored to the actual url+parameter it was seen on,
+    richer than a bare name guess).
 
     Dedup keeps the HIGHEST-confidence hypothesis per vuln_class (a rule
     firing twice for the same class, e.g. idor from both numeric-id-paths

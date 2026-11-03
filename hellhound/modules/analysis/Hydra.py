@@ -752,8 +752,24 @@ async def _run_async(target, emit, options=None):
         ep["_hydra_roles"] = ep_role_map
         return ep_findings
 
+    # Identity model: auth_cookies/auth_headers is the same options shape
+    # http_utils.apply_session_config() reads everywhere else in this
+    # codebase (set via agent.py's _target_auth_options(), fed by
+    # capture_identity/swap_session). This module builds its own bare
+    # aiohttp.ClientSession instead of going through apply_session_config,
+    # so without this every param/logic-flaw probe ran as an anonymous
+    # visitor regardless of whatever identity was active — an auth-gated
+    # endpoint's params were invisible to it entirely.
+    _auth_cookies = options.get("auth_cookies") if options else None
+    _auth_headers = options.get("auth_headers") if options else None
+    session_kwargs = {}
+    if isinstance(_auth_cookies, dict) and _auth_cookies:
+        session_kwargs["cookies"] = _auth_cookies
+    if isinstance(_auth_headers, dict) and _auth_headers:
+        session_kwargs["headers"] = _auth_headers
+
     # Fire all endpoints concurrently
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(**session_kwargs) as session:
         engine.session = session
         tasks   = [process_endpoint(ep) for ep in endpoints]
         results = await asyncio.gather(*tasks, return_exceptions=True)
