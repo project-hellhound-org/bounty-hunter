@@ -211,6 +211,28 @@ def terminal_clear():
 # -------------------------------------------------
 def _launch_console():
     _configure_logging()
+
+    # Default to the Claude Code-style Textual TUI (scrollable transcript,
+    # pinned input, clickable/collapsible tool cards showing the real
+    # request/response). Set HELLHOUND_CLASSIC_UI=1 to force the classic
+    # prompt_toolkit REPL. If the TUI can't start for any reason, fall back
+    # to classic automatically rather than leaving the user with no console.
+    import os
+    _classic = os.environ.get("HELLHOUND_CLASSIC_UI", "").strip().lower()
+    use_classic = _classic not in ("", "0", "false", "no")
+
+    if not use_classic:
+        try:
+            from hellhound.core.tui import start_tui_session
+            start_tui_session()
+            return
+        except KeyboardInterrupt:
+            click.echo("\n[+] Exiting HELLHOUND.")
+            sys.exit(0)
+        except Exception as e:
+            click.echo(f"[!] TUI unavailable ({e}); falling back to the classic console. "
+                       f"Force classic anytime with HELLHOUND_CLASSIC_UI=1.")
+
     try:
         from hellhound.core.chat_ui import start_chat_session
         start_chat_session()
