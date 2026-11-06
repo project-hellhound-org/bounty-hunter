@@ -68,7 +68,16 @@ from hellhound.memory import (
     dismiss_false_positive,
     is_dismissed_as_false_positive,
 )
-from hellhound.memory.investigation import merge_state_list as _merge_state_list, record_timeline as _record_timeline
+from hellhound.memory.investigation import (
+    merge_state_list as _merge_state_list,
+    record_timeline as _record_timeline,
+    record_quirk as _record_quirk,
+    record_waf_observation as _record_waf_observation,
+    record_rate_limit_hit as _record_rate_limit_hit,
+    note_auth_mechanism as _note_auth_mechanism,
+    build_target_profile as _build_target_profile,
+    format_profile_block as _format_profile_block,
+)
 from hellhound.core.skills import (
     get_relevant_skills_prompt,
     discover_skills,
@@ -4014,10 +4023,28 @@ def _is_repeat_anonymous_session_cookie(cookie_name: str, tool_args: Dict[str, A
         return False
     existing = target.state.get("artifacts", []) if hasattr(target, "state") and isinstance(target.state, dict) else []
     name_lower = (cookie_name or "").strip().lower()
-    return any(
+    is_repeat = any(
         isinstance(a, dict) and str(a.get("field_name", "")).strip().lower() == name_lower
         for a in existing
     )
+    if is_repeat:
+        # Worth remembering across sessions: this host hands out a fresh
+        # session cookie on every anonymous page load. record_quirk dedups,
+        # so this only writes (and timelines) the first time per cookie name.
+        try:
+            _record_quirk(
+                target,
+                f"Server mints a fresh '{cookie_name}' session cookie on every anonymous request",
+                detail=(
+                    "Default PHP/framework session behavior — a new anonymous session value per page "
+                    "load is NOT a new identity; only a cookie set by a real login POST or SSO/OAuth leg "
+                    "represents a distinct session worth testing."
+                ),
+                source="curl",
+            )
+        except Exception:
+            pass  # quirk capture is best-effort, never changes the gate decision
+    return is_repeat
 
 
 def _flatten_json_dict(obj: Any, prefix: str = "") -> Dict[str, Any]:
@@ -5012,6 +5039,21 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                     del evidence_log[: len(evidence_log) - 40]
         except Exception:
             pass  # evidence capture is best-effort and must never break the actual request
+
+        # Passive target-profile observation — note how this host behaves
+        # (rate-limiting, WAF blocking) as we see it, so a resumed hunt
+        # already knows to pace itself / expect a WAF instead of
+        # re-discovering it from scratch. Best-effort; never affects the
+        # request result. A 429 is recorded as rate-limiting specifically
+        # (not lumped in with WAF blocks) since the right response differs:
+        # back off/pace vs. try an evasion/encoding mutation.
+        try:
+            if r.status_code == 429:
+                _record_rate_limit_hit(target, retry_after=(r.headers.get("Retry-After") or ""), source=url)
+            elif _looks_waf_blocked(r.status_code, r.text):
+                _record_waf_observation(target, blocked=True, detail=f"HTTP {r.status_code} on {url}")
+        except Exception:
+            pass  # profile observation is best-effort, never breaks the request
 
         # Store observed session cookies in target.state so subsequent tools (curl, gowitness, spider) can reuse them
         raw_set_cookie = r.headers.get("set-cookie") or r.headers.get("Set-Cookie")
@@ -6069,7 +6111,7 @@ _PIVOT_EXEMPT_TOOLS = frozenset((
     "save_file", "delete_file", "cookie_inspector", "update_plan",
     "recall_data", "load_skill", "listener", "recall_patterns",
     "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis",
-    "save_auth_flow",
+    "save_auth_flow", "profile",
 ))
 _PIVOT_LOW_SIGNAL_THRESHOLD = 3
 _PIVOT_DEAD_END_THRESHOLD = 5
@@ -11590,6 +11632,61 @@ def _search_raw_artifacts(target: Target, query: str, limit: int = 50, regex: bo
     }
 
 
+def _execute_profile(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Read or annotate the persistent TARGET PROFILE — the accumulated record
+    of what we know about how THIS host behaves (tech stack, WAF, rate
+    limiting, auth mechanism, quirks), persisted across sessions and
+    surfaced into the prompt every turn.
+
+    Local-only, no network traffic to the target — exempt from the scope
+    gate like recall_data/recall_patterns (see execute_tool_call's bypass
+    list). Most of the profile fills in automatically as other tools run
+    (a 429 from curl, a WAF block, the anonymous-session-cookie churn
+    quirk); this tool is for the model to (a) VIEW the current profile and
+    (b) NOTE a durable observation it reasoned out itself — e.g. "auth is
+    session-cookie-only, Bearer and ?api_key= both 401" — so it survives
+    into the next session instead of being re-derived every time.
+    """
+    action = (args.get("action") or "view").strip().lower()
+
+    if action == "note":
+        wrote = []
+        quirk = (args.get("quirk") or "").strip()
+        if quirk:
+            if _record_quirk(target, quirk, detail=(args.get("detail") or "").strip(), source="model"):
+                wrote.append("quirk")
+            else:
+                wrote.append("quirk (already known — no change)")
+        mechanism = (args.get("auth_mechanism") or "").strip()
+        cookie_name = (args.get("session_cookie_name") or "").strip()
+        auth_note = (args.get("auth_note") or "").strip()
+        if mechanism or cookie_name or auth_note:
+            _note_auth_mechanism(target, mechanism=mechanism, session_cookie_name=cookie_name, note=auth_note)
+            wrote.append("auth")
+        if not wrote:
+            return {
+                "error": "profile(action='note') needs something to record — pass 'quirk' (+ optional "
+                         "'detail'), and/or one of 'auth_mechanism' / 'session_cookie_name' / 'auth_note'.",
+            }
+        try:
+            save_target(target)
+        except Exception:
+            pass
+        if emit and hasattr(emit, "success"):
+            emit.success(f"[✓] Target profile updated ({', '.join(wrote)}).")
+        return {"status": "recorded", "updated": wrote, "profile": _build_target_profile(target)}
+
+    # Default: view
+    profile = _build_target_profile(target)
+    block = _format_profile_block(target)
+    return {
+        "status": "success",
+        "profile": profile,
+        "rendered": block or "(nothing learned about this host yet — the profile fills in as curl/recon tools run)",
+    }
+
+
 def _execute_recall_data(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Lets the model actively LOOK UP its own gathered data for this target,
@@ -12032,6 +12129,37 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["action"]
         },
         executor=_execute_update_plan
+    ),
+    "profile": ToolSpec(
+        name="profile",
+        description=(
+            "Read or annotate the persistent TARGET PROFILE — what we already know about how THIS specific "
+            "host behaves: tech stack, WAF/protection and how often it blocks, whether it rate-limits (HTTP "
+            "429s observed), its auth mechanism, and one-off quirks. It persists across sessions and is "
+            "injected into your context every turn, so this is how a hunt resumed days later already knows "
+            "'this host 429s fast / only honors a session cookie / mints a fresh PHPSESSID on every "
+            "anonymous hit' instead of re-learning it the hard way. Most of it fills in AUTOMATICALLY as "
+            "curl/recon tools run — you rarely need action='view' since the profile is already in your "
+            "prompt. Use action='note' to durably record something YOU reasoned out that automation "
+            "wouldn't catch: pass 'quirk' (+ optional 'detail') for a behavioral oddity, and/or "
+            "'auth_mechanism' / 'session_cookie_name' / 'auth_note' once you've worked out how auth "
+            "actually works (e.g. auth_mechanism='session-cookie-only', auth_note='Authorization: Bearer "
+            "and ?api_key= both return 401'). This is a target-specific profile, NOT a cross-target lesson "
+            "(use remember_lesson for 'this technique works on stack X everywhere')."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["view", "note"], "description": "'view' (default) returns the current profile; 'note' records a new observation."},
+                "quirk": {"type": "string", "description": "action='note': a one-line behavioral quirk about this host (deduped automatically)."},
+                "detail": {"type": "string", "description": "action='note': optional longer explanation for the quirk."},
+                "auth_mechanism": {"type": "string", "description": "action='note': how the target authenticates, e.g. 'session-cookie-only', 'JWT bearer', 'OAuth/SSO'."},
+                "session_cookie_name": {"type": "string", "description": "action='note': the name of the session cookie that actually authenticates, e.g. 'PHPSESSID'."},
+                "auth_note": {"type": "string", "description": "action='note': a specific observation about auth, e.g. 'Bearer header and ?api_key= both return 401; only the session cookie works'."}
+            },
+            "required": []
+        },
+        executor=_execute_profile
     ),
     "recall_data": ToolSpec(
         name="recall_data",
@@ -15004,7 +15132,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # host — gating it on is_in_scope would make it unable to do the one thing it's
         # for; delete_file's only "target" is a bare filename, which _extract_target_
         # from_args would wrongly try to parse as a host/URL).
-        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow"):
+        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow", "profile"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
@@ -15874,6 +16002,10 @@ If there is nothing worth generalizing, return an empty array: []"""
                         "one):\n" + "\n".join(lead_lines)
                     )
 
+            profile_block_text = _format_profile_block(self.target)
+            if profile_block_text:
+                intel_parts.append(profile_block_text)
+
             if intel_parts:
                 intel_block = "\n\n".join(intel_parts)
             else:
@@ -16119,6 +16251,10 @@ The researcher explicitly requested a formal report. Provide a structured, profe
 
         artifact_inventory_synth = format_artifact_inventory(self.target)
         artifact_block_synth = f"\n{artifact_inventory_synth}\n" if artifact_inventory_synth else ""
+
+        profile_inventory_synth = _format_profile_block(self.target)
+        if profile_inventory_synth:
+            artifact_block_synth += f"\n{profile_inventory_synth}\n"
 
         # A target only exists for prompt purposes once the researcher has
         # actually configured one (via /target, /scope, or a domain named in

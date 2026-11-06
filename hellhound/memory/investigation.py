@@ -17,6 +17,7 @@ write initializes the key it needs.
 """
 
 from datetime import datetime, timezone
+import re
 from typing import Any, Dict, List, Optional
 
 
@@ -709,3 +710,227 @@ def build_investigation_graph(target) -> Dict[str, List[Dict[str, Any]]]:
         add_edge(parent, fid)
 
     return {"nodes": nodes, "edges": edges}
+
+
+# ── Full Target Profile (roadmap #5) ─────────────────────────────────────────
+# A single structured, persistent record of what we've learned ABOUT the
+# target itself — as opposed to findings (what's wrong with it) or hypotheses
+# (what might be wrong). It accumulates the tech stack, how the WAF behaves,
+# where/when the host rate-limits, its auth mechanism, and any one-off quirks
+# worth remembering. It lives at target.state["profile"], so it persists with
+# everything else in task.json and survives across sessions for free, and it's
+# surfaced back into the orchestrator/synthesizer prompt every turn via
+# format_profile_block() — so a hunt resumed days later starts already knowing
+# "this host 429s fast / only honors a session cookie / mints a fresh PHPSESSID
+# on every anonymous hit" instead of silently re-learning it from scratch.
+#
+# Writes are append-only + deduplicated and auto-capped, same discipline as the
+# rest of this module; the tech/WAF lists other tools already populate
+# (state["technologies"], state["waf_detected"]) are NOT duplicated here — the
+# read model (build_target_profile) folds them in by reference so there is one
+# source of truth per fact.
+
+_PROFILE_QUIRK_CAP = 40
+_PROFILE_AUTH_NOTE_CAP = 20
+
+
+def _ensure_profile(target) -> Optional[Dict[str, Any]]:
+    """Returns target.state['profile'], initializing its sub-structure in
+    place. Returns None only when the target has no usable state dict."""
+    if not hasattr(target, "state") or target.state is None:
+        return None
+    prof = target.state.get("profile")
+    if not isinstance(prof, dict):
+        prof = {}
+        target.state["profile"] = prof
+    if not isinstance(prof.get("waf"), dict):
+        prof["waf"] = {}
+    if not isinstance(prof.get("rate_limit"), dict):
+        prof["rate_limit"] = {}
+    if not isinstance(prof.get("auth"), dict):
+        prof["auth"] = {}
+    if not isinstance(prof.get("quirks"), list):
+        prof["quirks"] = []
+    return prof
+
+
+def _norm_quirk(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def record_quirk(target, quirk: str, detail: str = "", source: str = "") -> bool:
+    """Records a one-off behavioral quirk about the target (deduped by
+    normalized quirk text — recording the same quirk twice is a no-op).
+    Returns True only when a genuinely new quirk was added."""
+    prof = _ensure_profile(target)
+    if prof is None or not (quirk or "").strip():
+        return False
+    key = _norm_quirk(quirk)
+    quirks = prof["quirks"]
+    for q in quirks:
+        if isinstance(q, dict) and _norm_quirk(q.get("quirk", "")) == key:
+            return False  # already known — don't duplicate or re-timeline
+    quirks.append({
+        "quirk": quirk.strip(),
+        "detail": (detail or "").strip(),
+        "source": (source or "").strip(),
+        "ts": _now_iso(),
+    })
+    if len(quirks) > _PROFILE_QUIRK_CAP:
+        prof["quirks"] = quirks[-_PROFILE_QUIRK_CAP:]
+    prof["updated_at"] = _now_iso()
+    record_timeline(target, f"Target profile: noted quirk — {quirk.strip()}")
+    return True
+
+
+def record_waf_observation(target, waf_names=None, blocked: bool = False, detail: str = "") -> None:
+    """Records WAF/protection signal. `waf_names` (str or list) merges into
+    the canonical state['waf_detected'] list other tools already use;
+    `blocked=True` bumps a running count of requests that looked WAF-blocked
+    (403/406/429/501 or a known block phrase), which pacing/strategy can read."""
+    prof = _ensure_profile(target)
+    if prof is None:
+        return
+    if waf_names:
+        names = [waf_names] if isinstance(waf_names, str) else list(waf_names)
+        merge_state_list(target, "waf_detected", [n for n in names if n])
+    if blocked:
+        waf = prof["waf"]
+        waf["block_events"] = int(waf.get("block_events", 0) or 0) + 1
+        waf["last_block_ts"] = _now_iso()
+        if detail:
+            waf["last_block_detail"] = str(detail)[:200]
+    prof["updated_at"] = _now_iso()
+
+
+def record_rate_limit_hit(target, retry_after: str = "", source: str = "") -> None:
+    """Records an observed HTTP 429 against the target. The first one leaves
+    a durable timeline note ('this host enforces rate limiting') so a resumed
+    session knows to pace itself here."""
+    prof = _ensure_profile(target)
+    if prof is None:
+        return
+    rl = prof["rate_limit"]
+    rl["events_429"] = int(rl.get("events_429", 0) or 0) + 1
+    rl["last_ts"] = _now_iso()
+    if retry_after:
+        rl["last_retry_after"] = str(retry_after)[:60]
+    if source:
+        rl["last_source"] = str(source)[:200]
+    prof["updated_at"] = _now_iso()
+    if rl["events_429"] == 1:
+        record_timeline(target, "Target profile: first HTTP 429 observed — this host enforces rate limiting; pace active testing.")
+
+
+def note_auth_mechanism(target, mechanism: str = "", session_cookie_name: str = "", note: str = "") -> None:
+    """Records what we've learned about how the target authenticates (e.g.
+    'session-cookie-only — Bearer header and ?api_key= both return 401')."""
+    prof = _ensure_profile(target)
+    if prof is None:
+        return
+    auth = prof["auth"]
+    if mechanism:
+        auth["mechanism"] = str(mechanism).strip()[:160]
+    if session_cookie_name:
+        auth["session_cookie_name"] = str(session_cookie_name).strip()[:60]
+    if note:
+        notes = auth.setdefault("notes", [])
+        if not isinstance(notes, list):
+            notes = []
+            auth["notes"] = notes
+        n = str(note).strip()
+        if n and n not in notes:
+            notes.append(n)
+            if len(notes) > _PROFILE_AUTH_NOTE_CAP:
+                auth["notes"] = notes[-_PROFILE_AUTH_NOTE_CAP:]
+    prof["updated_at"] = _now_iso()
+
+
+def build_target_profile(target) -> Dict[str, Any]:
+    """Normalized read model of the full target profile. Folds the tech-stack
+    and WAF-name lists other tools already populate in target.state into the
+    structured profile fields, so callers see one coherent picture without
+    this module having to own (and risk diverging on) those facts."""
+    st = target.state if hasattr(target, "state") and isinstance(target.state, dict) else {}
+    prof = st.get("profile") if isinstance(st.get("profile"), dict) else {}
+    waf = prof.get("waf") if isinstance(prof.get("waf"), dict) else {}
+    rl = prof.get("rate_limit") if isinstance(prof.get("rate_limit"), dict) else {}
+    auth = prof.get("auth") if isinstance(prof.get("auth"), dict) else {}
+    return {
+        "tech_stack": list(st.get("technologies", []) or []),
+        "waf": {
+            "detected": list(st.get("waf_detected", []) or []),
+            "block_events": int(waf.get("block_events", 0) or 0),
+            "last_block_ts": waf.get("last_block_ts", ""),
+            "last_block_detail": waf.get("last_block_detail", ""),
+        },
+        "rate_limit": {
+            "events_429": int(rl.get("events_429", 0) or 0),
+            "last_retry_after": rl.get("last_retry_after", ""),
+            "last_ts": rl.get("last_ts", ""),
+        },
+        "auth": {
+            "mechanism": auth.get("mechanism", ""),
+            "session_cookie_name": auth.get("session_cookie_name", ""),
+            "notes": list(auth.get("notes", []) or []),
+        },
+        "quirks": [q for q in prof.get("quirks", []) if isinstance(q, dict)],
+        "updated_at": prof.get("updated_at", ""),
+    }
+
+
+def format_profile_block(target) -> str:
+    """High-visibility TARGET PROFILE block for prompt injection — the
+    'what we already know about this host' companion to the harvested
+    artifact ledger. Returns '' when nothing substantive has been learned
+    yet, so a fresh target adds no noise to the prompt."""
+    p = build_target_profile(target)
+    lines: List[str] = []
+
+    if p["tech_stack"]:
+        lines.append("Tech stack: " + ", ".join(str(t) for t in p["tech_stack"][:10]))
+
+    waf = p["waf"]
+    if waf["detected"] or waf["block_events"]:
+        parts = []
+        if waf["detected"]:
+            parts.append("detected: " + ", ".join(str(w) for w in waf["detected"][:6]))
+        if waf["block_events"]:
+            blk = f"{waf['block_events']} request(s) looked WAF-blocked"
+            if waf["last_block_detail"]:
+                blk += f" (last: {waf['last_block_detail']})"
+            parts.append(blk)
+        lines.append("WAF/protection: " + "; ".join(parts))
+
+    rl = p["rate_limit"]
+    if rl["events_429"]:
+        extra = f", last Retry-After={rl['last_retry_after']}" if rl["last_retry_after"] else ""
+        lines.append(
+            f"Rate limiting: {rl['events_429']} HTTP 429(s) observed{extra} — pace active testing here, "
+            "prefer surgical curl over broad fuzzing"
+        )
+
+    auth = p["auth"]
+    if auth["mechanism"] or auth["session_cookie_name"] or auth["notes"]:
+        parts = []
+        if auth["mechanism"]:
+            parts.append(auth["mechanism"])
+        if auth["session_cookie_name"]:
+            parts.append(f"session cookie: {auth['session_cookie_name']}")
+        for n in auth["notes"][:3]:
+            parts.append(n)
+        lines.append("Auth: " + "; ".join(parts))
+
+    if p["quirks"]:
+        lines.append("Quirks (observed on this host — don't re-learn these the hard way):")
+        for q in p["quirks"][-8:]:
+            detail = f" — {q.get('detail')}" if q.get("detail") else ""
+            lines.append(f"  - {q.get('quirk')}{detail}")
+
+    if not lines:
+        return ""
+    return (
+        "================== TARGET PROFILE (persisted; what we already know about this host) ==================\n"
+        + "\n".join(lines)
+        + "\n======================================================================================================"
+    )
