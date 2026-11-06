@@ -9802,6 +9802,176 @@ def _execute_swap_session(args: Dict[str, Any], target: Target, emit: Any) -> Di
     }
 
 
+_RESPDIFF_MISSING = object()  # sentinel: a JSON key present on one side, absent on the other
+
+
+def _json_field_diff(a: Any, b: Any, path: str = "", out: Optional[List[Dict[str, Any]]] = None, cap: int = 60) -> List[Dict[str, Any]]:
+    """Recursive structural diff of two JSON-ish values. Returns a flat list
+    of {path, baseline, test} changes — 'which field differs', the signal
+    that actually matters for access-control/IDOR/mass-assignment work
+    (e.g. role: "user" -> "admin"). Bounded by `cap` so a huge array of
+    differences can't blow up the result."""
+    if out is None:
+        out = []
+    if len(out) >= cap:
+        return out
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k in list(dict.fromkeys(list(a.keys()) + list(b.keys()))):
+            if len(out) >= cap:
+                break
+            _json_field_diff(a.get(k, _RESPDIFF_MISSING), b.get(k, _RESPDIFF_MISSING),
+                             f"{path}.{k}" if path else str(k), out, cap)
+    elif isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            out.append({"path": path or "(root)", "baseline": f"<list len {len(a)}>", "test": f"<list len {len(b)}>"})
+        for i in range(min(len(a), len(b))):
+            if len(out) >= cap:
+                break
+            _json_field_diff(a[i], b[i], f"{path}[{i}]", out, cap)
+    else:
+        if a is not b and a != b:
+            out.append({
+                "path": path or "(root)",
+                "baseline": "<absent>" if a is _RESPDIFF_MISSING else a,
+                "test": "<absent>" if b is _RESPDIFF_MISSING else b,
+            })
+    return out
+
+
+def _try_json(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except Exception:
+        return _RESPDIFF_MISSING
+
+
+def _execute_response_diff(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Fire a BASELINE request and a TEST request, then surface exactly how the
+    two responses differ: status, body length, which JSON fields changed
+    (recursively, by path), and a bounded line-level diff for non-JSON
+    bodies. This is the mechanical backbone for access-control / IDOR /
+    mass-assignment testing — "the test response differs from baseline ONLY
+    in the `role` field (user -> admin)" is the signal a human researcher
+    eyeballs, computed deterministically instead of guessed from a wall of
+    JSON. It deliberately does NOT assert a vulnerability (that's
+    verify_finding's job, and record_finding's gate after that) — it just
+    reports the delta honestly, including "no difference at all", which is
+    itself the answer to a lot of false-positive IDOR claims.
+
+    Both sides run through _execute_curl, so each inherits the exact same
+    auto-attach/isolation/evidence-capture behavior as any curl call. The
+    two sides MUST resolve to the same host — a diff across two different
+    hosts is meaningless, and (per AGENTS.md) must never be a way to reach
+    an unvalidated second target: every resolved URL is re-checked against
+    the configured scope rules here before any request fires.
+    """
+    shared_url = (args.get("url") or "").strip()
+    shared_method = str(args.get("method") or "GET").upper()
+    baseline_spec = args.get("baseline") if isinstance(args.get("baseline"), dict) else {}
+    test_spec = args.get("test") if isinstance(args.get("test"), dict) else {}
+
+    def _side_url(spec):
+        return (spec.get("url") or shared_url or "").strip()
+
+    b_url, t_url = _side_url(baseline_spec), _side_url(test_spec)
+    if not b_url or not t_url:
+        return {"error": "response_diff needs a URL for each side — pass a shared 'url' and/or per-side "
+                         "'baseline'/'test' objects each with their own 'url'. The common IDOR shape is one "
+                         "shared 'url' with different 'cookies' per side (victim vs attacker identity)."}
+
+    # Same-host enforcement + explicit per-side scope check (defense in depth:
+    # the dispatcher's generic gate only inspects the top-level 'url', so a
+    # per-side override could otherwise slip past it).
+    b_host, _ = normalize_host(b_url if b_url.startswith(("http://", "https://")) else f"https://{b_url}")
+    t_host, _ = normalize_host(t_url if t_url.startswith(("http://", "https://")) else f"https://{t_url}")
+    if b_host and t_host and b_host != t_host:
+        return {"error": f"baseline host ('{b_host}') and test host ('{t_host}') differ — a response diff "
+                         f"must compare the SAME endpoint under two conditions (identity, parameter value), "
+                         f"not two different hosts. Refusing rather than silently testing a second target."}
+    if target and target.scope_rules and target.scope_rules.in_scope:
+        for u in (b_url, t_url):
+            allowed, reason = is_in_scope(u, target.scope_rules)
+            if not allowed:
+                return {"error": f"SCOPE_VIOLATION: {reason}", "target": u, "blocked": True}
+
+    def _build_curl_args(spec, side_url):
+        return {
+            "url": side_url,
+            "method": str(spec.get("method") or shared_method).upper(),
+            "headers": spec.get("headers"),
+            "cookies": spec.get("cookies"),
+            "json": spec.get("json"),
+            "body": spec.get("body"),
+            "isolate": bool(spec.get("isolate", args.get("isolate", False))),
+        }
+
+    baseline_resp = _execute_curl(_build_curl_args(baseline_spec, b_url), target, emit)
+    if isinstance(baseline_resp, dict) and baseline_resp.get("error"):
+        return {"error": f"baseline request failed: {baseline_resp['error']}"}
+    test_resp = _execute_curl(_build_curl_args(test_spec, t_url), target, emit)
+    if isinstance(test_resp, dict) and test_resp.get("error"):
+        return {"error": f"test request failed: {test_resp['error']}"}
+
+    b_status = baseline_resp.get("status_code")
+    t_status = test_resp.get("status_code")
+    b_body = baseline_resp.get("body_preview") or ""
+    t_body = test_resp.get("body_preview") or ""
+    b_ctype = (baseline_resp.get("headers") or {}).get("Content-Type", "") or (baseline_resp.get("headers") or {}).get("content-type", "")
+    t_ctype = (test_resp.get("headers") or {}).get("Content-Type", "") or (test_resp.get("headers") or {}).get("content-type", "")
+
+    result: Dict[str, Any] = {
+        "status": "success",
+        "baseline": {"url": b_url, "status_code": b_status, "length": len(b_body), "content_type": b_ctype},
+        "test": {"url": t_url, "status_code": t_status, "length": len(t_body), "content_type": t_ctype},
+        "status_changed": b_status != t_status,
+        "length_delta": len(t_body) - len(b_body),
+    }
+
+    b_json, t_json = _try_json(b_body), _try_json(t_body)
+    both_json = b_json is not _RESPDIFF_MISSING and t_json is not _RESPDIFF_MISSING
+    field_changes: List[Dict[str, Any]] = []
+    if both_json:
+        field_changes = _json_field_diff(b_json, t_json)
+        result["diff_type"] = "json"
+        result["field_changes"] = field_changes
+        result["field_change_count"] = len(field_changes)
+    else:
+        max_lines = int(args.get("max_body_diff_lines", 60) or 60)
+        line_diff = list(difflib.unified_diff(
+            b_body.splitlines(), t_body.splitlines(),
+            fromfile="baseline", tofile="test", lineterm=""))[: max_lines]
+        result["diff_type"] = "text"
+        result["body_line_diff"] = line_diff
+        result["body_line_diff_truncated"] = len(line_diff) >= max_lines
+
+    identical = (b_status == t_status) and (b_body == t_body)
+    if identical:
+        summary = ("Responses are IDENTICAL (same status, byte-identical body). For an IDOR/access-control "
+                   "test this means the test condition made NO difference — strong evidence it is NOT a "
+                   "cross-account bypass (either no auth gate at all, or the control change had no effect).")
+    else:
+        parts = [f"status {b_status} -> {t_status}" if b_status != t_status else f"status {b_status} (same)"]
+        if result["length_delta"]:
+            parts.append(f"body length {len(b_body)} -> {len(t_body)} ({result['length_delta']:+d} bytes)")
+        if both_json:
+            if field_changes:
+                preview = ", ".join(
+                    f"{c['path']}: {c['baseline']!r}->{c['test']!r}" for c in field_changes[:6])
+                parts.append(f"{len(field_changes)} JSON field(s) changed: {preview}"
+                             + (" ..." if len(field_changes) > 6 else ""))
+            else:
+                parts.append("JSON bodies parse but no field differs")
+        summary = "Responses DIFFER — " + "; ".join(parts) + (
+            ". A changed field under the TEST identity that holds another account's data (e.g. a different "
+            "user_id, wallet, email) is the IDOR signal — confirm with verify_finding before recording.")
+    result["summary"] = summary
+
+    if emit and hasattr(emit, "tool_result"):
+        pass  # the dispatcher already renders the result; nothing extra to print here
+    return result
+
+
 def _execute_verify_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Runs an INDEPENDENT, code-level signal check for a disputed or about-
@@ -11968,6 +12138,42 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["name"]
         },
         executor=_execute_swap_session
+    ),
+    "response_diff": ToolSpec(
+        name="response_diff",
+        description=(
+            "Fire a BASELINE request and a TEST request against the SAME endpoint and report exactly how the "
+            "two responses differ — status, body length, which JSON fields changed (recursively, by path, "
+            "e.g. 'role: user -> admin'), and a line-level diff for non-JSON. This is the workhorse for "
+            "access-control / IDOR / BOLA / mass-assignment testing: instead of eyeballing two walls of JSON "
+            "and guessing, you get the precise delta. The classic IDOR shape is ONE shared 'url' with "
+            "different 'cookies' per side (victim identity as baseline, attacker identity as test) — if the "
+            "attacker's response still contains the victim's own data, the changed fields show it. The "
+            "mass-assignment shape is a GET baseline, then a GET after a PUT that tried to set a field you "
+            "shouldn't control — if 'role'/'balance' actually changed, the diff proves persistence. It also "
+            "cleanly reports 'IDENTICAL' / 'no field differs', which is often the correct refutation of a "
+            "false IDOR (the test condition made no difference). This does NOT record or assert a finding — "
+            "follow up with verify_finding then record_finding. Both sides must hit the same host."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Shared endpoint URL used by both sides unless a side overrides it. e.g. 'http://host/api/transactions.php?user_id=5'."},
+                "method": {"type": "string", "description": "Shared HTTP method (default GET). Override per side inside 'baseline'/'test' if needed."},
+                "baseline": {
+                    "type": "object",
+                    "description": "The reference request (e.g. the victim's own session, or the pre-change state). Any of: url, method, headers (object), cookies (object), json (object), body (string), isolate (bool).",
+                },
+                "test": {
+                    "type": "object",
+                    "description": "The request to compare against baseline (e.g. the attacker's session, or the post-change state). Same shape as 'baseline'.",
+                },
+                "isolate": {"type": "boolean", "description": "Shared default for both sides: if true, do NOT auto-attach any stored session cookie/token (test truly unauthenticated / only what you pass explicitly). Default false.", "default": False},
+                "max_body_diff_lines": {"type": "integer", "description": "Cap on the non-JSON line diff (default 60).", "default": 60}
+            },
+            "required": []
+        },
+        executor=_execute_response_diff
     ),
     "verify_finding": ToolSpec(
         name="verify_finding",

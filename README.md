@@ -296,14 +296,14 @@ All actions can be triggered via slash commands or natural language:
 
 ## The Recon & Triage Arsenal
 
-Bounty Hunter coordinates **73 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
+Bounty Hunter coordinates **74 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
 
 | Category | Tools |
 | :--- | :--- |
 | **Passive & Active Recon** | `subfinder` `subdomain_sweep` `permute_subdomains` `resolve_candidates` `dns_bruteforce` `dig` `port_scan` `tls_cert_scan` `httpx` `nmap_service_scan` `wayback_urls` `gau_nuclei_sweep` `urlscan_recon` `google_dork` `otx_urls` `virustotal_lookup` `cloudscout` `wafbuster` |
 | **Crawling & Content Discovery** | `spider` `katana` `content_discovery` `fuzz_hunter` `vhost_fuzz` `js_miner` |
 | **Visual & Browser** | `browser_control` `save_auth_flow` `replay_auth_flow` `gowitness` |
-| **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `wpscan_scan` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `403_bypass` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` `replay_request` `verify_finding` |
+| **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `wpscan_scan` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `403_bypass` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` `replay_request` `response_diff` `verify_finding` |
 | **Takeover & Subdomain Health** | `takeover_scanner` `subzy` |
 | **Session, Scope & Workspace** | `cookie_inspector` `curl` `run_terminal_command` `set_target` `manage_scope` `manage_program` `listener` `recall_data` `profile` `update_plan` `recall_patterns` `capture_identity` `swap_session` `generate_hypotheses` `update_hypothesis` |
 | **HackerOne Program Intel** | `hackerone_policy` `hackerone_search` `hackerone_stats` |
@@ -356,6 +356,7 @@ The newest landings, in short. Full detail (including everything older) is in [C
 - **`verify_finding`** — real code-level signal checking for sqli/xss/ssrf/ssti/cors/idor, not just "the request went through."
 - **Persistent target profile** (`profile` tool) — a per-target record of how a host actually behaves (tech stack, WAF/protection + how often it blocks, rate-limiting/429s observed, auth mechanism, one-off quirks). Most of it fills in automatically as curl/recon tools run — a 429, a WAF block, the anonymous-session-cookie churn quirk — and it's injected into the model's context every turn, so a hunt resumed days later already knows "this host 429s fast / only honors a session cookie / mints a fresh PHPSESSID on every anonymous hit" instead of re-learning it. `profile(action='note')` records anything the model reasons out itself.
 - **Headless XSS execution confirmation** — `browser_control`'s `confirm_script_execution` + `verify_finding`'s `verify_xss` now confirm a payload actually *executes* in a real browser (not just that it reflected unescaped).
+- **`response_diff`** — fire a baseline and a test request against the same endpoint and get the exact delta: status, length, which JSON fields changed (recursively, by path — `role: user -> admin`), or a line diff for non-JSON. The deterministic backbone for IDOR/BOLA/access-control/mass-assignment work — including a clean "IDENTICAL / no field differs" verdict that refutes a lot of false IDOR claims. Both sides run through the scope-gated curl path; it reports the delta, it doesn't assert the finding.
 - **`recall_patterns`** — cross-target pattern memory; a technique that worked on a similarly-stacked target surfaces automatically.
 - **`manage_program`** fixed — creating a program no longer silently drags in whatever placeholder target happened to be active.
 
@@ -367,7 +368,7 @@ The honest gap between "runs tools well" and "hunts like a pro" is architecture,
 
 1. **Persistent, scriptable browser — interception** — record/replay is done (`save_auth_flow`/`replay_auth_flow`, below); request/response interception is what's left.
 2. **Burp/Caido ↔ identity model bridge** — Burp/Caido are already integrated as MCP-callable tools (`/mcp burp`, `/mcp caido` — history search, send-request, create-finding); what's still open is bridging `capture_identity`/`swap_session` to pull/push sessions through them, the way `browser_control` already is.
-3. **Intelligent request/response correlation** — spider output auto-parameterized and fed to the fuzzer by param type (ID, email, file, JSON); built-in response diffing against a baseline; endpoints auto-grouped by function (auth, payments, admin).
+3. **Intelligent request/response correlation** *(in progress)* — built-in baseline-vs-test response diffing has landed (`response_diff`: JSON field-level + line diff, the IDOR/access-control/mass-assignment backbone). Still open: spider output auto-parameterized and fed to the fuzzer by param type (ID, email, file, JSON), and endpoints auto-grouped by function (auth, payments, admin).
 4. **Real race/logic testing** — single-packet / last-byte synced requests, automatic state-mutation detection, multi-context coordinated race attacks.
 5. **Stealth/evasion as a first-class profile** — UA/TLS-fingerprint/IP rotation, WAF-fingerprint-driven bypass selection, distributed scan coordination with deduped results. (Builds on the persistent target profile — WAF behavior and rate-limit observations now persist per target; see CHANGELOG.)
 6. **Screenshots auto-attached per finding**, and a wider finding-chain pattern set beyond the first curated list.
