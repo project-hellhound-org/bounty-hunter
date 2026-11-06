@@ -510,3 +510,54 @@ def list_program_targets(program_name: str) -> List[str]:
     if not record:
         return []
     return list(record.get("targets", []))
+
+
+def rename_program(old_name: str, new_name: str, new_display: Optional[str] = None) -> Dict[str, Any]:
+    """Rename a program (e.g. to fix a typo). Moves the program's directory,
+    updates its record, re-points every attached target's `.program` field and
+    its per-domain symlink, and leaves the targets themselves untouched. Safe:
+    refuses if the new name already exists or the old one doesn't."""
+    safe_old = sanitize_program_name(old_name)
+    safe_new = sanitize_program_name(new_name)
+    if not safe_old or not safe_new:
+        return {"status": "error", "error": "bad_name", "message": "Both old and new program names are required."}
+    if safe_old == safe_new and (new_display is None):
+        return {"status": "error", "error": "same_name", "message": f"'{safe_old}' is already the name."}
+
+    record = load_program(safe_old)
+    if record is None:
+        return {"status": "error", "error": "not_found", "message": f"No program named '{safe_old}' exists."}
+    if safe_new != safe_old and load_program(safe_new) is not None:
+        return {"status": "error", "error": "already_exists", "message": f"A program named '{safe_new}' already exists."}
+
+    old_dir = os.path.dirname(get_program_path(safe_old))
+    new_dir = os.path.dirname(get_program_path(safe_new))
+
+    # Move the directory (unless only the display name is changing).
+    if safe_new != safe_old:
+        try:
+            # get_program_path() created new_dir already; only move if it's empty/new.
+            if os.path.isdir(new_dir) and not os.listdir(new_dir):
+                os.rmdir(new_dir)
+            os.rename(old_dir, new_dir)
+        except Exception as e:
+            return {"status": "error", "error": "move_failed", "message": f"Could not move program directory: {e}"}
+
+    record["name"] = safe_new
+    record["display_name"] = (new_display or new_name).strip() or safe_new
+    _save_program(record)
+
+    # Re-point every attached target + its per-domain symlink.
+    retargeted = []
+    for tname in record.get("targets", []):
+        try:
+            t = create_or_load_target(tname)
+            t.program = safe_new
+            save_target(t)
+            _ensure_program_target_link(safe_new, tname)
+            retargeted.append(tname)
+        except Exception:
+            continue
+
+    return {"status": "success", "old": safe_old, "new": safe_new,
+            "display_name": record["display_name"], "targets": retargeted}

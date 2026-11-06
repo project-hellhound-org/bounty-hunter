@@ -896,7 +896,26 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
             emit.info(f"  Disallowed: {rules.get('disallowed', [])}")
         return {"status": "success", "action": "scope_updated", **result}
 
-    msg = f"Unknown /program subcommand '{verb}'. Usage: /program [show [name] | list | create <name> [domains] | add <domain...> | attach <domain...> | scope <policy text>]"
+    if verb in ("rename", "edit"):
+        from hellhound.core.tasks import rename_program
+        rest = clean_args[1:]
+        if len(rest) < 2:
+            msg = "Usage: /program rename <old-name> <new-name>  (fixes a typo'd program name — moves its folder and re-points every attached domain)"
+            emit.warn(msg)
+            return {"status": "error", "error": "bad_usage", "message": msg}
+        old_name, new_name = rest[0], " ".join(rest[1:])
+        result = rename_program(old_name, new_name, new_display=new_name)
+        if result.get("status") != "success":
+            emit.warn(result.get("message", "Rename failed."))
+            return result
+        if not is_json:
+            emit.success(
+                f"Program '{result['old']}' renamed to '{result['new']}' "
+                f"(re-pointed {len(result['targets'])} target(s))."
+            )
+        return {"status": "success", "action": "renamed", **result}
+
+    msg = f"Unknown /program subcommand '{verb}'. Usage: /program [show [name] | list | create <name> [domains] | add <domain...> | attach <domain...> | scope <policy text> | rename <old> <new>]"
     emit.warn(msg)
     return {"status": "error", "error": "unknown_subcommand", "message": msg}
 
