@@ -22,6 +22,7 @@ schedules a coroutine onto it with asyncio.run_coroutine_threadsafe(...).result(
 """
 
 import asyncio
+import re
 import threading
 import time
 import base64
@@ -30,12 +31,14 @@ from typing import Any, Dict, List, Optional
 PLAYWRIGHT_AVAILABLE = False
 PLAYWRIGHT_ERROR = None
 try:
-    from playwright.async_api import async_playwright
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
     PLAYWRIGHT_AVAILABLE = True
 except ImportError as e:
     PLAYWRIGHT_ERROR = str(e)
+    PlaywrightTimeoutError = Exception  # unreachable without Playwright, but keeps the name bound
 except Exception as e:
     PLAYWRIGHT_ERROR = f"{type(e).__name__}: {e}"
+    PlaywrightTimeoutError = Exception
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -78,6 +81,7 @@ class _BrowserSession:
         self.context = None
         self.page = None
         self.network_log: List[Dict[str, Any]] = []
+        self.dialog_log: List[Dict[str, Any]] = []
         self.last_used = time.time()
 
     async def ensure_started(self):
@@ -138,6 +142,30 @@ class _BrowserSession:
 
         self.page.on("request", _on_request)
         self.page.on("response", _on_response)
+
+        # XSS-execution-confirmation support: a JS dialog (alert/confirm/
+        # prompt) is the clearest possible signal that INJECTED SCRIPT
+        # ACTUALLY RAN, as opposed to the payload merely sitting unescaped
+        # in the HTML (what the old text-only verifier could tell at best).
+        # Playwright auto-dismisses a dialog nobody handles, but ONLY when
+        # no listener is attached at all -- once we attach one, WE become
+        # responsible for dismissing it, or the page hangs waiting on it.
+        # Log first (so confirm_script_execution can inspect it later),
+        # then dismiss on a separate task -- dialog.dismiss()/accept() are
+        # coroutines and this callback itself must stay synchronous (it's
+        # invoked directly by the Playwright driver's dispatch loop).
+        def _on_dialog(dialog):
+            try:
+                self.dialog_log.append({
+                    "type": dialog.type,
+                    "message": dialog.message,
+                    "ts": time.time(),
+                })
+            except Exception:
+                pass
+            asyncio.create_task(_dismiss_dialog_safely(dialog))
+
+        self.page.on("dialog", _on_dialog)
         # Rolling cap -- a long interactive session shouldn't grow this file
         # or the tool-result payload unboundedly.
         self._cap_log()
@@ -145,6 +173,8 @@ class _BrowserSession:
     def _cap_log(self):
         if len(self.network_log) > 500:
             del self.network_log[: len(self.network_log) - 500]
+        if len(self.dialog_log) > 200:
+            del self.dialog_log[: len(self.dialog_log) - 200]
 
     async def close(self):
         try:
@@ -164,6 +194,7 @@ class _BrowserSession:
             pass
         self.playwright = self.browser = self.context = self.page = None
         self.network_log = []
+        self.dialog_log = []
 
 
 class _SessionRegistry:
@@ -249,6 +280,22 @@ def _looks_like_dead_browser(exc: Exception) -> bool:
     return any(marker in msg for marker in _DEAD_BROWSER_MARKERS)
 
 
+async def _dismiss_dialog_safely(dialog) -> None:
+    """Every JS dialog (alert/confirm/prompt) MUST be accepted or dismissed
+    once a 'dialog' listener is attached, or the page hangs waiting on it
+    forever. We always dismiss (never accept) -- this tool is confirming
+    that a payload executed, not actually interacting with the app, and
+    dismiss is the safer default for a 'confirm'/'prompt' that might gate
+    something (e.g. a destructive "are you sure?")."""
+    try:
+        await dialog.dismiss()
+    except Exception:
+        try:
+            await dialog.accept()
+        except Exception:
+            pass
+
+
 async def _do_action(key: str, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
     sess = _registry.get_or_create(key)
 
@@ -303,6 +350,71 @@ async def _do_action(key: str, action: str, params: Dict[str, Any]) -> Dict[str,
             }
 
 
+async def _find_fallback_fill_selector(page, selector: str) -> Optional[str]:
+    """CAUGHT IN THE WILD (VaultFi/localhost): fill('#username', ...) timed
+    out 15s against a real login form -- the field existed, just not under
+    that id (a common mismatch: the model guesses a selector from the
+    field's semantic role, not its actual markup). The researcher's own
+    workaround was eval_js to list every <input> on the page and find the
+    right one by name -- this does that automatically, once, before
+    giving up. Only ever consulted AFTER the exact selector already timed
+    out; never replaces a selector that actually works."""
+    tokens = {t.lower() for t in re.findall(r"[a-zA-Z]+", selector or "") if len(t) > 1}
+    try:
+        candidates = await page.eval_on_selector_all(
+            "input, textarea",
+            "els => els.filter(el => !el.disabled && el.offsetParent !== null).map(el => ({"
+            "sel: el.id ? ('#' + CSS.escape(el.id)) : (el.name ? (`${el.tagName.toLowerCase()}[name=\"${el.name}\"]`) : null), "
+            "name: el.name || '', id: el.id || '', placeholder: el.placeholder || '', type: (el.type || 'text').toLowerCase()"
+            "}))"
+        )
+    except Exception:
+        return None
+    candidates = [c for c in candidates if c.get("sel")]
+    if not candidates:
+        return None
+    for c in candidates:
+        hay_tokens = set(re.findall(r"[a-zA-Z]+", f"{c.get('name', '')} {c.get('id', '')} {c.get('placeholder', '')}".lower()))
+        if tokens & hay_tokens:
+            return c["sel"]
+    if tokens & {"user", "username", "email", "login"}:
+        for c in candidates:
+            if c.get("type") in ("text", "email"):
+                return c["sel"]
+    if tokens & {"pass", "password", "passwd", "pwd"}:
+        for c in candidates:
+            if c.get("type") == "password":
+                return c["sel"]
+    return None
+
+
+async def _find_fallback_click_selector(page) -> Optional[str]:
+    """Same idea as _find_fallback_fill_selector, for click -- the
+    researcher's own successful workaround in the wild was
+    document.querySelector('form').submit()/.click() on the real submit
+    control once the guessed selector timed out. Looks for a visible
+    submit-shaped control (type=submit, or text matching common sign-
+    in/continue/approve wording) rather than guessing blindly."""
+    try:
+        candidates = await page.eval_on_selector_all(
+            "button, input[type=submit], input[type=button], a[role=button]",
+            "els => els.filter(el => el.offsetParent !== null).map(el => ({"
+            "sel: el.id ? ('#' + CSS.escape(el.id)) : null, "
+            "type: (el.type || '').toLowerCase(), "
+            "text: (el.innerText || el.value || '').trim()"
+            "}))"
+        )
+    except Exception:
+        return None
+    for c in candidates:
+        if c.get("sel") and c.get("type") == "submit":
+            return c["sel"]
+    for c in candidates:
+        if c.get("sel") and re.search(r"sign\s*in|log\s*in|submit|continue|approve|confirm", c.get("text", ""), re.I):
+            return c["sel"]
+    return None
+
+
 async def _run_page_action(sess: "_BrowserSession", action: str, params: Dict[str, Any], timeout_ms: int) -> Dict[str, Any]:
     page = sess.page
 
@@ -326,16 +438,38 @@ async def _run_page_action(sess: "_BrowserSession", action: str, params: Dict[st
         selector = params.get("selector")
         if not selector:
             return {"status": "error", "error": "click requires a 'selector' parameter"}
-        await page.click(selector, timeout=timeout_ms)
-        return {"status": "success", "action": "click", "selector": selector, "url": page.url}
+        try:
+            await page.click(selector, timeout=timeout_ms)
+            return {"status": "success", "action": "click", "selector": selector, "url": page.url}
+        except PlaywrightTimeoutError:
+            fallback = await _find_fallback_click_selector(page)
+            if not fallback or fallback == selector:
+                raise
+            await page.click(fallback, timeout=timeout_ms)
+            return {
+                "status": "success", "action": "click", "selector": fallback, "url": page.url,
+                "original_selector": selector,
+                "fallback_note": f"'{selector}' timed out; clicked the page's own visible submit control ('{fallback}') instead.",
+            }
 
     if action == "fill":
         selector = params.get("selector")
         value = params.get("value")
         if not selector or value is None:
             return {"status": "error", "error": "fill requires 'selector' and 'value' parameters"}
-        await page.fill(selector, str(value), timeout=timeout_ms)
-        return {"status": "success", "action": "fill", "selector": selector}
+        try:
+            await page.fill(selector, str(value), timeout=timeout_ms)
+            return {"status": "success", "action": "fill", "selector": selector}
+        except PlaywrightTimeoutError:
+            fallback = await _find_fallback_fill_selector(page, selector)
+            if not fallback or fallback == selector:
+                raise
+            await page.fill(fallback, str(value), timeout=timeout_ms)
+            return {
+                "status": "success", "action": "fill", "selector": fallback,
+                "original_selector": selector,
+                "fallback_note": f"'{selector}' timed out; filled the closest-matching real field ('{fallback}') instead.",
+            }
 
     if action == "eval_js":
         script = params.get("script")
@@ -374,6 +508,76 @@ async def _run_page_action(sess: "_BrowserSession", action: str, params: Dict[st
             "action": "get_network_log",
             "count": len(sess.network_log),
             "entries": sess.network_log[-200:],
+        }
+
+    if action == "confirm_script_execution":
+        # CAUGHT IN THE WILD (roadmap item 7 / headless XSS execution
+        # confirmation): the old verify_xss (verify_engine.py) could only
+        # ever check that a payload's TEXT appears unescaped in the HTML --
+        # it never proved the browser actually RAN anything. A script that
+        # got sanitized into an inert string, or reflected into a context
+        # where it can't execute (inside an HTML comment, a disabled
+        # <textarea>, a CSP-blocked page), would still "verify" under the
+        # old check as long as the raw text matched. This gives a REAL
+        # execution signal instead: either a JS dialog (alert/confirm/
+        # prompt) actually fired, or the page's own running JS set a
+        # window property -- both only possible if the script interpreter
+        # genuinely executed the payload.
+        #
+        # Caller contract: the XSS payload under test must itself either
+        # (a) call alert('<marker>')/confirm('<marker>')/prompt('<marker>'),
+        # or (b) set window.__hh_xss_proof = '<marker>' (any JS, not just
+        # inline <script> -- an onerror=/onload= handler works too). Call
+        # this right after the goto/click that triggers the reflection; it
+        # inspects THIS session's dialog log (populated continuously since
+        # ensure_started, so a dialog fired during the goto itself is not
+        # missed) and the live page's current window state.
+        marker = str(params.get("marker") or params.get("payload_marker") or "").strip()
+        if not marker:
+            return {
+                "status": "error",
+                "error": (
+                    "confirm_script_execution requires a 'marker' parameter -- the unique token your XSS "
+                    "payload actually executes (e.g. the payload is \"alert('<marker>')\" or sets "
+                    "\"window.__hh_xss_proof='<marker>'\"), so a dialog firing or a JS variable being set can "
+                    "be tied specifically to THIS probe, not mistaken for a leftover from an earlier one."
+                ),
+            }
+        await page.wait_for_timeout(min(timeout_ms, 5000))
+        try:
+            window_proof = await page.evaluate(
+                "() => (window.__hh_xss_proof !== undefined && window.__hh_xss_proof !== null) "
+                "? String(window.__hh_xss_proof) : null"
+            )
+        except Exception:
+            window_proof = None
+        dialog_hit = next((d for d in sess.dialog_log if marker in str(d.get("message", ""))), None)
+        window_hit = bool(window_proof and marker in window_proof)
+        executed = bool(dialog_hit or window_hit)
+        if dialog_hit:
+            evidence = f"a JS {dialog_hit.get('type')} dialog fired with message {dialog_hit.get('message')!r} (contains the marker)"
+        elif window_hit:
+            evidence = f"window.__hh_xss_proof == {window_proof!r} (contains the marker)"
+        else:
+            evidence = None
+        return {
+            "status": "success",
+            "action": "confirm_script_execution",
+            "executed": executed,
+            "evidence": evidence,
+            "marker": marker,
+            "url": page.url,
+            "note": (
+                "Real script execution confirmed -- this is a code-level proof the browser actually ran "
+                "injected JS, not just that the payload text appears in the HTML. Pass execution_confirmed="
+                "true (and execution_evidence='" + (evidence or "") + "') to verify_finding/record_finding "
+                "for a much stronger xss verification than text reflection alone."
+                if executed else
+                "No dialog carrying this marker fired, and window.__hh_xss_proof doesn't contain it either -- "
+                "either the payload didn't actually execute (HTML-escaped, wrong injection context, CSP "
+                "blocked it, wrong page/timing) or it hasn't run yet (try again after goto, or raise "
+                "'timeout'). Do not report execution_confirmed=true from this result."
+            ),
         }
 
     if action == "screenshot":

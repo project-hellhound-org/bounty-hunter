@@ -154,14 +154,37 @@ def verify_ssrf(positive: Dict[str, Any], negative: Optional[Dict[str, Any]], ar
 
 # ── XSS ──────────────────────────────────────────────────────────────────
 def verify_xss(positive: Dict[str, Any], negative: Optional[Dict[str, Any]], args: Dict[str, Any]) -> VerifyResult:
+    # STRONGEST signal: real script execution confirmed in an actual
+    # browser (hellhound/core/browser_control.py's 'confirm_script_execution'
+    # action — a JS dialog genuinely fired, or the page's own running JS set
+    # a marker), not just a text match against the response body. This is
+    # additive/strengthening per AGENTS.md rule 2: the text-reflection check
+    # below is untouched and still applies exactly as before whenever the
+    # caller hasn't (or can't) run the browser-based check.
+    if bool(args.get("execution_confirmed")):
+        evidence = args.get("execution_evidence") or "execution_confirmed=true (see browser_control's confirm_script_execution result)"
+        return VerifyResult(True, "verified",
+            f"REAL script execution was confirmed in a headless browser — {evidence}. This is a stronger "
+            f"signal than text reflection: the injected script actually ran (a JS dialog fired, or the "
+            f"page's own code set a marker), not just that the payload text appears unescaped in the HTML.",
+            positive_evidence=str(evidence))
+
     payload = args.get("payload") or args.get("xss_payload")
     if not payload:
         return VerifyResult(False, "inconclusive",
-            "no 'payload' argument supplied — pass the exact injected string so reflection can be checked.")
+            "no 'payload' argument supplied — pass the exact injected string so reflection can be checked. "
+            "For a stronger check than text reflection, drive the same request through browser_control and "
+            "call action='confirm_script_execution' with a unique marker, then pass execution_confirmed=true "
+            "(and execution_evidence=<its evidence string>) here instead.")
     body = _body_of(positive)
     if payload in body:
         return VerifyResult(True, "verified",
-            "the exact payload reflects verbatim (unescaped) in the response body.",
+            "the exact payload reflects verbatim (unescaped) in the response body. This confirms the HTML "
+            "sink is unescaped — it does NOT by itself confirm a script actually ran (escaped-but-present "
+            "text, a dead context, or CSP could still block real execution). For a stronger result: goto the "
+            "same URL via browser_control, call action='confirm_script_execution' with a unique marker the "
+            "payload executes (e.g. alert('<marker>') or window.__hh_xss_proof='<marker>'), then re-call "
+            "this with execution_confirmed=true.",
             positive_evidence=payload)
     escaped_variants = [
         payload.replace("<", "&lt;").replace(">", "&gt;"),

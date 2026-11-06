@@ -296,13 +296,13 @@ All actions can be triggered via slash commands or natural language:
 
 ## The Recon & Triage Arsenal
 
-Bounty Hunter coordinates **70 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
+Bounty Hunter coordinates **72 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
 
 | Category | Tools |
 | :--- | :--- |
 | **Passive & Active Recon** | `subfinder` `subdomain_sweep` `permute_subdomains` `resolve_candidates` `dns_bruteforce` `dig` `port_scan` `tls_cert_scan` `httpx` `nmap_service_scan` `wayback_urls` `gau_nuclei_sweep` `urlscan_recon` `google_dork` `otx_urls` `virustotal_lookup` `cloudscout` `wafbuster` |
 | **Crawling & Content Discovery** | `spider` `katana` `content_discovery` `fuzz_hunter` `vhost_fuzz` `js_miner` |
-| **Visual & Browser** | `browser_control` `gowitness` |
+| **Visual & Browser** | `browser_control` `save_auth_flow` `replay_auth_flow` `gowitness` |
 | **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `wpscan_scan` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `403_bypass` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` `replay_request` `verify_finding` |
 | **Takeover & Subdomain Health** | `takeover_scanner` `subzy` |
 | **Session, Scope & Workspace** | `cookie_inspector` `curl` `run_terminal_command` `set_target` `manage_scope` `manage_program` `listener` `recall_data` `update_plan` `recall_patterns` `capture_identity` `swap_session` `generate_hypotheses` `update_hypothesis` |
@@ -349,12 +349,13 @@ You don't need to invoke these yourself — the agent pulls in whichever one a t
 
 The newest landings, in short. Full detail (including everything older) is in [CHANGELOG.md](CHANGELOG.md).
 
-- **Identity model** (`capture_identity`/`swap_session`) — snapshot a session, swap which one is active. Now bridged to `browser_control`, and extended to `fuzz_hunter`/`sqlmap_scan`/`hydra` (bearer tokens included, not just cookies).
-- **`generate_hypotheses`/`update_hypothesis`** — a rule-driven lead board ranking likely vuln classes from the fingerprinted stack, endpoints, params, and WAF, instead of enumerating the tool arsenal blind.
+- **Real-world fixes from an actual engagement log** — anonymous-session-cookie churn no longer wedges the artifact pre-flight gate open forever; `record_finding` evidence lookup prefers the actual payload-bearing proof over a coincidentally-same-URL unrelated request; `browser_control` falls back to a semantic DOM match when a guessed `fill`/`click` selector times out; a new error-streak pivot reflex nudges the model away from a tool that's outright failing repeatedly (not just coming back empty) toward an approach that's already proven to work; `export_report` now splits unrelated findings into separate reports by default (one submission per vuln, like a real engagement) instead of bundling everything into one file; saved finding/report filenames are slugged from the finding's own title instead of being indistinguishable `finding_<target>_<timestamp>.html`; `dismiss_finding` now has a `resolution` of `'patched'` distinct from `'false_positive'`, so marking a retested-and-fixed finding resolved doesn't also permanently block a real regression from ever being re-flagged.
+- **`save_auth_flow`/`replay_auth_flow`** — record a login once via ordinary `browser_control` calls, replay it headless anytime afterward (fresh session by default, per-step scope re-check, optional auto-`capture_identity` on success).
+- **Identity model** (`capture_identity`/`swap_session`) — snapshot a session, swap which one is active. Bridged to `browser_control`, and extended to `fuzz_hunter`/`sqlmap_scan`/`hydra` (bearer tokens included, not just cookies).
+- **`generate_hypotheses`/`update_hypothesis`** — a rule-driven lead board ranking likely vuln classes from the fingerprinted stack, endpoints, params, WAF, and now `hydra`'s real per-parameter role findings (admin flags, auth-sensitive params, OAuth sinks), plus Rails/Drupal rule coverage.
 - **`verify_finding`** — real code-level signal checking for sqli/xss/ssrf/ssti/cors/idor, not just "the request went through."
 - **`recall_patterns`** — cross-target pattern memory; a technique that worked on a similarly-stacked target surfaces automatically.
 - **`manage_program`** fixed — creating a program no longer silently drags in whatever placeholder target happened to be active.
-- **`remember_lesson`** — a real durable "remember this," not a reply that's forgotten when the session ends.
 
 ---
 
@@ -362,8 +363,8 @@ The newest landings, in short. Full detail (including everything older) is in [C
 
 The honest gap between "runs tools well" and "hunts like a pro" is architecture, not more tools. What's still genuinely open, in rough priority order (landed items and the fuller reasoning behind partly-reworked ones are in [CHANGELOG.md](CHANGELOG.md)):
 
-1. **Persistent, scriptable browser** — record an auth flow once (login → 2FA → token capture) and replay it headless; request/response interception.
-2. **Burp/Caido integration** for the identity model — curl/spider/browser/`fuzz_hunter`/`sqlmap_scan`/`hydra` already share it; this is the one piece that doesn't yet.
+1. **Persistent, scriptable browser — interception** — record/replay is done (`save_auth_flow`/`replay_auth_flow`, below); request/response interception is what's left.
+2. **Burp/Caido ↔ identity model bridge** — Burp/Caido are already integrated as MCP-callable tools (`/mcp burp`, `/mcp caido` — history search, send-request, create-finding); what's still open is bridging `capture_identity`/`swap_session` to pull/push sessions through them, the way `browser_control` already is.
 3. **Intelligent request/response correlation** — spider output auto-parameterized and fed to the fuzzer by param type (ID, email, file, JSON); built-in response diffing against a baseline; endpoints auto-grouped by function (auth, payments, admin).
 4. **Real race/logic testing** — single-packet / last-byte synced requests, automatic state-mutation detection, multi-context coordinated race attacks.
 5. **Full target profiles** beyond lessons-learned — tech stack, WAF behavior, rate limits, quirks, persisted and reused across sessions.
@@ -373,7 +374,7 @@ The honest gap between "runs tools well" and "hunts like a pro" is architecture,
 9. **Passive → active intel fusion** — CT logs + Wayback + gau + OTX deduped straight into `httpx`/fuzzing; JS sourcemap recovery → secret extraction → endpoint mapping, fed straight back into the fuzzer.
 10. **A real playbook engine** — conditional branching workflows ("new subdomain → screenshot → tech-detect → if WordPress, run X"), not just sequential tool chaining.
 
-**Next concrete step:** more `generate_hypotheses` rule coverage (more frameworks/CMSes) and richer signal sources (`fuzz_hunter`'s per-parameter findings, not just names).
+**Next concrete step:** the Burp/Caido ↔ identity model bridge, or request/response interception for the scriptable browser.
 
 ---
 

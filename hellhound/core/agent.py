@@ -3959,6 +3959,67 @@ def _is_benign_tracking_cookie(cookie_name: str) -> bool:
     return any(re.search(p, name, re.I) for p in BENIGN_COOKIE_NAME_PATTERNS)
 
 
+# CAUGHT IN THE WILD (VaultFi/localhost banking test app): every single
+# unauthenticated GET — even a bare page load — got a brand-new PHPSESSID
+# minted by the server (ordinary default PHP session behavior, nothing to
+# do with auth). Each new value is a genuinely different string, so the
+# (field_name, value) dedup above treated every one as a FRESH, never-
+# before-seen "high-value security artifact," which re-tripped
+# ARTIFACT_PRE_FLIGHT_GATE over and over — the researcher watched spider/
+# content_discovery get blocked by a NEW stale session cookie mere turns
+# after the PREVIOUS stale session cookie had already been tested and
+# shown dead (401). Once you've established that an anonymous page load
+# on this target hands out a worthless default session, a second, third,
+# twentieth anonymous page load handing out ANOTHER worthless default
+# session is not new information and should not re-block discovery. A
+# session cookie only represents something genuinely NEW and worth
+# testing again when it comes back from an actual auth action (a login
+# POST, an OAuth/SSO callback) — that's a specific identity's session, not
+# the default anonymous one everyone gets.
+_SESSION_LIKE_COOKIE_NAME = re.compile(r"session|phpsessid|jsessionid|connect\.sid|^sid$", re.I)
+
+
+def _is_credential_bearing_request(tool_args: Dict[str, Any]) -> bool:
+    """True if this request looks like it's actually attempting
+    authentication (login POST with username/password-shaped body, or an
+    OAuth/SSO authorize/callback leg) rather than a plain anonymous page
+    load that merely happens to mint a default session cookie."""
+    if not isinstance(tool_args, dict):
+        return False
+    url = str(tool_args.get("url", "")).lower()
+    if re.search(r"(sso|oauth|callback|/authorize|saml)", url):
+        return True
+    if str(tool_args.get("method", "GET")).upper() != "POST":
+        return False
+    blob_parts = []
+    for key in ("data", "json", "body"):
+        v = tool_args.get(key)
+        if isinstance(v, dict):
+            blob_parts.append(" ".join(f"{k}={v2}" for k, v2 in v.items()))
+        elif isinstance(v, str):
+            blob_parts.append(v)
+    blob = " ".join(blob_parts)
+    return bool(re.search(r"\b(username|user|email|password|passwd|pwd|login)\b\s*=", blob, re.I))
+
+
+def _is_repeat_anonymous_session_cookie(cookie_name: str, tool_args: Dict[str, Any], target: Target) -> bool:
+    """True when a newly-seen cookie is session-shaped, came from a plain
+    non-credential-bearing request, and a cookie of that same name has
+    already been recorded for this target before — i.e. this is just
+    another worthless default anonymous session, not a new identity's
+    session worth re-triggering the pre-flight gate over."""
+    if not _SESSION_LIKE_COOKIE_NAME.search(cookie_name or ""):
+        return False
+    if _is_credential_bearing_request(tool_args):
+        return False
+    existing = target.state.get("artifacts", []) if hasattr(target, "state") and isinstance(target.state, dict) else []
+    name_lower = (cookie_name or "").strip().lower()
+    return any(
+        isinstance(a, dict) and str(a.get("field_name", "")).strip().lower() == name_lower
+        for a in existing
+    )
+
+
 def _flatten_json_dict(obj: Any, prefix: str = "") -> Dict[str, Any]:
     items: Dict[str, Any] = {}
     if isinstance(obj, dict):
@@ -4091,6 +4152,28 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
         source_url = tool_name
 
     new_artifacts: List[Dict[str, Any]] = []
+
+    # Anonymous-session-cookie churn guard (see _is_repeat_anonymous_
+    # session_cookie above) -- tracks field_names already known for this
+    # target so that the SECOND+ occurrence of the same session-cookie
+    # NAME within this very call (not just across calls) is also
+    # recognized as a repeat, not just the first.
+    _known_field_names = {
+        str(a.get("field_name", "")).strip().lower()
+        for a in (target.state.get("artifacts", []) if isinstance(target.state.get("artifacts"), list) else [])
+        if isinstance(a, dict)
+    }
+    _is_cred_action = _is_credential_bearing_request(tool_args)
+
+    def _session_cookie_consumed_flag(c_name: str) -> bool:
+        name_lower = (c_name or "").strip().lower()
+        is_repeat = (
+            bool(_SESSION_LIKE_COOKIE_NAME.search(c_name or ""))
+            and not _is_cred_action
+            and name_lower in _known_field_names
+        )
+        _known_field_names.add(name_lower)
+        return is_repeat
 
     # 1. Process structured dictionary output from tool
     if isinstance(tool_output, dict):
@@ -4279,15 +4362,16 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
                             continue
                         if not c_val:
                             continue
+                        _repeat = _session_cookie_consumed_flag(c_name)
                         new_artifacts.append({
                             "field_name": c_name,
                             "value": c_val,
                             "source": f"{tool_name.upper()} {source_url}".strip(),
                             "associated_identity": "session context",
                             "turn": turn_number,
-                            "consumed": False,
-                            "consumed_at": None,
-                            "consumed_by": None
+                            "consumed": _repeat,
+                            "consumed_at": (datetime.now(timezone.utc).isoformat() if _repeat else None),
+                            "consumed_by": ("auto_superseded_anon_session_churn" if _repeat else None)
                         })
                 elif "authorization" in hk_lower or "token" in hk_lower:
                     new_artifacts.append({
@@ -4306,15 +4390,16 @@ def extract_and_store_artifacts(tool_name: str, tool_args: Dict[str, Any], tool_
         if isinstance(cks, dict):
             for ck, cv in cks.items():
                 if cv and isinstance(cv, (str, int)) and str(cv).strip():
+                    _repeat = _session_cookie_consumed_flag(str(ck))
                     new_artifacts.append({
                         "field_name": str(ck),
                         "value": str(cv).strip(),
                         "source": f"{tool_name.upper()} {source_url}".strip(),
                         "associated_identity": "session cookie",
                         "turn": turn_number,
-                        "consumed": False,
-                        "consumed_at": None,
-                        "consumed_by": None
+                        "consumed": _repeat,
+                        "consumed_at": (datetime.now(timezone.utc).isoformat() if _repeat else None),
+                        "consumed_by": ("auto_superseded_anon_session_churn" if _repeat else None)
                     })
 
         # F. Extract JSON objects or tokens embedded inside response text
@@ -5622,11 +5707,12 @@ def _execute_generate_hypotheses(args: Dict[str, Any], target: Target, emit: Any
     if not isinstance(param_names, list):
         param_names = target.state.get("parameters") or []
     waf_names = target.state.get("waf_detected") or []
+    param_signals = target.state.get("param_signals") or []
 
     try:
         static_hyps = _hypothesis_engine.generate(
             tech_stack=tech_stack, endpoints=endpoints, headers=headers,
-            context={"parameters": param_names, "waf_detected": waf_names},
+            context={"parameters": param_names, "waf_detected": waf_names, "param_signals": param_signals},
         )
     except Exception as e:
         return {"error": f"hypothesis_engine.generate failed: {e}"}
@@ -5983,6 +6069,7 @@ _PIVOT_EXEMPT_TOOLS = frozenset((
     "save_file", "delete_file", "cookie_inspector", "update_plan",
     "recall_data", "load_skill", "listener", "recall_patterns",
     "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis",
+    "save_auth_flow",
 ))
 _PIVOT_LOW_SIGNAL_THRESHOLD = 3
 _PIVOT_DEAD_END_THRESHOLD = 5
@@ -6095,7 +6182,8 @@ def _execute_browser_control(args: Dict[str, Any], target: Target, emit: Any) ->
             "status": "error",
             "error": (
                 "browser_control requires an 'action': goto, click, fill, eval_js, get_storage, get_cookies, "
-                "get_network_log, screenshot, close, list_sessions (which sessions are open for this target), "
+                "get_network_log, confirm_script_execution (real proof an XSS payload actually ran — see "
+                "verify_finding), screenshot, close, list_sessions (which sessions are open for this target), "
                 "or close_all (tear down every session for this target at once)."
             ),
         }
@@ -6188,6 +6276,210 @@ def _execute_browser_control(args: Dict[str, Any], target: Target, emit: Any) ->
                 save_target(target)
         except Exception:
             pass  # cookie sync is best-effort and must never break the actual browser action
+
+    # Record/replay (roadmap item 1): every successful STATE-MUTATING action
+    # (goto/click/fill/eval_js — not the read-only ones like get_cookies/
+    # screenshot) gets appended to target.state["browser_action_log"][session],
+    # a per-session ring buffer, always on — no separate "start recording"
+    # step to remember before driving a login. save_auth_flow later snapshots
+    # whatever's in this log into a named, reusable flow; replay_auth_flow
+    # replays it headless against a (usually fresh) session. Capped at 100
+    # entries per session so a long interactive session doesn't grow this
+    # unbounded.
+    if (
+        result.get("status") == "success"
+        and action in ("goto", "click", "fill", "eval_js")
+        and hasattr(target, "state") and isinstance(target.state, dict)
+    ):
+        try:
+            logs = target.state.setdefault("browser_action_log", {})
+            if not isinstance(logs, dict):
+                logs = {}
+                target.state["browser_action_log"] = logs
+            session_log = logs.setdefault(session_id, [])
+            if not isinstance(session_log, list):
+                session_log = []
+                logs[session_id] = session_log
+            if action == "goto":
+                step_params = {"url": args.get("url"), "wait_for": args.get("wait_for")}
+            elif action in ("click", "fill"):
+                step_params = {"selector": args.get("selector")}
+                if action == "fill":
+                    step_params["value"] = args.get("value")
+            else:  # eval_js
+                step_params = {"script": args.get("script")}
+            session_log.append({"action": action, "params": step_params})
+            if len(session_log) > 100:
+                del session_log[: len(session_log) - 100]
+            save_target(target)
+        except Exception:
+            pass  # recording is best-effort and must never break the actual browser action
+
+    return result
+
+
+def _execute_save_auth_flow(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Snapshots whatever browser_control actions were just driven in a session
+    (goto/click/fill/eval_js — see the recorder at the bottom of
+    _execute_browser_control, always on, no separate "start recording" step)
+    into a named, reusable flow under target.state["browser_flows"][name].
+    This is the "record an auth flow once" half of the roadmap item —
+    log in normally via ordinary browser_control calls (goto the login page,
+    fill username, fill password, click submit), then call this once to save
+    that exact sequence so replay_auth_flow can re-drive it headless later
+    without the model re-issuing every step by hand, e.g. once a session
+    expires or for a fresh account.
+
+    Read-only actions (get_cookies/get_storage/get_network_log/screenshot)
+    are never recorded in the first place, so nothing to filter out here.
+
+    NOTE: a recorded `fill` step stores the literal value typed (so a
+    password used during recording IS captured at rest in this target's
+    saved state) — same storage location and risk profile as the cookies/
+    auth_token capture_identity already persists there, not a new class of
+    exposure, but worth knowing before saving a flow built from a real
+    credential.
+    """
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"error": "save_auth_flow requires a 'name' for the saved flow (e.g. 'login')."}
+    session_id = (args.get("session") or args.get("session_id") or "default").strip() or "default"
+
+    if not hasattr(target, "state") or not isinstance(target.state, dict):
+        return {"error": "No active target to save a flow against."}
+
+    logs = target.state.get("browser_action_log") or {}
+    steps = logs.get(session_id) if isinstance(logs, dict) else None
+    if not isinstance(steps, list) or not steps:
+        return {
+            "status": "nothing_to_save",
+            "note": f"No recorded browser_control actions found for session '{session_id}' yet — drive the "
+                    f"flow with ordinary browser_control calls (goto/click/fill) first, then call this again.",
+        }
+
+    flows = target.state.setdefault("browser_flows", {})
+    if not isinstance(flows, dict):
+        flows = {}
+        target.state["browser_flows"] = flows
+    flows[name] = {
+        "session": session_id,
+        "actions": [dict(s) for s in steps],
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        save_target(target)
+    except Exception:
+        pass
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[+] Saved auth flow '{name}' ({len(steps)} step(s) from session '{session_id}').")
+
+    return {
+        "status": "saved",
+        "name": name,
+        "steps_saved": len(steps),
+        "source_session": session_id,
+    }
+
+
+def _execute_replay_auth_flow(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Replays a flow saved by save_auth_flow, headless, step by step, against
+    a (by default FRESH, never the live default session) browser_control
+    session — the "replay it headless" half of the roadmap item: get a
+    working, authenticated session back without the model re-driving every
+    goto/click/fill by hand.
+
+    Defaults the replay target session to "<flow_name>_replay" rather than
+    "default" so a replay can never silently clobber whatever live session
+    is already in use — pass `session` explicitly to replay into a specific
+    session instead (e.g. "default" to refresh the actual live one).
+
+    SCOPE: this drives real browser navigation, same as browser_control
+    itself. Each recorded 'goto' URL is re-checked against this target's
+    scope rules before being replayed (not just trusted because it was
+    in-scope back when it was first recorded) — scope rules can change
+    between record and replay, and the Scope Security Gate is unconditional
+    (see AGENTS.md). Replay stops immediately, before navigating, on the
+    first out-of-scope URL.
+
+    Stops on the first FAILED step (doesn't push through a broken flow and
+    pretend the rest still makes sense) and reports exactly which step and
+    why. On full success, optionally folds the resulting session straight
+    into capture_identity via `capture_identity_as` — closing the loop from
+    "replay a login" to "now I have a named identity to swap_session into."
+    """
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"error": "replay_auth_flow requires the 'name' of a flow saved via save_auth_flow."}
+
+    if not hasattr(target, "state") or not isinstance(target.state, dict):
+        return {"error": "No active target to replay a flow against."}
+
+    flows = target.state.get("browser_flows") or {}
+    flow = flows.get(name) if isinstance(flows, dict) else None
+    if not isinstance(flow, dict) or not flow.get("actions"):
+        return {
+            "error": f"No saved flow named '{name}' — call save_auth_flow(name='{name}') after driving the "
+                     f"flow with browser_control first, or check the name against recall_data(category='browser_flows')."
+        }
+
+    replay_session = (args.get("session") or args.get("session_id") or f"{name}_replay").strip() or f"{name}_replay"
+    capture_identity_as = (args.get("capture_identity_as") or "").strip() or None
+
+    steps = flow["actions"]
+    replayed = []
+    for i, step in enumerate(steps):
+        step_action = step.get("action")
+        step_params = dict(step.get("params") or {})
+
+        if step_action == "goto":
+            url = step_params.get("url") or ""
+            if url and target.scope_rules and target.scope_rules.in_scope:
+                normalized, _scheme = normalize_host(url)
+                if normalized:
+                    allowed, reason = is_in_scope(normalized, target.scope_rules)
+                    if not allowed:
+                        return {
+                            "error": f"SCOPE_VIOLATION: replay of flow '{name}' blocked at step {i + 1}/{len(steps)} "
+                                     f"(goto {url}) — {reason}. Replay stopped before navigating; nothing from "
+                                     f"this step or later ran.",
+                            "blocked": True,
+                            "steps_replayed": replayed,
+                        }
+
+        step_args = {"action": step_action, "session": replay_session, **step_params}
+        step_result = _execute_browser_control(step_args, target, emit)
+        replayed.append({"step": i + 1, "action": step_action, "result": step_result})
+        if not isinstance(step_result, dict) or step_result.get("status") != "success":
+            return {
+                "status": "replay_failed",
+                "name": name,
+                "failed_at_step": i + 1,
+                "total_steps": len(steps),
+                "error": (step_result or {}).get("error", "step did not report success"),
+                "steps_replayed": replayed,
+                "note": "Replay stopped at the first failed step rather than continuing a broken flow — the "
+                        "site may have changed (different selector/flow), or the saved flow may need re-recording.",
+            }
+
+    result: Dict[str, Any] = {
+        "status": "replayed",
+        "name": name,
+        "session": replay_session,
+        "steps_replayed": len(steps),
+    }
+
+    if capture_identity_as:
+        identity_result = _execute_capture_identity(
+            {"name": capture_identity_as, "from_browser_session": replay_session}, target, emit
+        )
+        result["identity_capture"] = identity_result
+        result["identity_captured"] = identity_result.get("status") == "captured"
+
+    if emit and hasattr(emit, "success"):
+        emit.success(f"[+] Replayed auth flow '{name}' ({len(steps)} step(s)) into session '{replay_session}'.")
 
     return result
 
@@ -8049,6 +8341,38 @@ def _execute_hydra(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
             if finding not in target.findings:
                 target.findings.append(finding)
 
+        # Persist the full per-parameter role/impact map (not just the
+        # subset that cleared the bar for a `vulns` finding above) into
+        # target.state["param_signals"] — this was computed every call and
+        # then entirely discarded (same "computed and thrown away" pattern
+        # wafbuster had before its own persistence fix), so
+        # generate_hypotheses had no way to see hydra's richer per-
+        # parameter signal (admin flags, auth-sensitive params, path
+        # references, GraphQL introspectability, OAuth callback sinks) —
+        # only bare discovered parameter NAMES. Deduped by (url, parameter)
+        # and kept to the single highest-impact finding per pair so
+        # repeated hydra runs don't grow this unbounded; capped overall so
+        # a huge endpoint set can't bloat target.state indefinitely.
+        try:
+            if hasattr(target, "state") and isinstance(target.state, dict) and surfaces:
+                bucket = target.state.setdefault("param_signals", [])
+                if not isinstance(bucket, list):
+                    bucket = []
+                    target.state["param_signals"] = bucket
+                by_key = {(s.get("url"), s.get("parameter")): s for s in bucket if isinstance(s, dict)}
+                for s in surfaces:
+                    if not isinstance(s, dict) or not s.get("roles"):
+                        continue
+                    k = (s.get("url"), s.get("parameter"))
+                    existing = by_key.get(k)
+                    if existing is None or (s.get("impact_score", 0) or 0) > (existing.get("impact_score", 0) or 0):
+                        by_key[k] = s
+                merged = sorted(by_key.values(), key=lambda s: -(s.get("impact_score", 0) or 0))[:200]
+                target.state["param_signals"] = merged
+                save_target(target)
+        except Exception:
+            pass
+
         return {
             "url": url,
             "raw": res.get("raw", "") if isinstance(res, dict) else str(res),
@@ -8913,7 +9237,34 @@ def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     return result_payload
 
 
-def _lookup_curl_evidence(target: Target, request_ref: str, limit: int = 2) -> List[str]:
+# CAUGHT IN THE WILD (VaultFi/localhost): a SQLi finding on /login.php's
+# username parameter was confirmed via sqlmap, but request_ref was just
+# the bare endpoint ("http://localhost:8081/login.php") -- and the SAME
+# URL also got hit repeatedly afterward by completely unrelated, benign
+# plain-login curl calls (testing the SSO flow). URL-containment matching
+# alone can't tell those apart, so the two MOST RECENT /login.php curl
+# entries -- plain "username=testuser&password=testpass123" logins with
+# nothing injection-related in them -- won, and got attached to the
+# finding as its "proof." A triager correctly called this out: both
+# captured responses were identical 302s with no evidence of the actual
+# SLEEP-based timing delay sqlmap used to confirm the bug. The real proof
+# (sqlmap's own payload + timing output) existed in terminal_evidence_log
+# the whole time, but _lookup_curl_evidence never got a chance to miss so
+# the terminal fallback below never triggered. Fix: for vuln classes where
+# the PoC is a specific payload (not just "any request to this URL"),
+# only accept a curl-log match that actually contains a payload marker for
+# that class -- returning nothing is correct here, since it's what makes
+# record_finding fall through to _lookup_terminal_evidence next.
+_INJECTION_EVIDENCE_MARKERS: Dict[str, "re.Pattern"] = {
+    "sqli": re.compile(r"sleep\s*\(|benchmark\s*\(|waitfor\s+delay|union\s+select|'\s*(and|or)\b|--\s|#\s*(--)?\s*$|/\*!", re.I),
+    "xss": re.compile(r"<script|onerror\s*=|onload\s*=|javascript:|alert\s*\(", re.I),
+    "ssti": re.compile(r"\{\{.*?\}\}|\$\{.*?\}|<%=.*?%>", re.I),
+    "ssrf": re.compile(r"169\.254\.169\.254|metadata\.google|file://|gopher://|dict://", re.I),
+    "cmdi": re.compile(r";\s*(ls|whoami|id|cat)\b|\|\s*(ls|whoami|id)\b|`[^`]+`|\$\([^)]+\)", re.I),
+}
+
+
+def _lookup_curl_evidence(target: Target, request_ref: str, limit: int = 2, kind: Optional[str] = None) -> List[str]:
     """
     Pulls REAL, previously-captured request/response text for a given
     endpoint out of target.state['curl_evidence_log'] (populated by every
@@ -8926,6 +9277,16 @@ def _lookup_curl_evidence(target: Target, request_ref: str, limit: int = 2) -> L
     often a bare path/endpoint label while the log stores full URLs, and
     returns the most recent matches first — the last-run variant of a test
     (e.g. the winning Origin value) is usually the one worth citing.
+
+    When `kind` names a payload-driven vuln class (see
+    _INJECTION_EVIDENCE_MARKERS), matches are filtered to ones whose raw
+    text actually contains that class's payload signature — an ordinary,
+    unrelated request to the same URL (e.g. ?user logging in normally
+    minutes later for an unrelated reason) is never accepted as "proof" of
+    an injection-class bug just because the URL matches. If no
+    payload-bearing match exists in this log, returns [] so the caller
+    (record_finding) falls through to terminal_evidence_log instead of
+    citing misleading evidence.
     """
     if not request_ref or not hasattr(target, "state") or not isinstance(target.state, dict):
         return []
@@ -8938,6 +9299,9 @@ def _lookup_curl_evidence(target: Target, request_ref: str, limit: int = 2) -> L
         if isinstance(e, dict) and e.get("url")
         and (ref_lower in e["url"].lower() or e["url"].lower() in ref_lower)
     ]
+    marker = _INJECTION_EVIDENCE_MARKERS.get((kind or "").strip().lower())
+    if marker is not None:
+        matches = [m for m in matches if marker.search(str(m.get("raw") or ""))]
     return [m["raw"] for m in matches[:limit] if m.get("raw")]
 
 
@@ -9157,6 +9521,31 @@ def _detect_finding_chains(target: Target, new_finding: Dict[str, Any]) -> List[
                     notes.append(f"{pattern['label']} — paired with existing finding '{other.get('type', '?')}'. {pattern['guidance']}")
 
     return notes
+
+
+def _findings_are_related_pair(blob_a: str, blob_b: str, host_a: str, host_b: str) -> bool:
+    """Same correlation logic as _detect_finding_chains, but for a single
+    pair of findings rather than "new finding vs. everything already on
+    the target" -- used by export_report to decide whether a set of
+    findings being exported together actually belong in one combined
+    report, or should be split into separate ones (see export_report's
+    docstring/comment at its call site for why this matters)."""
+    for pattern in _CHAIN_PATTERNS:
+        triggers_a = pattern["triggers_a"]
+        triggers_b = pattern.get("triggers_b") or ()
+        if pattern.get("same_host_special"):
+            hit_a = any(t in blob_a for t in triggers_a)
+            hit_b = any(t in blob_b for t in triggers_a)
+            if (hit_a or hit_b) and host_a and host_a == host_b:
+                return True
+            continue
+        a_hit_a = any(t in blob_a for t in triggers_a)
+        b_hit_b = any(t in blob_b for t in triggers_b)
+        b_hit_a = any(t in blob_a for t in triggers_b)
+        a_hit_b = any(t in blob_b for t in triggers_a)
+        if (a_hit_a and b_hit_b) or (b_hit_a and a_hit_b):
+            return True
+    return False
 
 
 def _execute_capture_identity(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -9523,7 +9912,7 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
             ),
         }
 
-    raw_evidence_matches = _lookup_curl_evidence(target, request_ref)
+    raw_evidence_matches = _lookup_curl_evidence(target, request_ref, kind=kind)
     if not raw_evidence_matches and request_ref:
         # Fallback to terminal_evidence_log -- a PoC run via sqlmap, hydra,
         # nmap, or a hand-rolled script through run_terminal_command never
@@ -9532,6 +9921,15 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         # without this a sqlmap-confirmed SQLi finding would hit the
         # no-evidence gate below despite real captured output existing.
         raw_evidence_matches = _lookup_terminal_evidence(target, request_ref)
+    if not raw_evidence_matches and request_ref:
+        # Last resort: neither log has payload-specific proof for this
+        # kind. Rather than block a finding that otherwise has SOME real
+        # captured request/response behind it, fall back to the plain,
+        # unfiltered same-URL curl match (pre-existing behavior for every
+        # kind without a payload marker). This only ever fires when
+        # nothing better exists -- the kind-aware lookup above already
+        # prefers actual payload evidence when it's there.
+        raw_evidence_matches = _lookup_curl_evidence(target, request_ref)
 
     # EVIDENCE GUARDRAIL — the actual fix for the "LFI report had no PoC"
     # bug: a finding that names a SPECIFIC endpoint (request_ref given) but
@@ -9792,36 +10190,67 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
 
 def _execute_dismiss_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
-    Retracts a finding the researcher has reviewed and determined is NOT a
-    real vulnerability (a false positive) — e.g. an endpoint whose content
-    merely changes between requests because it's dynamic (live counters,
-    timestamps, randomized sample data), not because of an access-control
-    flaw.
+    Retracts a finding from the active list. Two DIFFERENT reasons a
+    finding stops being active, distinguished by `resolution`
+    ("false_positive", the default, or "patched"), because they need
+    OPPOSITE handling of future re-detection:
 
-    This does three things, not just one:
-    1. Removes the matching entry from target.findings (and its evidence
-       card) so it stops counting toward "N verified findings" and stops
-       being eligible for export_report.
-    2. Permanently blocks record_finding from accepting the SAME
-       (kind, endpoint) pair again this target, citing the stated reason —
-       see is_dismissed_as_false_positive(), checked at the top of
-       _execute_record_finding.
-    3. Writes an immediate cross-target lesson (hellhound/memory/lessons.py)
-       so a DIFFERENT target with the same tech signature also benefits,
-       rather than waiting for the end-of-session LLM lesson-mining pass
-       (_finalize_target_lessons) to maybe notice it.
+    - resolution="false_positive" (default): the researcher reviewed it
+      and determined it was NEVER a real vulnerability — e.g. an endpoint
+      whose content merely changes between requests because it's dynamic
+      (live counters, timestamps, randomized sample data), not an
+      access-control flaw. This does three things:
+      1. Removes the matching entry from target.findings (and its
+         evidence card) so it stops counting toward "N verified findings"
+         and stops being eligible for export_report.
+      2. Permanently blocks record_finding from accepting the SAME
+         (kind, endpoint) pair again this target, citing the stated
+         reason — see is_dismissed_as_false_positive(), checked at the
+         top of _execute_record_finding.
+      3. Writes an immediate cross-target lesson (hellhound/memory/
+         lessons.py) so a DIFFERENT target with the same tech signature
+         also benefits.
 
-    A researcher correction ("that's a false positive, remove it") is
-    useless if it only changes what gets said in THIS reply — it has to
-    change what the orchestrator does on the NEXT tool call and in the
-    NEXT session. That's what this tool is for.
+    - resolution="patched": CAUGHT IN THE WILD (VaultFi/localhost) — a
+      researcher retested two already-reported, already-verified findings
+      after the dev patched them, confirmed via a direct re-run (sqlmap
+      itself said "not vulnerable") that the fix held, and had NO correct
+      way to record that outcome: calling this tool with the only
+      resolution it had ("false positive") would have been factually
+      wrong AND would have permanently blocked record_finding from ever
+      re-flagging that exact (kind, endpoint) pair again on this target —
+      meaning a REGRESSION (the patch getting reverted, or a new instance
+      of the same bug) would silently go undetected forever after. A
+      finding that was real and got fixed is not the same fact as a
+      finding that was never real, and treating them the same poisons
+      future detection. This path still removes it from the active
+      findings list and evidence/export eligibility (same as a false
+      positive, since it shouldn't appear in a NEW report either), but
+      skips both the permanent re-flagging block and the "confirmed false
+      positive" lesson — recording a neutral "was real, patched as of
+      <date>" timeline note instead, so the history survives without
+      blocking a legitimate future regression finding.
+
+    A researcher correction is useless if it only changes what gets said
+    in THIS reply — it has to change what the orchestrator does on the
+    NEXT tool call and in the NEXT session. That's what this tool is for,
+    for whichever of the two outcomes actually happened.
     """
+    resolution = str(args.get("resolution", "false_positive")).strip().lower()
+    if resolution not in ("false_positive", "patched"):
+        resolution = "false_positive"
     reason = str(args.get("reason", "")).strip()
     if not reason:
-        return {
-            "status": "no_reason_given",
-            "note": "Nah bro, dismiss_finding needs a reason — one sentence on WHY this isn't a real vulnerability (e.g. 'content is dynamic/live, differs between any two requests regardless of the id parameter'). That reason is what stops the same mistake from happening again.",
-        }
+        note = (
+            "Nah bro, dismiss_finding needs a reason — one sentence on WHY this isn't a real vulnerability "
+            "(e.g. 'content is dynamic/live, differs between any two requests regardless of the id parameter')."
+            " That reason is what stops the same mistake from happening again."
+            if resolution == "false_positive" else
+            "dismiss_finding with resolution='patched' still needs a reason — one sentence on how you confirmed "
+            "the fix holds (e.g. 'retested with the same sqlmap command post-patch, confirmed not vulnerable')."
+            " That's what gets recorded in the timeline."
+        )
+        return {"status": "no_reason_given", "note": note}
 
     title = str(args.get("title", "")).strip()
     kind = str(args.get("kind", "")).strip().lower()
@@ -9893,31 +10322,53 @@ def _execute_dismiss_finding(args: Dict[str, Any], target: Target, emit: Any) ->
 
     label = title or f"{kind} on {request_ref or '(no endpoint given)'}"
     try:
-        dismiss_false_positive(target, item=label, reason=reason, kind=kind, endpoint=request_ref)
-        # Immediate cross-target lesson — don't wait for end-of-session
-        # mining, which only fires on set_target and depends on an LLM
-        # call succeeding at summarizing the whole transcript correctly.
-        sig_tags = [t for t in (kind, *re.split(r"[.\-_/:?&=]+", (request_ref or "").lower())) if t and len(t) > 2]
-        add_lesson(
-            technique=f"Flagging '{kind or 'this'}' based on response differences at {request_ref or title}",
-            outcome="failed",
-            tech_signature=sig_tags,
-            note=f"Researcher-confirmed false positive: {reason}",
-            target_name=target.name if target else "",
-        )
-        save_target(target)
+        if resolution == "patched":
+            # It WAS real -- do not call dismiss_false_positive (that
+            # would permanently block record_finding from ever flagging
+            # this exact (kind, endpoint) pair again, which is exactly
+            # wrong for a regression: the same bug reappearing because
+            # the fix got reverted, or a new instance of it, must still
+            # be catchable). Just a neutral timeline note for the record.
+            _record_timeline(target, f"Finding marked PATCHED/resolved: {label}", {"reason": reason})
+            save_target(target)
+        else:
+            dismiss_false_positive(target, item=label, reason=reason, kind=kind, endpoint=request_ref)
+            # Immediate cross-target lesson — don't wait for end-of-session
+            # mining, which only fires on set_target and depends on an LLM
+            # call succeeding at summarizing the whole transcript correctly.
+            sig_tags = [t for t in (kind, *re.split(r"[.\-_/:?&=]+", (request_ref or "").lower())) if t and len(t) > 2]
+            add_lesson(
+                technique=f"Flagging '{kind or 'this'}' based on response differences at {request_ref or title}",
+                outcome="failed",
+                tech_signature=sig_tags,
+                note=f"Researcher-confirmed false positive: {reason}",
+                target_name=target.name if target else "",
+            )
+            save_target(target)
     except Exception as e:
         return {"error": f"Failed to dismiss finding: {e}"}
 
     if emit and hasattr(emit, "success"):
-        emit.success(f"[✓] Dismissed as false positive: {label}")
+        emit.success(f"[✓] {'Marked patched/resolved' if resolution == 'patched' else 'Dismissed as false positive'}: {label}")
 
-    result = {
-        "status": "dismissed",
-        "label": label,
-        "removed_from_findings": removed is not None,
-        "note": f"Removed and blocked from re-recording. '{kind or 'this'}' on this endpoint will not be flagged again on this target unless genuinely new evidence contradicts: {reason}",
-    }
+    if resolution == "patched":
+        result = {
+            "status": "marked_patched",
+            "label": label,
+            "removed_from_findings": removed is not None,
+            "note": (
+                f"Removed from active findings/report eligibility, but NOT permanently blocked — "
+                f"'{kind or 'this'}' on this endpoint can still be flagged again on this target if it genuinely "
+                f"reappears (regression / fix reverted). Recorded: {reason}"
+            ),
+        }
+    else:
+        result = {
+            "status": "dismissed",
+            "label": label,
+            "removed_from_findings": removed is not None,
+            "note": f"Removed and blocked from re-recording. '{kind or 'this'}' on this endpoint will not be flagged again on this target unless genuinely new evidence contradicts: {reason}",
+        }
     return result
 
 
@@ -10219,8 +10670,18 @@ function hhCopy(id, btn) {{
             out_path = Path(existing_path)
             out_path.parent.mkdir(parents=True, exist_ok=True)
         else:
+            # CAUGHT IN THE WILD (VaultFi/localhost, 2-finding session):
+            # both auto-saved reports were named finding_localhost_<ts>.html
+            # -- identical except for a timestamp a human has to open the
+            # file to compare, so there was no way to tell the SQLi report
+            # apart from the IDOR one by filename alone. Slugging the
+            # finding's own title (falling back to its vuln-class kind)
+            # into the filename makes multiple saved findings for the same
+            # target distinguishable at a glance in a file listing.
             safe_target = re.sub(r"[^A-Za-z0-9._-]+", "_", target_name).strip("_") or "default"
-            fname = f"finding_{safe_target}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
+            title_slug = re.sub(r"[^A-Za-z0-9]+", "_", (title or kind or "finding")).strip("_").lower()
+            title_slug = re.sub(r"_+", "_", title_slug)[:60].strip("_") or re.sub(r"[^a-z0-9]+", "_", (kind or "finding").lower()).strip("_")
+            fname = f"finding_{safe_target}_{title_slug}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
             out_path = reports_dir / fname
         out_path.write_text(html_doc, encoding="utf-8")
 
@@ -10418,6 +10879,62 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
             "note": f"Nah bro, none of those finding_ref values matched anything actually recorded for this target — {', '.join(unmatched_refs) if unmatched_refs else 'nothing to go on'}. Not going to include a finding I can't verify was really logged. Call record_finding first for each confirmed result (or check target.findings for the exact title wording), then retry export_report with those as finding_ref.",
             "unmatched_refs": unmatched_refs,
         }
+
+    # CAUGHT IN THE WILD (VaultFi/localhost): export_report was asked for
+    # "the full report" covering an SQLi finding and an unrelated IDOR
+    # finding, and bundled both into one combined report.html. In a real
+    # engagement, unrelated vulnerabilities go to the triager as SEPARATE
+    # submissions -- bundling only makes sense when they're actually part
+    # of the same exploit chain (one finding enables/amplifies another, or
+    # they share a host via a takeover-style relationship -- see
+    # _CHAIN_PATTERNS). Default here mirrors that: 2+ findings that aren't
+    # ALL mutually related get split into one standalone report per
+    # finding instead of one file with everything in it. Pass combine=true
+    # to force the old one-file-for-everything behavior when that's
+    # genuinely what's wanted (e.g. a periodic summary report).
+    if len(resolved_findings) > 1 and not bool(args.get("combine", False)):
+        def _resolve_real_finding(ref: str) -> Dict[str, Any]:
+            key = ref.strip().lower()
+            rf = findings_by_type.get(key)
+            if rf:
+                return rf
+            for ftype_key, fdict in findings_by_type.items():
+                if key and (key in ftype_key or ftype_key in key):
+                    return fdict
+            return {}
+
+        blobs, hosts = [], []
+        for item in resolved_findings:
+            rf = _resolve_real_finding(str(item.get("finding_ref", "")))
+            blobs.append(f"{rf.get('type', '')} {rf.get('kind', '')} {rf.get('note', '')} {item.get('finding_ref', '')}".lower())
+            hosts.append(_finding_host(rf))
+
+        all_related = all(
+            _findings_are_related_pair(blobs[i], blobs[j], hosts[i], hosts[j])
+            for i in range(len(blobs)) for j in range(i + 1, len(blobs))
+        )
+        if not all_related:
+            split_reports = []
+            for item in resolved_findings:
+                sub_args = dict(args)
+                sub_args["findings"] = [item]
+                sub_args["combine"] = True  # this item is alone -- never recurse again
+                sub_args["new_file"] = True  # each finding gets its own distinct file, not a shared overwritable one
+                if not str(args.get("report_title") or "").strip():
+                    sub_args["report_title"] = f"{item.get('finding_ref', 'Security Finding')} — Security Report"
+                split_reports.append(_execute_export_report(sub_args, target, emit))
+            if emit and hasattr(emit, "success"):
+                emit.success(f"[✓] {len(split_reports)} separate report(s) written (findings aren't mutually related — see note)")
+            return {
+                "status": "split_into_separate_reports",
+                "note": (
+                    f"These {len(resolved_findings)} findings don't chain into or otherwise relate to each other, "
+                    "so — matching real-engagement practice — each got its own standalone report file instead of "
+                    "one combined write-up. Pass combine=true on this call if a single bundled report is actually "
+                    "what you want (e.g. a periodic summary)."
+                ),
+                "reports": split_reports,
+            }
 
     # What got recorded but left out of the report entirely?
     all_recorded_display = set()
@@ -10681,7 +11198,17 @@ function hhCopy(id, btn) {{
     # new_file=true explicitly to snapshot the current report under its own
     # timestamp instead (e.g. for versioning before/after a fix is applied).
     if bool(args.get("new_file", False)):
-        fname = f"report_{safe_target_for_fname}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
+        # When this is a single-finding report (the common case after the
+        # unrelated-findings split above), slug its title in too -- same
+        # fix as _auto_save_finding_report, same reason: a folder full of
+        # report_<target>_<timestamp>.html files is impossible to tell
+        # apart without opening each one.
+        if len(resolved_findings) == 1:
+            title_slug = re.sub(r"[^A-Za-z0-9]+", "_", str(resolved_findings[0].get("finding_ref", ""))).strip("_").lower()
+            title_slug = re.sub(r"_+", "_", title_slug)[:60].strip("_")
+            fname = f"report_{safe_target_for_fname}_{title_slug + '_' if title_slug else ''}{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
+        else:
+            fname = f"report_{safe_target_for_fname}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.html"
     else:
         fname = f"report_{safe_target_for_fname}.html"
     out_path = reports_dir / fname
@@ -10953,6 +11480,7 @@ _RECALL_CATEGORIES = {
     "curl_evidence_log": "state",
     "campaign_plan": "state",
     "hypotheses": "state",
+    "browser_flows": "state",
     "findings": "findings",  # lives on target.findings, not target.state
     "raw_artifacts": "raw_search",  # full-text search over ~/.hellhound/targets/<target>/raw/*.txt
 }
@@ -11420,7 +11948,10 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "Also folds in any prior CONFIRMED technique from a similarly-stacked target via the pattern "
             "store (recall_patterns' data) as an extra, higher-confidence lead, plus discovered PARAMETER "
             "NAMES (a 'redirect'/'cmd'/'file' parameter hints at open_redirect/command_injection/lfi even "
-            "before the stack is fully known) and any WAF already fingerprinted (wafbuster) as a flag to "
+            "before the stack is fully known), hydra's richer per-parameter ROLE findings if hydra has run "
+            "(admin flags, auth-sensitive params, path references, GraphQL introspectability, OAuth "
+            "callback sinks — each anchored to the real url+parameter it was seen on, not just a name "
+            "guess), and any WAF already fingerprinted (wafbuster) as a flag to "
             "run waf_evasion_probe before writing a blocked payload off as a dead end. Writes to a "
             "persistent lead board on this target (visible every turn) — use update_hypothesis as you test "
             "each one so the board stays accurate. A hypothesis is a LEAD, never a finding — still "
@@ -11460,14 +11991,15 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "dismiss_finding": ToolSpec(
         name="dismiss_finding",
-        description="Retract a finding the researcher has told you is NOT a real vulnerability — a false positive. Call this THE MOMENT the researcher says something you flagged isn't a bug, rather than just agreeing in your reply and leaving it sitting in findings. This removes it from recorded findings AND permanently stops record_finding from accepting the same kind+endpoint pair again on this target (citing your stated reason), AND writes a cross-target lesson so other targets with a similar stack benefit too. Match what you dismiss using the SAME title (or kind+request_ref) you originally used in record_finding.",
+        description="Retract a finding that's no longer active — for TWO different reasons, set via `resolution`, which matter because they have opposite effects on future detection. resolution='false_positive' (default): the researcher has told you it was NEVER a real vulnerability. Removes it from recorded findings AND PERMANENTLY stops record_finding from accepting the same kind+endpoint pair again on this target, AND writes a cross-target lesson. resolution='patched': the finding WAS real and verified, and a retest (e.g. re-running the same PoC/sqlmap command post-fix) now confirms the fix holds. Removes it from active findings/report eligibility too, but does NOT permanently block it and does NOT write a false-positive lesson — a regression (fix reverted, bug reintroduced) must still be catchable. Never use 'false_positive' for a bug that was real and got fixed — that silently blocks future regression detection on an endpoint that's genuinely vulnerable again later. Call this THE MOMENT the researcher tells you either outcome, rather than just agreeing in your reply and leaving the stale finding sitting there. Match what you dismiss using the SAME title (or kind+request_ref) you originally used in record_finding.",
         parameters={
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "The exact (or close) title you used in record_finding for this finding, if there is one. Omit if you never got as far as record_finding and are dismissing a pattern/lead before recording it."},
                 "kind": {"type": "string", "description": "Category, e.g. 'idor', 'sqli' — same value you used (or would have used) in record_finding. Required if title is omitted."},
                 "request_ref": {"type": "string", "description": "The URL/endpoint this applies to. Required if title is omitted — required together with kind."},
-                "reason": {"type": "string", "description": "REQUIRED. One sentence on WHY this isn't real — e.g. 'response content is dynamic/live (online user count, order totals) and differs between any two requests regardless of which user_id was passed — not evidence of per-user access control'. This exact reason is what prevents the same mistake from happening again, so be specific about the actual mechanism, not just 'false positive'."}
+                "resolution": {"type": "string", "enum": ["false_positive", "patched"], "description": "'false_positive' (default) if it was never a real bug. 'patched' if it WAS real/verified and a retest now confirms the fix holds — this is the one that does NOT permanently block re-detection, so a regression can still be caught."},
+                "reason": {"type": "string", "description": "REQUIRED. For false_positive: one sentence on WHY this isn't real, e.g. 'response content is dynamic/live and differs between any two requests regardless of which user_id was passed'. For patched: one sentence on how the fix was confirmed, e.g. 'retested with the identical sqlmap command post-patch, confirmed not vulnerable'. Be specific about the actual mechanism, not just 'false positive' or 'fixed'."}
             },
             "required": ["reason"]
         },
@@ -11513,7 +12045,8 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "takeover_candidates, technologies, credentials, secrets, failed_credentials, cookies, "
             "dismissed_false_positives, curl_evidence_log (captured request/response proof), campaign_plan, "
             "hypotheses (the full lead board from generate_hypotheses, not just the top 10 shown in the "
-            "prompt), findings (confirmed findings on this target), raw_artifacts (FULL-TEXT SEARCH across every "
+            "prompt), browser_flows (every auth flow saved via save_auth_flow and its step count), "
+            "findings (confirmed findings on this target), raw_artifacts (FULL-TEXT SEARCH across every "
             "saved raw tool-output file for this target — use this when you need to find something that "
             "isn't one of the structured categories above, e.g. 'that one curl response from 20 turns ago' "
             "or a specific string somewhere inside a huge saved JS bundle/HTML page. For raw_artifacts, "
@@ -12011,20 +12544,25 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "same time). Only the 'default' session's cookies are folded into the shared target session that "
             "curl/other tools reuse, specifically so a second named session never clobbers the primary one. "
             "'list_sessions' shows what's currently open for this target; 'close_all' tears all of them down "
-            "at once ('close' alone only closes the one session it was called with)."
+            "at once ('close' alone only closes the one session it was called with). For XSS, 'confirm_script_"
+            "execution' gives REAL proof a payload actually ran (a JS dialog genuinely fired, or the page's "
+            "own code set a marker) instead of just text-matching the response body — goto/click to trigger "
+            "the reflection, then call this with the unique `marker` your payload executes, and pass the "
+            "result's execution_confirmed/execution_evidence into verify_finding for a much stronger check."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "One of: 'goto' (navigate), 'click' (click an element), 'fill' (type into a field), 'eval_js' (run JavaScript in the page and return its result), 'get_storage' (read localStorage + sessionStorage), 'get_cookies' (read all cookies), 'get_network_log' (requests/responses seen so far), 'screenshot' (base64 PNG), 'close' (tear down the current `session` only), 'list_sessions' (show every open session for this target), or 'close_all' (tear down every open session for this target at once).",
+                    "description": "One of: 'goto' (navigate), 'click' (click an element), 'fill' (type into a field), 'eval_js' (run JavaScript in the page and return its result), 'get_storage' (read localStorage + sessionStorage), 'get_cookies' (read all cookies), 'get_network_log' (requests/responses seen so far), 'confirm_script_execution' (real proof an XSS payload executed — checks for a fired JS dialog or a window.__hh_xss_proof marker, see `marker`), 'screenshot' (base64 PNG), 'close' (tear down the current `session` only), 'list_sessions' (show every open session for this target), or 'close_all' (tear down every open session for this target at once).",
                 },
                 "session": {"type": "string", "description": "Optional. Name of an independent browser context/session (e.g. 'victim', 'attacker') — defaults to 'default', the single ordinary session. Different names get fully isolated cookies/storage, for testing two logged-in identities at once."},
                 "url": {"type": "string", "description": "Required for action='goto'. Full URL to navigate to."},
                 "selector": {"type": "string", "description": "Required for 'click'/'fill'. A CSS selector, e.g. '#username', 'button[type=submit]'."},
                 "value": {"type": "string", "description": "Required for 'fill'. The text to type into the selected field."},
                 "script": {"type": "string", "description": "Required for 'eval_js'. JavaScript to evaluate in the page context, e.g. 'document.title' or '() => window.__APP_STATE__'."},
+                "marker": {"type": "string", "description": "Required for 'confirm_script_execution'. A unique token your XSS payload itself executes — either call alert('<marker>')/confirm('<marker>')/prompt('<marker>'), or set window.__hh_xss_proof='<marker>' (an onerror=/onload= handler works too, not just an inline <script> tag)."},
                 "wait_for": {"type": "string", "description": "Optional, for 'goto'. One of 'load' (default), 'domcontentloaded', 'networkidle', or 'commit'."},
                 "full_page": {"type": "boolean", "description": "Optional, for 'screenshot'. Capture the full scrollable page instead of just the viewport. Default false."},
                 "timeout": {"type": "number", "description": "Seconds to wait for the action before giving up. Default 15.", "default": 15}
@@ -12032,6 +12570,51 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["action"]
         },
         executor=_execute_browser_control
+    ),
+    "save_auth_flow": ToolSpec(
+        name="save_auth_flow",
+        description=(
+            "Snapshots the browser_control actions just driven in a session (goto/click/fill/eval_js — "
+            "recorded automatically, no separate 'start recording' step needed) into a named, reusable flow. "
+            "Drive a login normally first (goto the login page, fill username, fill password, click submit) "
+            "via ordinary browser_control calls, THEN call this once to save that exact sequence under a "
+            "name like 'login'. Pairs with replay_auth_flow, which re-drives the saved sequence headless "
+            "later — e.g. once a session expires, or to get a fresh identity without re-walking every click "
+            "by hand. Local-only, no network traffic of its own."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name to save this flow under, e.g. 'login' or 'admin_login'."},
+                "session": {"type": "string", "description": "Which browser_control session's recorded actions to snapshot. Defaults to 'default'."},
+            },
+            "required": ["name"]
+        },
+        executor=_execute_save_auth_flow
+    ),
+    "replay_auth_flow": ToolSpec(
+        name="replay_auth_flow",
+        description=(
+            "Replays a flow saved by save_auth_flow, headless, step by step — record an auth flow once, "
+            "replay it any number of times afterward instead of re-driving every goto/click/fill by hand. "
+            "Defaults to a FRESH session ('<name>_replay') so a replay never silently clobbers whatever "
+            "live session is already open; pass `session` explicitly (e.g. 'default') to replay into a "
+            "specific one instead. Every recorded 'goto' URL is re-checked against this target's current "
+            "scope rules before being replayed, not just trusted because it was in-scope when first "
+            "recorded. Stops at the first failed step rather than pushing through a broken flow. Pass "
+            "`capture_identity_as` to automatically fold the resulting session into capture_identity once "
+            "replay succeeds, so it's immediately usable via swap_session."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name of the flow to replay, as saved via save_auth_flow."},
+                "session": {"type": "string", "description": "Which browser_control session to replay into. Defaults to '<name>_replay' (a fresh session), never 'default' unless explicitly passed."},
+                "capture_identity_as": {"type": "string", "description": "Optional. If given, automatically calls capture_identity(name=<this>, from_browser_session=<replay session>) once replay succeeds."},
+            },
+            "required": ["name"]
+        },
+        executor=_execute_replay_auth_flow
     ),
     "spider": ToolSpec(
         name="spider",
@@ -14421,7 +15004,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # host — gating it on is_in_scope would make it unable to do the one thing it's
         # for; delete_file's only "target" is a bare filename, which _extract_target_
         # from_args would wrongly try to parse as a host/URL).
-        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis"):
+        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
@@ -14879,6 +15462,53 @@ If there is nothing worth generalizing, return an empty array: []"""
                                 )
                     elif tool_name in streaks and streaks[tool_name]:
                         streaks[tool_name] = 0
+                    save_target(self.target)
+                except Exception:
+                    pass
+
+            # CAUGHT IN THE WILD (VaultFi/localhost): browser_control's
+            # fill/click kept timing out against a real login form across
+            # TWO separate browser sessions in the same turn (6+ straight
+            # error results) while a curl-only version of the exact same
+            # SSO flow had already succeeded minutes earlier in the same
+            # session -- yet nothing ever told the model to give up on the
+            # browser and just use the curl path that already worked. The
+            # pivot reflex above only ever looks at _result_is_low_signal,
+            # which explicitly returns False (by design) for any result
+            # carrying "error" -- repeated outright FAILURES were never
+            # tracked at all, only repeated-but-successful empty results.
+            # This is the missing other half: a separate streak, keyed the
+            # same way, for genuine tool errors specifically (never for a
+            # deliberate `blocked`/`requires_approval` stop -- those are
+            # intentional security gates, not flakiness, and must never be
+            # nudged toward "try a different tool," which could read as
+            # encouragement to route around a scope block).
+            if tool_name not in _PIVOT_EXEMPT_TOOLS and self.target and hasattr(self.target, "state") and isinstance(self.target.state, dict):
+                try:
+                    error_streaks = self.target.state.setdefault("_tool_error_streaks", {})
+                    is_genuine_error = (
+                        isinstance(result, dict) and bool(result.get("error"))
+                        and not result.get("blocked") and not result.get("requires_approval")
+                    )
+                    if is_genuine_error:
+                        error_streaks[tool_name] = error_streaks.get(tool_name, 0) + 1
+                        _err_streak = error_streaks[tool_name]
+                        if _err_streak >= _PIVOT_LOW_SIGNAL_THRESHOLD:
+                            note = (
+                                f"'{tool_name}' has FAILED outright (not just come back empty -- actually errored) "
+                                f"{_err_streak} time(s) in a row against this target. Retrying the exact same way is "
+                                f"unlikely to start working on its own."
+                            )
+                            if _err_streak >= _PIVOT_DEAD_END_THRESHOLD:
+                                note += (
+                                    f" STOP retrying {tool_name} like this. Switch tools/approach now -- in "
+                                    f"particular, if a DIFFERENT tool already achieved this same outcome earlier in "
+                                    f"this session (e.g. curl already completing a flow that {tool_name} keeps "
+                                    f"failing on), use that proven path instead of continuing to fight this one."
+                                )
+                            result["_error_pivot_note"] = note
+                    elif tool_name in error_streaks and error_streaks[tool_name]:
+                        error_streaks[tool_name] = 0
                     save_target(self.target)
                 except Exception:
                     pass
