@@ -26,16 +26,17 @@ import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
-from rich.text import Text
 from rich.markup import escape as _rich_escape
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, VerticalScroll
+from textual.content import Content
 from textual.widgets import Collapsible, Footer, Input, Markdown, Static
 
 from hellhound.core.emit import PlainEmit
+from hellhound.core.tui_status import WorkingIndicator
 
 
 # ── Small helpers ────────────────────────────────────────────────────────────
@@ -134,6 +135,10 @@ class AssistantMessage(Static):
 class LogLine(Static):
     """An inline status/info line (warn/success/section/etc.)."""
 
+    def __init__(self, content, raw: str = "") -> None:
+        super().__init__(content)
+        self.raw = raw  # original message text, for introspection/tests
+
 
 class ToolCard(Collapsible):
     """A clickable, collapsible tool-call card.
@@ -204,13 +209,13 @@ class TextualEmit(PlainEmit):
 
 # ── The app ──────────────────────────────────────────────────────────────────
 
-_LOGO = r"""[bold red]        ▲                 ▲
-       /█\   .───────.   /█\
-      /███\_/  ▄   ▄  \_/███\
-     < ◥███   [bold white](●) (●)[/bold white]   ███◤ >
-      \ ◥██    \___/    ██◤ /
-       \__ \_  ▲ ▲ ▲  _/ __/
-          \__\ ▼ ▼ ▼ /__/[/bold red]"""
+_LOGO = r"""[bold red]    ▲                 ▲
+   /█\   .───────.   /█\
+  /███\_/  ▄   ▄  \_/███\
+ < ◥███   [bold white](●) (●)[/bold white]   ███◤ >
+  \ ◥██    \___/    ██◤ /
+   \__ \_  ▲ ▲ ▲  _/ __/
+      \__\ ▼ ▼ ▼ /__/[/bold red]"""
 
 
 class HellhoundApp(App):
@@ -218,15 +223,20 @@ class HellhoundApp(App):
 
     TITLE = "HELLHOUND — Bounty Hunter"
     CSS = """
-    Screen { background: $background; }
-    #banner { color: red; padding: 0 1; height: auto; }
-    #transcript { height: 1fr; padding: 0 1; }
-    UserMessage { color: $text; background: $boost; margin: 1 0 0 0; padding: 0 1; border-left: thick red; }
-    AssistantMessage { margin: 1 0; padding: 0 1; }
+    Screen { background: #0b0d12; }
+    #banner { height: auto; background: #0b0d12; }
+    #logo { width: auto; height: auto; color: red; padding: 0 2 0 1; }
+    #baninfo { width: 1fr; height: auto; padding: 1 1 0 2; }
+    #transcript { height: 1fr; padding: 0 1; background: #0b0d12; scrollbar-background: #0b0d12; scrollbar-color: #5a1f27; }
+    UserMessage { color: $text; background: #1a1d26; margin: 1 0 0 0; padding: 0 1; border-left: thick red; }
+    AssistantMessage { margin: 1 0 0 0; padding: 0 1; }
+    Markdown { margin: 0 0 1 0; padding: 0 1; background: #0b0d12; }
     LogLine { color: $text-muted; margin: 0 0 0 1; }
-    ToolCard { margin: 0 0 0 1; border: none; }
-    ToolCard > CollapsibleTitle { color: red; }
-    #prompt { dock: bottom; border: round red; }
+    ToolCard { margin: 0 0 0 1; border: none; background: #0b0d12; }
+    ToolCard > CollapsibleTitle { color: red; background: #0b0d12; }
+    #working { height: 1; padding: 0 2; color: $text; }
+    #prompt { height: 3; border: round red; margin: 0 1; background: #0b0d12; }
+    Footer { height: 1; background: #141821; }
     """
 
     BINDINGS = [
@@ -250,9 +260,14 @@ class HellhoundApp(App):
 
     # -- lifecycle --
     def compose(self) -> ComposeResult:
-        yield Static(self._banner_text(), id="banner", markup=True)
+        yield Horizontal(
+            Static(_LOGO, id="logo", markup=True),
+            Static("", id="baninfo", markup=True),
+            id="banner",
+        )
         yield VerticalScroll(id="transcript")
-        yield Input(placeholder="Ask Hellhound, or type /help …  (Esc cancels a running turn, Ctrl+Q quits)", id="prompt")
+        yield WorkingIndicator(id="working")
+        yield Input(placeholder="Ask Hellhound, or type /help …", id="prompt")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -264,16 +279,58 @@ class HellhoundApp(App):
         if self._dispatch_fn is None:
             from hellhound.core.commands import dispatch as _dispatch
             self._dispatch_fn = _dispatch
+        self.query_one("#baninfo", Static).update(self._banner_info())
         self.query_one("#prompt", Input).focus()
 
-    def _banner_text(self) -> str:
+    def _banner_info(self) -> str:
+        """The at-a-glance context the old UI showed — model/provider, target,
+        scope status, recent targets — minus the redundant product name (the
+        logo already says who this is)."""
         tname = self._initial_target
+        scope_active = False
         try:
             if self._agent is not None and getattr(self._agent, "target", None):
                 tname = self._agent.target.name
+                rules = getattr(self._agent.target, "scope_rules", None)
+                scope_active = bool(rules and getattr(rules, "in_scope", None))
         except Exception:
             pass
-        return f"{_LOGO}\n[bold red]HELLHOUND[/bold red] · Bounty Hunter   [dim]target:[/dim] [white]{_rich_escape(str(tname))}[/white]"
+
+        model = provider = handle = ""
+        recent = ""
+        try:
+            from hellhound.core.ai_utils import load_config
+            cfg = load_config()
+            model = str(cfg.get("ai_model", "") or "")
+            if len(model) > 26:
+                model = model[:23] + "…"
+            provider = str(cfg.get("ai_provider", "") or "").capitalize()
+            handle = str(cfg.get("researcher_handle", "") or "")
+        except Exception:
+            pass
+        try:
+            from hellhound.core.tasks import list_targets
+            others = [t for t in list_targets(exclude_default=True) if t != tname][:3]
+            recent = ", ".join(others) if others else "none yet"
+        except Exception:
+            recent = "none yet"
+
+        scope_str = "[red]Active Scope[/red]" if scope_active else "[dim]Default Scope[/dim]"
+        who = (f"{model} ({provider})" if model else "—") + (f" · @{handle}" if handle else "")
+        lines = [
+            "[white]Welcome back, Researcher.[/white]",
+            f"[dim]Model:[/dim] {_rich_escape(who)}",
+            f"[dim]Target:[/dim] [white]{_rich_escape(str(tname))}[/white]  [dim]·[/dim] {scope_str}",
+            f"[dim]Recent:[/dim] {_rich_escape(recent)}",
+            "[dim]Type[/dim] [red]/help[/red] [dim]or just ask.  Esc cancels · Ctrl+Q quits[/dim]",
+        ]
+        return "\n".join(lines)
+
+    def refresh_banner(self) -> None:
+        try:
+            self.query_one("#baninfo", Static).update(self._banner_info())
+        except Exception:
+            pass
 
     # -- transcript mutations (always called on the UI thread) --
     def _mount(self, widget) -> None:
@@ -281,10 +338,16 @@ class HellhoundApp(App):
         self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
 
     def add_log_line(self, msg: str) -> None:
-        self._mount(LogLine(Text.from_markup(_safe_markup(msg))))
+        msg = str(msg)
+        try:
+            content = Content.from_markup(msg)
+        except Exception:
+            content = Content(msg)  # literal, no markup
+        self._mount(LogLine(content, raw=msg))
 
     def add_user_message(self, text: str) -> None:
-        self._mount(UserMessage(Text(f"❯ {text}")))
+        # Literal Content so brackets in the user's own text never parse as markup.
+        self._mount(UserMessage(Content(f"❯ {text}")))
 
     def new_assistant_message(self) -> AssistantMessage:
         self._assistant = AssistantMessage()
@@ -298,16 +361,37 @@ class HellhoundApp(App):
         self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
 
     def finalize_assistant_message(self, text: Optional[str]) -> None:
+        # Make sure we have the full text (streaming may have been empty if the
+        # command path returned a value without on_token).
         if text and (self._assistant is None or not self._assistant.text.strip()):
             if self._assistant is None:
                 self.new_assistant_message()
             self._assistant.append(text)
+
+        # Swap the raw streamed Static for a rendered Markdown widget (headers,
+        # **bold**, lists, code fences) — the classic UI rendered markdown and
+        # the streamed raw text looked worse. Done once at the end so we don't
+        # re-render markdown on every token.
+        if self._assistant is not None:
+            final = self._assistant.text
+            if final.strip():
+                try:
+                    md = Markdown(final)
+                    self.query_one("#transcript", VerticalScroll).mount(md, after=self._assistant)
+                    self._assistant.remove()
+                except Exception:
+                    pass  # keep the raw Static if markdown mount fails
         self._assistant = None
 
     def start_tool_card(self, tool_name: str, args: Dict[str, Any]) -> None:
         card = ToolCard(tool_name, args)
         self._pending_cards.setdefault(tool_name, []).append(card)
         self._mount(card)
+        # Pin the spinner to the running tool so you can see WHAT is running.
+        try:
+            self.query_one("#working", WorkingIndicator).set_label(f"Running {tool_name}")
+        except Exception:
+            pass
 
     def finish_tool_card(self, tool_name: str, result: Any) -> None:
         stack = self._pending_cards.get(tool_name)
@@ -317,6 +401,11 @@ class HellhoundApp(App):
                 card.set_result(result)
             except Exception:
                 pass
+        # Back to the rotating phrases between tools.
+        try:
+            self.query_one("#working", WorkingIndicator).set_label("")
+        except Exception:
+            pass
 
     # -- input handling --
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -328,6 +417,10 @@ class HellhoundApp(App):
         inp.disabled = True
         self.add_user_message(line)
         self._cancel_event = threading.Event()
+        try:
+            self.query_one("#working", WorkingIndicator).start()
+        except Exception:
+            pass
         self.run_turn(line)
 
     def action_cancel_turn(self) -> None:
@@ -335,6 +428,10 @@ class HellhoundApp(App):
         self.add_log_line("[bold orange1][!][/bold orange1] cancel requested — winding down this turn…")
 
     def _reenable_input(self) -> None:
+        try:
+            self.query_one("#working", WorkingIndicator).stop()
+        except Exception:
+            pass
         inp = self.query_one("#prompt", Input)
         inp.disabled = False
         inp.focus()
@@ -404,7 +501,8 @@ class HellhoundApp(App):
                 self.call_from_thread(self.finalize_assistant_message, final_text)
             elapsed = time.monotonic() - t0
             es = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed >= 60 else f"{elapsed:.0f}s"
-            self.call_from_thread(self.add_log_line, f"[dim]✳ {es}[/dim]")
+            self.call_from_thread(self.add_log_line, f"[dim]✳ Cooked for {es}[/dim]")
+            self.call_from_thread(self.refresh_banner)  # target/scope may have changed
             self.call_from_thread(self._reenable_input)
 
 
@@ -420,15 +518,6 @@ def _looks_like_command(line: str) -> bool:
     except Exception:
         pass
     return False
-
-
-def _safe_markup(msg: str) -> str:
-    """Rich markup passthrough that won't blow up on stray brackets."""
-    try:
-        Text.from_markup(msg)
-        return msg
-    except Exception:
-        return _rich_escape(str(msg))
 
 
 def start_tui_session(initial_target: Optional[str] = None) -> None:
