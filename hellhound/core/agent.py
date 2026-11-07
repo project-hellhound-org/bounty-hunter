@@ -7101,6 +7101,123 @@ def _execute_jwt_forge(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     }
 
 
+def _adapt_external_spider_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert the standalone `spider` binary's JSON report into the internal
+    `intel` shape the rest of _execute_spider already consumes. The external
+    tool stores each endpoint's params as a {query,form,js,openapi,runtime}
+    dict; the internal consumer wants a flat list of param names. Everything
+    else (source list, forms, secrets) maps across directly. Keeping this a
+    pure adapter is the whole point: when a newer spider.py is dropped in,
+    only its OUTPUT contract matters — no emit/engine wiring to touch."""
+    if not isinstance(report, dict):
+        return {"endpoints": [], "forms": []}
+    endpoints = []
+    for ep in report.get("endpoints", []) or []:
+        if not isinstance(ep, dict):
+            continue
+        params = ep.get("params", {})
+        flat: List[str] = []
+        if isinstance(params, dict):
+            for bucket in ("query", "form", "js", "openapi", "runtime"):
+                flat.extend(p for p in (params.get(bucket) or []) if p)
+        elif isinstance(params, list):
+            flat = [p for p in params if p]
+        endpoints.append({
+            "url": ep.get("url"),
+            "source": ep.get("source", []) or [],
+            "params": flat,
+            "methods": ep.get("methods", []) or [],
+            "auth_required": ep.get("auth_required", False),
+            "parameter_sensitive": ep.get("parameter_sensitive", False),
+        })
+    return {
+        "endpoints": endpoints,
+        "forms": report.get("forms", []) or [],
+        "credentials": report.get("credentials", []) or [],
+        "secrets": report.get("secrets", []) or [],
+        "js_orphan_params": report.get("js_orphan_params", {}) or {},
+        "summary": report.get("summary", {}) or {},
+        "meta": report.get("meta", {}) or {},
+    }
+
+
+def _external_spider_path() -> Optional[str]:
+    """Path to the standalone `spider` binary if installed, else None."""
+    import shutil
+    p = shutil.which("spider")
+    if p:
+        return p
+    # ~/.local/bin may not be on the agent's PATH even when the binary exists.
+    cand = os.path.expanduser("~/.local/bin/spider")
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
+    try:
+        return get_binary_path("spider")
+    except Exception:
+        return None
+
+
+def _run_external_spider(url: str, opts: Dict[str, Any], emit: Any, timeout: int = 300) -> Optional[Dict[str, Any]]:
+    """Invoke the standalone `spider` binary like any other external tool
+    (ffuf/feroxbuster-style: subprocess in, structured output out) and return
+    an engine-shaped result dict. Returns None to signal 'fall back to the
+    internal module' (binary missing or unusable). The entry URL was already
+    scope-gated by execute_tool_call; the crawl stays same-origin from there,
+    the same surface the internal crawler covered."""
+    binpath = _external_spider_path()
+    if not binpath:
+        return None
+    import subprocess
+    import tempfile
+    out_fd, out_path = tempfile.mkstemp(suffix=".json", prefix="hh_spider_")
+    os.close(out_fd)
+    cmd = [binpath, url, "--format", "json", "--out", out_path,
+           "--depth", str(int(opts.get("depth", 2) or 2)),
+           "--no-liveness-check", "--max-runtime", str(max(30, timeout - 20))]
+    # Carry the active identity/auth, same as the internal path did.
+    cookie = opts.get("cookie")
+    if isinstance(cookie, dict):
+        cookie = "; ".join(f"{k}={v}" for k, v in cookie.items())
+    if cookie:
+        cmd += ["--cookie", str(cookie)]
+    headers = opts.get("headers")
+    if isinstance(headers, dict):
+        for hk, hv in headers.items():
+            cmd += ["--header", f"{hk}: {hv}"]
+    if emit and hasattr(emit, "info"):
+        try:
+            emit.info(f"spider (external binary) crawling {url} …")
+        except Exception:
+            pass
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Partial report may still have been written; try to read it.
+        proc = None
+    except Exception as e:
+        return {"intel": {}, "crashed": True, "error": f"external spider failed to launch: {e}"}
+    report = {}
+    try:
+        with open(out_path, "r", encoding="utf-8") as f:
+            report = json.load(f)
+    except Exception:
+        report = {}
+    finally:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
+    if not report:
+        # Nothing parseable — let the caller fall back to the internal crawler
+        # rather than returning an empty "success".
+        return None
+    return {
+        "intel": _adapt_external_spider_report(report),
+        "crashed": False,
+        "error": (proc.stderr.strip()[:400] if (proc is not None and proc.returncode not in (0, None) and proc.stderr) else None),
+    }
+
+
 def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     from hellhound.core.engine import HellhoundEngine
     url = args.get("url") or target.name
@@ -7141,7 +7258,13 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
         _known_endpoints_before = set(target.state.get("endpoints") or [])
 
     try:
-        res = engine.run_single("spider", url, options=opts, emit=emit)
+        # Prefer the standalone `spider` binary (the maintained, latest crawler)
+        # invoked like any external tool — drop in a newer spider.py and it's
+        # used automatically, no emit/engine wiring to update. Fall back to the
+        # bundled module only when the binary isn't installed or returns nothing.
+        res = _run_external_spider(url, opts, emit, timeout=int(args.get("max_runtime", 300) or 300))
+        if res is None:
+            res = engine.run_single("spider", url, options=opts, emit=emit)
         intel = res.get("intel", {}) if isinstance(res, dict) else {}
         if intel and hasattr(target, "state"):
             target.state["spider_intel"] = intel

@@ -39,6 +39,7 @@ from textual.widgets.option_list import Option
 from hellhound.core.emit import PlainEmit
 from hellhound.core.tui_status import WorkingIndicator
 from hellhound.core.tui_complete import compute_suggestions
+from hellhound.core.tui_banners import random_banner
 
 
 # ── Small helpers ────────────────────────────────────────────────────────────
@@ -247,15 +248,6 @@ class TextualEmit(PlainEmit):
 
 # ── The app ──────────────────────────────────────────────────────────────────
 
-_LOGO = r"""[bold red]    ▲                 ▲
-   /█\   .───────.   /█\
-  /███\_/  ▄   ▄  \_/███\
- < ◥███   [bold white](●) (●)[/bold white]   ███◤ >
-  \ ◥██    \___/    ██◤ /
-   \__ \_  ▲ ▲ ▲  _/ __/
-      \__\ ▼ ▼ ▼ /__/[/bold red]"""
-
-
 class HellhoundApp(App):
     """Claude Code-style interactive terminal for Hellhound."""
 
@@ -304,7 +296,7 @@ class HellhoundApp(App):
     # -- lifecycle --
     def compose(self) -> ComposeResult:
         yield Horizontal(
-            Static(_LOGO, id="logo", markup=True),
+            Static(random_banner(), id="logo", markup=True),
             Static("", id="baninfo", markup=True),
             id="banner",
         )
