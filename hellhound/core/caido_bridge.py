@@ -92,8 +92,15 @@ class CaidoClient:
                 verify=self.config.verify_tls,
             )
         except Exception as e:
-            self.last_error = str(e)
-            return {"error": f"Could not reach Caido at {self.config.url}: {e}"}
+            # anyio/httpx raise an ExceptionGroup ("unhandled errors in a
+            # TaskGroup (1 sub-exception)") which is meaningless to a user —
+            # unwrap it to the concrete underlying reason.
+            sub = getattr(e, "exceptions", None)
+            msg = "; ".join(str(x) for x in sub[:2]) if sub else str(e)
+            if not msg or "TaskGroup" in msg:
+                msg = "connection refused — is the Caido MCP bridge running and the token current?"
+            self.last_error = msg
+            return {"error": f"Could not reach Caido at {self.config.url}: {msg}"}
 
         if resp.status_code == 401 or resp.status_code == 403:
             self.last_error = f"HTTP {resp.status_code} — Caido access token missing/expired (tokens expire after 7 days)."

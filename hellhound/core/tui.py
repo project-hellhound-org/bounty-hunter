@@ -291,7 +291,9 @@ class HellhoundApp(App):
         self._dispatch_fn = dispatch_fn
         self._cancel_event = threading.Event()
         self._pending_cards: Dict[str, list] = {}
-        self._assistant: Optional[AssistantMessage] = None
+        self._assistant_md: Optional[Markdown] = None  # live-rendered reply
+        self._assistant_buf = ""                         # accumulated reply text
+        self._last_md_flush = 0.0                        # throttle timestamp
         self._sugg_nav = False  # True once the user arrow-navigates the dropdown
 
     # -- lifecycle --
@@ -403,43 +405,57 @@ class HellhoundApp(App):
         # Literal Content so brackets in the user's own text never parse as markup.
         self._mount(UserMessage(Content(f"❯ {text}")))
 
-    def new_assistant_message(self) -> AssistantMessage:
-        self._assistant = AssistantMessage()
-        self._mount(self._assistant)
-        return self._assistant
+    def new_assistant_message(self) -> Markdown:
+        # Reply renders LIVE into a Markdown widget as tokens stream in
+        # (throttled), so formatting appears instantly like Claude Code
+        # instead of only at the end.
+        self._assistant_buf = ""
+        self._last_md_flush = 0.0
+        self._assistant_md = Markdown("")
+        self._mount(self._assistant_md)
+        return self._assistant_md
 
     def append_assistant_token(self, token: str) -> None:
-        if self._assistant is None:
+        if self._assistant_md is None:
             self.new_assistant_message()
-        self._assistant.append(token)
-        self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
+        self._assistant_buf += token
+        now = time.monotonic()
+        # Throttle the markdown re-parse to ~10x/sec so it stays smooth on a
+        # fast token stream but still visibly renders as it arrives.
+        if now - self._last_md_flush >= 0.1:
+            self._last_md_flush = now
+            try:
+                self._assistant_md.update(self._assistant_buf)
+            except Exception:
+                pass
+            self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
 
     def finalize_assistant_message(self, text: Optional[str]) -> None:
         # Prefer the authoritative cleaned return value (text) over the raw
         # streamed buffer: handle_message/dispatch already strip orchestrator
-        # tool-call JSON and other noise, so rendering `text` is what stops
-        # raw JSON leaking into the transcript (a live-streamed token blob can
-        # contain it; the final return does not).
-        streamed = self._assistant.text if self._assistant is not None else ""
-        final = (text if (text and text.strip()) else streamed) or ""
+        # tool-call JSON and other noise, so the final render stops raw JSON
+        # leaking into the transcript (a live-streamed token blob can contain
+        # it; the final return does not).
+        final = (text if (text and text.strip()) else self._assistant_buf) or ""
         final = final.strip()
-
-        # Last-ditch guard: never render a bare tool-call JSON object as the
-        # assistant reply (it's leaked internal plumbing, not prose).
         if _looks_like_tool_call_json(final):
             final = ""
 
-        if self._assistant is not None:
+        if self._assistant_md is not None:
             if final:
                 try:
-                    md = Markdown(final)
-                    self.query_one("#transcript", VerticalScroll).mount(md, after=self._assistant)
+                    self._assistant_md.update(final)
                 except Exception:
-                    pass  # keep the raw Static if markdown mount fails
-            self._assistant.remove()
+                    pass
+            else:
+                try:
+                    self._assistant_md.remove()
+                except Exception:
+                    pass
+            self._assistant_md = None
         elif final:
             self.query_one("#transcript", VerticalScroll).mount(Markdown(final))
-        self._assistant = None
+        self._assistant_buf = ""
 
     def start_tool_card(self, tool_name: str, args: Dict[str, Any]) -> None:
         card = ToolCard(tool_name, args)
