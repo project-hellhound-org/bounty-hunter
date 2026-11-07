@@ -6113,7 +6113,7 @@ _PIVOT_EXEMPT_TOOLS = frozenset((
     "save_file", "delete_file", "cookie_inspector", "update_plan",
     "recall_data", "load_skill", "listener", "recall_patterns",
     "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis",
-    "save_auth_flow", "profile", "map_surface", "stealth", "parallel",
+    "save_auth_flow", "profile", "map_surface", "stealth", "parallel", "self_audit",
 ))
 _PIVOT_LOW_SIGNAL_THRESHOLD = 3
 _PIVOT_DEAD_END_THRESHOLD = 5
@@ -12080,6 +12080,72 @@ def _search_raw_artifacts(target: Target, query: str, limit: int = 50, regex: bo
     }
 
 
+def _execute_self_audit(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Live self-introspection — answer 'what are you / what tools do you have /
+    what's your architecture / what are your limitations' from FACT, not
+    memory. Reads the live tool registry, loaded skills, and active model
+    config, and pairs them with an honest, curated capabilities + known-gaps
+    summary so the self-report stays accurate as tools are added/removed.
+    Local, read-only, no network.
+    """
+    tools = sorted(TOOL_REGISTRY.keys())
+    try:
+        from hellhound.core.skills import discover_skills
+        skills = sorted(discover_skills().keys())
+    except Exception:
+        skills = []
+    try:
+        from hellhound.core.ai_utils import load_config
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+
+    def _m(role):
+        prov = str(cfg.get(f"{role}_provider") or cfg.get("ai_provider") or "")
+        model = str(cfg.get(f"{role}_model") or cfg.get("ai_model") or "")
+        if model and prov and not model.lower().startswith(prov.lower()):
+            return f"{prov}/{model}"
+        return model or prov or "unset"
+
+    return {
+        "status": "success",
+        "identity": {
+            "name": "HELLHOUND — Bounty Hunter",
+            "researcher": cfg.get("researcher_handle") or "unset",
+        },
+        "models": {"orchestrator": _m("orchestrator"), "synthesizer": _m("synthesizer")},
+        "tools": {"count": len(tools), "names": tools},
+        "skills": {"count": len(skills), "names": skills},
+        "architecture": [
+            "Two-tier: a fast Orchestrator selects/runs tools; a deep Synthesizer writes the report — both roles can be the same model.",
+            "Unconditional Scope Gate — every network tool is scope-checked before any packet leaves.",
+            "Non-prunable harvested-artifact ledger pinned into the prompt every turn.",
+            "Per-target persistent profile (tech stack, WAF behavior, rate-limit observations, quirks) + findings + cross-target lessons/patterns.",
+            "Verification gates on record_finding (real evidence + explicit verified=true for critical/high sqli/xss/ssrf/idor/access-control).",
+        ],
+        "capabilities": [
+            "Recon: subdomain enum, DNS brute/resolve, port scan, HTTP/tech fingerprint, cloud-asset discovery, crawling (external spider ‖ katana), JS endpoint/secret mining.",
+            "Surface correlation: map_surface types every parameter (id/email/file/url/token/json/…) and groups endpoints by function into a ranked fuzz plan.",
+            "Validation: response_diff (baseline-vs-test field diff), verify_finding (class-specific checks), race_test (TOCTOU/limit-overrun), headless XSS execution confirmation.",
+            "Identity/session: capture_identity + swap_session multi-account, record/replay auth flows, cookie/JWT analysis & forging.",
+            "Evasion (authorized): stealth (WAF-aware browser headers), waf_evasion_probe (payload encoding/case bypasses).",
+            "Execution: parallel (fire independent recon tools concurrently), scope-/rate-gated curl, workspace-scoped terminal.",
+            "Reporting: record_finding, export_report (HTML + Markdown, embedded evidence/screenshots), finding-chain detection.",
+        ],
+        "known_limitations": [
+            "No persistent background monitoring — can't watch an endpoint for 24h or across sessions.",
+            "No passive Burp/Caido proxy-stream or project-file ingest (can send-request / create-finding via MCP, but not sit on the proxy).",
+            "Can't visually read / OCR / diff screenshots — gowitness captures them, interpretation is still the researcher's.",
+            "No post-exploitation / internal pivot — external web/app testing only (no CIDR enum, AD, cloud priv-esc, lateral movement).",
+            "No mobile app (APK/IPA) analysis tooling.",
+            "No real-time multi-researcher collaboration / shared live state.",
+            "parallel runs a concurrent BATCH, not a true streaming async runtime — can't feed one tool's partial output into another mid-run.",
+        ],
+        "note": "This is a live audit of the current build — tool/skill counts are read from the registry, not recalled from memory.",
+    }
+
+
 def _execute_stealth(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Return a WAF-aware, browser-realistic, rotated header set for the active
@@ -12741,6 +12807,20 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["calls"]
         },
         executor=_execute_parallel_stub,
+    ),
+    "self_audit": ToolSpec(
+        name="self_audit",
+        description=(
+            "Introspect YOURSELF — call this when the researcher asks what you are, what tools or "
+            "capabilities you have, how many tools, your architecture, your stats, or your LIMITATIONS. "
+            "Returns a LIVE audit read from the actual tool registry, loaded skills, and active model config, "
+            "paired with an honest curated capabilities + known-gaps summary. Use it so your self-description "
+            "is grounded in what's actually installed in THIS build instead of recalled from memory (which "
+            "goes stale as tools are added). Local, instant, no network. Then answer in plain English from "
+            "what it returns — don't just dump the raw identifiers."
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        executor=_execute_self_audit,
     ),
     "stealth": ToolSpec(
         name="stealth",
@@ -15853,7 +15933,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # host — gating it on is_in_scope would make it unable to do the one thing it's
         # for; delete_file's only "target" is a bare filename, which _extract_target_
         # from_args would wrongly try to parse as a host/URL).
-        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow", "profile", "map_surface", "stealth"):
+        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow", "profile", "map_surface", "stealth", "self_audit"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
@@ -17106,7 +17186,12 @@ INSTRUCTIONS:
   reciting the literal registry identifiers (export_report, sqlmap_scan,
   dns_bruteforce) verbatim. The exact identifier is implementation detail,
   not how you'd naturally talk about yourself, and reciting it breaks the
-  persona for no benefit. Exception: if the researcher is clearly asking
+  persona for no benefit. If you're not certain of the EXACT current tool
+  set, architecture, stats, or LIMITATIONS — especially for "what are your
+  limitations," "what's your architecture," "how many tools do you have" —
+  call self_audit FIRST (it's local and instant, reads the live registry)
+  and answer from what it returns, not from memory, which goes stale as
+  tools are added. Exception: if the researcher is clearly asking
   at the technical/dev level — "what's the exact tool name for X," "list
   your tool registry," "what args does save_file take" — answer precisely
   with the real identifier; that's a different, legitimate question.
