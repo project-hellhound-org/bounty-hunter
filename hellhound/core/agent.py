@@ -12111,7 +12111,8 @@ def _execute_self_audit(args: Dict[str, Any], target: Target, emit: Any) -> Dict
     return {
         "status": "success",
         "identity": {
-            "name": "HELLHOUND — Bounty Hunter",
+            "name": "Bounty Hunter",
+            "project": "Project Hellhound",
             "researcher": cfg.get("researcher_handle") or "unset",
         },
         "models": {"orchestrator": _m("orchestrator"), "synthesizer": _m("synthesizer")},

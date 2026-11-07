@@ -329,6 +329,16 @@ Ask the agent itself ("what tools do you have for X?") for what any one of these
 
 ---
 
+## Proving Ground — Simulated Bounty Arena
+
+<p align="center">
+  <img src="Images/simulated-arena.svg" alt="Bounty Hunter simulated bounty arena scoreboard — $16,000 across 5 confirmed findings" width="100%"/>
+</p>
+
+> **What this is:** a controlled benchmark, not a real-world payout record. Bounty Hunter was run end-to-end against an **internal simulated bounty arena** — intentionally-vulnerable targets (e.g. a mock banking/storefront app) with a triage LLM acting as the program, validating each report and assigning a bounty. It's how we measure the thing the project cares about most: telling a *confirmed* bug apart from a false positive and capturing evidence strong enough to score. Every finding above was confirmed with real captured request/response evidence before it was awarded. Figures are simulated and do not represent real bug-bounty earnings.
+
+---
+
 ## Hunting Methodology Skills
 
 Bounty Hunter includes **30 specialized methodology skills**, loaded dynamically into the agent's reasoning context only when a turn actually needs one — not injected all at once.
