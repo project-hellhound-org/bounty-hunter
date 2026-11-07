@@ -26,23 +26,11 @@ _HOUND = r"""[bold red]    ▲                 ▲
       \__\ ▼ ▼ ▼ /__/[/bold red]"""
 
 
-# Tai Lung — the inspiration: hulking silhouette, pointed ears, glowing
-# red/orange eyes. Derived from the reference image, hand-cleaned.
-_TAILUNG = r"""[bold red]          ▟█   █   █▙
-          ▜██ ███████▛
-         ███[bold #ff7a00]◤◥[/bold #ff7a00]███[bold #ff7a00]◤◥[/bold #ff7a00]███
-  █████████████████████████
-  █████████████████████████
-███████  █████████████  ███████
-██████   █████████████   ██████
-██████   ████████████    ██████
-███████  ██████████████ ████████[/bold red]"""
-
-
 # (name, markup). Add new banners here — that's the whole integration.
+# The pool is kept (msfconsole-style random picker) so good banners can be
+# dropped in later; right now the hound is the only one.
 _BANNERS: List[Tuple[str, str]] = [
     ("hound", _HOUND),
-    ("tailung", _TAILUNG),
 ]
 
 
