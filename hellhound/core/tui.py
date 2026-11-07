@@ -318,6 +318,23 @@ class HellhoundApp(App):
             self._dispatch_fn = _dispatch
         self.query_one("#baninfo", Static).update(self._banner_info())
         self.query_one("#prompt", Input).focus()
+        self._check_ai_ready()
+
+    @work(thread=True, exclusive=False)
+    def _check_ai_ready(self) -> None:
+        """Surface the classic UI's 'AI not configured' feedback on startup —
+        run off the UI thread since it may ping Ollama."""
+        issues = _ai_readiness()
+        if not issues:
+            return
+        msg = ("[bold orange1][!][/bold orange1] No AI is fully configured yet — "
+               + "; ".join(issues)
+               + ". Set one with [bold red]/model[/bold red] (or [bold red]/model set-key <provider> <key>[/bold red]); "
+               "until then hunting turns can't run.")
+        try:
+            self.call_from_thread(self.add_log_line, msg)
+        except Exception:
+            pass
 
     def _banner_info(self) -> str:
         """The at-a-glance context the old UI showed — model/provider, target,
@@ -478,14 +495,21 @@ class HellhoundApp(App):
 
     # -- input handling --
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        # Enter SUBMITS the typed command. It only accepts a dropdown suggestion
-        # when the user has actively arrow-navigated into the list (Tab always
-        # accepts). This stops the dropdown from hijacking Enter on a command
-        # you've already typed in full (e.g. "/setup tools auto-install on").
+        # Enter behavior (matches the classic completer):
+        #  - still typing the COMMAND NAME (one "/token", not yet an exact
+        #    command) -> Enter COMPLETES it (so "/se"+Enter -> "/setup "),
+        #  - arrow-navigated into the list -> Enter accepts the highlighted one,
+        #  - otherwise (full command, args, or plain text) -> Enter SUBMITS.
+        # Tab always completes; Esc dismisses.
         box = self._suggest()
-        if box.display and self._sugg_nav:
-            chosen = box.current_line()
-            if chosen is not None:
+        raw = event.value or ""
+        chosen = box.current_line() if box.display else None
+        if chosen is not None:
+            toks = raw.split()
+            first = toks[0] if toks else ""
+            typing_cmd_name = raw.startswith("/") and len(toks) <= 1 and not raw.endswith(" ")
+            is_exact = typing_cmd_name and _is_exact_command(first)
+            if (typing_cmd_name and not is_exact) or self._sugg_nav:
                 inp = self.query_one("#prompt", Input)
                 inp.value = chosen
                 inp.cursor_position = len(chosen)
@@ -493,7 +517,7 @@ class HellhoundApp(App):
                 box.update_for(chosen)
                 return
 
-        line = (event.value or "").strip()
+        line = raw.strip()
         if not line:
             return
 
@@ -615,6 +639,49 @@ def _looks_like_tool_call_json(text: str) -> bool:
     except Exception:
         return False
     return isinstance(obj, dict) and ("tool" in obj or "args" in obj or "tool_call" in obj)
+
+
+def _is_exact_command(token: str) -> bool:
+    """True if `token` (e.g. '/setup') is already a complete, known command —
+    so Enter submits it instead of re-completing it from the dropdown."""
+    if not token:
+        return False
+    try:
+        from hellhound.core.commands import get_command
+        return bool(get_command(token) or get_command(token.lstrip("/")))
+    except Exception:
+        return False
+
+
+def _ai_readiness() -> List[str]:
+    """Returns a list of human-readable issues if the configured AI providers
+    aren't usable yet (cloud provider with no key, or local Ollama not
+    reachable). Empty list == good to go. Mirrors the classic UI's startup
+    'AI not configured' feedback so a fresh install knows what to set."""
+    issues: List[str] = []
+    try:
+        from hellhound.core.ai_utils import load_config
+        cfg = load_config()
+    except Exception:
+        return issues
+    api_keys = cfg.get("api_keys", {}) if isinstance(cfg.get("api_keys"), dict) else {}
+    checked = set()
+    for role in ("orchestrator", "synthesizer"):
+        prov = str(cfg.get(f"{role}_provider") or cfg.get("ai_provider") or "ollama").lower()
+        if prov in checked:
+            continue
+        checked.add(prov)
+        if prov == "ollama":
+            try:
+                import requests as _rq
+                _rq.get("http://localhost:11434/api/tags", timeout=1.5)
+            except Exception:
+                issues.append(f"{role}: local Ollama isn't reachable on :11434 (start it, or `/model {role} <cloud-provider> <model>`)")
+        else:
+            key = api_keys.get(prov) or os.environ.get(f"{prov.upper()}_API_KEY")
+            if not key:
+                issues.append(f"{role}: no {prov} API key set (`/model set-key {prov} <key>`)")
+    return issues
 
 
 def _looks_like_command(line: str) -> bool:

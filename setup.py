@@ -18,6 +18,7 @@ setup(
         "requests",
         "rich",
         "prompt_toolkit",
+        "textual>=0.80",
     ],
     entry_points={
         "console_scripts": [

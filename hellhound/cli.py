@@ -60,15 +60,17 @@ def _configure_logging():
 )
 @click.option("--print", "-p", "print_cmd", default=None, help="Execute a slash command in headless mode and print output")
 @click.option("--json", "-j", "json_output", is_flag=True, default=False, help="Force structured JSON output for automation")
+@click.option("--classic", is_flag=True, default=False, help="Launch the classic prompt_toolkit console instead of the Textual TUI")
 @click.version_option("12.7.0", prog_name="HELLHOUND")
 @click.pass_context
-def cli(ctx, print_cmd, json_output):
+def cli(ctx, print_cmd, json_output, classic):
     """
     HELLHOUND — Autonomous bug bounty recon & triage assistant
 
     Run without arguments to launch the interactive chat console.
 
-      hellhound                     → interactive console
+      hellhound                     → interactive Textual TUI
+      hellhound --classic           → classic prompt_toolkit console
       hellhound --print "/scope show --json"
       hellhound -p "/recon example.com"
     """
@@ -77,7 +79,7 @@ def cli(ctx, print_cmd, json_output):
         return
 
     if ctx.invoked_subcommand is None:
-        _launch_console()
+        _launch_console(classic=classic)
 
 
 def _execute_headless(command_str: str, force_json: bool = False):
@@ -209,17 +211,18 @@ def terminal_clear():
 # -------------------------------------------------
 # Shared launcher
 # -------------------------------------------------
-def _launch_console():
+def _launch_console(classic: bool = False):
     _configure_logging()
 
     # Default to the Claude Code-style Textual TUI (scrollable transcript,
     # pinned input, clickable/collapsible tool cards showing the real
-    # request/response). Set HELLHOUND_CLASSIC_UI=1 to force the classic
-    # prompt_toolkit REPL. If the TUI can't start for any reason, fall back
-    # to classic automatically rather than leaving the user with no console.
+    # request/response). Force the classic prompt_toolkit REPL with either
+    # `hellhound --classic` or HELLHOUND_CLASSIC_UI=1. If the TUI can't start
+    # for any reason, fall back to classic automatically rather than leaving
+    # the user with no console.
     import os
     _classic = os.environ.get("HELLHOUND_CLASSIC_UI", "").strip().lower()
-    use_classic = _classic not in ("", "0", "false", "no")
+    use_classic = classic or (_classic not in ("", "0", "false", "no"))
 
     if not use_classic:
         try:

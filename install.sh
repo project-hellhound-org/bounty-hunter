@@ -157,6 +157,7 @@ if ! _pip_install_with_retry -e "$PROJECT_ROOT"; then
 fi
 stop_animation
 success "HELLHOUND core engine installed"
+info "Interactive Textual TUI ready — run 'hellhound' for it, or 'hellhound --classic' for the classic console."
 
 # ── 4. Playwright (Spider-style handling) ──────────────
 stop_animation
