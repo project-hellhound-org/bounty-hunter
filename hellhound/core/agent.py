@@ -6113,7 +6113,7 @@ _PIVOT_EXEMPT_TOOLS = frozenset((
     "save_file", "delete_file", "cookie_inspector", "update_plan",
     "recall_data", "load_skill", "listener", "recall_patterns",
     "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis",
-    "save_auth_flow", "profile", "map_surface", "stealth",
+    "save_auth_flow", "profile", "map_surface", "stealth", "parallel",
 ))
 _PIVOT_LOW_SIGNAL_THRESHOLD = 3
 _PIVOT_DEAD_END_THRESHOLD = 5
@@ -12276,6 +12276,23 @@ def _execute_remember_lesson_stub(args: Dict[str, Any], target: Target, emit: An
     return {"error": "remember_lesson must be routed through Agent.execute_tool_call, not called directly."}
 
 
+# Tools that must NOT run inside `parallel` — they mutate critical shared
+# state (target identity, findings, scope, report, workspace files) or aren't
+# meaningfully independent. parallel is for overlapping INDEPENDENT recon/probing.
+_PARALLEL_BLACKLIST = frozenset((
+    "parallel", "set_target", "record_finding", "dismiss_finding", "export_report",
+    "manage_scope", "manage_program", "save_file", "delete_file", "remember_lesson",
+    "verify_finding", "race_test",
+))
+
+
+def _execute_parallel_stub(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Placeholder — the real implementation (Agent._execute_parallel) needs
+    self.execute_tool_call so each sub-call is independently scope-gated, so
+    it's special-cased in Agent.execute_tool_call. Never actually reached."""
+    return {"error": "parallel must be routed through Agent.execute_tool_call, not called directly."}
+
+
 def _execute_load_skill(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Loads a skill's full methodology content on demand, by name, from the skill menu."""
     name = str(args.get("name", "")).strip()
@@ -12695,6 +12712,35 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["action"]
         },
         executor=_execute_update_plan
+    ),
+    "parallel": ToolSpec(
+        name="parallel",
+        description=(
+            "Run several INDEPENDENT tool calls CONCURRENTLY instead of one-at-a-time — recon pipelining. "
+            "Pass 'calls': a list of {tool, args} objects (max 6); they fire together (up to 4 at once) and "
+            "each is STILL scope-gated and rate-limited individually. Use it to overlap independent work — "
+            "e.g. subfinder on the root domain WHILE httpx probes a known host WHILE js_miner pulls a JS "
+            "bundle, instead of waiting for each in turn. Do NOT use it for calls that depend on each other's "
+            "output (chain those normally), and it rejects tools that mutate critical state or aren't "
+            "independent (set_target, record_finding, verify_finding, race_test, export_report, manage_scope/"
+            "program, save/delete_file). Returns each call's result. Good first move on a new target: fan out "
+            "subfinder + httpx + content_discovery at once."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "calls": {
+                    "type": "array",
+                    "description": "List of {tool, args} objects to run concurrently (max 6).",
+                    "items": {"type": "object", "properties": {
+                        "tool": {"type": "string", "description": "Tool name to run."},
+                        "args": {"type": "object", "description": "That tool's arguments."}},
+                        "required": ["tool"]},
+                }
+            },
+            "required": ["calls"]
+        },
+        executor=_execute_parallel_stub,
     ),
     "stealth": ToolSpec(
         name="stealth",
@@ -15671,6 +15717,65 @@ If there is nothing worth generalizing, return an empty array: []"""
                 return str(val)
         return self._display_host
 
+    def _execute_parallel(self, args: Any, emit: Any = None) -> Dict[str, Any]:
+        """Run several INDEPENDENT tool calls concurrently. Each sub-call is
+        dispatched back through execute_tool_call, so it inherits the full
+        scope gate / rate limiter / circuit breaker / dedup — parallelism
+        changes only the WAITING, never the safety checks. For recon
+        pipelining (subfinder ‖ httpx ‖ js_miner)."""
+        if not isinstance(args, dict):
+            args = {}
+        calls = args.get("calls")
+        if not isinstance(calls, list) or not calls:
+            return {"error": "parallel needs 'calls': a list of {tool, args} objects to run concurrently, e.g. "
+                             '[{"tool":"subfinder","args":{...}}, {"tool":"httpx","args":{...}}].'}
+        norm = []
+        for c in calls:
+            if not isinstance(c, dict):
+                continue
+            t = str(c.get("tool") or "").strip()
+            if not t:
+                continue
+            if t in _PARALLEL_BLACKLIST:
+                return {"error": f"'{t}' can't run inside parallel — it mutates critical state or isn't "
+                                 "independent. Use parallel for independent recon/probing (subfinder, httpx, "
+                                 "js_miner, curl, port_scan, content_discovery, graphql_probe, …) and chain "
+                                 "state-changing tools normally."}
+            a = c.get("args") if isinstance(c.get("args"), dict) else {}
+            norm.append((t, a))
+        if not norm:
+            return {"error": "No valid {tool, args} entries in 'calls'."}
+        if len(norm) > 6:
+            return {"error": f"parallel is capped at 6 concurrent calls (got {len(norm)}) — split into batches."}
+
+        if emit and hasattr(emit, "info"):
+            try:
+                emit.info(f"parallel: firing {len(norm)} tools at once — {', '.join(t for t, _ in norm)}")
+            except Exception:
+                pass
+
+        results: List[Optional[Dict[str, Any]]] = [None] * len(norm)
+
+        def _run(i: int, tool: str, a: Dict[str, Any]):
+            try:
+                results[i] = {"tool": tool, "result": self.execute_tool_call(tool, a, emit)}
+            except Exception as e:
+                results[i] = {"tool": tool, "error": f"{type(e).__name__}: {e}"}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(norm)), thread_name_prefix="hh-par") as ex:
+            futs = [ex.submit(_run, i, t, a) for i, (t, a) in enumerate(norm)]
+            concurrent.futures.wait(futs, timeout=600)
+
+        return {
+            "status": "success",
+            "ran": len(norm),
+            "tools": [t for t, _ in norm],
+            "results": results,
+            "note": "Each sub-call was independently scope-gated and rate-limited. State merges are "
+                    "best-effort under concurrency (dedup on read); re-run a specific tool if a result "
+                    "looks partial.",
+        }
+
     def execute_tool_call(self, tool_name: str, args: Any, emit: Any = None) -> Dict[str, Any]:
         """
         Executes a tool with hard code-level scope validation, safe method policy,
@@ -15734,6 +15839,11 @@ If there is nothing worth generalizing, return an empty array: []"""
         # compaction pass reloads it from disk.
         if tool_name == "remember_lesson":
             return self._execute_remember_lesson(args, emit)
+
+        # parallel is a meta-tool: it dispatches its sub-calls back through
+        # THIS method so each one is independently scope-gated/rate-limited.
+        if tool_name == "parallel":
+            return self._execute_parallel(args, emit)
 
         # Internal memory & finding recording tools operate locally on target state.
         # manage_scope/save_file/delete_file join this list for the same reason: they

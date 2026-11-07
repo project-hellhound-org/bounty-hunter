@@ -169,13 +169,20 @@ def get_target_path(target_name: str) -> str:
     return os.path.join(target_dir, "task.json")
 
 
+import threading as _threading
+_SAVE_LOCK = _threading.Lock()  # serialize task.json writes so concurrent
+                                # tool execution (the `parallel` tool) can't
+                                # interleave two writers into one corrupt file
+
+
 def save_target(target: Target) -> None:
     target.last_active = datetime.now(timezone.utc).isoformat()
     path = get_target_path(target.name)
     try:
-        rotate_if_needed(Path(path))
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(target.to_dict(), f, indent=2, ensure_ascii=False)
+        with _SAVE_LOCK:
+            rotate_if_needed(Path(path))
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(target.to_dict(), f, indent=2, ensure_ascii=False)
     except Exception as e:
         print(f"[!] Warning: Failed to persist target {target.name}: {e}")
 
