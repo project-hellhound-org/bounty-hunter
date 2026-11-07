@@ -7,9 +7,16 @@
 
 set -e
 
-# Re-attach stdin to /dev/tty if piped (e.g. curl ... | bash)
-if [ ! -t 0 ] && [ -e /dev/tty ]; then
-    exec < /dev/tty 2>/dev/null || true
+# Support `curl ... | bash`. We must NOT globally `exec < /dev/tty` here:
+# when bash is reading THIS script from the pipe (fd 0), reassigning fd 0
+# severs bash's own source and the rest of the script is lost (that's the
+# curl "(23) Failure writing output" seen on a piped install). Instead, we
+# read interactive prompts explicitly from /dev/tty via $TTY below, and
+# sudo already reads its password from the tty — so the pipe stays intact.
+if [ -e /dev/tty ]; then
+    TTY=/dev/tty
+else
+    TTY=/dev/stdin
 fi
 
 RED='\033[91m'
@@ -299,8 +306,8 @@ if [ "${SKIP_OLLAMA:-0}" = "1" ]; then
 else
     echo ""
     info "HELLHOUND can use a local model (via Ollama) or a cloud provider (NVIDIA NIM, OpenAI, etc.)."
-    read -p "$(echo -e "${CYN}[?]${RST} Set up a local model now? [Y/n]: ")" -r PROMPT_REPLY
-    
+    read -p "$(echo -e "${CYN}[?]${RST} Set up a local model now? [Y/n]: ")" -r PROMPT_REPLY < "$TTY" || PROMPT_REPLY=""
+
     if [[ "$PROMPT_REPLY" =~ ^[Nn]$ ]]; then
         info "Skipping local model setup. Configure a cloud provider via /model after first launch."
     else
@@ -308,10 +315,10 @@ else
         echo "  1) qwen2.5:3b-instruct   (recommended — fast, ~2GB, good tool-calling reliability)"
         echo "  2) gemma2:2b             (smaller, ~1.6GB)"
         echo "  3) custom (enter Ollama model name)"
-        read -p "Choice [1]: " MODEL_CHOICE
+        read -p "Choice [1]: " MODEL_CHOICE < "$TTY" || MODEL_CHOICE=""
         case "$MODEL_CHOICE" in
             2) OLLAMA_MODEL="gemma2:2b" ;;
-            3) read -p "Ollama model name: " OLLAMA_MODEL ;;
+            3) read -p "Ollama model name: " OLLAMA_MODEL < "$TTY" || OLLAMA_MODEL="" ;;
             *) OLLAMA_MODEL="qwen2.5:3b-instruct" ;;
         esac
 

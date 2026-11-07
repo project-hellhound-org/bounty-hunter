@@ -1221,6 +1221,35 @@ KNOWN_TOOL_API_KEYS: Dict[str, str] = {
     "urlscan": "Free key: https://urlscan.io/user/signup (Settings -> API). Used by urlscan_recon for crawl-index search.",
 }
 
+# Env-var fallbacks the tool executors ALSO honor (see agent.py's
+# _execute_urlscan_recon / _execute_virustotal_lookup). /apikey must report a
+# key as set if it's reachable via ANY of these, not just the /apikey store —
+# otherwise a key exported as an env var shows as "unset" even though the tool
+# will happily use it (reported in the wild).
+_TOOL_ENV_VARS: Dict[str, str] = {
+    "urlscan": "URLSCAN_API_KEY",
+    "virustotal": "VT_API_KEY",
+}
+
+
+def _resolve_tool_key(name: str, tool_keys: Dict[str, Any], api_keys: Dict[str, Any]):
+    """Resolve a tool's API key the same way the tool executors do —
+    tool_api_keys, then the LLM api_keys bucket, then the env var — and report
+    WHERE it came from. Returns (value, source) or (None, None)."""
+    v = tool_keys.get(name) if isinstance(tool_keys, dict) else None
+    if v:
+        return v, "/apikey"
+    v = api_keys.get(name) if isinstance(api_keys, dict) else None
+    if v:
+        return v, "api_keys"
+    env = _TOOL_ENV_VARS.get(name)
+    if env:
+        import os
+        v = os.environ.get(env)
+        if v:
+            return v, f"${env}"
+    return None, None
+
 
 def handle_apikey(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
@@ -1245,13 +1274,22 @@ def handle_apikey(args: List[str], session_context: Dict[str, Any], emit: Any) -
     if not isinstance(tool_keys, dict):
         tool_keys = {}
 
+    api_keys = cfg.get("api_keys") if isinstance(cfg.get("api_keys"), dict) else {}
+
     if not clean_args:
+        all_names = sorted(set(KNOWN_TOOL_API_KEYS) | set(tool_keys))
+        resolved = {}
+        for name in all_names:
+            val, source = _resolve_tool_key(name, tool_keys, api_keys)
+            resolved[name] = {"set": bool(val), "source": source,
+                              "masked": _mask_secret(str(val)) if val else None}
         if not is_json:
             emit.info("API keys for external tools (/apikey <tool> <value> to set, /apikey <tool> --clear to remove):")
-            all_names = sorted(set(KNOWN_TOOL_API_KEYS) | set(tool_keys))
             for name in all_names:
-                if name in tool_keys and tool_keys[name]:
-                    emit(f"  [set]   {name}: {_mask_secret(str(tool_keys[name]))}")
+                r = resolved[name]
+                if r["set"]:
+                    src = f"  (via {r['source']})" if r["source"] and r["source"] != "/apikey" else ""
+                    emit(f"  [set]   {name}: {r['masked']}{src}")
                 else:
                     hint = KNOWN_TOOL_API_KEYS.get(name, "")
                     emit(f"  [unset] {name}" + (f" — {hint}" if hint else ""))
@@ -1259,7 +1297,8 @@ def handle_apikey(args: List[str], session_context: Dict[str, Any], emit: Any) -
                 emit.info("Nothing configured yet. e.g. /apikey wpscan <token>")
         return {
             "status": "success",
-            "tool_api_keys": {k: _mask_secret(str(v)) for k, v in tool_keys.items() if v},
+            "tool_api_keys": {n: r for n, r in resolved.items() if r["set"]},
+            "resolved": resolved,
             "known_tools": KNOWN_TOOL_API_KEYS,
         }
 

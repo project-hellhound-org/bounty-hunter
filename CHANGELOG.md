@@ -4,6 +4,9 @@ Full detail on everything that's landed, in case you want the "why," not just th
 
 ## Recent Upgrades
 
+- **Installer `curl | bash` now works, and `/apikey` reports env-var keys.**
+  - The installer used to `exec < /dev/tty` globally at the top; when bash reads the script FROM the pipe (`curl … | bash`), reassigning fd 0 severs bash's own script source, so the run died with `curl: (23) Failure writing output`. Fixed: no global stdin reassignment — the interactive prompts read from `/dev/tty` explicitly (`read … < "$TTY"`) and sudo reads its password from the tty, so the pipe stays intact and the one-liner works.
+  - `/apikey` (no args) now resolves each tool's key the same way the tool executors do — `tool_api_keys` → the `api_keys` bucket → the env var (`URLSCAN_API_KEY`, `VT_API_KEY`) — and reports it as `[set]` with the source (e.g. `via $URLSCAN_API_KEY`). Previously it only read the `/apikey` store, so a key exported as an env var showed as `[unset]` even though urlscan_recon/virustotal_lookup would happily use it.
 - **TUI install + classic-parity fixes (reported from a fresh install).**
   - **`textual` is now in `setup.py` `install_requires`.** `install.sh` does `pip install -e .`, which reads `install_requires` — not `requirements.txt` — so `textual` was never installed and every fresh install silently fell back to the classic console. Fixed; `install.sh` also prints a line confirming the TUI is ready and how to force classic.
   - **`hellhound --classic`** launches the classic prompt_toolkit console; bare `hellhound` is the Textual TUI (the `HELLHOUND_CLASSIC_UI=1` env var still works too).
