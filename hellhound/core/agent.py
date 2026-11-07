@@ -86,6 +86,7 @@ from hellhound.core.skills import (
 from hellhound.core.toolcheck import ensure_tool, get_binary_path, install_hint, is_available, pick_available
 from hellhound.core import verify_engine as _verify_engine
 from hellhound.core import hypothesis_engine as _hypothesis_engine
+from hellhound.core.surface_map import build_surface_map as _build_surface_map
 from hellhound.memory.pattern_db import PatternDB
 from hellhound.memory.schemas import make_pattern_entry, SchemaError as _PatternSchemaError
 
@@ -6111,7 +6112,7 @@ _PIVOT_EXEMPT_TOOLS = frozenset((
     "save_file", "delete_file", "cookie_inspector", "update_plan",
     "recall_data", "load_skill", "listener", "recall_patterns",
     "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis",
-    "save_auth_flow", "profile",
+    "save_auth_flow", "profile", "map_surface",
 ))
 _PIVOT_LOW_SIGNAL_THRESHOLD = 3
 _PIVOT_DEAD_END_THRESHOLD = 5
@@ -11802,6 +11803,29 @@ def _search_raw_artifacts(target: Target, query: str, limit: int = 50, regex: bo
     }
 
 
+def _execute_map_surface(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Correlate this target's gathered recon into a TYPED, PRIORITIZED attack
+    surface: every discovered parameter classified by data type (numeric_id,
+    email, file_path, url, token, json, boolean, …) with the test family it
+    warrants, plus endpoints grouped by function (auth/payments/admin/…) and a
+    ranked fuzz plan that puts the high-value groups first.
+
+    Local-only — reads target.state (spider/recon output), no network traffic,
+    so it's exempt from the scope gate like recall_data/profile. It does not
+    fuzz or record anything; it tells you WHAT to test with WHICH payload
+    shape, in what order. Run spider/katana/content_discovery first so there's
+    a surface to map.
+    """
+    smap = _build_surface_map(target)
+    if emit and hasattr(emit, "info"):
+        try:
+            emit.info(smap.get("summary", ""))
+        except Exception:
+            pass
+    return {"status": "success", **smap}
+
+
 def _execute_profile(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Read or annotate the persistent TARGET PROFILE — the accumulated record
@@ -12335,6 +12359,26 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["action"]
         },
         executor=_execute_update_plan
+    ),
+    "map_surface": ToolSpec(
+        name="map_surface",
+        description=(
+            "Correlate everything recon has gathered on this target into a TYPED, PRIORITIZED attack "
+            "surface — the step a human does before fuzzing blindly. Returns: (1) every discovered "
+            "parameter classified by DATA TYPE (numeric_id, uuid, email, file_path, url, token, search, "
+            "json, boolean) with the test family that type actually warrants — a numeric_id wants IDOR "
+            "enumeration, a file_path wants LFI/traversal, a url wants SSRF/open-redirect, a json body "
+            "wants mass-assignment, a search param wants SQLi/XSS — so you fuzz with type-appropriate "
+            "payloads instead of a generic wordlist; (2) endpoints grouped by FUNCTION (auth, payments, "
+            "admin, upload, user, api) so you work the high-value groups first; (3) a ranked fuzz plan. "
+            "Run this AFTER spider/katana/content_discovery have populated the surface, and BEFORE "
+            "deciding what to fuzz/verify. Local, read-only, no network — it tells you what to test and "
+            "in what order; it doesn't send traffic or record findings (use the real tools + verify_finding "
+            "for that). Complements generate_hypotheses (which guesses vuln class from param NAMES) by "
+            "adding value-based TYPE inference and functional endpoint grouping."
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        executor=_execute_map_surface,
     ),
     "profile": ToolSpec(
         name="profile",
@@ -15338,7 +15382,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # host — gating it on is_in_scope would make it unable to do the one thing it's
         # for; delete_file's only "target" is a bare filename, which _extract_target_
         # from_args would wrongly try to parse as a host/URL).
-        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow", "profile"):
+        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow", "profile", "map_surface"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
