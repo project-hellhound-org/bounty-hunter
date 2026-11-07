@@ -8,3 +8,4 @@ textual>=0.80
 cryptography
 beautifulsoup4
 lxml
+textual
