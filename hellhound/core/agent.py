@@ -87,6 +87,7 @@ from hellhound.core.toolcheck import ensure_tool, get_binary_path, install_hint,
 from hellhound.core import verify_engine as _verify_engine
 from hellhound.core import hypothesis_engine as _hypothesis_engine
 from hellhound.core.surface_map import build_surface_map as _build_surface_map
+from hellhound.core.stealth import build_stealth_headers as _build_stealth_headers
 from hellhound.memory.pattern_db import PatternDB
 from hellhound.memory.schemas import make_pattern_entry, SchemaError as _PatternSchemaError
 
@@ -6112,7 +6113,7 @@ _PIVOT_EXEMPT_TOOLS = frozenset((
     "save_file", "delete_file", "cookie_inspector", "update_plan",
     "recall_data", "load_skill", "listener", "recall_patterns",
     "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis",
-    "save_auth_flow", "profile", "map_surface",
+    "save_auth_flow", "profile", "map_surface", "stealth",
 ))
 _PIVOT_LOW_SIGNAL_THRESHOLD = 3
 _PIVOT_DEAD_END_THRESHOLD = 5
@@ -12079,6 +12080,29 @@ def _search_raw_artifacts(target: Target, query: str, limit: int = 50, regex: bo
     }
 
 
+def _execute_stealth(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Return a WAF-aware, browser-realistic, rotated header set for the active
+    target — for AUTHORIZED testing, so a WAF/CDN doesn't false-block the
+    researcher's own legitimate test traffic (a bare non-browser client is
+    flagged before the payload is even evaluated). Reads the WAF the target
+    profile already fingerprinted and tunes the header set + surfaces
+    WAF-specific tactics. Local, read-only, no network — the model passes the
+    returned `headers` to its curl/request calls. Not a way around auth/scope.
+    """
+    ua = args.get("user_agent") or None
+    extra = args.get("extra") if isinstance(args.get("extra"), dict) else None
+    rotate = args.get("rotate", True)
+    result = _build_stealth_headers(target, ua=ua, rotate=bool(rotate), extra=extra)
+    if emit and hasattr(emit, "info"):
+        try:
+            wafs = result.get("waf_profile", {}).get("matched_wafs") or []
+            emit.info(f"stealth headers ready (UA rotated{', tuned for ' + ', '.join(wafs) if wafs else ''}).")
+        except Exception:
+            pass
+    return {"status": "success", **result}
+
+
 def _execute_map_surface(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Correlate this target's gathered recon into a TYPED, PRIORITIZED attack
@@ -12671,6 +12695,31 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["action"]
         },
         executor=_execute_update_plan
+    ),
+    "stealth": ToolSpec(
+        name="stealth",
+        description=(
+            "Get a WAF-aware, browser-realistic, rotated HTTP header set for the active target — for "
+            "AUTHORIZED testing, so a WAF/CDN doesn't false-block your own legitimate test traffic. On a "
+            "live program a bare `python-requests`/non-browser client is flagged and dropped before the "
+            "actual payload is even evaluated; this returns a coherent browser header set (rotated "
+            "User-Agent + matching Accept/Sec-Fetch/sec-ch-ua headers) tuned to whichever WAF the target "
+            "profile already fingerprinted (Cloudflare/Akamai/AWS/Imperva/ModSecurity/F5), plus the "
+            "WAF-specific tactics worth applying. Call it, then pass the returned `headers` to your "
+            "curl/sqlmap/fuzz calls. It does NOT bypass authentication or scope and isn't about hiding "
+            "activity from the program owner — it just makes authorized requests look like a normal browser. "
+            "For a specifically-blocked PAYLOAD, use waf_evasion_probe (encoding/case mutations) instead."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "user_agent": {"type": "string", "description": "Pin a specific User-Agent instead of rotating."},
+                "rotate": {"type": "boolean", "description": "Rotate the UA through the pool (default true).", "default": True},
+                "extra": {"type": "object", "description": "Extra headers to merge in."}
+            },
+            "required": []
+        },
+        executor=_execute_stealth,
     ),
     "map_surface": ToolSpec(
         name="map_surface",
@@ -15694,7 +15743,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # host — gating it on is_in_scope would make it unable to do the one thing it's
         # for; delete_file's only "target" is a bare filename, which _extract_target_
         # from_args would wrongly try to parse as a host/URL).
-        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow", "profile", "map_surface"):
+        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow", "profile", "map_surface", "stealth"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
