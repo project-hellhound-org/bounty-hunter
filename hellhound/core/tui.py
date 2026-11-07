@@ -292,6 +292,7 @@ class HellhoundApp(App):
         self._cancel_event = threading.Event()
         self._pending_cards: Dict[str, list] = {}
         self._assistant: Optional[AssistantMessage] = None
+        self._sugg_nav = False  # True once the user arrow-navigates the dropdown
 
     # -- lifecycle --
     def compose(self) -> ComposeResult:
@@ -450,15 +451,20 @@ class HellhoundApp(App):
     # -- autocomplete wiring --
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "prompt":
+            # Fresh typing resets "did the user navigate the dropdown", so
+            # Enter after typing submits instead of accepting a suggestion.
+            self._sugg_nav = False
             self._suggest().update_for(event.value or "")
 
     def _suggest(self) -> SuggestionBox:
         return self.query_one(SuggestionBox)
 
     def action_sugg_next(self) -> None:
+        self._sugg_nav = True
         self._suggest().move(1)
 
     def action_sugg_prev(self) -> None:
+        self._sugg_nav = True
         self._suggest().move(-1)
 
     def action_sugg_accept(self) -> None:
@@ -472,17 +478,20 @@ class HellhoundApp(App):
 
     # -- input handling --
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        # If the dropdown is open with a highlight, Enter accepts the
-        # suggestion into the input rather than submitting — same feel as the
-        # old prompt_toolkit completer.
+        # Enter SUBMITS the typed command. It only accepts a dropdown suggestion
+        # when the user has actively arrow-navigated into the list (Tab always
+        # accepts). This stops the dropdown from hijacking Enter on a command
+        # you've already typed in full (e.g. "/setup tools auto-install on").
         box = self._suggest()
-        chosen = box.current_line()
-        if chosen is not None:
-            inp = self.query_one("#prompt", Input)
-            inp.value = chosen
-            inp.cursor_position = len(chosen)
-            box.update_for(chosen)
-            return
+        if box.display and self._sugg_nav:
+            chosen = box.current_line()
+            if chosen is not None:
+                inp = self.query_one("#prompt", Input)
+                inp.value = chosen
+                inp.cursor_position = len(chosen)
+                self._sugg_nav = False
+                box.update_for(chosen)
+                return
 
         line = (event.value or "").strip()
         if not line:
