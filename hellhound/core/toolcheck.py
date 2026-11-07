@@ -34,6 +34,10 @@ OTHER_TOOLS: Dict[str, str] = {
     "nuclei": "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
     "jsluice": "go install github.com/BishopFox/jsluice/cmd/jsluice@latest",
     "uro": "pip install uro",
+    # The deeper crawler, maintained as its own pip package (console script
+    # `spider`). bounty-hunter invokes it as an external binary; when it's
+    # missing, spider falls back to katana. This hint lets /setup install it.
+    "spider": "pip install hellhound-spider",
     # Not a single runnable command (varies by distro/package manager) —
     # try_install() below recognizes the parenthetical and skips
     # auto-exec for this one rather than running it literally.

@@ -2,9 +2,9 @@
 """
 Generic interactive browser-control tool.
 
-Why this exists: the existing Playwright usage in hellhound/modules/recon/spider.py
+Why this exists: a crawler's Playwright usage (e.g. the external `spider` tool)
 is all one-shot -- it launches a browser, crawls, and tears everything down inside a
-single module.run() call. That's fine for recon, but it can't do a multi-step
+single run. That's fine for recon, but it can't do a multi-step
 interactive flow (log in, solve a client-side redirect, click through an MFA
 prompt, then poke at an authenticated page) across SEPARATE tool calls, because
 there's no persistent page between calls.
