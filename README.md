@@ -296,14 +296,14 @@ All actions can be triggered via slash commands or natural language:
 
 ## The Recon & Triage Arsenal
 
-Bounty Hunter coordinates **75 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
+Bounty Hunter coordinates **76 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
 
 | Category | Tools |
 | :--- | :--- |
 | **Passive & Active Recon** | `subfinder` `subdomain_sweep` `permute_subdomains` `resolve_candidates` `dns_bruteforce` `dig` `port_scan` `tls_cert_scan` `httpx` `nmap_service_scan` `wayback_urls` `gau_nuclei_sweep` `urlscan_recon` `google_dork` `otx_urls` `virustotal_lookup` `cloudscout` `wafbuster` |
 | **Crawling & Content Discovery** | `spider` `katana` `content_discovery` `fuzz_hunter` `vhost_fuzz` `js_miner` |
 | **Visual & Browser** | `browser_control` `save_auth_flow` `replay_auth_flow` `gowitness` |
-| **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `wpscan_scan` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `403_bypass` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` `map_surface` `replay_request` `response_diff` `verify_finding` |
+| **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `wpscan_scan` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `403_bypass` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` `map_surface` `replay_request` `response_diff` `race_test` `verify_finding` |
 | **Takeover & Subdomain Health** | `takeover_scanner` `subzy` |
 | **Session, Scope & Workspace** | `cookie_inspector` `curl` `run_terminal_command` `set_target` `manage_scope` `manage_program` `listener` `recall_data` `profile` `update_plan` `recall_patterns` `capture_identity` `swap_session` `generate_hypotheses` `update_hypothesis` |
 | **HackerOne Program Intel** | `hackerone_policy` `hackerone_search` `hackerone_stats` |
@@ -371,7 +371,7 @@ The honest gap between "runs tools well" and "hunts like a pro" is architecture,
 1. **Persistent, scriptable browser — interception** — record/replay is done (`save_auth_flow`/`replay_auth_flow`, below); request/response interception is what's left.
 2. **Burp/Caido ↔ identity model bridge** — Burp/Caido are already integrated as MCP-callable tools (`/mcp burp`, `/mcp caido` — history search, send-request, create-finding); what's still open is bridging `capture_identity`/`swap_session` to pull/push sessions through them, the way `browser_control` already is.
 3. **Intelligent request/response correlation** *(landed)* — baseline-vs-test response diffing (`response_diff`: JSON field-level + line diff, the IDOR/access-control/mass-assignment backbone), plus `map_surface`: spider output auto-parameterized by inferred data type (ID, email, file, url, token, json, boolean → each mapped to its test family) and endpoints auto-grouped by function (auth, payments, admin, upload, user, api) into a ranked fuzz plan.
-4. **Real race/logic testing** — single-packet / last-byte synced requests, automatic state-mutation detection, multi-context coordinated race attacks.
+4. **Real race/logic testing** *(first slice landed)* — `race_test`: fires N barrier-synchronized identical requests at a single-use action (redeem/withdraw/transfer/coupon), counts how many actually succeeded (`success_marker`), and GETs a `state_url` before/after to show the state over-mutating. Still open: tighter single-packet (HTTP/2) sync and multi-context coordinated races.
 5. **Stealth/evasion as a first-class profile** — UA/TLS-fingerprint/IP rotation, WAF-fingerprint-driven bypass selection, distributed scan coordination with deduped results. (Builds on the persistent target profile — WAF behavior and rate-limit observations now persist per target; see CHANGELOG.)
 6. **Screenshots auto-attached per finding**, and a wider finding-chain pattern set beyond the first curated list.
 7. **Passive → active intel fusion** — CT logs + Wayback + gau + OTX deduped straight into `httpx`/fuzzing; JS sourcemap recovery → secret extraction → endpoint mapping, fed straight back into the fuzzer.

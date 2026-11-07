@@ -7219,13 +7219,11 @@ def _run_external_spider(url: str, opts: Dict[str, Any], emit: Any, timeout: int
 
 
 def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
-    from hellhound.core.engine import HellhoundEngine
     url = args.get("url") or target.name
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
     depth = args.get("depth", 2)
 
-    engine = HellhoundEngine()
     opts = {"depth": depth, "max_pages": 50, "target": url}
 
     # Propagate session cookies / auth headers from args or target.state for authenticated crawling
@@ -7258,13 +7256,22 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
         _known_endpoints_before = set(target.state.get("endpoints") or [])
 
     try:
-        # Prefer the standalone `spider` binary (the maintained, latest crawler)
-        # invoked like any external tool — drop in a newer spider.py and it's
-        # used automatically, no emit/engine wiring to update. Fall back to the
-        # bundled module only when the binary isn't installed or returns nothing.
+        # The crawler is the standalone `spider` binary (its own pip package,
+        # the maintained/latest version), invoked like any external tool —
+        # drop in a newer spider.py and it's used automatically, no wiring to
+        # update. When it isn't installed, fall back to katana (bounty-hunter's
+        # other crawler) and surface the one-line install for spider, exactly
+        # like every other optional external tool.
         res = _run_external_spider(url, opts, emit, timeout=int(args.get("max_runtime", 300) or 300))
         if res is None:
-            res = engine.run_single("spider", url, options=opts, emit=emit)
+            if emit and hasattr(emit, "warn"):
+                emit.warn("spider (deeper crawler) isn't installed — using katana instead. "
+                          "Install the deeper crawler with: pip install hellhound-spider  (or run /setup).")
+            kat = _execute_katana(args, target, emit)
+            if isinstance(kat, dict):
+                kat["crawler_used"] = "katana (fallback — spider not installed)"
+                kat["spider_install_hint"] = "pip install hellhound-spider"
+            return kat
         intel = res.get("intel", {}) if isinstance(res, dict) else {}
         if intel and hasattr(target, "state"):
             target.state["spider_intel"] = intel
@@ -9969,6 +9976,152 @@ def _try_json(text: str) -> Any:
         return _RESPDIFF_MISSING
 
 
+_RACE_MAX_COUNT = 50  # hard cap: a controlled burst for a race test, never a DoS
+
+
+def _execute_race_test(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Fire N identical requests at the SAME endpoint as close to simultaneously
+    as possible (barrier-synchronized) to probe for race conditions / TOCTOU
+    logic flaws — the limit-overrun / double-spend / coupon-reuse class that a
+    one-request-at-a-time tool can't surface. Reports the outcome distribution
+    and, when a `state_url` is given, GETs it before and after the burst and
+    diffs it (reusing response_diff's field-diff) to show whether state
+    actually over-mutated (e.g. balance dropped by 3× a single transfer).
+
+    It does NOT record a finding — it's a signal-gatherer; confirm with the
+    state diff / success count and then verify_finding + record_finding. The
+    burst is hard-capped at 50 requests (a race test, not a stress/DoS tool).
+    Scope-gated like every network tool; a `state_url` must hit the same host.
+    """
+    url = (args.get("url") or "").strip()
+    if not url:
+        return {"error": "race_test needs 'url' — the endpoint whose single-use action you want to race "
+                         "(e.g. redeem coupon, withdraw, transfer, apply credit)."}
+    method = (args.get("method") or "POST").upper()
+    try:
+        count = int(args.get("count", 20))
+    except Exception:
+        count = 20
+    count = max(2, min(_RACE_MAX_COUNT, count))
+    success_marker = args.get("success_marker")
+    state_url = (args.get("state_url") or "").strip()
+
+    # Scope: the dispatcher gated `url`; re-check it + state_url here (defense
+    # in depth) and require same host, exactly like response_diff/verify_finding.
+    host_of = lambda u: normalize_host(u if u.startswith(("http://", "https://")) else f"https://{u}")[0]
+    if state_url and host_of(state_url) and host_of(url) and host_of(state_url) != host_of(url):
+        return {"error": f"state_url host ('{host_of(state_url)}') differs from the race target "
+                         f"('{host_of(url)}') — they must be the same host. Refusing."}
+    if target and target.scope_rules and target.scope_rules.in_scope:
+        for u in [url] + ([state_url] if state_url else []):
+            allowed, reason = is_in_scope(u, target.scope_rules)
+            if not allowed:
+                return {"error": f"SCOPE_VIOLATION: {reason}", "target": u, "blocked": True}
+
+    auth = _target_auth_options(target) if not args.get("isolate") else {}
+    headers = {"User-Agent": "Hellhound/1.0"}
+    headers.update(auth.get("auth_headers", {}))
+    if isinstance(args.get("headers"), dict):
+        headers.update(args["headers"])
+    cookies = dict(auth.get("auth_cookies", {}))
+    if isinstance(args.get("cookies"), dict):
+        cookies.update(args["cookies"])
+    json_payload = args.get("json") if isinstance(args.get("json"), (dict, list)) else None
+    data_payload = args.get("body") if args.get("body") is not None else args.get("data")
+
+    def _get_state(u):
+        try:
+            r = requests.get(u, headers=headers, cookies=cookies or None, timeout=10, verify=False, allow_redirects=False)
+            return {"status": r.status_code, "body": r.text[:4000]}
+        except Exception as e:
+            return {"error": str(e)}
+
+    state_before = _get_state(state_url) if state_url else None
+
+    # Barrier-synchronized burst: every worker blocks until all are ready, then
+    # releases together — the requests hit the wire within a sub-millisecond
+    # window, widening the odds of landing inside a check-then-act race.
+    results: List[Optional[Dict[str, Any]]] = [None] * count
+    barrier = threading.Barrier(count)
+
+    def _worker(i: int):
+        try:
+            barrier.wait(timeout=15)
+        except threading.BrokenBarrierError:
+            results[i] = {"error": "barrier_broken"}
+            return
+        t0 = time.monotonic()
+        try:
+            if json_payload is not None:
+                r = requests.request(method, url, headers=headers, cookies=cookies or None, json=json_payload, timeout=15, verify=False, allow_redirects=False)
+            else:
+                r = requests.request(method, url, headers=headers, cookies=cookies or None, data=data_payload, timeout=15, verify=False, allow_redirects=False)
+            results[i] = {"status": r.status_code, "length": len(r.content), "body": (r.text or "")[:1500], "ms": round((time.monotonic() - t0) * 1000, 1)}
+        except Exception as e:
+            results[i] = {"error": f"{type(e).__name__}: {e}"}
+
+    threads = [threading.Thread(target=_worker, args=(i,), daemon=True) for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    state_after = _get_state(state_url) if state_url else None
+
+    # ── Analysis ──
+    ok = [r for r in results if isinstance(r, dict) and "status" in r]
+    errs = [r for r in results if isinstance(r, dict) and r.get("error")]
+    status_dist: Dict[str, int] = {}
+    for r in ok:
+        status_dist[str(r["status"])] = status_dist.get(str(r["status"]), 0) + 1
+    n_2xx = sum(1 for r in ok if 200 <= int(r["status"]) < 300)
+    n_marker = None
+    if success_marker:
+        n_marker = sum(1 for r in ok if success_marker in (r.get("body") or ""))
+
+    state_delta = None
+    if state_before and state_after and "body" in state_before and "body" in state_after:
+        b_json, a_json = _try_json(state_before["body"]), _try_json(state_after["body"])
+        if b_json is not _RESPDIFF_MISSING and a_json is not _RESPDIFF_MISSING:
+            state_delta = _json_field_diff(b_json, a_json)
+        else:
+            state_delta = ("changed" if state_before["body"] != state_after["body"] else "unchanged")
+
+    # ── Verdict (advisory — never records) ──
+    successes = n_marker if n_marker is not None else n_2xx
+    strong_state = isinstance(state_delta, list) and len(state_delta) > 0
+    if successes > 1:
+        verdict = (f"POSSIBLE RACE — {successes} request(s) succeeded"
+                   + (f" (matched success_marker {success_marker!r})" if n_marker is not None else " (HTTP 2xx)")
+                   + f" out of {count} fired simultaneously. If this action is supposed to succeed only ONCE "
+                     "(redeem/withdraw/transfer/apply), that's the race. Confirm the state actually "
+                     "over-mutated, then verify_finding + record_finding.")
+    elif strong_state:
+        verdict = (f"POSSIBLE RACE — only {successes} response(s) looked successful, but the state at "
+                   f"{state_url} changed across the burst: {state_delta[:5]}. Check whether it moved more "
+                   "than a single request should have.")
+    else:
+        verdict = (f"No obvious race — {successes} successful response(s) out of {count}; the server likely "
+                   "serialized the requests (locking/idempotency). A tighter single-packet technique or a "
+                   "wider window might still win, but this run shows no over-application.")
+
+    return {
+        "status": "success",
+        "url": url,
+        "fired": count,
+        "status_distribution": status_dist,
+        "successful_responses": successes,
+        "errors": len(errs),
+        "success_marker_hits": n_marker,
+        "state_before": state_before,
+        "state_after": state_after,
+        "state_delta": state_delta,
+        "sample_responses": ok[:6],
+        "verdict": verdict,
+    }
+
+
 def _execute_response_diff(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Fire a BASELINE request and a TEST request, then surface exactly how the
@@ -12285,6 +12438,42 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["name"]
         },
         executor=_execute_swap_session
+    ),
+    "race_test": ToolSpec(
+        name="race_test",
+        description=(
+            "Probe for RACE CONDITIONS / TOCTOU logic flaws — the limit-overrun / double-spend / "
+            "coupon-reuse / balance-exhaustion class that a one-request-at-a-time tool can't find. It "
+            "fires N identical requests at the SAME endpoint barrier-synchronized (released together, so "
+            "they hit the server within a sub-millisecond window), then reports the outcome distribution. "
+            "Use it on any action that's supposed to succeed exactly ONCE: redeem a coupon/gift card, "
+            "withdraw/transfer funds, apply a credit, accept an invite, vote, claim a one-per-user reward. "
+            "Give 'success_marker' (a string that appears only in a successful response, e.g. 'Transfer "
+            "successful') so it can count how many of the N actually succeeded — more than one is the race. "
+            "Even stronger: give 'state_url' (e.g. the balance/inventory endpoint) and it GETs it before and "
+            "after the burst and diffs it, so you can see the state over-mutate (balance dropped 3× a single "
+            "transfer). Fire the authenticated identity you want (capture_identity/swap_session apply). It "
+            "does NOT record a finding — confirm the over-application, then verify_finding + record_finding. "
+            "Hard-capped at 50 requests (a race test, not a stress/DoS tool). Scope-gated; state_url must be "
+            "the same host."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The endpoint whose single-use action to race (the request that performs the action)."},
+                "method": {"type": "string", "description": "HTTP method for the action (default POST)."},
+                "count": {"type": "integer", "description": "How many simultaneous requests to fire (default 20, capped at 50)."},
+                "json": {"type": "object", "description": "JSON body for the action request (e.g. {\"coupon\":\"SAVE50\"})."},
+                "body": {"type": "string", "description": "Raw/form body for the action request, if not JSON."},
+                "headers": {"type": "object", "description": "Extra request headers."},
+                "cookies": {"type": "object", "description": "Explicit cookies (otherwise the active identity's session is used)."},
+                "isolate": {"type": "boolean", "description": "If true, do NOT auto-attach the stored session — only what you pass. Default false.", "default": False},
+                "success_marker": {"type": "string", "description": "A string present only in a SUCCESSFUL response — the tool counts how many of the N responses contain it. >1 = likely race."},
+                "state_url": {"type": "string", "description": "Optional same-host endpoint reflecting the state the action mutates (e.g. the balance/inventory API). GET'd before and after the burst and diffed, so you can see the state over-mutate."}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_race_test,
     ),
     "response_diff": ToolSpec(
         name="response_diff",
