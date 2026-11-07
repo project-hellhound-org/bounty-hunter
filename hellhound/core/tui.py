@@ -265,11 +265,11 @@ class HellhoundApp(App):
     #banner { height: auto; background: #0b0d12; }
     #logo { width: auto; height: auto; color: red; padding: 0 2 0 1; }
     #baninfo { width: 1fr; height: auto; padding: 1 1 0 2; }
-    #transcript { height: 1fr; padding: 0 1; background: #0b0d12; scrollbar-background: #0b0d12; scrollbar-color: #5a1f27; }
-    UserMessage { color: $text; background: #1a1d26; margin: 1 0 0 0; padding: 0 1; border-left: thick red; }
+    #transcript { height: 1fr; padding: 1 2; background: #0b0d12; scrollbar-background: #0b0d12; scrollbar-color: #5a1f27; }
+    UserMessage { color: $text; background: #1a1d26; margin: 2 0 1 0; padding: 0 1; border-left: thick red; }
     AssistantMessage { margin: 1 0 0 0; padding: 0 1; }
-    Markdown { margin: 0 0 1 0; padding: 0 1; background: #0b0d12; }
-    LogLine { color: $text-muted; margin: 0 0 0 1; }
+    Markdown { margin: 1 0 2 0; padding: 0 1; background: #0b0d12; }
+    LogLine { color: $text-muted; margin: 0 0 1 1; }
     ToolCard { margin: 0 0 0 1; border: none; background: #0b0d12; }
     ToolCard > CollapsibleTitle { color: red; background: #0b0d12; }
     #working { height: 1; padding: 0 2; color: $text; }
