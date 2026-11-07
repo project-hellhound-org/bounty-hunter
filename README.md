@@ -120,7 +120,11 @@ Everything you need to install, configure AI backends, and run Bounty Hunter in 
 
 #### Option A: One-Line Remote Installer
 ```bash
-curl -fsSL https://raw.githubusercontent.com/project-hellhound-org/bounty-hunter/main/install.sh | bash
+# Download, then run — do NOT pipe to bash. The installer needs sudo and
+# asks interactive questions; `curl ... | bash` makes stdin the script
+# itself, which breaks those prompts (curl error 23 / a half-finished run).
+curl -fsSL https://raw.githubusercontent.com/project-hellhound-org/bounty-hunter/main/install.sh -o hellhound-install.sh
+bash hellhound-install.sh
 ```
 
 #### Option B: Standard Git Clone
