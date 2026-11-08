@@ -603,6 +603,26 @@ class HellhoundApp(App):
                         self._agent.set_target(session_ctx["target"])
                     except Exception:
                         pass
+            elif _looks_autonomous_msg(line):
+                # Plain message that clearly asks for a hands-off, run-to-
+                # completion engagement — route through dispatch, whose plain-NL
+                # path applies the same auto-continuation loop as /hunt (keeps
+                # going class by class instead of stopping after the first batch).
+                session_ctx = {
+                    "target": self._agent.target.name,
+                    "scope_rules": self._agent.target.scope_rules,
+                    "options": {},
+                }
+                res = self._dispatch_fn(line, session_ctx, emit, on_token=on_token, cancel_check=self._cancel_event.is_set)
+                if isinstance(res, dict):
+                    final_text = res.get("response") or res.get("advice")
+                elif isinstance(res, str):
+                    final_text = res
+                if session_ctx.get("target") and session_ctx["target"] != "default":
+                    try:
+                        self._agent.set_target(session_ctx["target"])
+                    except Exception:
+                        pass
             else:
                 next_input = line
                 while True:
@@ -698,6 +718,16 @@ def _ai_readiness() -> List[str]:
             if not key:
                 issues.append(f"{role}: no {prov} API key set (`/model set-key {prov} <key>`)")
     return issues
+
+
+def _looks_autonomous_msg(line: str) -> bool:
+    """Plain message that asks for a hands-off run-to-completion engagement —
+    routed through dispatch's auto-continuation loop (same as /hunt)."""
+    try:
+        from hellhound.core.commands import _looks_autonomous
+        return _looks_autonomous(line)
+    except Exception:
+        return False
 
 
 def _looks_like_command(line: str) -> bool:

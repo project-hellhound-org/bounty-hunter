@@ -459,11 +459,110 @@ def handle_scan(args: List[str], session_context: Dict[str, Any], emit: Any,
     }
 
 
+# /hunt is the AUTONOMOUS command — unlike an interactive turn, there is nobody
+# to type "continue" when the model pauses mid-engagement to report progress.
+# Observed in the wild: a headless hunt did ~19 tool calls (surface map + JWT),
+# then ENDED its turn with a "what's left to test" plan and never tested SQLi/
+# IDOR/mass-assignment/etc. These constants drive an auto-continuation loop that
+# keeps nudging the beast forward until it signals completion, stalls, or hits a
+# real budget — turning "do a batch, report back" into "run the whole engagement".
+_HUNT_DONE_RE = re.compile(r"\bENGAGEMENT\s+COMPLETE\b", re.I)
+_HUNT_PENDING_RE = re.compile(
+    r"next steps?|what'?s left|haven'?t (?:yet|tested)|in progress|i'?ll (?:start|now|continue)|"
+    r"still (?:need|to)|remaining|left to test|to be tested|let me continue|moving on to", re.I)
+_HUNT_CONTINUE_PROMPT = (
+    "Continue the engagement autonomously — do not stop to summarize or ask for confirmation. Work "
+    "through the vulnerability classes and endpoints you have not yet tested: for each, actually send the "
+    "exploit, CONFIRM it with verify_finding (or the class tool — mass_assign_probe, response_diff, "
+    "race_test, jwt_forge, js_miner), and call record_finding with the real captured evidence for every bug "
+    "you confirm. Keep going class by class. ONLY when you have tested every class and then run "
+    "reverify_findings and export_report, end your reply with the exact token: ENGAGEMENT COMPLETE")
+
+
+def _hunt_findings_count(agent) -> int:
+    try:
+        return len(agent.target.findings or [])
+    except Exception:
+        return 0
+
+
+# Intent detection for AUTONOMOUS engagement requests typed WITHOUT /hunt, so a
+# normal message like "test localhost:8081 thoroughly" or "don't stop until
+# you've found every bug" gets the same auto-continuation loop — while a casual
+# question ("is this XSS?", "what does this endpoint do?") stays a single turn.
+_AUTONOMY_STRONG_RE = re.compile(
+    r"autonomous|don'?t stop|do not stop|until (?:it'?s )?(?:done|finished|complete)|"
+    r"keep going until|full (?:engagement|pentest|assessment|audit|test)|"
+    r"complete (?:engagement|pentest|assessment|audit)|end[- ]to[- ]end|"
+    r"find all (?:the )?(?:bugs?|vulns?|vulnerabilities)|every (?:bug|vuln|vulnerability)|"
+    r"run the (?:whole|full|entire)|hunt (?:for )?(?:bugs|vulns|everything)", re.I)
+_AUTONOMY_ENGAGE_RE = re.compile(r"\b(test|pentest|pen-?test|hunt|assess|audit|exploit|attack|pwn|recon)\b", re.I)
+_AUTONOMY_DEPTH_RE = re.compile(r"\b(thorough(?:ly)?|exhaustive(?:ly)?|complete(?:ly)?|full|deep(?:ly)?|comprehensive|everything|all (?:the )?(?:endpoints|params|inputs))\b", re.I)
+
+
+def _looks_autonomous(text: str) -> bool:
+    """True when a plain message clearly asks for a hands-off, run-to-completion
+    engagement (so it earns the auto-continuation loop), conservatively — when
+    unsure, return False so the default stays a single interactive turn."""
+    t = text or ""
+    if _AUTONOMY_STRONG_RE.search(t):
+        return True
+    return bool(_AUTONOMY_ENGAGE_RE.search(t) and _AUTONOMY_DEPTH_RE.search(t))
+
+
+def _run_autonomous_continuation(agent, answer: str, session_context: Dict[str, Any], emit: Any,
+                                 on_token: Optional[Callable[[str], None]] = None,
+                                 cancel_check: Optional[Callable[[], bool]] = None):
+    """
+    Shared auto-continuation loop: keep nudging the agent forward until it emits
+    the ENGAGEMENT COMPLETE token, stalls (two turns with no new findings AND no
+    pending-work language), hits the iteration cap, the wall-clock budget, or the
+    user cancels. Returns (final_answer, continuations, stopped_reason). `answer`
+    is the result of the FIRST (already-run) turn.
+    """
+    budget_s = float(os.environ.get("HELLHOUND_HUNT_BUDGET_S", "1500"))
+    max_cont = int(os.environ.get("HELLHOUND_HUNT_MAX_CONTINUATIONS", "12"))
+    deadline = time.time() + budget_s
+    continuations = 0
+    stalls = 0
+    last_count = _hunt_findings_count(agent)
+    cancelled = False
+    while (continuations < max_cont and time.time() < deadline
+           and not _HUNT_DONE_RE.search(answer or "")):
+        if cancel_check and cancel_check():
+            cancelled = True
+            break
+        cur = _hunt_findings_count(agent)
+        made_progress = cur > last_count
+        has_pending = bool(_HUNT_PENDING_RE.search(answer or ""))
+        if not made_progress and not has_pending:
+            stalls += 1
+            if stalls >= 2:
+                break
+        else:
+            stalls = 0
+        last_count = cur
+        continuations += 1
+        if emit and hasattr(emit, "info"):
+            emit.info(f"[auto-continue {continuations}/{max_cont}] "
+                      f"{cur} finding(s) so far, {int(deadline - time.time())}s budget left")
+        answer = agent.handle_message(_HUNT_CONTINUE_PROMPT, session_context=session_context,
+                                      emit=emit, on_token=on_token, cancel_check=cancel_check)
+    reason = ("cancelled" if cancelled
+              else "signaled_complete" if _HUNT_DONE_RE.search(answer or "")
+              else "budget" if (continuations >= max_cont or time.time() >= deadline)
+              else "stalled")
+    return answer, continuations, reason
+
+
 def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any,
                 on_token: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """
     /hunt [target] [--json]
-    Delegates to the agent's own reasoning for an autonomous, scope-aware multi-stage hunt and triage.
+    Runs an AUTONOMOUS, scope-aware multi-stage engagement to completion: it keeps
+    driving the agent forward (auto-"continue") until the agent signals it is done,
+    stalls, or hits the wall-clock/iteration budget — instead of stopping after the
+    first turn the way a single interactive message would.
     """
     is_json = "--json" in args or getattr(emit, "json_mode", False)
     clean_args = [a for a in args if a not in ("--json", "-j")]
@@ -478,14 +577,29 @@ def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any,
     session_context["target"] = target
     agent = get_agent(target)
     prompt = (
-        f"Execute a complete, autonomous, scope-aware multi-stage hunt against target {target}. "
-        f"Discover the surface area (subdomains, ports, live hosts), run passive and active analysis "
-        f"modules (spider, surface_auditor, corsbuster, graphql, exmap, wafbuster), and triage all findings."
-    )
+        f"Execute a complete, autonomous, scope-aware penetration test of {target} and do NOT stop to "
+        f"report back mid-engagement. Methodology: (1) map the surface — crawl, read any JS bundles, "
+        f"enumerate every endpoint and parameter; (2) if signup is open, register your own test accounts "
+        f"to test authenticated and multi-user flows; (3) SYSTEMATICALLY test every input/endpoint for "
+        f"each class — SQL injection (including the login form), reflected & stored XSS, IDOR/BOLA "
+        f"(compare two accounts), mass assignment on write endpoints (mass_assign_probe), SSTI, SSRF, "
+        f"CORS, weak/forgeable JWT, race conditions, open redirect, path traversal, command injection, "
+        f"and secrets/PII bundled in client JS (js_miner). For EACH confirmed bug: verify_finding, then "
+        f"record_finding with the real captured evidence — do not just describe it. Work class by class "
+        f"and do not stop after the first finding. When every class has been tested, run reverify_findings "
+        f"then export_report, and end your final reply with the exact token: ENGAGEMENT COMPLETE")
+
     answer = agent.handle_message(prompt, session_context=session_context, emit=emit, on_token=on_token)
+    answer, continuations, reason = _run_autonomous_continuation(
+        agent, answer, session_context, emit, on_token)
+
     if not is_json and not on_token:
         emit(answer)
-    return {"status": "success", "target": target, "advice": answer}
+    return {
+        "status": "success", "target": target, "advice": answer,
+        "continuations": continuations, "findings_recorded": _hunt_findings_count(agent),
+        "stopped_reason": reason,
+    }
 
 
 def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
@@ -2950,13 +3064,35 @@ def dispatch(raw_input: str, session_context: Dict[str, Any], emit: Any = None,
             print(json.dumps(result, indent=2))
         return result
 
-    # Plain natural language input -> Route directly to Agent Reasoning Loop
-    response = agent_handle_message(raw_clean, session_context=session_context, emit=emit, on_token=on_token, cancel_check=cancel_check)
+    # Plain natural language input -> Route to the Agent Reasoning Loop.
+    # If the message clearly asks for a hands-off, run-to-completion engagement
+    # (not a casual question), apply the SAME auto-continuation loop as /hunt so
+    # the user doesn't have to remember the slash command — a single interactive
+    # turn otherwise stops after the first batch and waits for a human "continue".
+    autonomous = _looks_autonomous(raw_clean)
+    continuations = 0
+    reason = None
+    if autonomous:
+        agent = get_agent(session_context.get("target"))
+        if emit and hasattr(emit, "info"):
+            emit.info("[*] Autonomous request detected — running to completion (type to interrupt). "
+                      "Use a short question for a single-turn answer.")
+        response = agent.handle_message(raw_clean, session_context=session_context, emit=emit,
+                                        on_token=on_token, cancel_check=cancel_check)
+        response, continuations, reason = _run_autonomous_continuation(
+            agent, response, session_context, emit, on_token, cancel_check=cancel_check)
+    else:
+        response = agent_handle_message(raw_clean, session_context=session_context, emit=emit, on_token=on_token, cancel_check=cancel_check)
     if "--json" in tokens or getattr(emit, "json_mode", False):
         res_dict = {"status": "success", "response": response}
+        if autonomous:
+            res_dict.update({"autonomous": True, "continuations": continuations, "stopped_reason": reason})
         print(json.dumps(res_dict, indent=2))
         return res_dict
     else:
         if not on_token:
             emit(response)
-        return {"status": "success", "response": response}
+        res = {"status": "success", "response": response}
+        if autonomous:
+            res.update({"autonomous": True, "continuations": continuations, "stopped_reason": reason})
+        return res
