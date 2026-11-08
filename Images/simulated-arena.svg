@@ -1,28 +1,40 @@
-<svg viewBox="0 0 640 232" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bounty Hunter simulated bounty arena scoreboard: $16,000 across 5 confirmed findings">
+<svg viewBox="0 0 660 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bounty Hunter simulated bounty arena scoreboard: $16,000 across 5 confirmed findings">
   <title>Bounty Hunter — Simulated Bounty Arena</title>
-  <rect width="640" height="232" rx="12" fill="#0b0d12"/>
-  <rect x="0" y="0" width="640" height="40" rx="12" fill="#161b22"/>
-  <rect x="0" y="28" width="640" height="12" fill="#161b22"/>
-  <text x="18" y="26" fill="#ff3b3b" font-family="monospace" font-size="16" font-weight="bold">&#9650; BOUNTY HUNTER</text>
-  <text x="182" y="26" fill="#8b949e" font-family="monospace" font-size="12.5">&#183; Simulated Bounty Arena</text>
-  <rect x="548" y="10" width="80" height="20" rx="4" fill="#d29922"/>
-  <text x="588" y="24" text-anchor="middle" fill="#07100a" font-family="monospace" font-size="11" font-weight="bold">SIMULATED</text>
+  <rect width="660" height="300" rx="12" fill="#0b0d12"/>
 
-  <text x="18" y="82" fill="#8b949e" font-family="monospace" font-size="12">TOTAL AWARDED (intentionally-vulnerable test targets)</text>
-  <text x="18" y="126" fill="#2ea043" font-family="monospace" font-size="44" font-weight="bold">$16,000</text>
+  <!-- header -->
+  <rect x="0" y="0" width="660" height="44" rx="12" fill="#161b22"/>
+  <rect x="0" y="30" width="660" height="14" fill="#161b22"/>
+  <text x="20" y="29" fill="#ff3b3b" font-family="monospace" font-size="16" font-weight="bold">&#9650; BOUNTY HUNTER</text>
+  <text x="188" y="29" fill="#8b949e" font-family="monospace" font-size="12.5">&#183; Simulated Bounty Arena</text>
+  <rect x="560" y="12" width="84" height="20" rx="4" fill="#d29922"/>
+  <text x="602" y="26" text-anchor="middle" fill="#07100a" font-family="monospace" font-size="11" font-weight="bold">SIMULATED</text>
 
-  <text x="330" y="72" fill="#e6edf3" font-family="monospace" font-size="12.5">&#9679; 5 findings confirmed</text>
-  <text x="330" y="94" fill="#ff6a6a" font-family="monospace" font-size="12.5">&#9679; 1 Critical &#183; 2&#215; SQL injection</text>
-  <text x="330" y="116" fill="#d29922" font-family="monospace" font-size="12.5">&#9679; 4 High &#183; AuthZ / IDOR / Auth</text>
+  <!-- left: total -->
+  <text x="20" y="92" fill="#8b949e" font-family="monospace" font-size="12.5">TOTAL AWARDED</text>
+  <text x="20" y="140" fill="#2ea043" font-family="monospace" font-size="46" font-weight="bold">$16,000</text>
 
-  <line x1="18" y1="146" x2="622" y2="146" stroke="#30363d" stroke-width="1"/>
+  <!-- right: stats (clear of the number) -->
+  <text x="372" y="84" fill="#e6edf3" font-family="monospace" font-size="12.5">&#9679; 5 findings confirmed</text>
+  <text x="372" y="110" fill="#ff6a6a" font-family="monospace" font-size="12.5">&#9679; 1 Critical &#183; 2&#215; SQL injection</text>
+  <text x="372" y="136" fill="#d29922" font-family="monospace" font-size="12.5">&#9679; 4 High &#183; AuthZ / IDOR / Auth</text>
 
-  <text x="18" y="168" fill="#c9d1d9" font-family="monospace" font-size="11">Boolean-blind SQLi &#183; product.php?id &#8594; DB exfil</text>
-  <text x="622" y="168" text-anchor="end" fill="#2ea043" font-family="monospace" font-size="11" font-weight="bold">$5,000</text>
-  <text x="18" y="186" fill="#c9d1d9" font-family="monospace" font-size="11">Time-based blind SQLi &#183; POST /login.php</text>
-  <text x="622" y="186" text-anchor="end" fill="#2ea043" font-family="monospace" font-size="11" font-weight="bold">$4,000</text>
-  <text x="18" y="204" fill="#c9d1d9" font-family="monospace" font-size="11">Mass assignment &#8594; admin &#183; /api/profile.php</text>
-  <text x="622" y="204" text-anchor="end" fill="#2ea043" font-family="monospace" font-size="11" font-weight="bold">$3,000</text>
-  <text x="18" y="222" fill="#c9d1d9" font-family="monospace" font-size="11">Reset-token leak &#8594; ATO &#160;&#160;&#8226;&#160;&#160; IDOR &#183; transactions user_id</text>
-  <text x="622" y="222" text-anchor="end" fill="#2ea043" font-family="monospace" font-size="11" font-weight="bold">$2,500 + $1,500</text>
+  <!-- divider -->
+  <line x1="20" y1="168" x2="640" y2="168" stroke="#30363d" stroke-width="1"/>
+
+  <!-- findings, one per row -->
+  <text x="20" y="194" fill="#c9d1d9" font-family="monospace" font-size="12">Boolean-blind SQLi &#183; product.php?id &#8594; DB exfil</text>
+  <text x="640" y="194" text-anchor="end" fill="#2ea043" font-family="monospace" font-size="12" font-weight="bold">$5,000</text>
+
+  <text x="20" y="218" fill="#c9d1d9" font-family="monospace" font-size="12">Time-based blind SQLi &#183; POST /login.php</text>
+  <text x="640" y="218" text-anchor="end" fill="#2ea043" font-family="monospace" font-size="12" font-weight="bold">$4,000</text>
+
+  <text x="20" y="242" fill="#c9d1d9" font-family="monospace" font-size="12">Mass assignment &#8594; admin &#183; /api/profile.php</text>
+  <text x="640" y="242" text-anchor="end" fill="#2ea043" font-family="monospace" font-size="12" font-weight="bold">$3,000</text>
+
+  <text x="20" y="266" fill="#c9d1d9" font-family="monospace" font-size="12">Password-reset token leak &#8594; account takeover</text>
+  <text x="640" y="266" text-anchor="end" fill="#2ea043" font-family="monospace" font-size="12" font-weight="bold">$2,500</text>
+
+  <text x="20" y="290" fill="#c9d1d9" font-family="monospace" font-size="12">IDOR &#183; /api/transactions.php?user_id=</text>
+  <text x="640" y="290" text-anchor="end" fill="#2ea043" font-family="monospace" font-size="12" font-weight="bold">$1,500</text>
 </svg>
