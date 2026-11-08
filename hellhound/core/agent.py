@@ -6090,6 +6090,13 @@ def _session_fingerprint(target: Optional[Target]) -> str:
             "cookies": target.state.get("cookies"),
             "session_cookie": target.state.get("session_cookie"),
             "auth_token": target.state.get("auth_token"),
+            # The ACTIVE IDENTITY is what swap_session changes, and it's the
+            # whole point of IDOR/BOLA testing: "request the SAME url, now as
+            # the attacker." Without it here, swap_session followed by the
+            # same curl got wrongly skipped as an exact duplicate — the one
+            # request the researcher most needs to fire. Caught in the wild
+            # against the VaultFi lab.
+            "active_identity": target.state.get("active_identity"),
         }, sort_keys=True, default=str)
     except Exception:
         return ""
