@@ -4660,6 +4660,18 @@ def check_artifact_preflight_gate(tool_name: str, args: Dict[str, Any], target: 
             return None
 
     unconsumed = find_unconsumed_artifacts(target, history=history)
+    # A session cookie does NOT block broad discovery: every crawler/fuzzer
+    # here auto-attaches the active session, so running one after you log in
+    # IS using/testing that cookie (crawling the authenticated surface is the
+    # whole point). Only NON-session actionable artifacts — a leaked token,
+    # api key, delegation/impersonation endpoint, credential found in a
+    # response — still gate discovery, since those need an explicit test
+    # before you wander off. Caught on the VaultFi lab: a plain session cookie
+    # was blocking the authenticated crawl the researcher actually wanted.
+    unconsumed = [
+        a for a in unconsumed
+        if not _SESSION_LIKE_COOKIE_NAME.search(str(a.get("field_name", "")))
+    ]
     if not unconsumed:
         return None
 
