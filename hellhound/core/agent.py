@@ -85,6 +85,7 @@ from hellhound.core.skills import (
 )
 from hellhound.core.toolcheck import ensure_tool, get_binary_path, install_hint, is_available, pick_available
 from hellhound.core import verify_engine as _verify_engine
+from hellhound.core import reverify as _reverify
 from hellhound.core import hypothesis_engine as _hypothesis_engine
 from hellhound.core.surface_map import build_surface_map as _build_surface_map
 from hellhound.core.stealth import build_stealth_headers as _build_stealth_headers
@@ -11424,6 +11425,123 @@ def _render_steps_to_reproduce(raw: Any) -> str:
     return f'<ol class="steps-list">{items}</ol>'
 
 
+def _execute_reverify_findings(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Pre-submission freshness sweep: for each recorded finding, replay its
+    EXACT captured request live and decide whether it STILL reproduces, so a
+    report never goes out with a PoC that was silently patched (or was a
+    flaky positive) between discovery and submission — the fastest way to
+    burn signal with a program. See hellhound/core/reverify.py for the
+    verdict logic; this executor is just the orchestration.
+
+    Each replay goes back through _execute_curl (so it's scope-gated/rate-
+    limited/evidence-capturing like any curl), and each finding's endpoint is
+    re-checked against the scope rules here too (defense in depth — this tool
+    has no single top-level 'url' for the dispatcher's generic gate to catch).
+    It stamps `reproduces` / `reverified_at` / `reverify_reason` onto each
+    finding (which export_report then surfaces) but NEVER edits severity,
+    deletes, or files anything — a stale finding is flagged for the
+    researcher, not silently dropped.
+
+    Optional `only`: a list of finding titles/endpoints to limit the sweep to.
+    """
+    findings = target.findings if isinstance(target.findings, list) else []
+    if not findings:
+        return {"status": "no_findings", "note": "No recorded findings to re-verify yet — record_finding first."}
+
+    only = args.get("only")
+    only_set = {str(x).strip().lower() for x in only} if isinstance(only, list) else None
+
+    results: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        title = str(f.get("type") or "").strip()
+        ref = str(f.get("target") or "").strip()
+        if only_set is not None and not (
+            title.lower() in only_set or ref.lower() in only_set
+        ):
+            continue
+
+        if not ref:
+            skipped.append({"finding": title, "reason": "no request_ref/endpoint on this finding to replay"})
+            continue
+
+        entry = _reverify.find_evidence_entry(target, f)
+        if not entry or not entry.get("url"):
+            f["reproduces"] = "uncertain"
+            f["reverified_at"] = now_iso
+            f["reverify_reason"] = ("no captured request in this session's evidence log to replay — "
+                                    "re-run the PoC with the curl tool so it can be re-verified.")
+            skipped.append({"finding": title, "reason": "no captured request to replay"})
+            continue
+
+        # Per-endpoint scope re-check before firing (same defense-in-depth as
+        # response_diff / verify_finding's control request).
+        url = str(entry.get("url"))
+        if target and target.scope_rules and target.scope_rules.in_scope:
+            allowed, reason = is_in_scope(url, target.scope_rules)
+            if not allowed:
+                skipped.append({"finding": title, "reason": f"endpoint out of scope now ({reason})"})
+                continue
+
+        replay_args = _reverify.request_args_from_entry(entry)
+        live = _execute_curl(replay_args, target, emit)
+        if not isinstance(live, dict) or live.get("error"):
+            f["reproduces"] = "uncertain"
+            f["reverified_at"] = now_iso
+            f["reverify_reason"] = f"replay failed ({live.get('error') if isinstance(live, dict) else 'no response'}) — re-check manually."
+            results.append({"finding": title, "kind": f.get("kind"), "verdict": "uncertain",
+                            "reason": f["reverify_reason"], "url": url})
+            continue
+
+        verdict = _reverify.assess(f, live, entry)
+        f["reproduces"] = verdict["verdict"]
+        f["reverified_at"] = now_iso
+        f["reverify_reason"] = verdict["reason"]
+        results.append({
+            "finding": title, "kind": f.get("kind"), "severity": f.get("severity"),
+            "url": url, **verdict,
+        })
+
+    try:
+        save_target(target)
+    except Exception as e:
+        return {"error": f"Re-verified in memory but failed to persist stamps: {e}"}
+
+    stale = [r for r in results if r.get("verdict") == "stale"]
+    uncertain = [r for r in results if r.get("verdict") == "uncertain"]
+    summary = _reverify.summarize(results)
+
+    if emit and hasattr(emit, "info"):
+        emit.info(f"[reverify_findings] {summary}")
+    if stale and emit and hasattr(emit, "warn"):
+        for r in stale:
+            emit.warn(f"[STALE] '{r['finding']}' no longer reproduces: {r['reason']}")
+
+    return {
+        "status": "ok",
+        "summary": summary,
+        "reverified_count": len(results),
+        "reproduces": [r for r in results if r.get("verdict") == "reproduces"],
+        "stale": stale,
+        "uncertain": uncertain,
+        "skipped": skipped,
+        "note": (
+            "STALE findings no longer reproduce on a live replay — do NOT include them in a submission "
+            "as-is; either re-confirm the bug is still there (and re-record) or dismiss_finding(resolution="
+            "'patched'). 'uncertain' usually means a dead replayed session (re-auth and re-run) or a "
+            "changed response worth a manual look. export_report reads these stamps and warns on anything "
+            "not freshly reproducing."
+            if (stale or uncertain) else
+            "Every re-verified finding still reproduces — clear to assemble the report."
+        ),
+    }
+
+
 def _embed_image_base64(path: Path) -> Optional[str]:
     try:
         ext = path.suffix.lower().lstrip(".") or "png"
@@ -11518,6 +11636,64 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
             "unmatched_refs": unmatched_refs,
         }
 
+    # ── Pre-submission freshness check ──
+    # Read the reproduces/reverified_at stamps reverify_findings leaves on each
+    # recorded finding. We don't fire requests here (export_report is an
+    # assembly step, not a network tool) — we just refuse to let a finding
+    # known-stale, or never freshness-checked, sail into a submission silently.
+    def _recorded_for_ref(ref: str) -> Optional[Dict[str, Any]]:
+        key = ref.strip().lower()
+        if key in findings_by_type:
+            return findings_by_type[key]
+        for t, rf in findings_by_type.items():
+            if key and (key in t or t in key):
+                return rf
+        return None
+
+    stale_in_report: List[str] = []
+    uncertain_in_report: List[str] = []
+    unchecked_in_report: List[str] = []
+    for item in resolved_findings:
+        rf = _recorded_for_ref(str(item.get("finding_ref", "")))
+        if rf is None:
+            continue
+        rep = str(rf.get("reproduces") or "").strip().lower()
+        label = str(rf.get("type") or item.get("finding_ref"))
+        if rep == "stale":
+            stale_in_report.append(label)
+        elif rep == "uncertain":
+            uncertain_in_report.append(label)
+        elif not rep:
+            unchecked_in_report.append(label)
+
+    freshness_warning = None
+    if stale_in_report:
+        freshness_warning = (
+            f"⚠ {len(stale_in_report)} finding(s) in this report NO LONGER REPRODUCE on a live replay "
+            f"({', '.join(stale_in_report)}). Do NOT submit them as-is — re-confirm the bug is still "
+            f"there (and re-record) or dismiss_finding(resolution='patched'). Re-run reverify_findings "
+            f"after fixing."
+        )
+    elif unchecked_in_report:
+        freshness_warning = (
+            f"{len(unchecked_in_report)} finding(s) in this report were never freshness-checked "
+            f"({', '.join(unchecked_in_report)}). Before submitting, run reverify_findings so you don't "
+            f"file a PoC that was silently patched since you found it."
+        )
+    elif uncertain_in_report:
+        freshness_warning = (
+            f"{len(uncertain_in_report)} finding(s) came back 'uncertain' on re-verification "
+            f"({', '.join(uncertain_in_report)}) — usually a dead replayed session. Re-auth and re-run "
+            f"reverify_findings to confirm before submitting."
+        )
+
+    def _attach_freshness(d: Dict[str, Any]) -> Dict[str, Any]:
+        if freshness_warning:
+            d["freshness_warning"] = freshness_warning
+            if stale_in_report:
+                d["stale_findings"] = stale_in_report
+        return d
+
     # CAUGHT IN THE WILD (VaultFi/localhost): export_report was asked for
     # "the full report" covering an SQLi finding and an unrelated IDOR
     # finding, and bundled both into one combined report.html. In a real
@@ -11563,7 +11739,7 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
                 split_reports.append(_execute_export_report(sub_args, target, emit))
             if emit and hasattr(emit, "success"):
                 emit.success(f"[✓] {len(split_reports)} separate report(s) written (findings aren't mutually related — see note)")
-            return {
+            return _attach_freshness({
                 "status": "split_into_separate_reports",
                 "note": (
                     f"These {len(resolved_findings)} findings don't chain into or otherwise relate to each other, "
@@ -11572,7 +11748,7 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
                     "what you want (e.g. a periodic summary)."
                 ),
                 "reports": split_reports,
-            }
+            })
 
     # What got recorded but left out of the report entirely?
     all_recorded_display = set()
@@ -11895,7 +12071,9 @@ function hhCopy(id, btn) {{
         result["unmatched_refs"] = unmatched_refs
     if omitted:
         result["omitted_recorded_findings"] = omitted
-    return result
+    if emit and freshness_warning and hasattr(emit, "warn"):
+        emit.warn(f"[!] {freshness_warning}")
+    return _attach_freshness(result)
 
 
 def _rehost_value(obj: Any, old_host: str, new_host: str) -> Any:
@@ -12816,6 +12994,32 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["kind", "url"]
         },
         executor=_execute_verify_finding
+    ),
+    "reverify_findings": ToolSpec(
+        name="reverify_findings",
+        description=(
+            "PRE-SUBMISSION FRESHNESS SWEEP — run this right before export_report. For every recorded "
+            "finding it replays the EXACT captured request live and decides whether the bug STILL "
+            "reproduces, so you never file a report whose PoC was silently patched (or was a flaky "
+            "positive) between discovery and submission — the single fastest way to burn signal with a "
+            "program and get throttled/banned. Each finding gets stamped reproduces=reproduces|stale|"
+            "uncertain: STALE = it no longer fires on a live replay (do NOT file as-is — re-confirm or "
+            "dismiss_finding(resolution='patched')); uncertain = dead replayed session (re-auth and re-run) "
+            "or a changed response worth a manual look; reproduces = still good to file. Uses the class "
+            "verifier's live signal where one exists (SQL error, cloud-metadata marker, CORS headers), else "
+            "an honest HTTP-status-class comparison against discovery. Replays are scope-gated like any "
+            "curl; it NEVER edits severity, deletes, or files anything. export_report reads these stamps "
+            "and warns on anything not freshly reproducing."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "only": {"type": "array", "items": {"type": "string"},
+                         "description": "Optional — limit the sweep to these finding titles or endpoints. Omit to re-verify every recorded finding."},
+            },
+            "required": []
+        },
+        executor=_execute_reverify_findings
     ),
     "recall_patterns": ToolSpec(
         name="recall_patterns",

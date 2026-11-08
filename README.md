@@ -306,7 +306,7 @@ All actions can be triggered via slash commands or natural language:
 
 ## The Recon & Triage Arsenal
 
-Bounty Hunter coordinates **79 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
+Bounty Hunter coordinates **80 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
 
 | Category | Tools |
 | :--- | :--- |
@@ -317,7 +317,7 @@ Bounty Hunter coordinates **79 tools** into a unified, scope-governed execution 
 | **Takeover & Subdomain Health** | `takeover_scanner` `subzy` |
 | **Session, Scope & Workspace** | `cookie_inspector` `curl` `run_terminal_command` `set_target` `manage_scope` `manage_program` `listener` `parallel` `self_audit` `recall_data` `profile` `update_plan` `recall_patterns` `capture_identity` `swap_session` `generate_hypotheses` `update_hypothesis` |
 | **HackerOne Program Intel** | `hackerone_policy` `hackerone_search` `hackerone_stats` |
-| **Findings, Artifacts & Reporting** | `record_finding` `dismiss_finding` `remember_lesson` `export_report` `read_artifact` `save_file` `delete_file` `load_skill` |
+| **Findings, Artifacts & Reporting** | `record_finding` `dismiss_finding` `reverify_findings` `remember_lesson` `export_report` `read_artifact` `save_file` `delete_file` `load_skill` |
 
 Ask the agent itself ("what tools do you have for X?") for what any one of these actually does — asking beats a wall of description text here, and the answer always reflects the real, current tool list instead of a snapshot that can drift out of date.
 

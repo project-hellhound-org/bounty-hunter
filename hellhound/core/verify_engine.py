@@ -3,9 +3,10 @@ hellhound/core/verify_engine.py — independent, code-level signal checking
 for findings, to sit alongside (never replace) the existing VERIFICATION
 GATE in agent.py's `_execute_record_finding`.
 
-Why this exists: `ReproEngine` (repro_engine.py) replays a captured
-request and reports the HTTP status code — that proves a request was
-SENT, not that the vulnerability actually fired. The VERIFICATION GATE
+Why this exists: simply replaying a captured request and reporting the
+HTTP status code proves a request was SENT, not that the vulnerability
+actually fired (that was all the retired ReproEngine ever did). The
+VERIFICATION GATE
 added earlier (`_VERIFICATION_REQUIRED_CLASSES` in agent.py) requires the
 model to explicitly set `verified=true` with a substantive
 `verification_note` before sqli/xss/ssrf/idor/access-control findings can
