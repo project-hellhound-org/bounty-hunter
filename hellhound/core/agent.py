@@ -10198,8 +10198,32 @@ def _execute_response_diff(args: Dict[str, Any], target: Target, emit: Any) -> D
     """
     shared_url = (args.get("url") or "").strip()
     shared_method = str(args.get("method") or "GET").upper()
-    baseline_spec = args.get("baseline") if isinstance(args.get("baseline"), dict) else {}
-    test_spec = args.get("test") if isinstance(args.get("test"), dict) else {}
+    baseline_spec = dict(args.get("baseline")) if isinstance(args.get("baseline"), dict) else {}
+    test_spec = dict(args.get("test")) if isinstance(args.get("test"), dict) else {}
+    # Convenience: baseline_identity/test_identity at the top level map onto the
+    # per-side 'identity' field, so the dead-simple IDOR call is
+    # response_diff(url=..., baseline_identity="victim", test_identity="attacker").
+    if args.get("baseline_identity"):
+        baseline_spec.setdefault("identity", args["baseline_identity"])
+    if args.get("test_identity"):
+        test_spec.setdefault("identity", args["test_identity"])
+
+    def _resolve_identity(name):
+        """Resolve a captured identity's cookies + auth token from the store."""
+        ids = target.state.get("identities", {}) if (target and isinstance(getattr(target, "state", None), dict)) else {}
+        rec = ids.get(name) if isinstance(ids, dict) else None
+        if not isinstance(rec, dict):
+            return None  # not captured
+        return rec.get("cookies") or {}, rec.get("auth_token") or ""
+
+    # Validate any named identities up front so the researcher gets a clear
+    # "capture it first" instead of a silently-wrong same-session diff.
+    for side_name, spec in (("baseline", baseline_spec), ("test", test_spec)):
+        ident = spec.get("identity")
+        if ident and _resolve_identity(ident) is None:
+            captured = list((target.state.get("identities") or {}).keys()) if target and isinstance(target.state, dict) else []
+            return {"error": f"{side_name} identity '{ident}' isn't captured — capture it first with "
+                             f"capture_identity(name='{ident}', ...). Captured so far: {captured or 'none'}."}
 
     def _side_url(spec):
         return (spec.get("url") or shared_url or "").strip()
@@ -10226,14 +10250,33 @@ def _execute_response_diff(args: Dict[str, Any], target: Target, emit: Any) -> D
                 return {"error": f"SCOPE_VIOLATION: {reason}", "target": u, "blocked": True}
 
     def _build_curl_args(spec, side_url):
+        cookies = spec.get("cookies")
+        headers = spec.get("headers")
+        isolate = bool(spec.get("isolate", args.get("isolate", False)))
+        # Per-side identity: ride ONLY this captured identity's session on this
+        # side. Passing its (non-empty) cookies explicitly suppresses the active
+        # session's auto-attach, and isolate=True is belt-and-suspenders — this
+        # is what makes a real cross-account IDOR diff instead of accidentally
+        # testing the same session on both sides (the exact trap hit on the lab).
+        ident = spec.get("identity")
+        if ident:
+            resolved = _resolve_identity(ident)
+            if resolved is not None:
+                ic, itok = resolved
+                if ic:
+                    cookies = ic
+                if itok:
+                    headers = dict(headers or {})
+                    headers.setdefault("Authorization", f"Bearer {itok}")
+                isolate = True
         return {
             "url": side_url,
             "method": str(spec.get("method") or shared_method).upper(),
-            "headers": spec.get("headers"),
-            "cookies": spec.get("cookies"),
+            "headers": headers,
+            "cookies": cookies,
             "json": spec.get("json"),
             "body": spec.get("body"),
-            "isolate": bool(spec.get("isolate", args.get("isolate", False))),
+            "isolate": isolate,
         }
 
     baseline_resp = _execute_curl(_build_curl_args(baseline_spec, b_url), target, emit)
@@ -12642,9 +12685,13 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "two responses differ — status, body length, which JSON fields changed (recursively, by path, "
             "e.g. 'role: user -> admin'), and a line-level diff for non-JSON. This is the workhorse for "
             "access-control / IDOR / BOLA / mass-assignment testing: instead of eyeballing two walls of JSON "
-            "and guessing, you get the precise delta. The classic IDOR shape is ONE shared 'url' with "
-            "different 'cookies' per side (victim identity as baseline, attacker identity as test) — if the "
-            "attacker's response still contains the victim's own data, the changed fields show it. The "
+            "and guessing, you get the precise delta. EASIEST IDOR SHAPE: one shared 'url' plus "
+            "baseline_identity + test_identity naming two captured identities (e.g. baseline_identity='victim', "
+            "test_identity='attacker') — the tool rides ONLY each named identity's session on its own side, so "
+            "you get a real cross-account diff instead of accidentally testing the same active session on both "
+            "sides (a common trap; passing an empty cookies={} does NOT isolate, the active session still "
+            "auto-attaches). If the attacker's response still contains the victim's own data, the changed "
+            "fields show it. The "
             "mass-assignment shape is a GET baseline, then a GET after a PUT that tried to set a field you "
             "shouldn't control — if 'role'/'balance' actually changed, the diff proves persistence. It also "
             "cleanly reports 'IDENTICAL' / 'no field differs', which is often the correct refutation of a "
@@ -12656,13 +12703,15 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "properties": {
                 "url": {"type": "string", "description": "Shared endpoint URL used by both sides unless a side overrides it. e.g. 'http://host/api/transactions.php?user_id=5'."},
                 "method": {"type": "string", "description": "Shared HTTP method (default GET). Override per side inside 'baseline'/'test' if needed."},
+                "baseline_identity": {"type": "string", "description": "Name of a captured identity (capture_identity) to ride on the BASELINE side — the tool uses only that identity's session, isolating it from the active one. The clean way to do cross-account IDOR."},
+                "test_identity": {"type": "string", "description": "Name of a captured identity to ride on the TEST side (e.g. the attacker). Diffed against baseline_identity."},
                 "baseline": {
                     "type": "object",
-                    "description": "The reference request (e.g. the victim's own session, or the pre-change state). Any of: url, method, headers (object), cookies (object), json (object), body (string), isolate (bool).",
+                    "description": "The reference request. Any of: url, method, headers, cookies, json, body, isolate — OR 'identity' (a captured identity name, same effect as baseline_identity).",
                 },
                 "test": {
                     "type": "object",
-                    "description": "The request to compare against baseline (e.g. the attacker's session, or the post-change state). Same shape as 'baseline'.",
+                    "description": "The request to compare against baseline. Same shape as 'baseline' (incl. 'identity').",
                 },
                 "isolate": {"type": "boolean", "description": "Shared default for both sides: if true, do NOT auto-attach any stored session cookie/token (test truly unauthenticated / only what you pass explicitly). Default false.", "default": False},
                 "max_body_diff_lines": {"type": "integer", "description": "Cap on the non-JSON line diff (default 60).", "default": 60}
