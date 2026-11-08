@@ -86,6 +86,9 @@ _SQLI_ERROR_SIGNATURES = [
     "warning: mysqli", "syntax error at or near", "unterminated quoted string",
     "supplied argument is not a valid mysql", "sqlstate[",
     "you have an error in your sql syntax",
+    # SQLite (sqlite3 raises these verbatim; extremely common on Python/Flask stacks)
+    "unrecognized token", "sqlite error", "no such column", "sqlite3.",
+    "incomplete input", "sql error: near", "unterminated string",
 ]
 
 

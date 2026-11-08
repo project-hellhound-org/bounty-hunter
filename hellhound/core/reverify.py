@@ -62,24 +62,29 @@ def _body_of(resp: Optional[Dict[str, Any]]) -> str:
     return str(resp.get("body_preview") or resp.get("body") or "")
 
 
-def _original_resp_from_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+def _parse_raw_response(raw: str) -> Dict[str, Any]:
     """
     Reconstruct a response dict (status_code/headers/body_preview) from a
-    stored curl_evidence_log entry's human-readable `raw` block — shaped like
-    "$ curl ...\\n\\nHTTP/1.1 <status> <reason>\\n<headers>\\n\\n<body>" — so the
-    class verifier can be run against the ORIGINAL response too, not just the
-    live one. Lets us detect "the signal that defined this finding is gone"
-    for verifiers (like sqli) that return inconclusive, not refuted, on an
-    absent signal.
+    human-readable evidence `raw` block — shaped like
+    "$ curl ...\\n\\nHTTP/1.1 <status> <reason>\\n<headers>\\n\\n<body>". Parses
+    the status straight out of the HTTP line (not a sibling field) so this
+    works for a finding's DISCOVERY evidence string, not just a log entry.
+    Lets the class verifier run against the ORIGINAL response too, so we catch
+    "the signal that defined this finding is gone" for verifiers (like sqli)
+    that return inconclusive, not refuted, on an absent signal.
     """
-    raw = str(entry.get("raw") or "")
-    status = _status_of(entry)
+    raw = str(raw or "")
+    status: Optional[int] = None
     body = ""
     headers: Dict[str, str] = {}
     if raw:
         parts = raw.split("\n\n")
         for i, p in enumerate(parts):
             if p.lstrip().startswith("HTTP/"):
+                http_line = p.splitlines()[0]
+                m = re.search(r"HTTP/\S+\s+(\d{3})", http_line)
+                if m:
+                    status = int(m.group(1))
                 body = "\n\n".join(parts[i + 1:]).strip()
                 for hl in p.splitlines()[1:]:  # skip the HTTP status line itself
                     if ":" in hl:
@@ -87,6 +92,14 @@ def _original_resp_from_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
                         headers[k.strip().lower()] = v.strip()
                 break
     return {"status_code": status, "body_preview": body, "headers": headers}
+
+
+def _original_resp_from_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Original response from a structured log entry (status falls back to the entry field)."""
+    resp = _parse_raw_response(str(entry.get("raw") or ""))
+    if resp.get("status_code") is None:
+        resp["status_code"] = _status_of(entry)
+    return resp
 
 
 def _status_of(resp: Optional[Dict[str, Any]]) -> Optional[int]:
@@ -147,6 +160,23 @@ def request_args_from_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     return args
 
 
+def _discovery_original(finding: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    The authoritative ORIGINAL (discovery-time) response to compare against.
+    Prefer the evidence stored ON the finding at record_finding time — a later
+    reverify replay appends fresh entries to curl_evidence_log, so the newest
+    log entry for this URL can be a POST-patch response and must NOT be treated
+    as the baseline. Fall back to the structured log entry only if the finding
+    carries no stored evidence.
+    """
+    raw_ev = finding.get("raw_evidence")
+    if isinstance(raw_ev, list) and raw_ev:
+        return _parse_raw_response(str(raw_ev[0]))
+    if isinstance(raw_ev, str) and raw_ev.strip():
+        return _parse_raw_response(raw_ev)
+    return _original_resp_from_entry(entry)
+
+
 def assess(finding: Dict[str, Any], live_resp: Dict[str, Any],
            entry: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -156,7 +186,8 @@ def assess(finding: Dict[str, Any], live_resp: Dict[str, Any],
     original_status, signal}.
     """
     kind = str(finding.get("kind") or "").strip().lower()
-    orig_status = _status_of(entry)
+    orig_resp = _discovery_original(finding, entry)
+    orig_status = _status_of(orig_resp)
     live_status = _status_of(live_resp)
     live_body_l = _body_of(live_resp).lower()
 
@@ -207,7 +238,7 @@ def assess(finding: Dict[str, Any], live_resp: Dict[str, Any],
     orig_vres = None
     if vres is not None and vres.status != "no_verifier_for_class":
         try:
-            orig_vres = verify_engine.verify(kind, _original_resp_from_entry(entry), None, vargs)
+            orig_vres = verify_engine.verify(kind, orig_resp, None, vargs)
             orig_had_signal = orig_vres.status == "verified"
         except Exception:
             orig_had_signal = False

