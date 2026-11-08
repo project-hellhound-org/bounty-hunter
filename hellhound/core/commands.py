@@ -681,8 +681,11 @@ def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any,
     agent = get_agent(target)
     prompt = (
         f"Execute a complete, autonomous, scope-aware penetration test of {target} and do NOT stop to "
-        f"report back mid-engagement. Methodology: (1) map the surface — crawl, read any JS bundles, "
-        f"enumerate every endpoint and parameter; (2) if signup is open, register your own test accounts "
+        f"report back mid-engagement. Methodology: (1) map the surface — crawl, read any JS bundles, AND "
+        f"run content_discovery and fuzz_hunter to enumerate UNLINKED endpoints/params too (a lot of the "
+        f"best bugs — SSRF, LFI, command injection, admin panels — live on endpoints like /fetch, /download, "
+        f"/ping, /admin that are never linked from the homepage; never conclude a class is absent just "
+        f"because you didn't see its endpoint linked); (2) if signup is open, register your own test accounts "
         f"to test authenticated and multi-user flows; (3) SYSTEMATICALLY test every input/endpoint for "
         f"each class — SQL injection (including the login form), reflected & stored XSS, IDOR/BOLA "
         f"(compare two accounts), mass assignment on write endpoints (mass_assign_probe), SSTI, SSRF, "
