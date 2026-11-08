@@ -261,8 +261,14 @@ def run(target, emit, options=None):
 
     all_endpoints = []
     all_graphql_ops = set()
+    bundled_hits = []
     fetched = 0
     fetch_errors = 0
+
+    try:
+        from hellhound.core.js_intel import scan_bundled_data
+    except Exception:
+        scan_bundled_data = None
 
     for i, js_url in enumerate(js_todo):
         emit.progress_update(i, "JSMiner")
@@ -274,6 +280,14 @@ def run(target, emit, options=None):
             eps, graphql_ops = _extract_endpoints(resp.text, js_url)
             all_endpoints.extend(eps)
             all_graphql_ops.update(graphql_ops)
+            # Also mine each bundle for sensitive data baked in (keys, JWTs,
+            # emails, embedded user records) — the js_miner finds endpoints,
+            # this catches the data-exposure bugs those bundles leak.
+            if scan_bundled_data is not None:
+                try:
+                    bundled_hits.extend(scan_bundled_data(resp.text, js_url))
+                except Exception:
+                    pass
         except Exception:
             fetch_errors += 1
             continue
@@ -303,6 +317,7 @@ def run(target, emit, options=None):
         "intel": {
             "endpoints": deduped,
             "graphql_operations": sorted(all_graphql_ops),
+            "bundled_data": bundled_hits,
             "js_files_scanned": fetched,
             "js_files_found": len(js_files),
             "fetch_errors": fetch_errors,

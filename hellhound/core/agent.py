@@ -8886,16 +8886,47 @@ def _execute_js_miner(args: Dict[str, Any], target: Target, emit: Any) -> Dict[s
 
     intel = res.get("intel", {}) if isinstance(res, dict) else {}
     endpoints = intel.get("endpoints", [])
+    bundled_hits = list(intel.get("bundled_data", []) or [])
+
+    # Also scan the MAIN PAGE HTML: framework state blobs (__NEXT_DATA__,
+    # __INITIAL_STATE__, __APOLLO_STATE__, window.__INIT_PROFILE__, inline JSON)
+    # that bundle a user's own — or OTHER users' — records live in the document,
+    # not the JS chunks. This is where the real sensitive-data-exposure leaks are.
+    try:
+        from hellhound.core.js_intel import scan_bundled_data, summarize_bundled_hits
+        auth = _target_auth_options(target)
+        r = _bounded_request(lambda: requests.get(
+            url, headers={"User-Agent": "Hellhound/1.0", **auth.get("auth_headers", {})},
+            cookies=auth.get("auth_cookies") or None, timeout=12, verify=False, allow_redirects=True))
+        if r is not None and getattr(r, "text", None):
+            bundled_hits.extend(scan_bundled_data(r.text, url))
+    except Exception:
+        summarize_bundled_hits = lambda h: ""  # noqa: E731
 
     # Feed discovered endpoints into the same spider-intel store every
-    # other discovery tool writes to, so content_discovery/fuzz_hunter/
-    # cors_buster etc. pick these up automatically on their next pass
-    # instead of the researcher having to hand-copy the list across.
+    # other discovery tool writes to.
     endpoint_urls = [e.get("url") for e in endpoints if isinstance(e, dict) and e.get("url")]
     if endpoint_urls and hasattr(target, "state"):
         try:
             update_from_spider(target, endpoints=endpoint_urls)
-            save_target(target)
+        except Exception:
+            pass
+    # Persist high-signal bundled secrets (JWTs/api keys) into the secrets
+    # store so the artifact ledger and reporting pick them up.
+    if bundled_hits and hasattr(target, "state") and isinstance(target.state, dict):
+        secs = target.state.setdefault("secrets", [])
+        for h in bundled_hits:
+            if h.get("type") in ("jwt", "api_key") and h.get("sample") and h["sample"] not in secs:
+                secs.append(h["sample"])
+    try:
+        save_target(target)
+    except Exception:
+        pass
+
+    high_bundled = [h for h in bundled_hits if h.get("severity") == "high"]
+    if high_bundled and emit and hasattr(emit, "info"):
+        try:
+            emit.info(summarize_bundled_hits(bundled_hits))
         except Exception:
             pass
 
@@ -8907,10 +8938,12 @@ def _execute_js_miner(args: Dict[str, Any], target: Target, emit: Any) -> Dict[s
         "endpoints_found": len(endpoints),
         "endpoints": endpoints[:100],
         "graphql_operations": intel.get("graphql_operations", []),
+        "bundled_data_leaks": bundled_hits[:40],
+        "bundled_data_summary": summarize_bundled_hits(bundled_hits) if bundled_hits else None,
         "note": (
             "No JS files were reachable to mine — if JS is known to exist, try passing 'js_urls' "
             "explicitly, or run spider/katana first so this can pick up already-discovered .js URLs."
-        ) if not endpoints and not intel.get("js_files_scanned") else None,
+        ) if not endpoints and not intel.get("js_files_scanned") and not bundled_hits else None,
     }
 
 
@@ -14034,7 +14067,14 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "as the default when the goal is endpoint discovery from JS; use js_static_analysis "
             "instead when sourcemaps might be exposed and source recovery/sink detection is the goal. "
             "Reuses this target's captured session automatically so it can reach JS gated behind "
-            "login, and feeds anything found into this target's discovered-endpoints list."
+            "login, and feeds anything found into this target's discovered-endpoints list. It ALSO now "
+            "flags BUNDLED SENSITIVE DATA / PII baked into the client-side code and the page's initial "
+            "state — framework state blobs (__NEXT_DATA__, window.__NUXT__, __INITIAL_STATE__, "
+            "__APOLLO_STATE__, window.__INIT_PROFILE__, inline application/json) that embed a user's own "
+            "or OTHER users' records (emails, roles, hashes, balances, wallets), plus hardcoded JWTs, API "
+            "keys, and employee/user emails. Those are sensitive-data-exposure findings on their own and "
+            "the IDs/roles in them often turn into IDOR — see 'bundled_data_leaks' in the result (advisory; "
+            "confirm the data is cross-user/non-public, then verify_finding + record_finding)."
         ),
         parameters={
             "type": "object",
