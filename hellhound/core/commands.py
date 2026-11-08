@@ -470,13 +470,52 @@ _HUNT_DONE_RE = re.compile(r"\bENGAGEMENT\s+COMPLETE\b", re.I)
 _HUNT_PENDING_RE = re.compile(
     r"next steps?|what'?s left|haven'?t (?:yet|tested)|in progress|i'?ll (?:start|now|continue)|"
     r"still (?:need|to)|remaining|left to test|to be tested|let me continue|moving on to", re.I)
+
+# The vuln classes a hunt must account for, and the record_finding `kind`s that
+# count as "actually recorded" for each. The completion gate (below) cross-checks
+# the model's self-reported coverage against what's really in target.findings, so
+# a class it CONFIRMED but never record_finding'd (seen in the wild: it verified a
+# reflected XSS, then dropped it and declared the engagement complete) can't slip
+# through — a confirmed-but-unrecorded bug earns nothing on a real program.
+_HUNT_CLASSES = ["sqli", "xss", "idor", "mass_assignment", "ssti", "ssrf", "lfi",
+                 "cmdi", "open_redirect", "cors", "jwt", "race", "bundled_secrets"]
+_HUNT_FINDING_KINDS = {
+    "sqli": {"sqli", "sql_injection"},
+    "xss": {"xss", "reflected_xss", "stored_xss", "dom_xss"},
+    "idor": {"idor", "bola", "access_control", "broken_access_control", "authz_bypass", "bac"},
+    "mass_assignment": {"mass_assignment", "mass_assign"},
+    "ssti": {"ssti"},
+    "ssrf": {"ssrf"},
+    "lfi": {"lfi", "path_traversal", "directory_traversal", "file_read"},
+    "cmdi": {"cmdi", "command_injection", "os_command_injection", "rce"},
+    "open_redirect": {"open_redirect", "open_redirection"},
+    "cors": {"cors", "cors_misconfig", "cors_misconfiguration"},
+    "jwt": {"jwt", "auth_bypass", "jwt_forge", "algorithm_confusion", "broken_auth"},
+    "race": {"race", "race_condition", "toctou"},
+    "bundled_secrets": {"bundled_secrets", "secret_exposure", "info_leak",
+                        "sensitive_data_exposure", "pii", "hardcoded_secret"},
+}
+# Parses the required machine-readable block, lines like "xss=recorded".
+_HUNT_COVERAGE_TOKEN_RE = re.compile(r"\b([a-z_]{3,16})\s*=\s*(recorded|not_present|not_tested)\b", re.I)
+
+_HUNT_COVERAGE_CONTRACT = (
+    "You may ONLY output ENGAGEMENT COMPLETE after you have, for EVERY class, either recorded a finding or "
+    "ruled it out by actually testing it — and you MUST prove it by ending your message with a machine-"
+    "readable COVERAGE block, one line per class in exactly this form:\n"
+    "COVERAGE:\n" + "\n".join(f"{c}=<recorded|not_present|not_tested>" for c in _HUNT_CLASSES) + "\n"
+    "Rules: mark a class `recorded` ONLY if you actually called record_finding for it (a confirmed bug you "
+    "did not record_finding does not count and earns nothing — record it first). Mark `not_present` ONLY "
+    "after you genuinely tested it — and before deciding an endpoint doesn't exist, use content_discovery / "
+    "fuzz_hunter to find UNLINKED endpoints (e.g. /fetch, /download, /ping, /admin), don't assume. `not_"
+    "tested` means you still owe it work. ENGAGEMENT COMPLETE is only valid when no class is `not_tested`.")
+
 _HUNT_CONTINUE_PROMPT = (
     "Continue the engagement autonomously — do not stop to summarize or ask for confirmation. Work "
     "through the vulnerability classes and endpoints you have not yet tested: for each, actually send the "
     "exploit, CONFIRM it with verify_finding (or the class tool — mass_assign_probe, response_diff, "
     "race_test, jwt_forge, js_miner), and call record_finding with the real captured evidence for every bug "
-    "you confirm. Keep going class by class. ONLY when you have tested every class and then run "
-    "reverify_findings and export_report, end your reply with the exact token: ENGAGEMENT COMPLETE")
+    "you confirm. Keep going class by class. When every class is tested, run reverify_findings and "
+    "export_report. " + _HUNT_COVERAGE_CONTRACT)
 
 
 def _hunt_findings_count(agent) -> int:
@@ -484,6 +523,51 @@ def _hunt_findings_count(agent) -> int:
         return len(agent.target.findings or [])
     except Exception:
         return 0
+
+
+def _hunt_recorded_kinds(agent) -> set:
+    try:
+        return {str(f.get("kind", "")).strip().lower() for f in (agent.target.findings or []) if isinstance(f, dict)}
+    except Exception:
+        return set()
+
+
+def _hunt_completion_gaps(answer: str, agent):
+    """
+    Cross-check the model's COVERAGE block against reality. Returns
+    (untested, unrecorded): classes still owed work, and classes it claimed
+    `recorded` but which have no matching finding in target.findings. An empty
+    result on both means ENGAGEMENT COMPLETE is trustworthy.
+    """
+    tokens = {m.group(1).lower(): m.group(2).lower()
+              for m in _HUNT_COVERAGE_TOKEN_RE.finditer(answer or "")}
+    recorded_kinds = _hunt_recorded_kinds(agent)
+    untested, unrecorded = [], []
+    for cls in _HUNT_CLASSES:
+        status = tokens.get(cls)
+        if status is None or status == "not_tested":
+            untested.append(cls)
+        elif status == "recorded" and not (_HUNT_FINDING_KINDS.get(cls, set()) & recorded_kinds):
+            unrecorded.append(cls)
+    return untested, unrecorded
+
+
+def _hunt_coverage_nudge(untested, unrecorded) -> str:
+    parts = ["Not done yet — your coverage is incomplete."]
+    if unrecorded:
+        parts.append(
+            f"You marked these CONFIRMED/recorded but there is no record_finding for them in this target's "
+            f"findings: {', '.join(unrecorded)}. A confirmed bug that isn't recorded earns nothing — call "
+            f"record_finding for each one NOW with its real captured evidence.")
+    if untested:
+        parts.append(
+            f"These classes are still not tested: {', '.join(untested)}. Actually test each one (send the "
+            f"exploit, verify it). Before marking any class not_present because 'the endpoint doesn't exist', "
+            f"run content_discovery / fuzz_hunter to find UNLINKED endpoints (e.g. /fetch, /download, /ping, "
+            f"/admin) first.")
+    parts.append("Then re-emit the COVERAGE block. Do not output ENGAGEMENT COMPLETE until every class is "
+                 "`recorded` (with a real record_finding) or `not_present` (after really testing it).")
+    return " ".join(parts)
 
 
 # Intent detection for AUTONOMOUS engagement requests typed WITHOUT /hunt, so a
@@ -527,11 +611,30 @@ def _run_autonomous_continuation(agent, answer: str, session_context: Dict[str, 
     stalls = 0
     last_count = _hunt_findings_count(agent)
     cancelled = False
-    while (continuations < max_cont and time.time() < deadline
-           and not _HUNT_DONE_RE.search(answer or "")):
+    completed = False
+    while continuations < max_cont and time.time() < deadline:
         if cancel_check and cancel_check():
             cancelled = True
             break
+
+        # Completion gate: a bare "ENGAGEMENT COMPLETE" isn't enough — verify the
+        # model's COVERAGE block shows every class tested AND every class it marked
+        # `recorded` actually has a finding. Gaps -> reject and nudge, don't stop.
+        if _HUNT_DONE_RE.search(answer or ""):
+            untested, unrecorded = _hunt_completion_gaps(answer, agent)
+            if not untested and not unrecorded:
+                completed = True
+                break
+            last_count = _hunt_findings_count(agent)
+            continuations += 1
+            if emit and hasattr(emit, "info"):
+                emit.info(f"[auto-continue {continuations}/{max_cont}] declared complete but coverage has gaps "
+                          f"(untested={untested}, confirmed-but-unrecorded={unrecorded}) — pushing back")
+            answer = agent.handle_message(_hunt_coverage_nudge(untested, unrecorded),
+                                          session_context=session_context, emit=emit,
+                                          on_token=on_token, cancel_check=cancel_check)
+            continue
+
         cur = _hunt_findings_count(agent)
         made_progress = cur > last_count
         has_pending = bool(_HUNT_PENDING_RE.search(answer or ""))
@@ -549,7 +652,7 @@ def _run_autonomous_continuation(agent, answer: str, session_context: Dict[str, 
         answer = agent.handle_message(_HUNT_CONTINUE_PROMPT, session_context=session_context,
                                       emit=emit, on_token=on_token, cancel_check=cancel_check)
     reason = ("cancelled" if cancelled
-              else "signaled_complete" if _HUNT_DONE_RE.search(answer or "")
+              else "signaled_complete" if completed
               else "budget" if (continuations >= max_cont or time.time() >= deadline)
               else "stalled")
     return answer, continuations, reason
@@ -587,7 +690,7 @@ def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any,
         f"and secrets/PII bundled in client JS (js_miner). For EACH confirmed bug: verify_finding, then "
         f"record_finding with the real captured evidence — do not just describe it. Work class by class "
         f"and do not stop after the first finding. When every class has been tested, run reverify_findings "
-        f"then export_report, and end your final reply with the exact token: ENGAGEMENT COMPLETE")
+        f"then export_report. " + _HUNT_COVERAGE_CONTRACT)
 
     answer = agent.handle_message(prompt, session_context=session_context, emit=emit, on_token=on_token)
     answer, continuations, reason = _run_autonomous_continuation(
