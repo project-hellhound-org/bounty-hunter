@@ -5408,6 +5408,30 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                     f"produces 401/403 or empty results on EVERYTHING, which looks like 'not vulnerable' but "
                     f"actually means 'not logged in'."
                 )
+                # Multi-identity: if a NAMED captured identity is active, mark
+                # ITS stored record stale too. Otherwise a later swap_session
+                # BACK to this identity silently reloads the now-dead cookies,
+                # and every IDOR/BOLA test under it reads "not vulnerable" when
+                # it really means "not logged in as that identity" -- the exact
+                # way a dead attacker/victim session poisons a cross-account
+                # test. Cleared again below if auto-relogin revives the session.
+                _active_id = target.state.get("active_identity")
+                if _active_id and _active_id != "anonymous":
+                    _ids = target.state.get("identities")
+                    if isinstance(_ids, dict) and isinstance(_ids.get(_active_id), dict):
+                        _ids[_active_id]["stale"] = True
+                        _ids[_active_id]["stale_reason"] = reason
+                        _ids[_active_id]["stale_at"] = time.time()
+                        resp_dict["active_identity_stale"] = (
+                            f"Captured identity '{_active_id}' is now marked STALE ({reason}). Re-capture it "
+                            f"(log in as '{_active_id}' again, then capture_identity(name='{_active_id}', ...)) "
+                            f"before using it in another cross-account/IDOR test -- swap_session back to it as-is "
+                            f"would just replay the dead session."
+                        )
+                        try:
+                            save_target(target)
+                        except Exception:
+                            pass
                 recipe = target.state.get("last_login_recipe")
                 last_attempt_raw = target.state.get("last_reauth_attempt_ts", 0) or 0
                 # This crashed the whole curl call with "unsupported operand
@@ -5495,6 +5519,23 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
                         relogin_error = f"re-login attempt raised {type(e).__name__}: {e}"
 
                     if relogin_ok:
+                        # Auto-relogin refreshed target.state["cookies"] -- push
+                        # that fresh session back into the ACTIVE identity's
+                        # stored record too and clear its stale flag, so a later
+                        # swap_session to it uses the revived session instead of
+                        # the dead cookies we just replaced. Without this the
+                        # live session works but the identity store stays stale.
+                        _active_id = target.state.get("active_identity")
+                        if _active_id and _active_id != "anonymous":
+                            _ids = target.state.get("identities")
+                            if isinstance(_ids, dict) and isinstance(_ids.get(_active_id), dict):
+                                _ids[_active_id]["cookies"] = target.state.get("cookies")
+                                if target.state.get("auth_token"):
+                                    _ids[_active_id]["auth_token"] = target.state.get("auth_token")
+                                _ids[_active_id].pop("stale", None)
+                                _ids[_active_id].pop("stale_reason", None)
+                                _ids[_active_id].pop("stale_at", None)
+                                resp_dict.pop("active_identity_stale", None)
                         save_target(target)
                         # Retry the ORIGINAL request once with the fresh
                         # session -- reported as separate retry_* fields
@@ -9973,7 +10014,7 @@ def _execute_swap_session(args: Dict[str, Any], target: Target, emit: Any) -> Di
     if emit and hasattr(emit, "success"):
         emit.success(f"[✓] Swapped active session to identity '{name}' — curl/spider/etc. now auto-attach this identity's cookies/auth token." + (" Also refreshed the matching open browser session." if browser_session_synced else ""))
 
-    return {
+    result = {
         "status": "swapped",
         "name": name,
         "has_cookies": bool(identity.get("cookies")),
@@ -9984,6 +10025,18 @@ def _execute_swap_session(args: Dict[str, Any], target: Target, emit: Any) -> Di
             f"— a session named exactly '{name}' auto-seeds from this identity's cookies on its first goto."
         ),
     }
+    # If this identity was marked stale earlier (a request under it came back
+    # 401/redirect-to-login and auto-relogin never revived it), warn now rather
+    # than let the agent run a whole cross-account test on a dead session and
+    # misread the uniform 401s as "not vulnerable".
+    if identity.get("stale"):
+        result["stale_warning"] = (
+            f"HEADS UP: identity '{name}' was flagged STALE ({identity.get('stale_reason') or 'session died earlier'}). "
+            f"Its stored cookies/token likely no longer authenticate. Re-capture it (log in as '{name}' again, then "
+            f"capture_identity(name='{name}', ...)) before relying on it — otherwise requests under it will 401 and "
+            f"look like 'no access' when it's really 'dead session'."
+        )
+    return result
 
 
 _RESPDIFF_MISSING = object()  # sentinel: a JSON key present on one side, absent on the other
