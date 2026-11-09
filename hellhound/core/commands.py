@@ -699,6 +699,21 @@ def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any,
     answer, continuations, reason = _run_autonomous_continuation(
         agent, answer, session_context, emit, on_token)
 
+    # Guaranteed pre-submission freshness sweep: a hunt that was cut off by the
+    # budget/stall before the model ran its own reverify_findings still gets its
+    # recorded findings re-verified, so a stale PoC is flagged rather than left
+    # unchecked. Idempotent and cheap — skipped entirely if the model already
+    # stamped the findings this run (clean completions run reverify themselves).
+    try:
+        findings = getattr(agent.target, "findings", None) or []
+        if findings and not any(isinstance(f, dict) and f.get("reverified_at") for f in findings):
+            from hellhound.core.agent import _execute_reverify_findings
+            if emit and hasattr(emit, "info"):
+                emit.info("[hunt] final reverify_findings sweep on recorded findings before wrap-up")
+            _execute_reverify_findings({}, agent.target, emit)
+    except Exception:
+        pass
+
     if not is_json and not on_token:
         emit(answer)
     return {
