@@ -10622,6 +10622,139 @@ def _execute_mass_assign_probe(args: Dict[str, Any], target: Target, emit: Any) 
     }
 
 
+# Parameter names that typically carry a per-object/per-user identifier — the
+# field an IDOR/BOLA lives in when the app trusts it without an ownership check.
+_IDOR_PARAM_RE = re.compile(
+    r"(^id$|_id$|^uid$|^pid$|^gid$|user|account|acct|customer|client|member|profile|"
+    r"owner|order|invoice|doc|file|number|^ref$|^key$|^no$)", re.I)
+# Default victim identifiers to try when the caller doesn't supply any.
+_IDOR_DEFAULT_IDS = ["administrator", "admin", "carlos", "root", "0", "1", "2", "3"]
+# Response language that means access was DENIED (so a 200-with-this isn't IDOR).
+_IDOR_DENIED_RE = re.compile(
+    r"access denied|not authori[sz]ed|unauthori[sz]ed|forbidden|permission denied|"
+    r"you (?:do not|don'?t) have|not found|no such|does not exist|invalid (?:user|id|account)", re.I)
+
+
+def _execute_idor_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Sweeps an id-like parameter for IDOR / BOLA: requests the SAME endpoint under
+    YOUR current session but with the identifier changed to other users' values,
+    and reports which substitutions returned a DIFFERENT 200 response (i.e. some
+    other object/account's data) instead of being denied — the signal the app
+    trusts the id without an ownership check.
+
+    Give it a `url` whose query carries the id (e.g. .../my-account?id=wiener);
+    it auto-detects the id parameter (override with `param`) and its own baseline
+    value, fetches the baseline, then tries each candidate in `values` (default:
+    common admin usernames + small integers, plus numeric neighbours of a numeric
+    baseline). A candidate that returns HTTP 200 with a body that differs
+    materially from the baseline and shows no access-denied language is flagged as
+    a probable IDOR; if you pass `victim_marker` (a string unique to a victim's
+    data) it's upgraded to confirmed when that marker appears. Runs the active
+    identity (capture_identity/swap_session) or a named `identity`. Advisory —
+    confirm with verify_finding(kind='idor') + record_finding. Same-host/scope
+    checked. It never records anything itself.
+    """
+    from urllib.parse import urlencode
+    url = (args.get("url") or "").strip()
+    if not url:
+        return {"error": "idor_probe needs 'url' — the endpoint whose id parameter to sweep (e.g. .../account?id=wiener)."}
+
+    parsed = urlparse(url if url.startswith(("http://", "https://")) else f"https://{url}")
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    if not pairs:
+        return {"error": "idor_probe needs an id in the URL query (e.g. ?id=123). For a path-based id "
+                         "(/account/123), use response_diff/curl to vary the path segment instead."}
+
+    # pick the id parameter: explicit, else the first id-like name, else the first param
+    param = str(args.get("param") or "").strip()
+    keys = [k for k, _ in pairs]
+    if not param:
+        param = next((k for k in keys if _IDOR_PARAM_RE.search(k)), keys[0])
+    if param not in keys:
+        return {"error": f"parameter '{param}' isn't in the URL query ({keys}).", "known_params": keys}
+    baseline_val = next((v for k, v in pairs if k == param), "")
+
+    identity = args.get("identity")
+    method = str(args.get("method") or "GET").upper()
+
+    # scope check (same host as the given url)
+    host, _ = normalize_host(parsed.geturl())
+    if target and target.scope_rules and target.scope_rules.in_scope:
+        allowed, reason = is_in_scope(parsed.geturl(), target.scope_rules)
+        if not allowed:
+            return {"error": f"SCOPE_VIOLATION: {reason}", "target": parsed.geturl(), "blocked": True}
+
+    # candidate victim ids
+    values = args.get("values")
+    if isinstance(values, list) and values:
+        candidates = [str(v) for v in values]
+    else:
+        candidates = list(_IDOR_DEFAULT_IDS)
+        if baseline_val.isdigit():  # a numeric id — try neighbours too
+            n = int(baseline_val)
+            candidates += [str(x) for x in (n - 1, n + 1, n - 2, n + 2) if x >= 0]
+    candidates = [c for c in dict.fromkeys(candidates) if c != baseline_val]  # dedupe, drop own id
+
+    victim_marker = str(args.get("victim_marker") or "").strip()
+
+    def _fetch(val):
+        q = urlencode([(k, (val if k == param else v)) for k, v in pairs])
+        side_url = parsed._replace(query=q).geturl()
+        a = {"url": side_url, "method": method, "isolate": bool(args.get("isolate"))}
+        if identity:
+            a["identity"] = identity
+        return side_url, _execute_curl(a, target, emit)
+
+    _, base_resp = _fetch(baseline_val)
+    base_body = str(base_resp.get("body_preview") or base_resp.get("body") or "") if isinstance(base_resp, dict) else ""
+    base_status = base_resp.get("status_code") if isinstance(base_resp, dict) else None
+
+    hits = []
+    tested = []
+    for val in candidates[:12]:
+        side_url, resp = _fetch(val)
+        if not isinstance(resp, dict):
+            continue
+        status = resp.get("status_code")
+        body = str(resp.get("body_preview") or resp.get("body") or "")
+        tested.append({"value": val, "status": status})
+        if status != 200:
+            continue
+        denied = bool(_IDOR_DENIED_RE.search(body[:4000]))
+        differs = body.strip() != base_body.strip() and len(body.strip()) > 40
+        marker_hit = bool(victim_marker and victim_marker in body)
+        if marker_hit or (differs and not denied):
+            hits.append({
+                "value": val, "status": status, "url": side_url,
+                "victim_marker_present": marker_hit,
+                "note": ("victim marker found in response" if marker_hit
+                         else "returned a different 200 body than your own id (likely another object's data)"),
+            })
+
+    if hits:
+        summary = (f"Probable IDOR/BOLA on '{param}' — {len(hits)} substituted id(s) returned another "
+                   f"object's data under your own session: {', '.join(h['value'] for h in hits)}. "
+                   f"The endpoint trusts '{param}' without an ownership check. Confirm with "
+                   f"verify_finding(kind='idor', victim_marker=<something unique to that victim>) then record_finding.")
+        if emit and hasattr(emit, "warn"):
+            emit.warn(f"[idor_probe] {summary}")
+    else:
+        summary = (f"No IDOR detected on '{param}' — none of the {len(tested)} substituted ids returned a "
+                   f"distinct accessible 200 (all matched your own data, were denied, or errored). "
+                   f"If the id space is unpredictable (UUIDs/GUIDs), supply real victim ids via 'values'.")
+
+    return {
+        "status": "vulnerable" if hits else "not_vulnerable",
+        "param": param,
+        "baseline_value": baseline_val,
+        "baseline_status": base_status,
+        "hits": hits,
+        "tested": tested,
+        "summary": summary,
+    }
+
+
 def _execute_verify_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Runs an INDEPENDENT, code-level signal check for a disputed or about-
@@ -13203,6 +13336,35 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["url"]
         },
         executor=_execute_mass_assign_probe
+    ),
+    "idor_probe": ToolSpec(
+        name="idor_probe",
+        description=(
+            "Sweeps an id-like URL parameter for IDOR / BOLA (broken object-level authorization): requests the "
+            "SAME endpoint under YOUR current session but with the identifier swapped to OTHER users' values, "
+            "and flags which substitutions returned a different HTTP 200 body (another object/account's data) "
+            "instead of being denied — the signal the app trusts the id without an ownership check. Give it a "
+            "url whose query carries the id (e.g. .../my-account?id=wiener); it auto-detects the id param and "
+            "baseline value, then tries common admin usernames + small integers (+ numeric neighbours of a "
+            "numeric id), or your own `values` list. Pass `victim_marker` (a string unique to a victim's data) "
+            "to upgrade a hit to confirmed. The classic use: log in as a low-priv user, then idor_probe its "
+            "account/order/profile endpoint. Runs the active identity (capture_identity/swap_session) or a "
+            "named `identity`. Advisory — confirm with verify_finding(kind='idor') + record_finding."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Endpoint whose id param to sweep, WITH the id in the query, e.g. https://host/my-account?id=wiener."},
+                "param": {"type": "string", "description": "Which query parameter is the id (auto-detected from id-like names if omitted)."},
+                "values": {"type": "array", "items": {"type": "string"}, "description": "Candidate victim ids to try instead of the built-in list (use real ids when the space is unpredictable, e.g. UUIDs)."},
+                "victim_marker": {"type": "string", "description": "A string unique to a victim's own data (email, name, order #) — a hit containing it is a confirmed cross-account read."},
+                "method": {"type": "string", "description": "HTTP method (default GET)."},
+                "identity": {"type": "string", "description": "Optional captured identity to send the requests as (e.g. a low-priv account)."},
+                "isolate": {"type": "boolean", "description": "Suppress the auto-attached active session (use when passing identity or explicit auth)."},
+            },
+            "required": ["url"]
+        },
+        executor=_execute_idor_probe
     ),
     "verify_finding": ToolSpec(
         name="verify_finding",
