@@ -9046,6 +9046,28 @@ def _execute_jsluice(args: Dict[str, Any], target: Target, emit: Any) -> Dict[st
     }
 
 
+# Endpoint paths that are high-value the moment they're discovered — an admin
+# panel, a user-delete/management action, an internal/debug/config surface. When
+# js_miner pulls these out of a JS bundle they're often the whole finding (e.g. an
+# unprotected admin panel whose unpredictable URL is disclosed in the JS), so they
+# must be surfaced loudly, not buried in a flat 100-endpoint list.
+_SENSITIVE_ENDPOINT_RE = re.compile(
+    r"(admin|/delete|/remove\b|/drop\b|internal|/debug|/config|/backup|/console|/manage|"
+    r"privileg|impersonat|superuser|/root\b|api[_-]?key|/secret|/token\b|/export|/dump|"
+    r"/exec|/cmd\b|/private|/staff|/moderat|user[_-]?management|/users?/\w)", re.I)
+
+
+def _flag_sensitive_endpoints(endpoints):
+    """Return the discovered endpoints that look high-value (admin/delete/internal…)."""
+    out = []
+    for e in endpoints or []:
+        u = e.get("url") if isinstance(e, dict) else (e if isinstance(e, str) else None)
+        if u and _SENSITIVE_ENDPOINT_RE.search(u):
+            out.append(u)
+    # dedupe, keep order
+    return list(dict.fromkeys(out))
+
+
 def _execute_js_miner(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     CAUGHT IN THE WILD (2026-10): the researcher asked for a tool that
@@ -9130,6 +9152,14 @@ def _execute_js_miner(args: Dict[str, Any], target: Target, emit: Any) -> Dict[s
         except Exception:
             pass
 
+    # Intelligence: flag the high-value endpoints among what was extracted so the
+    # brain acts on the admin/delete/internal path instead of scanning a flat list
+    # (an unprotected admin panel whose unpredictable URL is disclosed in the JS is
+    # a classic — the path IS the finding).
+    sensitive_eps = _flag_sensitive_endpoints(endpoints)
+    if sensitive_eps and emit and hasattr(emit, "warn"):
+        emit.warn(f"[js_miner] HIGH-VALUE endpoint(s) disclosed in JS: {', '.join(sensitive_eps[:6])}")
+
     return {
         "url": url,
         "js_files_found": intel.get("js_files_found", 0),
@@ -9137,6 +9167,11 @@ def _execute_js_miner(args: Dict[str, Any], target: Target, emit: Any) -> Dict[s
         "fetch_errors": intel.get("fetch_errors", 0),
         "endpoints_found": len(endpoints),
         "endpoints": endpoints[:100],
+        "sensitive_endpoints": sensitive_eps[:20] or None,
+        "sensitive_endpoints_note": (
+            "These paths were disclosed in the client-side JS and look high-value (admin/delete/internal/"
+            "secret). Go hit them directly — an unprotected admin panel or user-management action reachable "
+            "at a URL only revealed in JS is itself a broken-access-control finding." if sensitive_eps else None),
         "graphql_operations": intel.get("graphql_operations", []),
         "bundled_data_leaks": bundled_hits[:40],
         "bundled_data_summary": summarize_bundled_hits(bundled_hits) if bundled_hits else None,

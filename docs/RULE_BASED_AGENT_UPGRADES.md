@@ -24,7 +24,7 @@ do next.
 | *(param-payload intelligence)* | — | NOT a module upgrade — type-appropriate payloads per param (numeric_id→IDOR, file_path→traversal, url→SSRF, search→SQLi/XSS) is a **reasoning-layer** concern: the brain consumes `map_surface`'s param-type→test-family inference when crafting curl/sqlmap/payload calls | ▢ (prompt/reasoning) |
 | `surface_auditor` | audits ports/headers/surface | rank findings by exploitability; emit a **class→endpoint attack plan** the brain can execute, not a flat dump | ▢ |
 | `graphql` | probes GraphQL | if introspection is open, auto-surface the **sensitive queries/mutations + injectable args**, not just the schema | ▢ |
-| `js_miner` | finds endpoints in JS | ✅ already extended with `js_intel` (bundled secrets/PII, not just endpoints) | ✅ (earlier) |
+| `js_miner` | finds endpoints in JS | ✅ `js_intel` (bundled secrets/PII) + now **flags high-value paths** (admin/delete/internal/secret disclosed in JS) as `sensitive_endpoints` so the admin panel URL leaked in JS is the headline, not buried | ✅ |
 | `sourceauditor` / `blobunpacker` | unpack sourcemaps | prioritise **secrets/auth-logic/endpoints** over raw dumps; feed the secrets store | ▢ |
 | `cloudscout` | cloud recon | map discovered buckets/metadata to **testable SSRF/takeover targets** | ▢ |
 | `transport_auditor` | TLS/transport audit | surface only **exploitable** transport issues (downgrade, mixed-content auth), suppress informational noise | ▢ |
