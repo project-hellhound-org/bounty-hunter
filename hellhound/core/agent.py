@@ -7738,10 +7738,39 @@ def _execute_wafbuster(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
         except Exception:
             pass  # best-effort persistence; never break the actual WAF check result over this
 
-        return {
-            "url": url,
-            "result": res
-        }
+        # Intelligence layer: a rule-based "a WAF exists" result is only half the
+        # job — turn the fingerprint into ACTIONABLE, WAF-specific guidance the AI
+        # brain can act on. Reuse stealth's WAF→tactics table (same one the
+        # `stealth` tool uses) so a detected Cloudflare/Akamai/Imperva/etc. comes
+        # back with the coherent browser-header set and the specific tactics
+        # (pacing, header-order, encoding) that make authorised test traffic get
+        # through, instead of leaving the model to guess what the WAF implies.
+        out = {"url": url, "result": res}
+        try:
+            waf_names = []
+            if hasattr(target, "state") and isinstance(target.state, dict):
+                waf_names = list(target.state.get("waf_detected") or [])
+            if not waf_names and isinstance(res, dict):
+                waf_names = ((res.get("data") or {}).get("waf")) or []
+            if waf_names:
+                from hellhound.core import stealth as _stealth
+                prof = _stealth.waf_evasion_profile(waf_names)
+                if prof.get("matched_wafs") or prof.get("notes"):
+                    out["waf_evasion_intel"] = {
+                        "detected": waf_names,
+                        "matched_profiles": prof.get("matched_wafs"),
+                        "recommended_headers": prof.get("headers"),
+                        "tactics": prof.get("notes"),
+                    }
+                    out["actionable_note"] = (
+                        "A WAF is present — don't just note it. Apply the recommended_headers (coherent "
+                        "browser set) via the `stealth` tool on your curl/sqlmap/fuzz calls so legit test "
+                        "traffic isn't dropped before the payload is even evaluated, and if a SPECIFIC payload "
+                        "gets blocked use waf_evasion_probe (encoding/case mutations). The tactics above are "
+                        "the per-WAF levers for this exact family.")
+        except Exception:
+            pass  # evasion intel is additive; never break the WAF result over it
+        return out
     except Exception as e:
         return {"url": url, "error": f"WAF check error: {e}"}
 
