@@ -594,6 +594,19 @@ def _looks_autonomous(text: str) -> bool:
     return bool(_AUTONOMY_ENGAGE_RE.search(t) and _AUTONOMY_DEPTH_RE.search(t))
 
 
+def _hunt_turn_iterations() -> int:
+    """Per-turn tool-iteration cap for a hunt. Deliberately well below the
+    default 60 so each turn ENDS and hands control back to the continuation loop
+    (which re-focuses the model and runs the completion gate) instead of the
+    model doing the entire engagement in one unbounded turn that gets killed by
+    the wall clock before the loop/gate/export ever run — observed in the wild:
+    a single turn did 122 tool calls, never returned, so no report was exported."""
+    try:
+        return max(6, int(os.environ.get("HELLHOUND_HUNT_TURN_ITERATIONS", "30")))
+    except (TypeError, ValueError):
+        return 30
+
+
 def _run_autonomous_continuation(agent, answer: str, session_context: Dict[str, Any], emit: Any,
                                  on_token: Optional[Callable[[str], None]] = None,
                                  cancel_check: Optional[Callable[[], bool]] = None):
@@ -606,6 +619,7 @@ def _run_autonomous_continuation(agent, answer: str, session_context: Dict[str, 
     """
     budget_s = float(os.environ.get("HELLHOUND_HUNT_BUDGET_S", "1500"))
     max_cont = int(os.environ.get("HELLHOUND_HUNT_MAX_CONTINUATIONS", "12"))
+    turn_iters = _hunt_turn_iterations()
     deadline = time.time() + budget_s
     continuations = 0
     stalls = 0
@@ -632,6 +646,7 @@ def _run_autonomous_continuation(agent, answer: str, session_context: Dict[str, 
                           f"(untested={untested}, confirmed-but-unrecorded={unrecorded}) — pushing back")
             answer = agent.handle_message(_hunt_coverage_nudge(untested, unrecorded),
                                           session_context=session_context, emit=emit,
+                                          max_iterations=turn_iters,
                                           on_token=on_token, cancel_check=cancel_check)
             continue
 
@@ -650,7 +665,8 @@ def _run_autonomous_continuation(agent, answer: str, session_context: Dict[str, 
             emit.info(f"[auto-continue {continuations}/{max_cont}] "
                       f"{cur} finding(s) so far, {int(deadline - time.time())}s budget left")
         answer = agent.handle_message(_HUNT_CONTINUE_PROMPT, session_context=session_context,
-                                      emit=emit, on_token=on_token, cancel_check=cancel_check)
+                                      emit=emit, max_iterations=turn_iters,
+                                      on_token=on_token, cancel_check=cancel_check)
     reason = ("cancelled" if cancelled
               else "signaled_complete" if completed
               else "budget" if (continuations >= max_cont or time.time() >= deadline)
@@ -690,12 +706,20 @@ def handle_hunt(args: List[str], session_context: Dict[str, Any], emit: Any,
         f"each class — SQL injection (including the login form), reflected & stored XSS, IDOR/BOLA "
         f"(compare two accounts), mass assignment on write endpoints (mass_assign_probe), SSTI, SSRF, "
         f"CORS, weak/forgeable JWT, race conditions, open redirect, path traversal, command injection, "
-        f"and secrets/PII bundled in client JS (js_miner). For EACH confirmed bug: verify_finding, then "
+        f"and secrets/PII bundled in client JS (js_miner). Target the RIGHT endpoint for each class — most "
+        f"misses come from testing a class on the wrong endpoint: CORS on any endpoint that returns JSON/"
+        f"data (send an attacker Origin, check ACAO/ACAC reflection) — NOT a profile page; race conditions "
+        f"on STATE-CHANGING money/quota actions (transfer, purchase, redeem, apply-coupon, withdraw, vote) — "
+        f"NOT read-only reads; SSTI on EVERY endpoint that reflects your input into a rendered page (try "
+        f"them all, e.g. a /render or greeting/preview param, not just search); command injection on params "
+        f"that smell like they feed a shell (host, ip, domain, cmd, target, file); LFI/path-traversal on "
+        f"file/path/download/include/template params. For EACH confirmed bug: verify_finding, then "
         f"record_finding with the real captured evidence — do not just describe it. Work class by class "
         f"and do not stop after the first finding. When every class has been tested, run reverify_findings "
         f"then export_report. " + _HUNT_COVERAGE_CONTRACT)
 
-    answer = agent.handle_message(prompt, session_context=session_context, emit=emit, on_token=on_token)
+    answer = agent.handle_message(prompt, session_context=session_context, emit=emit,
+                                  max_iterations=_hunt_turn_iterations(), on_token=on_token)
     answer, continuations, reason = _run_autonomous_continuation(
         agent, answer, session_context, emit, on_token)
 
@@ -3199,6 +3223,7 @@ def dispatch(raw_input: str, session_context: Dict[str, Any], emit: Any = None,
             emit.info("[*] Autonomous request detected — running to completion (type to interrupt). "
                       "Use a short question for a single-turn answer.")
         response = agent.handle_message(raw_clean, session_context=session_context, emit=emit,
+                                        max_iterations=_hunt_turn_iterations(),
                                         on_token=on_token, cancel_check=cancel_check)
         response, continuations, reason = _run_autonomous_continuation(
             agent, response, session_context, emit, on_token, cancel_check=cancel_check)
