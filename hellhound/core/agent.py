@@ -11621,15 +11621,72 @@ def _evidence_markdown_block(raw: str) -> str:
     return "\n".join(parts)
 
 
+# Self-identifying secret/PII tokens to visually HIGHLIGHT in a report's
+# evidence, so the actual leaked value in an information-disclosure / IDOR /
+# secret-exposure finding jumps out instead of being buried in a wall of
+# response text (a reviewer shouldn't have to grep the HTML to find the API key
+# the bug exposed). Operate on HTML-escaped text — these tokens are alphanumeric
+# so escaping doesn't disturb them.
+_LEAK_TOKEN_PATTERNS = [
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}\.eyJ[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\b"),  # JWT
+    re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{10,}\b"),                                   # Stripe
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),                                           # AWS
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{20,}\b"),                                             # Google
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),                                          # GitHub
+    re.compile(r"\bglpat-[A-Za-z0-9_\-]{18,}\b"),                                           # GitLab
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),                                                    # long hex (keys/hashes/session ids)
+    re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),                    # email (PII)
+]
+# A value that follows a sensitive key name (works on HTML-escaped JSON/kv where
+# quotes are &quot;), e.g.  "api_key":"ak_live_…"  -> highlight just the value.
+_LEAK_KV_PATTERN = re.compile(
+    r"((?:&quot;|&#39;|['\"])?(?:api[_-]?key|apikey|secret|token|password|passwd|"
+    r"private[_-]?key|access[_-]?key|auth[_-]?token|session[_-]?id)(?:&quot;|&#39;|['\"])?"
+    r"\s*[:=]\s*(?:&quot;|&#39;|['\"])?)([A-Za-z0-9._\-]{6,})", re.I)
+
+
+def _highlight_leaks_html(escaped: str) -> str:
+    """Wrap secret/PII-looking tokens in <mark class="leak"> within already-
+    HTML-escaped text. Merges overlapping matches so nothing is double-wrapped."""
+    if not escaped:
+        return escaped
+    spans = []
+    for rx in _LEAK_TOKEN_PATTERNS:
+        for m in rx.finditer(escaped):
+            spans.append((m.start(), m.end()))
+    for m in _LEAK_KV_PATTERN.finditer(escaped):
+        spans.append((m.start(2), m.end(2)))  # highlight only the value, not the key name
+    if not spans:
+        return escaped
+    spans.sort()
+    merged = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    out, last = [], 0
+    for s, e in merged:
+        out.append(escaped[last:s])
+        out.append(f'<mark class="leak">{escaped[s:e]}</mark>')
+        last = e
+    out.append(escaped[last:])
+    return "".join(out)
+
+
 def _evidence_html_block(raw: str) -> str:
     """Same split as _evidence_markdown_block, rendered as HTML for the
-    report page itself."""
+    report page itself. Secret/PII tokens in the response are highlighted so the
+    actual leaked value in a disclosure/IDOR finding is immediately visible."""
     parsed = _parse_evidence_text(raw)
     html = ""
     if parsed["command"]:
-        html += f'<div class="section-label">Request</div><pre class="code-block">{_html_escape(parsed["command"])}</pre>'
+        html += f'<div class="section-label">Request</div><pre class="code-block">{_highlight_leaks_html(_html_escape(parsed["command"]))}</pre>'
     resp_label = f"Response ({_html_escape(parsed['status_label'])})" if parsed["status_label"] else "Response"
-    html += f'<div class="section-label">{resp_label}</div><pre class="code-block">{_html_escape(parsed["body"])}</pre>'
+    body_html = _highlight_leaks_html(_html_escape(parsed["body"]))
+    html += f'<div class="section-label">{resp_label}</div><pre class="code-block">{body_html}</pre>'
+    if 'class="leak"' in body_html or 'class="leak"' in html:
+        html += '<div class="leak-legend">⬑ highlighted = secret / PII exposed in the response — the proof of this finding</div>'
     return html
 
 
@@ -11731,6 +11788,8 @@ def _auto_save_finding_report(
   .sev-badge {{ display:inline-block; color:#0d0f14; font-weight:700; font-size:.75em; padding:3px 10px; border-radius:999px; letter-spacing:.04em; background:{color}; margin-bottom:10px; }}
   .section-label {{ text-transform:uppercase; letter-spacing:.06em; font-size:.72em; color:#7d8590; margin:14px 0 4px; font-weight:600; }}
   .code-block {{ background:#0a0c10; border:1px solid #262b36; border-radius:6px; padding:12px 14px; overflow-x:auto; font-size:.82em; white-space:pre-wrap; word-break:break-all; margin-bottom:10px; }}
+  .code-block mark.leak {{ background:#5a1e1e; color:#ffd24d; font-weight:700; padding:0 3px; border-radius:3px; box-shadow:0 0 0 1px #ff6b6b inset; }}
+  .leak-legend {{ color:#ff9f6b; font-size:.75em; margin:-4px 0 12px 2px; }}
   .kind {{ color:#7d8590; font-size:.85em; }}
   .copy-btn {{ background:#1c2029; border:1px solid #333a47; color:#c7ccd3; font-size:.72em; padding:3px 10px; border-radius:6px; cursor:pointer; margin-left:8px; }}
   .copy-btn:hover {{ background:#262b36; }}
@@ -17034,7 +17093,22 @@ If there is nothing worth generalizing, return an empty array: []"""
             reason = guard_result.get("reason", "Method requires human approval")
             approved = False
 
-            if emit and hasattr(emit, "request_approval"):
+            # Up-front authorization for an authorized engagement where the owner
+            # has explicitly OK'd destructive testing — e.g. a CTF/lab whose
+            # objective IS a destructive action (PortSwigger "delete user carlos"),
+            # or a pentest with written authorization to delete/modify. Default
+            # OFF: destructive actions still require a live human approval
+            # everywhere else (GUI prompt / TTY prompt / blocked in headless).
+            # The researcher grants it for the session with
+            # HELLHOUND_APPROVE_DESTRUCTIVE=1; every use is logged loudly and
+            # still counted as an approval in the turn diagnostics. This is the
+            # human approval given ahead of time, not a removal of the gate.
+            if str(os.environ.get("HELLHOUND_APPROVE_DESTRUCTIVE", "")).strip().lower() in ("1", "true", "yes", "on"):
+                self._approvals_granted_this_turn = getattr(self, "_approvals_granted_this_turn", 0) + 1
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(f"[!] Destructive action PRE-AUTHORIZED (HELLHOUND_APPROVE_DESTRUCTIVE=1): {method} {url} — {reason}")
+                # fall through to execute
+            elif emit and hasattr(emit, "request_approval"):
                 # GUI (or any other emit implementation) that can actually
                 # surface a blocking approve/deny prompt outside a TTY.
                 try:
