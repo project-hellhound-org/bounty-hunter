@@ -7773,23 +7773,111 @@ def _execute_surface_auditor(args: Dict[str, Any], target: Target, emit: Any) ->
         return {"url": url, "error": f"Surface auditor error: {e}"}
 
 
+# Surface intelligence for CORS target selection. A CORS misconfig only MATTERS
+# on an endpoint that returns sensitive data a cross-origin attacker would want
+# to read, and that the browser would send credentials to — i.e. a JSON/data API,
+# ideally an authenticated one. Testing a login page, the HTML homepage, or a CSS
+# file for CORS is wasted effort and noise. These heuristics score a discovered
+# endpoint for CORS-relevance so the right targets are prioritised instead of the
+# tool blindly sweeping every URL rule-based. (Seen in the wild: the agent kept
+# running cors_checker against /api/profile / the account page instead of the
+# JSON data endpoint where the credentialed bug actually lived.)
+_CORS_DATA_PATH = re.compile(
+    r"(/api/|/v\d+/|/graphql|/rest/|account|profile|/me\b|user|data|export|download|"
+    r"balance|order|invoice|transaction|settings|wallet|key|token|secret|session|"
+    r"cart|basket|message|notification|admin|report|search|feed)", re.I)
+_CORS_SKIP_ASSET = re.compile(r"\.(js|css|png|jpe?g|gif|svg|woff2?|ttf|eot|ico|map|webp|pdf|mp4)(\?|$)", re.I)
+_CORS_SKIP_PAGE = re.compile(r"(/login|/register|/signup|/logout|/static/|/assets/|/css/|/js/|/images?/|favicon|robots\.txt|sitemap)", re.I)
+
+
+def _cors_worthiness(url: str, content_type: str = "", authenticated: bool = False):
+    """Score an endpoint 0..100 for how worth CORS-testing it is, with reasons."""
+    path = urlparse(url).path if "://" in url else url
+    if _CORS_SKIP_ASSET.search(url) or _CORS_SKIP_PAGE.search(path):
+        return 0, []
+    score = 0
+    reasons = []
+    ct = (content_type or "").lower()
+    if "json" in ct or "javascript" in ct and "api" in url.lower():
+        score += 50; reasons.append("returns JSON/data")
+    elif ct and "html" in ct:
+        score += 5  # an HTML page can still carry data, but it's a weak CORS target
+    if _CORS_DATA_PATH.search(path):
+        score += 35; reasons.append("data/API-shaped path")
+    if authenticated:
+        score += 20; reasons.append("credentialed (session attached)")
+    return score, reasons
+
+
+def _data_endpoints_from_surface(target: Target, limit: int = 20):
+    """
+    Pick the endpoints most worth CORS-testing from everything discovered so far
+    — real responses in curl_evidence_log (where we know the Content-Type and
+    whether a session rode along) first, then spider/known endpoints by path
+    shape. Returns [{url, score, reason}], best first.
+    """
+    cand = {}
+    if hasattr(target, "state") and isinstance(target.state, dict):
+        for e in reversed(target.state.get("curl_evidence_log") or []):
+            url = e.get("url")
+            if not url or url in cand:
+                continue
+            raw = str(e.get("raw") or "")
+            m = re.search(r"(?im)^content-type:\s*([^\r\n]+)", raw)
+            ct = m.group(1) if m else ""
+            authed = bool(e.get("req_cookies")) or "authorization" in raw.lower()[:1500]
+            score, reasons = _cors_worthiness(url, ct, authed)
+            if score > 0:
+                cand[url] = {"url": url, "score": score, "reason": ", ".join(reasons) or "data-shaped"}
+    # spider / known endpoints (path heuristics only — no observed content-type)
+    si = _effective_spider_intel(target, None) or {}
+    for ep in (si.get("endpoints") or []):
+        url = ep if isinstance(ep, str) else (ep.get("url") if isinstance(ep, dict) else None)
+        if not url or url in cand:
+            continue
+        score, reasons = _cors_worthiness(url)
+        if score > 0:
+            cand[url] = {"url": url, "score": score, "reason": ", ".join(reasons) or "data-shaped path"}
+    return sorted(cand.values(), key=lambda c: -c["score"])[:limit]
+
+
 def _execute_cors_checker(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     from hellhound.core.engine import HellhoundEngine
     url = args.get("url") or target.name
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
-    spider_intel = _effective_spider_intel(target, args.get("spider_intel"))
+    spider_intel = dict(_effective_spider_intel(target, args.get("spider_intel")) or {})
+
+    # Intelligence layer: identify the endpoints actually worth CORS-testing
+    # (JSON/data, ideally authenticated) and make sure CORSbuster tests THEM,
+    # not just whatever single URL was passed. They're merged into the endpoint
+    # list the engine sweeps, and surfaced back so the model knows where the real
+    # CORS exposure is instead of guessing.
+    smart_targets = _data_endpoints_from_surface(target)
+    if smart_targets:
+        existing = list(spider_intel.get("endpoints") or [])
+        existing_urls = {e if isinstance(e, str) else (e.get("url") if isinstance(e, dict) else None) for e in existing}
+        for st in smart_targets:
+            if st["url"] not in existing_urls:
+                existing.append(st["url"])
+        spider_intel["endpoints"] = existing
+
     opts = {"spider_intel": spider_intel}
     opts.update(_target_auth_options(target))
     engine = HellhoundEngine()
     try:
         res = engine.run_single("corsbuster", url, options=opts, emit=emit)
         _mirror_cors_evidence(res, target)
-        return {
-            "url": url,
-            "result": res
-        }
+        out = {"url": url, "result": res}
+        if smart_targets:
+            out["smart_cors_targets"] = smart_targets[:10]
+            out["targeting_note"] = (
+                "CORS only matters where sensitive data is returned to a credentialed cross-origin request. "
+                "Prioritised the data/API endpoints above (JSON responses / data-shaped paths / authenticated) "
+                "rather than sweeping every page. If CORSbuster found nothing, re-test the top smart target "
+                "directly with an attacker Origin header (and the victim's session) and diff the ACAO/ACAC.")
+        return out
     except Exception as e:
         return {"url": url, "error": f"CORS check error: {e}"}
 
