@@ -3990,6 +3990,16 @@ def _is_benign_tracking_cookie(cookie_name: str) -> bool:
 # the default anonymous one everyone gets.
 _SESSION_LIKE_COOKIE_NAME = re.compile(r"session|phpsessid|jsessionid|connect\.sid|^sid$", re.I)
 
+# Only these leaked-artifact field_names HARD-block broad discovery (see
+# check_artifact_preflight_gate): genuinely-actionable credentials worth testing
+# before wandering off to enumerate more surface. Bearer/JWT/auth tokens and
+# session cookies are deliberately EXCLUDED (auto-attached by crawlers / tested
+# via curl header injection, not a crawler), as are incidental data-leak values.
+_GATE_BLOCKING_CREDENTIAL = re.compile(
+    r"api[_-]?key|apikey|access[_-]?key|secret[_-]?key|private[_-]?key|"
+    r"client[_-]?secret|aws[_-]?secret|password|passwd|credential|"
+    r"delegation|impersonat", re.I)
+
 
 def _is_credential_bearing_request(tool_args: Dict[str, Any]) -> bool:
     """True if this request looks like it's actually attempting
@@ -4661,17 +4671,28 @@ def check_artifact_preflight_gate(tool_name: str, args: Dict[str, Any], target: 
             return None
 
     unconsumed = find_unconsumed_artifacts(target, history=history)
-    # A session cookie does NOT block broad discovery: every crawler/fuzzer
-    # here auto-attaches the active session, so running one after you log in
-    # IS using/testing that cookie (crawling the authenticated surface is the
-    # whole point). Only NON-session actionable artifacts — a leaked token,
-    # api key, delegation/impersonation endpoint, credential found in a
-    # response — still gate discovery, since those need an explicit test
-    # before you wander off. Caught on the VaultFi lab: a plain session cookie
-    # was blocking the authenticated crawl the researcher actually wanted.
+    # Broad discovery is blocked ONLY by a genuinely-actionable leaked
+    # CREDENTIAL that grants access the agent hasn't tested yet — an API key,
+    # password, private/client secret, or delegation/impersonation endpoint.
+    # Those are worth stopping to test before wandering off to enumerate more
+    # surface. It is NOT blocked by:
+    #   - session cookies or bearer/JWT/auth tokens — every crawler/fuzzer here
+    #     auto-attaches the ACTIVE session/token, and a leaked or forged token
+    #     is tested via curl header injection (which the agent does), not via a
+    #     crawler; and
+    #   - incidental sensitive-data VALUES surfaced in a response (a leaked
+    #     "quarterly numbers" string, PII) — those are findings to record, not
+    #     credentials to "consume".
+    # Caught on the lab: a pile of forged alg:none JWT variants (already proven
+    # against /api/admin) plus a leaked data string kept blocking fuzz_hunter,
+    # so the unlinked /fetch, /download, /ping endpoints (SSRF/LFI/command
+    # injection) were never discovered. The untested artifacts still show as
+    # "[UNTESTED - TEST THIS FIRST]" in the prompt inventory, so the nudge to
+    # test them remains — only the HARD block on endpoint discovery is lifted.
+    # The scope gate (the actual security control) is untouched.
     unconsumed = [
         a for a in unconsumed
-        if not _SESSION_LIKE_COOKIE_NAME.search(str(a.get("field_name", "")))
+        if _GATE_BLOCKING_CREDENTIAL.search(str(a.get("field_name", "")))
     ]
     if not unconsumed:
         return None
