@@ -20,7 +20,8 @@ do next.
 |-------|------------------|----------------------|--------|
 | `corsbuster` / `cors_checker` | sweeps every URL for ACAO/ACAC | `_data_endpoints_from_surface` scores endpoints (JSON/data + credentialed = top; login/static/favicon = 0); prioritises the data endpoints where a credentialed CORS read bites; returns `smart_cors_targets` + reasons | ✅ done (12 tests) |
 | `wafbuster` | detects "a WAF exists" | reuses `stealth.waf_evasion_profile` to return the WAF-family-specific **tactics + coherent header set** + a note to apply `stealth`/`waf_evasion_probe` | ✅ done |
-| `fuzz_hunter` | fuzzes params with a generic wordlist | consume `map_surface`/param-type inference → send **type-appropriate payloads per param** (numeric_id→IDOR ids, file_path→traversal, url→SSRF, search→SQLi/XSS); prioritise high-value params | ▢ next |
+| `fuzz_hunter` | recursive **path** discovery with a generic wordlist | tech-stack-aware ordering (PHP→.php, etc.), always probe a curated high-value set (admin/api/backup/config/.git), recurse into discovered high-value dirs | ▢ next |
+| *(param-payload intelligence)* | — | NOT a module upgrade — type-appropriate payloads per param (numeric_id→IDOR, file_path→traversal, url→SSRF, search→SQLi/XSS) is a **reasoning-layer** concern: the brain consumes `map_surface`'s param-type→test-family inference when crafting curl/sqlmap/payload calls | ▢ (prompt/reasoning) |
 | `surface_auditor` | audits ports/headers/surface | rank findings by exploitability; emit a **class→endpoint attack plan** the brain can execute, not a flat dump | ▢ |
 | `graphql` | probes GraphQL | if introspection is open, auto-surface the **sensitive queries/mutations + injectable args**, not just the schema | ▢ |
 | `js_miner` | finds endpoints in JS | ✅ already extended with `js_intel` (bundled secrets/PII, not just endpoints) | ✅ (earlier) |
