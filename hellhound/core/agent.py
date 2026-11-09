@@ -4853,6 +4853,26 @@ def _bounded_request(fn: Callable[[], Any], hard_timeout: float = 20.0):
         )
 
 
+def _evidence_body_snapshot(text: str, cap: int = 12000, head: int = 9000) -> str:
+    """
+    Response-body snapshot for the EVIDENCE log (what ends up in a report's
+    "captured request/response" proof). A naive text[:2000] truncates the body
+    right after a large header/nav preamble — so for a page like a PortSwigger
+    lab (or any real app with a big header) the actual proof (the injected rows,
+    the reflected value, the leaked field) sits PAST the cut and never makes it
+    into the report, leaving the finding asserted-but-not-shown. This keeps a
+    generous HEAD plus a TAIL, so the proof is captured whether it lands early
+    (just after the header) or late (a footer/JSON tail), with an explicit
+    omission marker in between for anything genuinely huge.
+    """
+    text = text or ""
+    if len(text) <= cap:
+        return text
+    tail = max(0, cap - head)
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n\n...[{omitted} bytes omitted]...\n\n{text[-tail:]}" if tail else text[:cap]
+
+
 def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     url = args.get("url") or target.name
     method = args.get("method", "GET").upper()
@@ -5033,7 +5053,7 @@ def _execute_curl(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, 
             elif data_payload is not None:
                 req_body_preview = str(data_payload)[:1000]
             resp_header_lines = "\n".join(f"{k}: {v}" for k, v in r.headers.items())
-            resp_body_preview = (r.text or "")[:2000]
+            resp_body_preview = _evidence_body_snapshot(r.text or "")
 
             curl_repro = f'curl -s -X {method} "{url}"'
             for hk, hv in headers.items():
@@ -9591,7 +9611,21 @@ def _lookup_curl_evidence(target: Target, request_ref: str, limit: int = 2, kind
     marker = _INJECTION_EVIDENCE_MARKERS.get((kind or "").strip().lower())
     if marker is not None:
         matches = [m for m in matches if marker.search(str(m.get("raw") or ""))]
-    return [m["raw"] for m in matches[:limit] if m.get("raw")]
+    # Dedupe by the exact request (method+url+body) so a report never shows the
+    # SAME request twice with contradictory responses — e.g. the same injection
+    # captured before AND after the lab was solved (one "Not solved", one
+    # "Solved"), which reads like the PoC doesn't reliably work. Keep the most
+    # recent capture of each distinct request (matches is already newest-first).
+    seen_reqs = set()
+    deduped = []
+    for m in matches:
+        sig = (str(m.get("method", "")), str(m.get("url", "")),
+               json.dumps(m.get("req_json"), sort_keys=True, default=str) if m.get("req_json") is not None else str(m.get("req_data") or ""))
+        if sig in seen_reqs:
+            continue
+        seen_reqs.add(sig)
+        deduped.append(m)
+    return [m["raw"] for m in deduped[:limit] if m.get("raw")]
 
 
 def _lookup_terminal_evidence(target: Target, request_ref: str, limit: int = 2) -> List[str]:
