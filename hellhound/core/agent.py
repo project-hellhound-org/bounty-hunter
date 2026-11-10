@@ -18902,7 +18902,16 @@ INSTRUCTIONS:
 
                 # Check if ask_neural_core returned a native tool call object (dict)
                 tool_call = None
-                if isinstance(ai_resp, dict) and "tool" in ai_resp:
+                _native_batch = None
+                if isinstance(ai_resp, list):
+                    # Native function-calling returned MULTIPLE structured tool
+                    # calls in one response — no text JSON to truncate/scramble.
+                    # Run them all this iteration via the batch path below.
+                    _native_batch = [c for c in ai_resp if isinstance(c, dict) and "tool" in c]
+                    if _native_batch:
+                        tool_call = _native_batch[0]
+                    ai_resp = json.dumps(ai_resp)  # string form for logging / prev-check
+                elif isinstance(ai_resp, dict) and "tool" in ai_resp:
                     tool_call = ai_resp
                     # Create a string representation for logging & prev check
                     ai_resp = json.dumps(tool_call)
@@ -18975,7 +18984,13 @@ INSTRUCTIONS:
                     # the model wasn't wrong to want 5 curls, it just never
                     # got credit for more than one of them before the turn
                     # ran out of budget.
-                    _batch = _extract_all_tool_calls(ai_resp) if isinstance(ai_resp, str) else [tool_call]
+                    # Prefer the structured native batch (no text to scramble);
+                    # fall back to text-JSON extraction for providers/models that
+                    # still emit batched calls in content.
+                    if _native_batch:
+                        _batch = _native_batch
+                    else:
+                        _batch = _extract_all_tool_calls(ai_resp) if isinstance(ai_resp, str) else [tool_call]
                     if not _batch or tool_call not in _batch:
                         _batch = [tool_call]
                     # Safety cap, independent of the destructive-action

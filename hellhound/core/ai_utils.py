@@ -1290,6 +1290,32 @@ def _post_with_retry(
     return last_resp, last_exc
 
 
+def _parse_native_tool_calls(tool_calls: List[Dict[str, Any]]):
+    """
+    Convert a provider's native `tool_calls` array into the orchestrator's
+    {"tool": name, "args": {...}} shape. Returns a LIST when the model emitted
+    several calls in one response, or a single dict for one — so the model can
+    batch multiple tool calls through the STRUCTURED API instead of writing them
+    as JSON in the text content (which truncates/scrambles on a generation-length
+    cap). Returns None if nothing parseable. Each call's args are parsed
+    independently, so one malformed arg blob never discards the others.
+    """
+    calls = []
+    for tc in (tool_calls or []):
+        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+        name = (fn.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            parsed_args = json.loads(fn.get("arguments", "{}") or "{}")
+        except Exception:
+            parsed_args = {}
+        calls.append({"tool": name, "args": parsed_args if isinstance(parsed_args, dict) else {}})
+    if not calls:
+        return None
+    return calls if len(calls) > 1 else calls[0]
+
+
 def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None, role: str = "orchestrator", tool_choice: str = "auto") -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
     """REST call to NVIDIA NIM OpenAI-compatible API with SSE streaming. Supports native tool calling.
 
@@ -1383,16 +1409,12 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             usage_tokens = data.get("usage", {}).get("completion_tokens")
             choice = data.get("choices", [{}])[0]
             msg = choice.get("message", {})
-            # Check for native tool calls
+            # Native tool calls — keep ALL of them (not just the first), so the
+            # model batches via the structured API instead of scrambling text.
             if msg.get("tool_calls"):
-                tc = msg["tool_calls"][0]  # Take first tool call
-                fn = tc.get("function", {})
-                try:
-                    parsed_args = json.loads(fn.get("arguments", "{}"))
-                except Exception:
-                    parsed_args = {}
-                result = {"tool": fn.get("name", ""), "args": parsed_args}
-                return (result, usage_tokens) if return_usage else result
+                result = _parse_native_tool_calls(msg["tool_calls"])
+                if result is not None:
+                    return (result, usage_tokens) if return_usage else result
             # No tool call — return text content
             text = strip_thinking_tags(msg.get("content", "")) or None
             return (text, usage_tokens) if return_usage else text
