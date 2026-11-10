@@ -1328,6 +1328,32 @@ def _single_or_list(calls):
     return calls if len(calls) > 1 else calls[0]
 
 
+# A reasoning model asked to call a tool will sometimes ignore the native
+# tool_calls channel and instead write the call as JSON *in the text content*
+# (often behind a reasoning preamble). If the reply then hits the generation-
+# length cap, that JSON gets sliced mid-object — the tool never fires and the
+# turn dead-ends on a "cut off mid-JSON" message that re-truncates identically
+# on every retry. These signatures spot that partial-tool-call-in-text so the
+# provider can retry forcing a *structured* tool call (no prose to truncate).
+_PARTIAL_TOOLCALL_IN_TEXT = re.compile(
+    r'\{\s*"tool"\s*:|"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:', re.I)
+
+
+def _looks_like_partial_tool_call(text: str) -> bool:
+    return bool(text) and bool(_PARTIAL_TOOLCALL_IN_TEXT.search(text))
+
+
+def _toolcall_token_floor(default_tokens: int, tools, tool_choice: str) -> int:
+    """Tool-calling with a reasoning model needs headroom: the model may emit a
+    reasoning preamble before the call, and a tight cap truncates the JSON (or
+    the structured call) mid-way. Floor the budget for any tool-calling request
+    so a single tool call can't be sliced off by the length cap. An explicit,
+    higher `max_response_tokens` is still honoured."""
+    if tools and tool_choice != "none":
+        return max(default_tokens, 16384)
+    return default_tokens
+
+
 def _parse_anthropic_tool_uses(content_blocks: List[Dict[str, Any]]):
     """Anthropic returns tool calls as `tool_use` content blocks with args already
     a dict (`input`). Keep ALL of them (multi-tool batching), same as the others."""
@@ -1406,7 +1432,8 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
                 model = f"nvidia/{model}"
 
         cfg = load_config()
-        resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
+        resolved_max_tokens = max_tokens or _toolcall_token_floor(
+            cfg.get("max_response_tokens", 8192), tools, tool_choice)
 
         payload = {
             "model": model,
@@ -1447,8 +1474,32 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
                 result = _parse_native_tool_calls(msg["tool_calls"])
                 if result is not None:
                     return (result, usage_tokens) if return_usage else result
+            # No native tool_calls. A reasoning model (Nemotron) sometimes writes
+            # the call as text JSON behind a reasoning preamble and hits the
+            # length cap mid-object — the tool never fires and every retry
+            # re-truncates identically (the self_audit dead-end). When the reply
+            # was length-truncated AND a partial tool-call is sitting in the
+            # text, retry ONCE with a bigger budget and tool_choice="required"
+            # so the model must return a STRUCTURED call (no prose to truncate).
+            content = msg.get("content", "") or ""
+            if (choice.get("finish_reason") == "length"
+                    and tool_choice == "auto"
+                    and _looks_like_partial_tool_call(content)):
+                payload["max_tokens"] = max(resolved_max_tokens * 2, 16384)
+                payload["tool_choice"] = "required"
+                r2, _ = _post_with_retry(url, headers, payload, timeout, stream=False)
+                if r2 is not None and r2.status_code == 200:
+                    data = r2.json()
+                    usage_tokens = data.get("usage", {}).get("completion_tokens") or usage_tokens
+                    choice = data.get("choices", [{}])[0]
+                    msg = choice.get("message", {})
+                    if msg.get("tool_calls"):
+                        result = _parse_native_tool_calls(msg["tool_calls"])
+                        if result is not None:
+                            return (result, usage_tokens) if return_usage else result
+                    content = msg.get("content", "") or content
             # No tool call — return text content
-            text = strip_thinking_tags(msg.get("content", "")) or None
+            text = strip_thinking_tags(content) or None
             return (text, usage_tokens) if return_usage else text
 
         r, net_err = _post_with_retry(url, headers, payload, timeout, stream=True)
@@ -1550,7 +1601,8 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
             messages.append({"role": "user", "content": prompt})
 
         cfg = load_config()
-        resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
+        resolved_max_tokens = max_tokens or _toolcall_token_floor(
+            cfg.get("max_response_tokens", 8192), tools, "auto")
 
         payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": resolved_max_tokens, "stream": True}
 
@@ -1643,7 +1695,8 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
             messages.append({"role": "user", "content": prompt})
 
         cfg = load_config()
-        resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
+        resolved_max_tokens = max_tokens or _toolcall_token_floor(
+            cfg.get("max_response_tokens", 8192), tools, "auto")
 
         payload = {
             "model": model,
@@ -1760,7 +1813,8 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
         contents.append({"role": "user", "parts": [{"text": user_message}]})
 
         cfg = load_config()
-        resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
+        resolved_max_tokens = max_tokens or _toolcall_token_floor(
+            cfg.get("max_response_tokens", 8192), tools, "auto")
 
         payload = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
@@ -1895,7 +1949,8 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
             messages.append({"role": "user", "content": prompt})
         
         cfg = load_config()
-        resolved_max_tokens = max_tokens or cfg.get("max_response_tokens", 8192)
+        resolved_max_tokens = max_tokens or _toolcall_token_floor(
+            cfg.get("max_response_tokens", 8192), tools, "auto")
         
         n_ctx = 4096
         n_predict = resolved_max_tokens
