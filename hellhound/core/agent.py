@@ -8975,17 +8975,30 @@ def _execute_js_static_analysis(args: Dict[str, Any], target: Target, emit: Any)
     # its actual return shape rather than assuming.
     findings = sa_intel.get("vulnerabilities", []) if isinstance(sa_intel, dict) else []
 
-    return {
+    # Intelligence: flag the high-value endpoints recovered from the source
+    # (admin/delete/internal/secret) so they're the headline, same as js_miner —
+    # a sourcemap that reconstructs an /admin-xyz or user-delete route is often
+    # the whole finding, not a line in a 50-endpoint dump.
+    sensitive_eps = _flag_sensitive_endpoints(new_endpoints)
+    out = {
         "url": url,
         "files_recovered": len(reconstructed),
         "secrets_found": len(secrets),
         "secrets": secrets[:25],
         "new_endpoints_found": len(new_endpoints),
         "new_endpoints": new_endpoints[:50],
+        "sensitive_endpoints": sensitive_eps[:20] or None,
         "static_analysis_findings": len(findings),
         "findings": findings[:50],
         "risk_score": sa_intel.get("risk_score", blob_intel.get("risk_score", 0)),
     }
+    if sensitive_eps:
+        out["sensitive_endpoints_note"] = (
+            "High-value paths recovered from the client source (admin/delete/internal/secret) — hit them "
+            "directly; an admin or user-management route reconstructed from a sourcemap is itself a lead.")
+        if emit and hasattr(emit, "warn"):
+            emit.warn(f"[js_static_analysis] high-value route(s) recovered: {', '.join(sensitive_eps[:6])}")
+    return out
 
 
 def _execute_jsluice(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:

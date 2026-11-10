@@ -25,7 +25,7 @@ do next.
 | `surface_auditor` | audits ports/headers/surface | rank findings by exploitability; emit a **class→endpoint attack plan** the brain can execute, not a flat dump | ▢ |
 | `graphql` | probes GraphQL (shallow: "exposed?") | when introspection is open it now pulls the schema and returns `sensitive_operations` — destructive/privileged mutations (deleteUser, updateUserRole, transferFunds…) + sensitive-noun queries (getUser…) with their args + why each is a lead | ✅ done (13 tests) |
 | `js_miner` | finds endpoints in JS | ✅ `js_intel` (bundled secrets/PII) + now **flags high-value paths** (admin/delete/internal/secret disclosed in JS) as `sensitive_endpoints` so the admin panel URL leaked in JS is the headline, not buried | ✅ |
-| `sourceauditor` / `blobunpacker` | unpack sourcemaps | prioritise **secrets/auth-logic/endpoints** over raw dumps; feed the secrets store | ▢ |
+| `sourceauditor` / `blobunpacker` | unpack sourcemaps | already surfaces secrets + static-analysis sinks; now also **flags high-value recovered routes** (admin/delete/internal) via the shared `_flag_sensitive_endpoints`, same as js_miner | ✅ done |
 | `cloudscout` | cloud recon | map discovered buckets/metadata to **testable SSRF/takeover targets** | ▢ |
 | `transport_auditor` | TLS/transport audit | surface only **exploitable** transport issues (downgrade, mixed-content auth), suppress informational noise | ▢ |
 | `hydra` | brute force | pull the **real usernames** harvested on this target + the confirmed login endpoint, instead of generic lists | ▢ |
