@@ -7,6 +7,18 @@ description: Universal methodology for Server-Side Request Forgery discovery and
 
 Execute when the target has ANY feature where the server fetches a URL, file, or resource on the user's behalf: webhook config, "import from URL," avatar-from-URL, PDF/document generation, link unfurling, image proxies, RSS/feed readers, or any headless-browser-backed rendering pipeline.
 
+## 0. Where SSRF Lives — Find the Server-Side Fetch, Don't Hammer the Target
+SSRF is **never** "just request `/admin` yourself." If an internal or privileged path returns **401 / 403 / 404 to you**, that is the SIGNAL, not a dead end: the app trusts requests that originate from ITS OWN server, so you reach that path by making the **server** fetch it for you. The moment you catch yourself `curl`-ing `/admin` directly and getting 401/403 — STOP, and go find the fetch feature.
+
+Hunt for the fetch primitive — any input where the backend retrieves a URL / host / resource on your behalf:
+- **Stock / inventory / availability / price check** ("check stock in another store", a `stockApi=` / `storeId=` field, `POST /product/stock`), **webhook config**, **import-from-URL**, **avatar / image-from-URL**, **PDF / screenshot / document generation**, **link preview / unfurl**, **RSS / feed reader**, **"test connection" / health check**, and generic `url=` / `dest=` / `path=` / `redirect=` / `callback=` / `proxy=` params.
+- The param often does NOT look like a bare URL. It may be a full `http://host:port/path?...` the server calls **verbatim** (so replace the WHOLE value), or just a `host` / `host:port` the server concatenates a fixed path onto.
+
+**The pivot (the actual exploit):** swap the fetch target for the internal resource, then chain the action.
+- `stockApi=http://stock.weliketoshop.net:8080/product/stock/check?productId=1` → `stockApi=http://localhost/admin`
+- then: `stockApi=http://localhost/admin/delete?username=carlos`
+- cloud: `http://169.254.169.254/latest/meta-data/` (AWS), `http://metadata.google.internal/` (GCP).
+
 ## 1. Identify the Fetch Primitive Before Testing
 **CRITICAL RULE:** Do not fire payloads blind. First determine WHAT is doing the fetching.
 - Read client-side JS and API docs for hints: `Puppeteer`, `wkhtmltopdf`, `Electron`, `Playwright`, `phantomjs`, or a generic HTTP client library.

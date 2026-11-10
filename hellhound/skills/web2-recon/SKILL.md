@@ -151,6 +151,49 @@ cat /tmp/urls.txt | grep -iE "theme|profile|signature|customize|email|invoice|pd
 # → if any hit, run web2-vuln-classes **CSS Injection**
 ```
 
+## ROI MAXIMIZATION — The Attack Surface Most Hunters Miss
+
+ROI isn't "more subdomains." It's the **forgotten, unlinked, and leaked** surface nobody else tested. After the standard pipeline, do these deliberately — with the agent's own tools:
+
+### 1. Harvest URLs from EVERY source, then dedupe into one surface
+Most of the gold is in history and JS, not the homepage links.
+```json
+{"tool": "wayback_urls", "args": {"domain": "<host>"}}
+{"tool": "gau_nuclei_sweep", "args": {"domain": "<host>"}}
+{"tool": "otx_urls", "args": {"domain": "<host>"}}
+{"tool": "urlscan_recon", "args": {"domain": "<host>"}}
+{"tool": "spider", "args": {"url": "https://<host>"}}
+{"tool": "js_miner", "args": {"url": "https://<host>"}}
+```
+`js_miner` is critical — endpoints, API routes, and secrets baked into JS bundles are never in the HTML or sitemap.
+
+### 2. DEPRECATED-BUT-STILL-LIVE — the single highest-ROI move
+Wayback/gau history is full of URLs the app no longer links to; the ones that **still return 200/401/403** are prime: old API versions (`/api/v1/` after v2 shipped), retired admin/debug endpoints, pre-auth-rewrite routes, test pages left in prod. Probe the historical set for what's still alive:
+```json
+{"tool": "httpx", "args": {"urls": ["<historical URL>", "..."], "status_code": true}}
+```
+Anything live that isn't linked anywhere current = test it hard. A forgotten `/api/v1/user/{id}` with no auth is a classic IDOR that v2 patched but v1 still serves.
+
+### 3. BACKUP / CONFIG / SOURCE / LEAKED FILES — on every live host AND every discovered directory
+Rarely linked, frequently left on disk. `curl` the high-signal ones directly (always works), and run `content_discovery` for a broader sweep:
+- **Backups of files you already found:** append `.bak .old .orig .save .swp .tmp ~ .1` (e.g. `config.php` → `config.php.bak`, `index.php~`); whole-site archives `backup.zip`, `www.zip`, `<domain>.zip`, `site.tar.gz`, `.tgz`, `.rar`.
+- **Config & secrets:** `.env` `.env.bak` `config.php.bak` `wp-config.php.bak` `settings.py.bak` `application.yml` `docker-compose.yml` `.npmrc` `.dockercfg`.
+- **DB dumps:** `dump.sql` `database.sql` `db.sql` `backup.sql` `.sql.gz`.
+- **VCS / metadata:** `.git/HEAD` `.svn/entries` `.DS_Store` (lists a directory's real contents) `.hg`.
+- **Debug / full-spec leaks:** `phpinfo.php` `/server-status` `/actuator` (Spring) `swagger.json` `openapi.json` `/api-docs` `/.well-known/`.
+```json
+{"tool": "curl", "args": {"url": "https://<host>/.env"}}
+{"tool": "curl", "args": {"url": "https://<host>/openapi.json"}}
+{"tool": "content_discovery", "args": {"url": "https://<host>"}}
+```
+`.DS_Store` and `swagger.json`/`openapi.json` are especially high-ROI — the first enumerates a directory's true contents, the second hands you the entire API surface including unlinked endpoints.
+
+### 4. Classify + rank by ROI, then test the top of the list
+```json
+{"tool": "map_surface", "args": {}}
+```
+Prioritise in order: (a) unlinked/forgotten endpoints still live, (b) endpoints with testable params (numeric id→IDOR, file/path→LFI/traversal, url→SSRF, search/q→XSS/SQLi), (c) sensitive paths (admin/internal/debug/api), (d) any exposed config/source/backup. Test the top of that list — that's where the bounty is, not the homepage you already crawled.
+
 ---
 
 ## JS ANALYSIS
