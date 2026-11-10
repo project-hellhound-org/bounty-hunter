@@ -6226,6 +6226,7 @@ _PIVOT_EXEMPT_TOOLS = frozenset((
     "recall_data", "load_skill", "listener", "recall_patterns",
     "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis",
     "save_auth_flow", "profile", "map_surface", "stealth", "parallel", "self_audit",
+    "background_task", "check_tasks",
 ))
 _PIVOT_LOW_SIGNAL_THRESHOLD = 3
 _PIVOT_DEAD_END_THRESHOLD = 5
@@ -13364,6 +13365,36 @@ def _execute_parallel_stub(args: Dict[str, Any], target: Target, emit: Any) -> D
     return {"error": "parallel must be routed through Agent.execute_tool_call, not called directly."}
 
 
+# Tools that must NOT be run detached in the background — anything that mutates
+# critical state (its result needs to land synchronously in the turn) or that is
+# itself a meta/control tool. Same spirit as _PARALLEL_BLACKLIST, plus the
+# background/parallel meta-tools themselves (no nesting).
+_BACKGROUND_BLACKLIST = frozenset(_PARALLEL_BLACKLIST | {"background_task", "check_tasks"})
+
+
+def _execute_background_task_stub(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Placeholder — the real implementation (Agent._execute_background_task) needs
+    self.execute_tool_call, so it's special-cased in Agent.execute_tool_call."""
+    return {"error": "background_task must be routed through Agent.execute_tool_call, not called directly."}
+
+
+def _execute_check_tasks(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Report background-task status and collect any finished results. Local, no
+    network — just reads the background-task registry."""
+    from hellhound.core import background_tasks as _bg
+    status = _bg.status_all()
+    finished = _bg.collect_finished()
+    running = [s for s in status if s.get("status") == "running"]
+    parts = []
+    if finished:
+        parts.append(f"Collected {len(finished)} finished background result(s) above — fold them into your testing.")
+    if running:
+        parts.append(f"{len(running)} task(s) still running; call check_tasks again later.")
+    if not finished and not running:
+        parts.append("No background tasks running and nothing new to collect.")
+    return {"status": "ok", "running": running, "finished": finished, "note": " ".join(parts)}
+
+
 def _execute_load_skill(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Loads a skill's full methodology content on demand, by name, from the skill menu."""
     name = str(args.get("name", "")).strip()
@@ -13903,6 +13934,41 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["calls"]
         },
         executor=_execute_parallel_stub,
+    ),
+    "background_task": ToolSpec(
+        name="background_task",
+        description=(
+            "Run ONE slow tool DETACHED in the background and get a task_id back IMMEDIATELY, so this turn "
+            "keeps going instead of blocking on it. For long jobs you don't need the result of right now — a "
+            "full spider/katana crawl, a nuclei/gau sweep, authenticated content_discovery/fuzz_hunter, a "
+            "wide port_scan, a sqlmap confirmation — kick it off, keep testing other things, then pick up the "
+            "result later with check_tasks. The tool still runs through the full scope gate + rate limiter in "
+            "the background thread (background changes only the WAITING, never the safety checks). Max 4 "
+            "background tasks at once. It rejects state-mutating/meta tools (record_finding, set_target, "
+            "export_report, verify_finding, parallel, …) — run those in the foreground. Pass 'tool' and its "
+            "'args'; optional 'label'."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "description": "The slow tool to run detached (e.g. spider, nuclei, content_discovery, fuzz_hunter, port_scan, gau_nuclei_sweep, sqlmap_scan)."},
+                "args": {"type": "object", "description": "That tool's arguments."},
+                "label": {"type": "string", "description": "Optional short label for the task (e.g. 'authenticated crawl of /admin')."},
+            },
+            "required": ["tool"]
+        },
+        executor=_execute_background_task_stub,
+    ),
+    "check_tasks": ToolSpec(
+        name="check_tasks",
+        description=(
+            "Check background tasks spawned with background_task: lists which are still running and COLLECTS "
+            "the results of any that finished (each finished result is returned once). Call this periodically "
+            "while you work on other things, or when you're ready to use a long scan's output — fold the "
+            "collected results into your testing just like a normal tool result. Local, no network."
+        ),
+        parameters={"type": "object", "properties": {}, "required": []},
+        executor=_execute_check_tasks,
     ),
     "self_audit": ToolSpec(
         name="self_audit",
@@ -16959,6 +17025,46 @@ If there is nothing worth generalizing, return an empty array: []"""
                     "looks partial.",
         }
 
+    def _execute_background_task(self, args: Any, emit: Any = None) -> Dict[str, Any]:
+        """Spawn ONE slow tool detached in the background and return a handle
+        immediately, so the turn keeps going instead of blocking on it (a full
+        spider / nuclei sweep / authenticated content-discovery). Collect the
+        result later with check_tasks. The tool still runs through
+        execute_tool_call in the thread, so it inherits the full scope gate /
+        rate limiter / circuit breaker — background changes only the WAITING."""
+        from hellhound.core import background_tasks as _bg
+        if not isinstance(args, dict):
+            args = {}
+        tool = str(args.get("tool") or "").strip()
+        inner = args.get("args") if isinstance(args.get("args"), dict) else {}
+        if not tool:
+            return {"error": 'background_task needs \'tool\' (and optional \'args\') — the slow tool to run '
+                             'detached, e.g. {"tool":"spider","args":{"url":"https://host"}}.'}
+        if tool in _BACKGROUND_BLACKLIST:
+            return {"error": f"'{tool}' can't run in the background — it mutates critical state or isn't "
+                             "independent. Background-run independent recon/scans (spider, nuclei, "
+                             "content_discovery, fuzz_hunter, gau_nuclei_sweep, port_scan, sqlmap_scan, "
+                             "gowitness, wayback_urls, …); run state-changing tools (record_finding, "
+                             "set_target, export_report) in the foreground."}
+        if tool not in TOOL_REGISTRY:
+            return {"error": f"Unknown tool '{tool}'. Can't background a tool that doesn't exist."}
+        label = str(args.get("label") or f"{tool}({inner.get('url') or inner.get('target') or inner.get('domain') or ''})")[:80]
+        spawned = _bg.spawn(label, lambda: self.execute_tool_call(tool, inner, emit))
+        if spawned.get("error"):
+            return spawned
+        if emit and hasattr(emit, "info"):
+            try:
+                emit.info(f"[background] spawned {spawned['task_id']} — {label} (keep working; collect with check_tasks)")
+            except Exception:
+                pass
+        return {
+            "status": "spawned",
+            "task_id": spawned["task_id"],
+            "label": label,
+            "note": "Running in the BACKGROUND — do NOT wait on it. Keep testing other things this turn; "
+                    "call check_tasks later to pick up the result once it's done.",
+        }
+
     def execute_tool_call(self, tool_name: str, args: Any, emit: Any = None) -> Dict[str, Any]:
         """
         Executes a tool with hard code-level scope validation, safe method policy,
@@ -17028,6 +17134,12 @@ If there is nothing worth generalizing, return an empty array: []"""
         if tool_name == "parallel":
             return self._execute_parallel(args, emit)
 
+        if tool_name == "background_task":
+            # Spawns the inner tool in a daemon thread; that inner call goes back
+            # through execute_tool_call (scope-gated) itself, so this dispatch is
+            # just the fire-and-return handle — safe to run before the scope gate.
+            return self._execute_background_task(args, emit)
+
         # Internal memory & finding recording tools operate locally on target state.
         # manage_scope/save_file/delete_file join this list for the same reason: they
         # touch target.scope_rules / target workspace storage, not the network, so
@@ -17036,7 +17148,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         # host — gating it on is_in_scope would make it unable to do the one thing it's
         # for; delete_file's only "target" is a bare filename, which _extract_target_
         # from_args would wrongly try to parse as a host/URL).
-        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow", "profile", "map_surface", "stealth", "self_audit"):
+        if tool_name in ("record_finding", "dismiss_finding", "export_report", "read_artifact", "manage_scope", "manage_program", "save_file", "delete_file", "cookie_inspector", "recall_patterns", "capture_identity", "swap_session", "generate_hypotheses", "update_hypothesis", "save_auth_flow", "profile", "map_surface", "stealth", "self_audit", "check_tasks"):
             return spec.executor(args, self.target, emit)
 
         target_candidate = self._extract_target_from_args(args)
