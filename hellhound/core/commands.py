@@ -532,6 +532,29 @@ def _hunt_recorded_kinds(agent) -> set:
         return set()
 
 
+# Classes whose ONLY reliable test is a dedicated tool — so a bare "not_present"
+# claim is untrustworthy unless that tool was actually run this session. Caught
+# on the vulnlab benchmark: a run marked mass_assignment/cors/race not_present
+# (and exported thin) without ever probing them, which the gate couldn't tell
+# apart from a real negative. idor/sqli/jwt are deliberately NOT here — they have
+# several legit test paths (curl + verify_finding, response_diff, manual payloads)
+# so requiring one specific tool would false-reject honest negatives.
+_HUNT_CLASS_REQUIRED_TOOL = {
+    "mass_assignment": ("mass_assign_probe",),
+    "race": ("race_test",),
+    "cors": ("cors_checker",),
+}
+
+
+def _hunt_tools_used(agent) -> str:
+    """A blob of this session's history, for substring-checking which tools ran."""
+    try:
+        hist = agent.target.state.get("history") or []
+        return " ".join(str(e) for e in hist if isinstance(e, dict))
+    except Exception:
+        return ""
+
+
 def _hunt_completion_gaps(answer: str, agent):
     """
     Cross-check the model's COVERAGE block against reality. Returns
@@ -542,6 +565,7 @@ def _hunt_completion_gaps(answer: str, agent):
     tokens = {m.group(1).lower(): m.group(2).lower()
               for m in _HUNT_COVERAGE_TOKEN_RE.finditer(answer or "")}
     recorded_kinds = _hunt_recorded_kinds(agent)
+    tools_blob = _hunt_tools_used(agent)
     untested, unrecorded = [], []
     for cls in _HUNT_CLASSES:
         status = tokens.get(cls)
@@ -549,6 +573,12 @@ def _hunt_completion_gaps(answer: str, agent):
             untested.append(cls)
         elif status == "recorded" and not (_HUNT_FINDING_KINDS.get(cls, set()) & recorded_kinds):
             unrecorded.append(cls)
+        elif status == "not_present":
+            # Coverage verification: a dedicated-tool class claimed absent but
+            # whose tool never ran this session was not actually tested.
+            req = _HUNT_CLASS_REQUIRED_TOOL.get(cls)
+            if req and not any(t in tools_blob for t in req):
+                untested.append(cls)
     return untested, unrecorded
 
 
@@ -565,6 +595,11 @@ def _hunt_coverage_nudge(untested, unrecorded) -> str:
             f"exploit, verify it). Before marking any class not_present because 'the endpoint doesn't exist', "
             f"run content_discovery / fuzz_hunter to find UNLINKED endpoints (e.g. /fetch, /download, /ping, "
             f"/admin) first.")
+        _tool_hint = [f"{c} -> run {_HUNT_CLASS_REQUIRED_TOOL[c][0]}"
+                      for c in untested if c in _HUNT_CLASS_REQUIRED_TOOL]
+        if _tool_hint:
+            parts.append("You cannot mark these `not_present` without having run their dedicated tool this "
+                         "session: " + "; ".join(_tool_hint) + ".")
     parts.append("Then re-emit the COVERAGE block. Do not output ENGAGEMENT COMPLETE until every class is "
                  "`recorded` (with a real record_finding) or `not_present` (after really testing it).")
     return " ".join(parts)
