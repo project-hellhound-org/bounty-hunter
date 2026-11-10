@@ -23,7 +23,7 @@ do next.
 | `fuzz_hunter` | recursive **path** discovery with a generic wordlist | tech-stack-aware ordering (PHP→.php, etc.), always probe a curated high-value set (admin/api/backup/config/.git), recurse into discovered high-value dirs | ▢ next |
 | *(param-payload intelligence)* | — | NOT a module upgrade — type-appropriate payloads per param (numeric_id→IDOR, file_path→traversal, url→SSRF, search→SQLi/XSS) is a **reasoning-layer** concern: the brain consumes `map_surface`'s param-type→test-family inference when crafting curl/sqlmap/payload calls | ▢ (prompt/reasoning) |
 | `surface_auditor` | audits ports/headers/surface | rank findings by exploitability; emit a **class→endpoint attack plan** the brain can execute, not a flat dump | ▢ |
-| `graphql` | probes GraphQL | if introspection is open, auto-surface the **sensitive queries/mutations + injectable args**, not just the schema | ▢ |
+| `graphql` | probes GraphQL (shallow: "exposed?") | when introspection is open it now pulls the schema and returns `sensitive_operations` — destructive/privileged mutations (deleteUser, updateUserRole, transferFunds…) + sensitive-noun queries (getUser…) with their args + why each is a lead | ✅ done (13 tests) |
 | `js_miner` | finds endpoints in JS | ✅ `js_intel` (bundled secrets/PII) + now **flags high-value paths** (admin/delete/internal/secret disclosed in JS) as `sensitive_endpoints` so the admin panel URL leaked in JS is the headline, not buried | ✅ |
 | `sourceauditor` / `blobunpacker` | unpack sourcemaps | prioritise **secrets/auth-logic/endpoints** over raw dumps; feed the secrets store | ▢ |
 | `cloudscout` | cloud recon | map discovered buckets/metadata to **testable SSRF/takeover targets** | ▢ |

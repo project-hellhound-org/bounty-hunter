@@ -7962,6 +7962,70 @@ def _mirror_cors_evidence(res: Dict[str, Any], target: Target) -> None:
         pass
 
 
+# GraphQL operations that are high-value the moment introspection exposes them:
+# state-changing/privileged mutations and queries that return sensitive data.
+# A rule-based "GraphQL is exposed" result isn't actionable — the AI brain needs
+# to know WHICH operation to attack (can a low-priv user call deleteUser? is
+# there SQLi in a filter arg? does getUser leak passwords?).
+# A clearly destructive/privileged VERB, or a SENSITIVE NOUN, in an operation
+# name. A mutation is flagged if it's destructive OR touches a sensitive noun; a
+# query only on a sensitive noun — so generic state-changers like addReview /
+# updateProfile aren't noise, but deleteUser / updateUserRole / getUser are.
+_GQL_DESTRUCTIVE_VERB = re.compile(
+    r"delete|remove|drop|destroy|revoke|disable|ban\b|deactivat|refund|transfer|payout|grant|promote|reset", re.I)
+_GQL_SENSITIVE_NOUN = re.compile(
+    r"user|admin|role|permission|privileg|password|passwd|credential|token|secret|apikey|api_key|"
+    r"account|payment|billing|invoice|order|ssn|email|impersonat|session|auth|key\b|wallet|balance", re.I)
+
+
+def _flag_graphql_risks(schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flag the sensitive/dangerous operations in an introspected schema.
+    `schema` = {"queries": [names], "mutations": [{"name":.., "args":[..]}]}."""
+    risks = []
+    for m in (schema.get("mutations") or []):
+        name = m.get("name") if isinstance(m, dict) else str(m)
+        if not name:
+            continue
+        destructive = bool(_GQL_DESTRUCTIVE_VERB.search(name))
+        sensitive = bool(_GQL_SENSITIVE_NOUN.search(name))
+        if destructive or sensitive:
+            risks.append({"operation": name, "type": "mutation",
+                          "args": (m.get("args") if isinstance(m, dict) else None),
+                          "why": ("destructive/privileged mutation — test for broken authorization (can a "
+                                  "low-priv or anonymous caller invoke it?) and injection in its arguments")})
+    for q in (schema.get("queries") or []):
+        name = q if isinstance(q, str) else (q.get("name") if isinstance(q, dict) else None)
+        if name and _GQL_SENSITIVE_NOUN.search(name):
+            risks.append({"operation": name, "type": "query",
+                          "why": "query over sensitive data — test whether it returns other users'/privileged "
+                                 "data (IDOR/BOLA) or is injectable via its filter args"})
+    return risks
+
+
+def _fetch_graphql_schema(url: str, target: Target) -> Optional[Dict[str, Any]]:
+    """Send a targeted introspection query and return the query/mutation operation
+    names (+ mutation arg names). Best-effort; returns None if introspection is off
+    or the endpoint doesn't answer. Issues no destructive traffic — read-only."""
+    q = ("{__schema{queryType{fields{name}} mutationType{fields{name args{name}}}}}")
+    try:
+        auth = _target_auth_options(target)
+        r = _bounded_request(lambda: requests.post(
+            url, json={"query": q},
+            headers={"Content-Type": "application/json", **auth.get("auth_headers", {})},
+            cookies=auth.get("auth_cookies") or None, timeout=10, verify=False))
+        if r is None or r.status_code != 200 or "__schema" not in (r.text or ""):
+            return None
+        data = (r.json() or {}).get("data", {}).get("__schema", {})
+        queries = [f.get("name") for f in ((data.get("queryType") or {}).get("fields") or []) if f.get("name")]
+        mutations = [{"name": f.get("name"), "args": [a.get("name") for a in (f.get("args") or []) if a.get("name")]}
+                     for f in ((data.get("mutationType") or {}).get("fields") or []) if f.get("name")]
+        if not queries and not mutations:
+            return None
+        return {"queries": queries, "mutations": mutations}
+    except Exception:
+        return None
+
+
 def _execute_graphql_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     from hellhound.core.engine import HellhoundEngine
     url = args.get("url") or target.name
@@ -7974,10 +8038,34 @@ def _execute_graphql_probe(args: Dict[str, Any], target: Target, emit: Any) -> D
     engine = HellhoundEngine()
     try:
         res = engine.run_single("graphql", url, options=opts, emit=emit)
-        return {
-            "url": url,
-            "result": res
-        }
+        out = {"url": url, "result": res}
+        # Intelligence: if a GraphQL endpoint is live with introspection open,
+        # pull the schema and surface the DANGEROUS operations to attack, instead
+        # of stopping at "GraphQL is exposed".
+        try:
+            discovered = ((res or {}).get("intel") or {}).get("endpoints") or []
+            gql_url = discovered[0] if discovered else url
+            if isinstance(gql_url, dict):
+                gql_url = gql_url.get("url") or url
+            schema = _fetch_graphql_schema(str(gql_url), target)
+            if schema:
+                risks = _flag_graphql_risks(schema)
+                out["introspection_enabled"] = True
+                out["operation_counts"] = {"queries": len(schema.get("queries") or []),
+                                           "mutations": len(schema.get("mutations") or [])}
+                if risks:
+                    out["sensitive_operations"] = risks[:25]
+                    out["graphql_note"] = (
+                        "Introspection is OPEN and exposes sensitive operations (above). This is itself an "
+                        "info-disclosure finding, and each listed op is a lead: test the mutations for broken "
+                        "authorization (call them as a low-priv/anonymous user) and the args of both for "
+                        "injection/IDOR. Craft the queries with curl and verify_finding before recording.")
+                    if emit and hasattr(emit, "warn"):
+                        emit.warn(f"[graphql] introspection open — {len(risks)} sensitive operation(s): "
+                                  f"{', '.join(r['operation'] for r in risks[:6])}")
+        except Exception:
+            pass  # intelligence layer is additive; never break the base result
+        return out
     except Exception as e:
         return {"url": url, "error": f"GraphQL check error: {e}"}
 
