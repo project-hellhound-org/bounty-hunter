@@ -50,6 +50,7 @@ from hellhound.core.ai_utils import (
     SYNTHESIZER_PERSONA,
     CHAT_PERSONA_SLM,
     ThinkingIndicator,
+    tool_text_fallback_enabled as _tool_text_fallback_enabled,
 )
 from hellhound.core.http_utils import (
     merge_global_context,
@@ -17846,6 +17847,12 @@ INSTRUCTIONS:
         # report_requested is added here so target-independent report/export
         # requests can still reach real tool execution with no target set.
         if (has_real_target or report_requested) and not _skip_orchestrator_loop:
+            # Whether to parse tool calls out of TEXT content at all this turn. On
+            # a native-FC-reliable provider (Claude) this is False, so the tool
+            # path is provably regex-free and structurally can't hit the
+            # mid-JSON-truncation dead-end (there's no text tool-call to cut).
+            # Computed once per turn (config-driven; see ai_utils).
+            _text_tool_fallback = _tool_text_fallback_enabled()
             for iteration in range(max_iterations):
                 self._current_turn = iteration + 1
                 if cancel_check and cancel_check():
@@ -17986,8 +17993,14 @@ INSTRUCTIONS:
                 if isinstance(ai_resp, str):
                     _prev_ai_resp = ai_resp
 
+                # Text-content tool-call extraction (the regex/brace-scan
+                # fallback). Skipped entirely on a native-FC-reliable provider
+                # (_text_tool_fallback False) — Claude emits structured tool_use
+                # only, so there's nothing in prose to parse and nothing a length
+                # cap can slice mid-object. Only the providers that scramble calls
+                # into text (NVIDIA, local) run this.
                 # Check for JSON tool invocation in text response (if native tool call didn't return a dict)
-                if not tool_call and isinstance(ai_resp, str):
+                if _text_tool_fallback and not tool_call and isinstance(ai_resp, str):
                     json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', ai_resp)
                     if json_match:
                         try:
@@ -18000,12 +18013,12 @@ INSTRUCTIONS:
                 # Balanced-brace scan — catches tool-call JSON that's well-formed
                 # except for stray trailing content after it (e.g. one extra
                 # '}'), which the older greedy regexes below fail on outright.
-                if not tool_call and isinstance(ai_resp, str) and '"tool"' in ai_resp:
+                if _text_tool_fallback and not tool_call and isinstance(ai_resp, str) and '"tool"' in ai_resp:
                     parsed = _extract_first_balanced_json(ai_resp)
                     if isinstance(parsed, dict) and "tool" in parsed:
                         tool_call = parsed
 
-                if not tool_call and isinstance(ai_resp, str):
+                if _text_tool_fallback and not tool_call and isinstance(ai_resp, str):
                     tool_json_match = re.search(r'(\{\s*"tool"\s*:\s*[\s\S]*\})', ai_resp)
                     if tool_json_match:
                         try:
@@ -18020,10 +18033,10 @@ INSTRUCTIONS:
                 # budget mid-JSON often leaves just `{"tool": "self_audit", "ar...`
                 # — unparseable, so every extractor above misses it and the turn
                 # dead-ends. A NO-ARG tool has nothing to lose, so recover it.
-                if not tool_call and isinstance(ai_resp, str):
+                if _text_tool_fallback and not tool_call and isinstance(ai_resp, str):
                     tool_call = _recover_noarg_tool_call(ai_resp) or tool_call
 
-                if not tool_call:
+                if _text_tool_fallback and not tool_call:
                     # Catch patterns like: record_finding { ... } or (Suggested next tool: record_finding { ... })
                     for reg_tool in TOOL_REGISTRY.keys():
                         pattern = rf'(?:Suggested next tool:\s*)?\b({reg_tool})\b\s*(\{{[\s\S]*\}})'

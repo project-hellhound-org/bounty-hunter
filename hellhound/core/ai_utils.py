@@ -132,6 +132,15 @@ def load_config() -> Dict[str, Any]:
         # getting truncated and needing "continue". Still overridable via
         # ~/.hellhound/config.json if a provider/budget needs it tighter.
         "max_response_tokens": 16384,
+        # Whether tool calls may be parsed out of TEXT content (the regex/brace-
+        # scan fallback) on top of native tool_calls. "auto" (default): off for a
+        # provider with reliable native function-calling (Claude emits structured
+        # tool_use only — so the path stays regex-free AND can't hit the mid-JSON
+        # truncation dead-end), on for providers that scramble calls into prose
+        # (NVIDIA Nemotron, local Ollama). Set "1"/true to force native-only for
+        # ANY provider, "0"/false to always keep the fallback. Env override:
+        # HELLHOUND_NATIVE_TOOLS_ONLY. See tool_text_fallback_enabled().
+        "native_tools_only": "auto",
         # Ceiling on tool calls per user turn in Agent.handle_message()'s
         # orchestrator loop. Kept generous (Claude-Code-CLI style — run
         # until DONE, not until an arbitrary shallow cap) because multi-stage
@@ -1110,6 +1119,48 @@ class _RepetitionGuard:
         window = self._buffer[-self._window_len:]
         occurrences = window.count(tail)
         return occurrences > self.max_repeats
+
+
+# Providers whose NATIVE function-calling is reliable enough that the agent's
+# text-JSON tool-call fallback (the regex/brace-scan layer) is pure dead weight:
+# the model emits structured tool_use blocks, never tool-call JSON in prose, so
+# there is nothing to regex-extract and — critically — nothing that can be sliced
+# off mid-object by a generation-length cap. Claude is the reference case. Other
+# providers (NVIDIA Nemotron, local Ollama) DO sometimes scramble calls into text,
+# so they keep the fallback.
+_NATIVE_FC_RELIABLE = frozenset({"anthropic"})
+
+
+def active_orchestrator_provider() -> str:
+    """The provider the orchestrator role actually runs on, resolved the same way
+    ask_neural_core resolves it (role override, then the global ai_provider)."""
+    cfg = load_config()
+    return str(cfg.get("orchestrator_provider") or cfg.get("ai_provider", "ollama") or "").lower()
+
+
+def tool_text_fallback_enabled() -> bool:
+    """Whether the agent should also parse tool calls out of TEXT content (its
+    regex/brace-scan fallback), on top of native tool_calls.
+
+    For a provider with reliable native function-calling (Claude) this returns
+    False: the tool-use path stays provably regex-free AND structurally immune to
+    the mid-JSON-truncation dead-end, because there is never a text tool-call to
+    cut. Providers that scramble calls into prose keep the fallback (True).
+
+    Override order (highest first): env HELLHOUND_NATIVE_TOOLS_ONLY, config
+    `native_tools_only` — each accepts 1/true (force native-only for ANY
+    provider), 0/false (always keep the fallback), or auto (per-provider)."""
+    env = os.environ.get("HELLHOUND_NATIVE_TOOLS_ONLY", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return False
+    if env in ("0", "false", "no", "off"):
+        return True
+    knob = str(load_config().get("native_tools_only", "auto")).strip().lower()
+    if knob in ("1", "true", "yes", "on"):
+        return False
+    if knob in ("0", "false", "no", "off"):
+        return True
+    return active_orchestrator_provider() not in _NATIVE_FC_RELIABLE
 
 
 def call_ai(prompt: str, provider: str, api_key: str, model: str = None, timeout: int = 300, system_prompt: str = None, history: list = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None, role: str = "orchestrator", tool_choice: str = "auto") -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
