@@ -3654,6 +3654,7 @@ def _compute_auto_continue(
     final_response: str,
     streak: int,
     streak_cap: int = 8,
+    truncated_tool_calls: bool = False,
 ) -> bool:
     """
     Pure decision function for whether handle_message's caller (the CLI
@@ -3663,7 +3664,16 @@ def _compute_auto_continue(
     AUTO-CONTINUE DECISION comment at its call site for the full reasoning;
     this is just the boolean logic.
     """
-    if not timed_out or was_cancelled or not tools_executed:
+    if was_cancelled:
+        return False
+    # A generation-length truncation mid-tool-call is NEVER a deliberate stop:
+    # the model intended more tool calls and the reply got cut off while emitting
+    # the JSON (the "say continue to run that last one" dead-end). Auto-continue
+    # it the same way Claude Code seamlessly continues a length-capped response —
+    # don't make the researcher type "continue". Bounded by the same streak cap.
+    if truncated_tool_calls:
+        return (not _looks_like_question_for_researcher(final_response)) and streak < streak_cap
+    if not timed_out or not tools_executed:
         return False
     if new_finding_this_turn:
         return False
@@ -19659,6 +19669,11 @@ INSTRUCTIONS:
         _findings_count_at_turn_end = len(self.target.findings) if isinstance(self.target.findings, list) else 0
         _new_finding_this_turn = _findings_count_at_turn_end > _findings_count_at_turn_start
         _auto_continue_streak = getattr(self, "_auto_continue_streak", 0)
+        # The turn ended on a generation-length truncation mid-tool-call (the
+        # "say continue to run that last one" message) — detect it so the turn
+        # auto-continues instead of dead-ending, Claude-Code-style.
+        _truncated_tool_calls = bool(re.search(
+            r"cut off mid-?json|generation-length limit", str(final_response or ""), re.I))
         should_auto_continue = _compute_auto_continue(
             timed_out=_timed_out,
             was_cancelled=_was_cancelled,
@@ -19666,6 +19681,7 @@ INSTRUCTIONS:
             new_finding_this_turn=_new_finding_this_turn,
             final_response=final_response,
             streak=_auto_continue_streak,
+            truncated_tool_calls=_truncated_tool_calls,
         )
         self._auto_continue_streak = (_auto_continue_streak + 1) if should_auto_continue else 0
         self.target.state["last_turn_diagnostics"]["auto_continue"] = should_auto_continue

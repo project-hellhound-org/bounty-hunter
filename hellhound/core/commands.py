@@ -469,7 +469,11 @@ def handle_scan(args: List[str], session_context: Dict[str, Any], emit: Any,
 _HUNT_DONE_RE = re.compile(r"\bENGAGEMENT\s+COMPLETE\b", re.I)
 _HUNT_PENDING_RE = re.compile(
     r"next steps?|what'?s left|haven'?t (?:yet|tested)|in progress|i'?ll (?:start|now|continue)|"
-    r"still (?:need|to)|remaining|left to test|to be tested|let me continue|moving on to", re.I)
+    r"still (?:need|to)|remaining|left to test|to be tested|let me continue|moving on to|"
+    # a generation-length truncation mid-tool-call is NOT a deliberate stop — the
+    # model intended more tool calls and got cut off, so the loop must continue
+    # (Claude-Code-style) instead of ending on a "say continue" dead-end.
+    r"cut off mid-?json|generation-length limit|didn'?t fire|say .?continue.? or", re.I)
 
 # The vuln classes a hunt must account for, and the record_finding `kind`s that
 # count as "actually recorded" for each. The completion gate (below) cross-checks
