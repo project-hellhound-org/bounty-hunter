@@ -15326,6 +15326,45 @@ _RELOCK_HOST_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Out-of-band / attacker-infrastructure companion domains. These are NOT
+# "sibling apps you might wander into and spray by mistake" (what the host-focus
+# pin guards against) — they are the engagement's OWN tooling: a PortSwigger
+# exploit-server you host a payload on and read the access log of, a Burp
+# Collaborator / interactsh / oastify callback domain. Using them is the POINT
+# of a cross-domain exploit (password-reset poisoning reads the leaked token out
+# of the exploit-server's access log; blind XSS/SSRF reads an OOB callback), so
+# the focus pin must never block them — otherwise an autonomous run, with no
+# human around to say "also check the exploit-server", dead-ends the moment it
+# needs its own infrastructure. They still pass the hard scope gate first.
+_OOB_COMPANION_RE = re.compile(
+    r'(?:^|\.)(?:'
+    r'exploit-server\.net|'                # PortSwigger exploit-server (host payload, read access log)
+    r'oastify\.com|burpcollaborator\.net|'
+    r'interact\.sh|oast\.(?:pro|live|site|fun|me|online)|'
+    r'requestrepo\.com|pipedream\.net|canarytokens\.(?:com|org)'
+    r')$',
+    re.IGNORECASE,
+)
+
+
+def _host_focus_allows(active_host: str, cand_host: str, pivot_open: bool) -> bool:
+    """Whether a tool call to cand_host is allowed under the active host-focus pin.
+
+    Allowed when: focus has been opened; there's no concrete host to compare;
+    it's the active host or a sub/parent of it (ordinary same-target recon); or
+    cand_host is OOB/attacker-infrastructure the engagement legitimately drives
+    (see _OOB_COMPANION_RE). Otherwise a different in-scope sibling domain is
+    blocked so the agent stays on what it was asked to test."""
+    if pivot_open:
+        return True
+    if not active_host or not cand_host or active_host == cand_host:
+        return True
+    if cand_host.endswith("." + active_host) or active_host.endswith("." + cand_host):
+        return True
+    if _OOB_COMPANION_RE.search(cand_host):
+        return True
+    return False
+
 
 def _url_in_path_scope(url: str, path_scope: str) -> bool:
     """True if url's path falls under path_scope (e.g. '/app')."""
@@ -17122,11 +17161,12 @@ If there is nothing worth generalizing, return an empty array: []"""
             active_reference = self.target.host or self.target.name
             active_host, _ = normalize_host(active_reference)
             cand_host, _ = normalize_host(target_candidate)
-            same_host_family = (
-                not active_host or not cand_host or active_host == cand_host
-                or cand_host.endswith("." + active_host) or active_host.endswith("." + cand_host)
-            )
-            if not same_host_family:
+            # OOB/attacker-infrastructure companions (exploit-server, Collaborator,
+            # interactsh…) are never a "spray" target — they're how a cross-domain
+            # exploit actually lands — so they're exempt from the focus pin even
+            # though they're a different domain. Everything else different-domain
+            # stays pinned. (_host_focus_allows folds in the same-host-family case.)
+            if not _host_focus_allows(active_host, cand_host, self._turn_host_pivot_open):
                 msg = (
                     f"[!] not doing that — '{cand_host}' is a different in-scope domain under this program, "
                     f"but the current focus is '{active_host}'. Say e.g. \"also check {cand_host}\" or "
