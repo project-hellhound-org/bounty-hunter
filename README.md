@@ -357,39 +357,28 @@ You don't need to invoke these yourself — the agent pulls in whichever one a t
 
 ## Recent Upgrades
 
-The newest landings, in short. Full detail (including everything older) is in [CHANGELOG.md](CHANGELOG.md).
+Highlights of recent work (full history in [CHANGELOG.md](CHANGELOG.md)):
 
-- **Real-world fixes from an actual engagement log** — anonymous-session-cookie churn no longer wedges the artifact pre-flight gate open forever; `record_finding` evidence lookup prefers the actual payload-bearing proof over a coincidentally-same-URL unrelated request; `browser_control` falls back to a semantic DOM match when a guessed `fill`/`click` selector times out; a new error-streak pivot reflex nudges the model away from a tool that's outright failing repeatedly (not just coming back empty) toward an approach that's already proven to work; `export_report` now splits unrelated findings into separate reports by default (one submission per vuln, like a real engagement) instead of bundling everything into one file; saved finding/report filenames are slugged from the finding's own title instead of being indistinguishable `finding_<target>_<timestamp>.html`; `dismiss_finding` now has a `resolution` of `'patched'` distinct from `'false_positive'`, so marking a retested-and-fixed finding resolved doesn't also permanently block a real regression from ever being re-flagged.
-- **`save_auth_flow`/`replay_auth_flow`** — record a login once via ordinary `browser_control` calls, replay it headless anytime afterward (fresh session by default, per-step scope re-check, optional auto-`capture_identity` on success).
-- **Identity model** (`capture_identity`/`swap_session`) — snapshot a session, swap which one is active. Bridged to `browser_control`, and extended to `fuzz_hunter`/`sqlmap_scan`/`hydra` (bearer tokens included, not just cookies).
-- **`generate_hypotheses`/`update_hypothesis`** — a rule-driven lead board ranking likely vuln classes from the fingerprinted stack, endpoints, params, WAF, and now `hydra`'s real per-parameter role findings (admin flags, auth-sensitive params, OAuth sinks), plus Rails/Drupal rule coverage.
-- **`verify_finding`** — real code-level signal checking for sqli/xss/ssrf/ssti/cors/idor, not just "the request went through."
-- **Persistent target profile** (`profile` tool) — a per-target record of how a host actually behaves (tech stack, WAF/protection + how often it blocks, rate-limiting/429s observed, auth mechanism, one-off quirks). Most of it fills in automatically as curl/recon tools run — a 429, a WAF block, the anonymous-session-cookie churn quirk — and it's injected into the model's context every turn, so a hunt resumed days later already knows "this host 429s fast / only honors a session cookie / mints a fresh PHPSESSID on every anonymous hit" instead of re-learning it. `profile(action='note')` records anything the model reasons out itself.
-- **Headless XSS execution confirmation** — `browser_control`'s `confirm_script_execution` + `verify_finding`'s `verify_xss` now confirm a payload actually *executes* in a real browser (not just that it reflected unescaped).
-- **`response_diff`** — fire a baseline and a test request against the same endpoint and get the exact delta: status, length, which JSON fields changed (recursively, by path — `role: user -> admin`), or a line diff for non-JSON. The deterministic backbone for IDOR/BOLA/access-control/mass-assignment work — including a clean "IDENTICAL / no field differs" verdict that refutes a lot of false IDOR claims. Both sides run through the scope-gated curl path; it reports the delta, it doesn't assert the finding.
-- **Claude Code-style interactive terminal (Textual TUI)** — a real full-screen console: a scrollable transcript, a pinned input box at the bottom, and every tool call rendered as a **clickable, collapsible card** you can expand to see the *actual* request/response (no more "a tool ran" with no visibility into what `curl` sent and got back). It reuses the exact same agent loop and slash-command dispatch as before — same brain, new shell — and is the default console now. The classic prompt_toolkit REPL is still one env var away (`HELLHOUND_CLASSIC_UI=1`), and is used automatically if the TUI can't start. The hound banner is now solid red across both. Includes: an **arrow-key slash-command autocomplete dropdown** (type `/` → pick a command; `/target `/`/program ` suggest saved target/program names), a **live animated working indicator** (spinner + rotating status phrases, pins to the running tool), markdown-rendered replies, and `exit`/`quit` support.
-- **`/program rename <old> <new>`** — fix a typo'd program name: moves the program's folder, updates its record, and re-points every attached domain and symlink.
-- **`recall_patterns`** — cross-target pattern memory; a technique that worked on a similarly-stacked target surfaces automatically.
-- **`manage_program`** fixed — creating a program no longer silently drags in whatever placeholder target happened to be active.
+- **Solves PortSwigger labs end-to-end** — reset-poisoning via host-header injection, exposed-API-doc user deletion, reflected / stored / DOM XSS (real browser `alert()`), CORS.
+- **Exploitation validation hardened** — XSS gated on real browser execution (a browser-disproved payload is refused, not recorded), `verify_finding` live class-checks, dismissed false positives can't silently re-appear, per-finding report splitting.
+- **Tool-calling made robust** — native-function-calling-first across every provider; the reasoning-model preamble that used to truncate calls mid-JSON is disabled; a provably regex-free path on Claude.
+- **Identity & session model** — `capture_identity`/`swap_session` and `save_auth_flow`/`replay_auth_flow`, bridged into the headless browser and the fuzzers.
+- **Textual TUI** — full-screen console with clickable, collapsible request/response cards (classic REPL still available via `HELLHOUND_CLASSIC_UI=1`).
+- **Codebase refactor** — the 20k-line `agent.py` is being split into focused `tools/` modules (one file per tool domain), each change gated by an AST import scan + smoke test.
 
 ---
 
 ## Roadmap — What's Next
 
-The honest gap between "runs tools well" and "hunts like a pro" is architecture, not more tools. What's still genuinely open, in rough priority order (landed items and the fuller reasoning behind partly-reworked ones are in [CHANGELOG.md](CHANGELOG.md)):
+The real gap between "runs tools well" and "hunts like a pro" is architecture, not more tools. Open, in rough priority (fuller reasoning in [CHANGELOG.md](CHANGELOG.md)):
 
-1. **Persistent, scriptable browser — interception** — record/replay is done (`save_auth_flow`/`replay_auth_flow`, below); request/response interception is what's left.
-2. **Burp/Caido ↔ identity model bridge** — Burp/Caido are already integrated as MCP-callable tools (`/mcp burp`, `/mcp caido` — history search, send-request, create-finding); what's still open is bridging `capture_identity`/`swap_session` to pull/push sessions through them, the way `browser_control` already is.
-3. **Intelligent request/response correlation** *(landed)* — baseline-vs-test response diffing (`response_diff`: JSON field-level + line diff, the IDOR/access-control/mass-assignment backbone), plus `map_surface`: spider output auto-parameterized by inferred data type (ID, email, file, url, token, json, boolean → each mapped to its test family) and endpoints auto-grouped by function (auth, payments, admin, upload, user, api) into a ranked fuzz plan.
-4. **Real race/logic testing** *(first slice landed)* — `race_test`: fires N barrier-synchronized identical requests at a single-use action (redeem/withdraw/transfer/coupon), counts how many actually succeeded (`success_marker`), and GETs a `state_url` before/after to show the state over-mutating. Still open: tighter single-packet (HTTP/2) sync and multi-context coordinated races.
-5. **Stealth/evasion as a first-class profile** *(first slice landed)* — `stealth`: a WAF-aware, rotated, browser-realistic header set (so a WAF doesn't false-block legit authorized test traffic), tuned to whichever WAF the target profile already fingerprinted. Still open: TLS-fingerprint / IP (residential proxy) rotation and distributed scan coordination.
-6. **Screenshots auto-attached per finding**, and a wider finding-chain pattern set beyond the first curated list.
-7. **Passive → active intel fusion** — CT logs + Wayback + gau + OTX deduped straight into `httpx`/fuzzing; JS sourcemap recovery → secret extraction → endpoint mapping, fed straight back into the fuzzer.
-8. **A real playbook engine** — conditional branching workflows ("new subdomain → screenshot → tech-detect → if WordPress, run X"), not just sequential tool chaining.
-
-**Next concrete step:** the Burp/Caido ↔ identity model bridge, or request/response interception for the scriptable browser.
+1. **Scriptable-browser request/response interception** — record/replay already landed; interception is what's left.
+2. **Burp/Caido ↔ identity bridge** — push/pull sessions through the already-integrated MCP tools.
+3. **Passive → active intel fusion** — CT logs / Wayback / gau / OTX deduped straight into probing; JS sourcemap → secrets → endpoints → fuzzer.
+4. **A playbook engine** — conditional branching workflows, not just sequential tool chaining.
 
 ---
+
 
 ## Scope Policy & Legal Compliance
 
