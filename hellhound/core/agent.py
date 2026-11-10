@@ -5807,6 +5807,21 @@ def _execute_browser_control(args: Dict[str, Any], target: Target, emit: Any) ->
     if isinstance(result, dict):
         result["session"] = session_id
 
+    # Remember the LATEST real-execution check so record_finding can refuse to
+    # log an XSS the browser just DISPROVED. confirm_script_execution is the
+    # authority on whether injected JS actually ran; recording an XSS finding
+    # right after it returned executed=False is a false positive (the payload
+    # landed in a context it can't execute in — e.g. inside an HTML attribute
+    # needing a "> breakout). Latest-wins: a later executed=True clears it.
+    if (action == "confirm_script_execution" and isinstance(result, dict)
+            and "executed" in result and hasattr(target, "state") and isinstance(target.state, dict)):
+        target.state["_last_xss_exec_check"] = {
+            "executed": bool(result.get("executed")),
+            "marker": result.get("marker"),
+            "url": result.get("url"),
+            "ts": time.time(),
+        }
+
     # Mirror curl's behavior: whatever cookies the browser is holding after
     # this action get folded into target.state, so curl/other tools (and a
     # later browser_control call) can reuse a session the browser itself
@@ -9837,6 +9852,31 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     severity = str(args.get("severity", "medium")).strip().lower()
     request_ref = str(args.get("request_ref", "")).strip()
     note = str(args.get("note", "")).strip()
+
+    # False-positive guard for XSS. confirm_script_execution is the authority on
+    # whether injected JS actually RAN in the browser; if its most recent result
+    # for this target was executed=False, recording an XSS now contradicts the
+    # beast's own evidence — the payload landed in a context it can't execute in
+    # (classically inside an HTML attribute / a document.write sink that needs a
+    # "> breakout first). Refuse it. Latest-wins: a working payload that
+    # re-confirms executed=True overwrites the check and clears this block.
+    if "xss" in kind and hasattr(target, "state") and isinstance(target.state, dict):
+        _xc = target.state.get("_last_xss_exec_check")
+        if isinstance(_xc, dict) and _xc.get("executed") is False:
+            return {
+                "status": "blocked_execution_disproved",
+                "note": (
+                    "Not recording this XSS — your last confirm_script_execution on this target came back "
+                    "executed=False, i.e. the browser PROVED the injected JS did NOT run. The payload landed "
+                    "in a context it can't execute in — very commonly inside an HTML attribute, or a "
+                    "document.write sink where your input sits inside <img src=\"...INPUT\">, so you must "
+                    "break OUT of the attribute first with a \"> (or '> ) prefix, e.g. "
+                    "\"><svg onload=alert(1)>. Recording it now would be a false positive. Craft a payload "
+                    "that actually fires alert()/sets window.__hh_xss_proof, re-run confirm_script_execution "
+                    "until executed=True, THEN record it."
+                ),
+                "last_execution_check": _xc,
+            }
 
     # Refuse to (re-)record something the researcher already explicitly
     # reviewed and rejected as a false positive on THIS target. Without
