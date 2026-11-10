@@ -322,10 +322,40 @@ real program — know the difference before you rely on lab experience:
   "a test account you registered/were given" (safe to complete fully).
 
 ## 7. Host Header Injection (Password Reset Poisoning)
-If the response body does not directly leak the token:
-- Test if the backend dynamically constructs the reset URL using the client-supplied `Host` header:
-  - Submit the password recovery request with a modified `Host` or `X-Forwarded-Host` header pointing to an external domain or controlled listener.
-  - If the server accepts the header and issues a reset email containing the poisoned host, the reset token will be delivered to the attacker-controlled server upon user click.
+If the reset token is NOT leaked in the response body, the app may build the reset
+link from a client-controlled host — a top account-takeover vector. Work it as a
+full chain; detecting reflection is only step 1, the takeover isn't real until you
+CAPTURE the token and reset the victim.
+
+1. **DETECT with `host_header_probe`** against the forgot-password / reset-request
+   endpoint — e.g. `host_header_probe {"url": ".../forgot-password", "method":
+   "POST", "body": "username=<victim>"}`. It overrides `Host`, `X-Forwarded-Host`,
+   `X-Host`, `X-Forwarded-Server`, `Forwarded` and reports which vector gets your
+   marker host reflected into a link / redirect / cookie. **Many apps (and the
+   "middleware" variant) trust `X-Forwarded-Host` specifically even when a raw
+   `Host` override is rejected by the front-end/CDN — always test both; the probe
+   does.**
+2. **WEAPONISE:** re-send the real password-reset request for the VICTIM with the
+   vulnerable header set to YOUR out-of-band host (your exploit-server / Burp
+   Collaborator / the `listener` tool). The app now emails the victim a reset link
+   whose host is yours.
+3. **CAPTURE THE TOKEN — the step that actually completes the takeover:**
+   - If a victim must click (a real app, or a lab's "Deliver email to victim"
+     action), trigger that first.
+   - Then **READ YOUR OOB SERVER'S ACCESS LOG**: `curl` the exploit-server's
+     access-log URL (or `listener` poll) and pull the reset token out of the
+     logged request path/query — e.g. `?temp-forgot-password-token=...`,
+     `?token=...`, `?reset=...`. The token is in the URL the victim's browser
+     requested against your host. (The exploit-server is in-scope infrastructure
+     for this engagement — reach it directly; it is not a focus violation.)
+4. **RESET & TAKE OVER:** submit the captured token to the app's OWN reset
+   endpoint (e.g. `/forgot-password?temp-forgot-password-token=<token>` with the
+   new password), then log in as the victim. Confirm with an authenticated request
+   as the victim, then `record_finding` with the captured access-log line + the
+   new victim session as evidence.
+
+Dangling-markup / back-office variants deliver the poisoned link to staff instead
+of a self-service victim — same chain, different recipient.
 
 ## 8. Post-Authentication Privilege Assessment
 Once authenticated into any account:
