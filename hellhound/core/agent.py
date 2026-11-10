@@ -3311,12 +3311,18 @@ _DIAG_QUESTION_RE = re.compile(
 # target, meaning real hunting work is already underway) still registers
 # normally — nothing here is a permanent opt-out.
 _MCP_RELEVANT_RE = re.compile(
-    r"\b(mcp|burp|caido|repeater|intercept(?:ing|or)?|proxy(?:ing)?)\b"
-    r"|\btools?\b[^.?!]{0,40}\b(you\s+have|access|available|see|connected|installed)\b"
-    r"|\baccess\s+to\s+(?:the\s+|your\s+)?tools?\b"
-    r"|\bwhat\s+tools\b",
+    r"\b(mcp|burp|caido|repeater|intercept(?:ing|or)?|proxy(?:ing)?)\b",
     re.IGNORECASE,
 )
+# CAUGHT IN THE WILD (TUI): "what tools do you have right now compared to old
+# archi" used to match here (via a generic \btools?\b...you have alternation)
+# and fire a Burp+Caido connection attempt — which, with Caido's MCP server not
+# running, dumped "[!] No luck getting into Burp" + "Couldn't reach Caido —
+# unhandled errors in a TaskGroup" into a reply that had NOTHING to do with
+# MCP. The researcher's own built-in tools (answered by self_audit) are not MCP
+# tools; "tools" alone must NEVER imply Burp/Caido. Registration now fires only
+# on an explicit mcp/burp/caido/proxy/repeater/intercept mention (or the /mcp
+# command, which triggers it directly regardless of this gate).
 
 # CAUGHT IN THE WILD (2026-10): registering BOTH Burp and Caido's tools
 # together whenever the message mentioned either one (via _MCP_RELEVANT_RE
@@ -14833,6 +14839,31 @@ def _strip_payload_context(text: str) -> str:
     return cleaned
 
 
+def _recover_noarg_tool_call(text: str) -> Optional[Dict[str, Any]]:
+    """Recover a truncated NO-ARG tool call from text.
+
+    A reasoning model that ran out of token budget mid-JSON often leaves only
+    `{"tool": "self_audit", "ar...` in its content — unparseable as JSON, so the
+    balanced-brace / regex extractors all miss it and the turn dead-ends asking
+    the researcher to "say continue" (which just re-truncates identically). But a
+    tool with NO required parameters has nothing to lose: the quoted name alone IS
+    the whole call. Recover it and run it with empty args. Returns None for any
+    tool that has required args, so this can never fabricate a call that was
+    missing arguments."""
+    if not text or '"tool"' not in text:
+        return None
+    m = re.search(r'"tool"\s*:\s*"([a-zA-Z_][a-zA-Z0-9_]*)"', text)
+    if not m:
+        return None
+    spec = TOOL_REGISTRY.get(m.group(1))
+    if spec is None:
+        return None
+    req = spec.parameters.get("required") if isinstance(getattr(spec, "parameters", None), dict) else None
+    if req:  # has required args -> don't guess
+        return None
+    return {"tool": m.group(1), "args": {}}
+
+
 def _extract_first_balanced_json(text: str) -> Optional[dict]:
     """
     Find the first '{' in text and parse the balanced JSON object it opens,
@@ -18426,6 +18457,14 @@ INSTRUCTIONS:
                                 tool_call = parsed
                         except Exception:
                             pass
+
+                # Safety net for the truncated-no-arg-tool dead-end (see
+                # _recover_noarg_tool_call): a reasoning model that ran out of
+                # budget mid-JSON often leaves just `{"tool": "self_audit", "ar...`
+                # — unparseable, so every extractor above misses it and the turn
+                # dead-ends. A NO-ARG tool has nothing to lose, so recover it.
+                if not tool_call and isinstance(ai_resp, str):
+                    tool_call = _recover_noarg_tool_call(ai_resp) or tool_call
 
                 if not tool_call:
                     # Catch patterns like: record_finding { ... } or (Suggested next tool: record_finding { ... })

@@ -1442,8 +1442,23 @@ def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-inst
             "max_tokens": resolved_max_tokens,
             "stream": True,
         }
+        # Reasoning models (Nemotron, DeepSeek-R1, QwQ, Magistral…) emit a long
+        # <think> preamble BY DEFAULT. When the caller asked thinking=False (the
+        # orchestrator does — it wants a decisive tool pick, not rumination) we
+        # must disable it EXPLICITLY, not just omit the flag: otherwise the model
+        # reasons anyway, the preamble eats the token budget, and a tiny tool call
+        # (self_audit) at the end gets sliced off mid-JSON — the TUI dead-end the
+        # researcher kept hitting. Only sent for known reasoning models so a plain
+        # model whose chat template has no "thinking" var is never handed an
+        # unknown kwarg.
+        _is_reasoning_model = any(
+            k in (model or "").lower()
+            for k in ("nemotron", "deepseek-r1", "deepseek-v3", "qwq", "magistral", "-r1", "reason")
+        )
         if thinking:
             payload["chat_template_kwargs"] = {"thinking": True}
+        elif _is_reasoning_model:
+            payload["chat_template_kwargs"] = {"thinking": False}
 
         if tools:
             payload["tools"] = tools
