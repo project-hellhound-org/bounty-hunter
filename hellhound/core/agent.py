@@ -14109,9 +14109,19 @@ def _recover_noarg_tool_call(text: str) -> Optional[Dict[str, Any]]:
     the whole call. Recover it and run it with empty args. Returns None for any
     tool that has required args, so this can never fabricate a call that was
     missing arguments."""
-    if not text or '"tool"' not in text:
+    if not text:
         return None
+    # Beast-native shape: {"tool": "self_audit", "args": ...
     m = re.search(r'"tool"\s*:\s*"([a-zA-Z_][a-zA-Z0-9_]*)"', text)
+    if not m:
+        # OpenAI/NVIDIA-NIM function-call shape emitted as TEXT (what Nemotron
+        # falls back to when it doesn't use the native tool_calls channel):
+        # {"name": "self_audit", "arguments": "{}"} — the beast's own regexes
+        # all look for "tool", so a truncated one of these used to slip past
+        # every extractor and dead-end. Match it too (anchored on the following
+        # "arguments" key so an unrelated "name" field can't be mistaken for a
+        # tool call).
+        m = re.search(r'"name"\s*:\s*"([a-zA-Z_][a-zA-Z0-9_]*)"\s*,\s*"arguments"', text)
     if not m:
         return None
     spec = TOOL_REGISTRY.get(m.group(1))
