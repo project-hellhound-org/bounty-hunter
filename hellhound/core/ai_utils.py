@@ -1306,14 +1306,46 @@ def _parse_native_tool_calls(tool_calls: List[Dict[str, Any]]):
         name = (fn.get("name") or "").strip()
         if not name:
             continue
-        try:
-            parsed_args = json.loads(fn.get("arguments", "{}") or "{}")
-        except Exception:
-            parsed_args = {}
+        raw_args = fn.get("arguments", "{}")
+        if isinstance(raw_args, dict):
+            parsed_args = raw_args  # Ollama returns args as a dict already, not a JSON string
+        else:
+            try:
+                parsed_args = json.loads(raw_args or "{}")
+            except Exception:
+                parsed_args = {}
         calls.append({"tool": name, "args": parsed_args if isinstance(parsed_args, dict) else {}})
     if not calls:
         return None
     return calls if len(calls) > 1 else calls[0]
+
+
+def _single_or_list(calls):
+    """Shared convention: None for no calls, a dict for one, a list for several."""
+    calls = [c for c in (calls or []) if isinstance(c, dict) and c.get("tool")]
+    if not calls:
+        return None
+    return calls if len(calls) > 1 else calls[0]
+
+
+def _parse_anthropic_tool_uses(content_blocks: List[Dict[str, Any]]):
+    """Anthropic returns tool calls as `tool_use` content blocks with args already
+    a dict (`input`). Keep ALL of them (multi-tool batching), same as the others."""
+    return _single_or_list([
+        {"tool": b.get("name", ""), "args": b.get("input") if isinstance(b.get("input"), dict) else {}}
+        for b in (content_blocks or []) if isinstance(b, dict) and b.get("type") == "tool_use"
+    ])
+
+
+def _parse_gemini_function_calls(parts: List[Dict[str, Any]]):
+    """Gemini returns tool calls as `functionCall` parts with args already a dict.
+    Keep ALL of them (multi-tool batching), same as the others."""
+    out = []
+    for p in (parts or []):
+        if isinstance(p, dict) and "functionCall" in p:
+            fc = p["functionCall"] or {}
+            out.append({"tool": fc.get("name", ""), "args": fc.get("args") if isinstance(fc.get("args"), dict) else {}})
+    return _single_or_list(out)
 
 
 def call_nvidia(prompt: str, api_key: str, model: str = "meta/llama-3.1-70b-instruct", timeout: int = 60, history: list = None, system_prompt: str = None, thinking: bool = False, max_tokens: int = None, on_token: Optional[Callable[[str], None]] = None, return_usage: bool = False, cancel_check: Optional[Callable[[], bool]] = None, tools: Optional[List[Dict[str, Any]]] = None, role: str = "orchestrator", tool_choice: str = "auto") -> Union[Optional[str], Tuple[Optional[str], Optional[int]]]:
@@ -1538,14 +1570,12 @@ def call_openai(prompt: str, api_key: str, model: str = "gpt-4o", timeout: int =
             choice = data.get("choices", [{}])[0]
             msg = choice.get("message", {})
             if msg.get("tool_calls"):
-                tc = msg["tool_calls"][0]
-                fn = tc.get("function", {})
-                try:
-                    parsed_args = json.loads(fn.get("arguments", "{}"))
-                except Exception:
-                    parsed_args = {}
-                result = {"tool": fn.get("name", ""), "args": parsed_args}
-                return (result, usage_tokens) if return_usage else result
+                # Keep ALL native tool calls (not just the first) so the model
+                # batches through the structured API — same multi-call fix as the
+                # NVIDIA/Ollama OpenAI-compatible paths.
+                result = _parse_native_tool_calls(msg["tool_calls"])
+                if result is not None:
+                    return (result, usage_tokens) if return_usage else result
             text = strip_thinking_tags(msg.get("content", "")) or None
             return (text, usage_tokens) if return_usage else text
         r = requests.post(url, headers=headers, json=payload, stream=True, timeout=timeout)
@@ -1646,11 +1676,12 @@ def call_anthropic(prompt: str, api_key: str, model: str = "claude-3-5-sonnet-20
                 return (err, None) if return_usage else err
             data = r.json()
             usage_tokens = data.get("usage", {}).get("output_tokens")
-            # Check for tool_use content blocks
-            for block in data.get("content", []):
-                if block.get("type") == "tool_use":
-                    result = {"tool": block.get("name", ""), "args": block.get("input", {})}
-                    return (result, usage_tokens) if return_usage else result
+            # Collect ALL tool_use content blocks (not just the first) so the
+            # model batches through the structured API, same multi-call support
+            # as the OpenAI-format providers.
+            result = _parse_anthropic_tool_uses(data.get("content", []))
+            if result is not None:
+                return (result, usage_tokens) if return_usage else result
             # No tool call — extract text
             text_parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
             text = strip_thinking_tags(" ".join(text_parts).strip()) or None
@@ -1769,11 +1800,11 @@ def ask_gemini(api_key: str, model: str, system_prompt: str, user_message: str, 
             candidates = data.get("candidates", [])
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
-                for part in parts:
-                    if "functionCall" in part:
-                        fc = part["functionCall"]
-                        result = {"tool": fc.get("name", ""), "args": fc.get("args", {})}
-                        return (result, usage_tokens) if return_usage else result
+                # Collect ALL functionCall parts (not just the first) so the model
+                # batches through the structured API, same as the other providers.
+                result = _parse_gemini_function_calls(parts)
+                if result is not None:
+                    return (result, usage_tokens) if return_usage else result
                 # No function call — extract text
                 raw_text = "".join(p.get("text", "") for p in parts if "text" in p)
                 text = strip_thinking_tags(raw_text.strip()) or None
@@ -1911,18 +1942,12 @@ def call_ollama(prompt: str, model: str = None, system_prompt: str = None, timeo
             data = r.json()
             eval_count = data.get("eval_count")
             msg = data.get("message", {})
-            # Check for native tool calls
+            # Native tool calls — keep ALL of them (Ollama returns args as a dict
+            # already; the shared parser handles both dict and JSON-string args).
             if msg.get("tool_calls"):
-                tc = msg["tool_calls"][0]
-                fn = tc.get("function", {})
-                args = fn.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {}
-                result = {"tool": fn.get("name", ""), "args": args}
-                return (result, eval_count) if return_usage else result
+                result = _parse_native_tool_calls(msg["tool_calls"])
+                if result is not None:
+                    return (result, eval_count) if return_usage else result
             # No tool call — return text content
             text = strip_thinking_tags(msg.get("content", "")) or None
             return (text, eval_count) if return_usage else text
