@@ -63,21 +63,23 @@ Works across two flexible interfaces:
 
 ## How It Works
 
-```
-You ──> /recon target.com ──> Orchestrator (Tool Selection) ──> Scope Security Gate
-                                     │                            │ (Blocks out-of-scope)
-                                     ▼                            ▼
-                          Active Reconnaissance        Binary Toolchain Verification
-                          ├─ Low-Noise Surgical HTTP   (Subfinder, DNSX, Naabu, HTTPX)
-                          ├─ Shuffledns + AlterX       (Gowitness, FFUF, Subzy)
-                          ├─ MassDNS + TLSX            (Native BAC & Logic Auditors)
-                          └─ Headless SPA Spider      
-                                     │
-                                     ▼ (Populates Non-Prunable Artifact Ledger)
-                          Synthesizer (Report Write-up) <── 30 Methodology Skills
-                                     │                     (Access Control, Auth Bypass,
-                                     ▼                      Web2, Web3, Mobile, CTF)
-                                /report (Submission-ready markdown/JSON/HTML)
+```mermaid
+flowchart TD
+    U(["You"]) --> CMD["/recon · /hunt &lt;target&gt;"]
+    CMD --> ORC["🧠 Orchestrator<br/><i>tool selection — native function-calling</i>"]
+    ORC --> GATE{{"🛡️ Scope Security Gate<br/><i>unconditionally blocks out-of-scope</i>"}}
+    GATE -. verifies binaries .-> TOOLS["🔧 Toolchain check<br/>subfinder · dnsx · naabu · httpx<br/>gowitness · ffuf · subzy · sqlmap"]
+    GATE == in scope ==> RECON["📡 Active Reconnaissance<br/>low-noise surgical HTTP · shuffledns + alterx<br/>massdns + tlsx · headless SPA spider<br/>82 scope-gated tools"]
+    RECON --> LEDGER[("🗄️ Non-prunable<br/>Artifact Ledger<br/><i>tokens · creds · cookies · crawl trees</i>")]
+    LEDGER --> VERIFY["✅ Verify &amp; Re-verify<br/><i>verify_finding · reverify_findings</i>"]
+    SKILLS["📚 30 methodology skills<br/>access-control · auth-bypass<br/>web2 · web3 · mobile · CTF"] --> SYN
+    VERIFY --> SYN["✍️ Synthesizer<br/><i>report write-up</i>"]
+    SYN --> REP["📄 /report<br/><b>submission-ready</b><br/>Markdown · JSON · HTML"]
+
+    classDef gate fill:#3a0d0d,stroke:#ff4d4d,color:#ffd1d1;
+    classDef store fill:#0d2a3a,stroke:#4db8ff,color:#d1ecff;
+    class GATE gate;
+    class LEDGER store;
 ```
 
 > **Orchestrator vs Synthesizer are ROLES, not model tiers.** Orchestrator calls select/run tools (native function-calling); Synthesizer calls write the researcher-facing prose at the end of a turn. Both can point at the SAME model — e.g. the recommended NVIDIA Nemotron 550B config below runs both roles on one model — or at two different ones if you want a cheap/fast model for tool selection and a stronger one for write-ups. Either way, the synthesizer call is always made with the same tool schema attached (just set to "don't call anything"), so it stays in a consistent tool-aware frame of reference for the whole turn rather than being dropped into a schema-free completion right after a history full of the orchestrator's own tool-call JSON.
