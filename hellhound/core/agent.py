@@ -13354,7 +13354,7 @@ def _execute_remember_lesson_stub(args: Dict[str, Any], target: Target, emit: An
 _PARALLEL_BLACKLIST = frozenset((
     "parallel", "set_target", "record_finding", "dismiss_finding", "export_report",
     "manage_scope", "manage_program", "save_file", "delete_file", "remember_lesson",
-    "verify_finding", "race_test",
+    "verify_finding", "race_test", "delegate",
 ))
 
 
@@ -13376,6 +13376,12 @@ def _execute_background_task_stub(args: Dict[str, Any], target: Target, emit: An
     """Placeholder — the real implementation (Agent._execute_background_task) needs
     self.execute_tool_call, so it's special-cased in Agent.execute_tool_call."""
     return {"error": "background_task must be routed through Agent.execute_tool_call, not called directly."}
+
+
+def _execute_delegate_stub(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Placeholder — the real implementation (Agent._execute_delegate) runs an
+    isolated nested handle_message, so it's special-cased in Agent.execute_tool_call."""
+    return {"error": "delegate must be routed through Agent.execute_tool_call, not called directly."}
 
 
 def _execute_check_tasks(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -13969,6 +13975,30 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         ),
         parameters={"type": "object", "properties": {}, "required": []},
         executor=_execute_check_tasks,
+    ),
+    "delegate": ToolSpec(
+        name="delegate",
+        description=(
+            "Spin up a FOCUSED sub-investigation (its own isolated context) to go DEEP on ONE lead, then "
+            "get back just its conclusion. Use it when a single thread deserves many steps — confirm one "
+            "candidate IDOR/BOLA end-to-end, fully map and test one GraphQL mutation, chase one SSRF, "
+            "brute one specific auth flow — and you don't want those dozen tool calls flooding this turn's "
+            "context. The sub-run drives the same agent loop on the SAME target (scope gate + rate limiter "
+            "still apply) but its intermediate steps are rolled back afterwards; only the conclusion and any "
+            "findings it recorded come back. ONE level deep (a sub-investigation can't delegate again), "
+            "foreground only. Pass a self-contained 'objective'; optional 'focus' (URLs/params to start "
+            "from) and 'max_iterations' (3-15, default 10)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "objective": {"type": "string", "description": "One self-contained goal for the sub-investigation, e.g. 'confirm the IDOR on /api/orders/{id} end-to-end and record_finding it if real'."},
+                "focus": {"type": "string", "description": "Optional URLs/endpoints/params to start from."},
+                "max_iterations": {"type": "integer", "description": "Optional step budget for the sub-run (3-15, default 10)."},
+            },
+            "required": ["objective"]
+        },
+        executor=_execute_delegate_stub,
     ),
     "self_audit": ToolSpec(
         name="self_audit",
@@ -17065,6 +17095,122 @@ If there is nothing worth generalizing, return an empty array: []"""
                     "call check_tasks later to pick up the result once it's done.",
         }
 
+    def _execute_delegate(self, args: Any, emit: Any = None) -> Dict[str, Any]:
+        """Run a FOCUSED sub-investigation (Claude-Code / XBOW-style subagent) in an
+        ISOLATED context, then hand back just its conclusion.
+
+        The sub-run drives the same orchestrator loop against the SAME target — so
+        the scope gate, rate limiter and findings ledger all still apply — but its
+        chatty back-and-forth (a dozen tool calls chasing one lead) is rolled back
+        from this turn's history afterwards. The parent turn therefore sees ONE
+        compact result instead of drowning in the sub-run's transcript, which is the
+        whole point: go DEEP on a single promising lead (confirm one candidate IDOR
+        end-to-end, fully map one GraphQL mutation, chase one SSRF) without blowing
+        the main thread's context budget. Findings recorded during the sub-run
+        persist — they live on the target ledger, not in history."""
+        if not isinstance(args, dict):
+            args = {}
+        objective = str(args.get("objective") or args.get("goal") or args.get("task") or "").strip()
+        if not objective:
+            return {"error": "delegate needs an 'objective' — one self-contained thing for the "
+                             "sub-investigation to accomplish (e.g. 'confirm the IDOR on "
+                             "/api/orders/{id} end-to-end and record_finding it if real')."}
+        if getattr(self, "_in_subagent", False):
+            return {"error": "already inside a delegated sub-investigation — nested delegation isn't "
+                             "allowed (one level deep). Finish this lead and return a conclusion; the "
+                             "parent decides what to delegate next."}
+        focus = args.get("focus") or args.get("focus_urls") or args.get("urls") or args.get("scope")
+        try:
+            budget = int(args.get("max_iterations", 10))
+        except Exception:
+            budget = 10
+        budget = max(3, min(budget, 15))
+
+        # A focused tasking brief — objective-only, like a real sub-task handoff.
+        lines = [
+            "You are a FOCUSED sub-investigation spun up by the lead agent. Do ONE thing well.",
+            "",
+            f"OBJECTIVE: {objective}",
+        ]
+        if focus:
+            if isinstance(focus, (list, tuple)):
+                focus = ", ".join(str(f) for f in focus)
+            lines.append(f"FOCUS HERE FIRST: {focus}")
+        lines += [
+            "",
+            "Rules:",
+            "- Stay strictly on this objective; do not wander into unrelated recon.",
+            "- You are on the SAME target and scope as the parent — the scope gate still applies.",
+            "- If you confirm a real, reproducible issue, record_finding it with evidence (don't just "
+            "describe it).",
+            "- When done (confirmed, disproven, or budget spent), STOP and give a 2-4 sentence "
+            "conclusion: what you tested, the result, and the proof reference.",
+        ]
+        sub_prompt = "\n".join(lines)
+
+        tgt = self.target
+        _titles = lambda: {(_f.get("title") or "") for _f in (tgt.findings or []) if isinstance(_f, dict)}
+        before_titles = _titles()
+
+        if emit and hasattr(emit, "info"):
+            try:
+                emit.info(f"[delegate] focused sub-investigation ({budget} steps max): {objective[:140]}")
+            except Exception:
+                pass
+
+        # ── Isolation: snapshot every turn-scoped field the parent reads again,
+        # run the nested turn, then restore. Lists are copied (the nested turn
+        # mutates self.history in place), so the sub-run's transcript is fully
+        # rolled back. Findings persist because they live on the target ledger,
+        # not in any of these fields.
+        _KEYS = ("history", "session_digest", "_active_session_context",
+                 "_approvals_denied_this_turn", "_approvals_granted_this_turn",
+                 "_auto_continue_streak", "_current_turn", "_forced_skill",
+                 "_last_turn_auto_continue", "_turn_host_pivot_open",
+                 "_turn_path_scope", "_turn_vendor_lock", "_turn_cancel_check")
+        saved = {}
+        for k in _KEYS:
+            if hasattr(self, k):
+                v = getattr(self, k)
+                saved[k] = list(v) if isinstance(v, list) else v
+        prev_in_sub = getattr(self, "_in_subagent", False)
+        cancel_check = saved.get("_turn_cancel_check")
+        self._in_subagent = True
+        _err = None
+        summary = None
+        try:
+            summary = self.handle_message(
+                sub_prompt,
+                session_context={"target": tgt.name},
+                emit=emit,
+                max_iterations=budget,
+                cancel_check=cancel_check,
+            )
+        except Exception as e:
+            _err = f"{type(e).__name__}: {e}"
+        finally:
+            self._in_subagent = prev_in_sub
+            for k, v in saved.items():
+                setattr(self, k, v)
+
+        new_findings = sorted(t for t in (_titles() - before_titles) if t)
+
+        if _err:
+            return {"status": "error", "objective": objective, "error": _err,
+                    "new_findings": new_findings,
+                    "note": "The sub-investigation raised an error; its context was still rolled back. "
+                            "Any findings above were recorded. Decide the next move yourself."}
+        return {
+            "status": "completed",
+            "objective": objective,
+            "steps_budget": budget,
+            "conclusion": (summary or "").strip() or "(sub-investigation returned no conclusion)",
+            "new_findings": new_findings,
+            "note": "Delegated sub-investigation finished; its intermediate steps were kept OUT of this "
+                    "turn's context. Any findings above were recorded to the shared ledger. Decide the "
+                    "next move from its conclusion — do not re-run what it already did.",
+        }
+
     def execute_tool_call(self, tool_name: str, args: Any, emit: Any = None) -> Dict[str, Any]:
         """
         Executes a tool with hard code-level scope validation, safe method policy,
@@ -17139,6 +17285,12 @@ If there is nothing worth generalizing, return an empty array: []"""
             # through execute_tool_call (scope-gated) itself, so this dispatch is
             # just the fire-and-return handle — safe to run before the scope gate.
             return self._execute_background_task(args, emit)
+
+        # delegate is a meta-tool: it runs a full, isolated sub-turn via
+        # handle_message (whose every tool call goes back through THIS method,
+        # scope-gated), so this dispatch is safe before the scope gate too.
+        if tool_name == "delegate":
+            return self._execute_delegate(args, emit)
 
         # Internal memory & finding recording tools operate locally on target state.
         # manage_scope/save_file/delete_file join this list for the same reason: they
@@ -17688,6 +17840,10 @@ If there is nothing worth generalizing, return an empty array: []"""
         # Overwritten fresh on every call; a stale reference from a prior
         # call is never reused since this line always runs first.
         self._active_session_context = session_context
+        # Expose this turn's cancel_check on the instance so a delegated
+        # sub-investigation (self._execute_delegate) can thread it into its
+        # nested handle_message and honour Ctrl+C just like the parent turn.
+        self._turn_cancel_check = cancel_check
         if session_context:
             t_name = session_context.get("target") or session_context.get("target_name")
             if t_name and t_name != "default" and t_name != self.target.name:
@@ -18921,6 +19077,11 @@ INSTRUCTIONS:
                     emit.set_label("Let me think")
 
                 def _call_orchestrator():
+                    _excl = _vendor_excluded_tool_names(self._turn_vendor_lock)
+                    # Inside a delegated sub-investigation, don't offer `delegate`
+                    # again — one level deep only, no recursive sub-agents.
+                    if getattr(self, "_in_subagent", False):
+                        _excl = _excl | {"delegate"}
                     return ask_neural_core(
                         prompt=user_text if iteration == 0 else "Continue analysis based on tool results. Choose next tool or output 'DONE'.",
                         system_prompt=_get_orchestrator_system_prompt(),
@@ -18929,7 +19090,7 @@ INSTRUCTIONS:
                         history=self._get_trimmed_history(max_turns=6, for_chat=False, turn_start_idx=turn_start_idx),
                         return_usage=True,
                         cancel_check=cancel_check,
-                        tools=Agent._build_native_tools(exclude=_vendor_excluded_tool_names(self._turn_vendor_lock))
+                        tools=Agent._build_native_tools(exclude=_excl)
                     )
 
                 ai_resp, tokens = _call_orchestrator()
