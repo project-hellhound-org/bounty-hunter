@@ -14,6 +14,8 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
+
+import hellhound
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -263,7 +265,7 @@ def _execute_feroxbuster_content(args: Dict[str, Any], target: Target, emit: Any
     if not binary:
         return {"error": "feroxbuster not installed", "hint": install_hint("feroxbuster")}
 
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = Path(hellhound.__file__).resolve().parent
     wordlist_candidates = [
         repo_root / "wordlists" / "web" / "directories-fast.txt",
         Path("/usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"),
@@ -430,7 +432,7 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
 
     binary = get_binary_path("ffuf") or "ffuf"
 
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = Path(hellhound.__file__).resolve().parent
     wordlist_candidates = [
         repo_root / "wordlists" / "web" / "directories-fast.txt",
         Path("/usr/share/wordlists/seclists/Discovery/Web-Content/common.txt"),

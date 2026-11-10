@@ -17,6 +17,8 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
+
+import hellhound
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -35,7 +37,7 @@ logger = logging.getLogger("hellhound.agent")
 
 def _resolve_resolvers_path() -> str:
     """Resolve DNS resolvers file, checking fast local list, tool configs, standard SecLists paths, or generating default public resolvers."""
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = Path(hellhound.__file__).resolve().parent
     candidates = [
         str(repo_root / "wordlists" / "dns" / "resolvers-fast.txt"),
         "/usr/share/wordlists/seclists/Miscellaneous/dns-resolvers.txt",
@@ -571,7 +573,7 @@ def _execute_takeover_scanner(args: Dict[str, Any], target: Target, emit: Any) -
     except Exception as e:
         return {"error": f"Failed to write temporary subdomains file: {e}"}
 
-    script_path = Path(__file__).resolve().parent.parent / "tools" / "takeover_scanner.sh"
+    script_path = Path(hellhound.__file__).resolve().parent / "tools" / "takeover_scanner.sh"
     if not script_path.exists():
         return {"error": f"takeover_scanner.sh not found at {script_path}"}
 
