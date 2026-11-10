@@ -18,6 +18,7 @@ import time
 import os
 import threading
 import concurrent.futures
+import uuid
 from pathlib import Path
 import re
 import subprocess
@@ -11019,6 +11020,169 @@ def _execute_idor_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict
     }
 
 
+# Header names an app might trust as "the host the user came in on" when it
+# builds absolute links (password-reset URLs, email confirmations), decides a
+# redirect target, or keys a cache entry. Each is a classic Host-header-injection
+# vector; Host itself is the strongest (the app wholesale trusts the Host line).
+_HOST_INJECT_VECTORS = (
+    ("Host", "Host"),
+    ("X-Forwarded-Host", "X-Forwarded-Host"),
+    ("X-Host", "X-Host"),
+    ("X-Forwarded-Server", "X-Forwarded-Server"),
+    ("X-HTTP-Host-Override", "X-HTTP-Host-Override"),
+    ("Forwarded", "Forwarded"),  # RFC 7239: Forwarded: host=evil
+)
+
+
+def _host_injection_hits(marker: str, status_code: Any, resp_headers: Dict[str, Any],
+                         body: str) -> List[Dict[str, Any]]:
+    """Pure detector: given one response to a Host-poisoned request, report every
+    place the attacker-controlled marker host came back out — ranked by how
+    exploitable that reflection is. No network, so it's unit-testable in isolation.
+
+      - in a Location/redirect header           -> redirect target is attacker-set
+      - in a URL/link context in the body       -> absolute links built from Host
+                                                    (password-reset-link poisoning,
+                                                     web-cache poisoning)
+      - in a Set-Cookie Domain=                  -> cookie scoped to attacker host
+      - bare in the body                         -> Host reflected (weaker on its own)
+    """
+    marker = (marker or "").lower()
+    if not marker:
+        return []
+    hits: List[Dict[str, Any]] = []
+    headers = {str(k).lower(): str(v) for k, v in (resp_headers or {}).items()}
+    body = body or ""
+    body_l = body.lower()
+
+    # 1. redirect / Location header — the app is sending the victim to our host
+    loc = headers.get("location", "")
+    if marker in loc.lower():
+        hits.append({"where": "location_header", "confidence": "high",
+                     "evidence": f"Location: {loc[:200]}",
+                     "impact": "open redirect / routing to attacker host via Host header"})
+
+    # 2. Set-Cookie Domain scoped to the attacker host
+    sc = headers.get("set-cookie", "")
+    if re.search(r"domain=\s*\.?" + re.escape(marker), sc, re.I):
+        hits.append({"where": "set_cookie_domain", "confidence": "high",
+                     "evidence": f"Set-Cookie: {sc[:200]}",
+                     "impact": "session cookie scoped to attacker-controlled domain"})
+
+    # 3. marker inside a URL/link context in the body — the money shot for
+    # password-reset poisoning: a reset/confirm link is built from the Host.
+    for m in re.finditer(r"(https?:)?//" + re.escape(marker) + r"[^\s\"'<>]*", body_l):
+        snippet = body[max(0, m.start() - 40): m.end() + 10]
+        hits.append({"where": "body_url", "confidence": "high",
+                     "evidence": f"...{snippet.strip()[:200]}...",
+                     "impact": "absolute URL/link built from the Host header "
+                               "(password-reset-link poisoning / web-cache poisoning)"})
+        break  # one is enough to prove it; don't spam identical hits
+
+    # 4. bare reflection in the body (no URL context) — real but weaker alone
+    if not any(h["where"] == "body_url" for h in hits) and marker in body_l:
+        idx = body_l.find(marker)
+        snippet = body[max(0, idx - 40): idx + len(marker) + 40]
+        hits.append({"where": "body_text", "confidence": "low",
+                     "evidence": f"...{snippet.strip()[:200]}...",
+                     "impact": "Host reflected into the response body (confirm it reaches a "
+                               "link/redirect/cache key to matter)"})
+    return hits
+
+
+def _execute_host_header_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """
+    Tests an endpoint for Host-header injection: re-sends the request with the
+    host identity (Host, X-Forwarded-Host, X-Host, …) overridden to an
+    attacker-controlled marker, and reports every vector whose marker comes back
+    out in a redirect, an absolute link in the body, or a cookie domain.
+
+    This is the engine behind password-reset-link poisoning (the reset email's
+    link is built from the Host the app trusted), web-cache poisoning, and some
+    routing-based SSRF. Point it at a link-generating endpoint — a password-reset
+    / "forgot password" POST is the classic — with `url` (and `method`/`body` for
+    a POST). Optional `marker` overrides the injected host. It sends to the REAL
+    host on the wire (the marker only ever rides in a header), so it never leaves
+    scope. Advisory only — confirm the end-to-end impact (e.g. the poisoned link
+    actually lands in the victim's email / cache) and record_finding it yourself.
+    Same-host/scope checked. Records nothing itself.
+    """
+    url = (args.get("url") or "").strip()
+    if not url:
+        return {"error": "host_header_probe needs 'url' — the endpoint to test (ideally a link-generating "
+                         "one like a password-reset / forgot-password POST)."}
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    parsed = urlparse(url)
+
+    if target and target.scope_rules and target.scope_rules.in_scope:
+        allowed, reason = is_in_scope(url, target.scope_rules)
+        if not allowed:
+            return {"error": f"SCOPE_VIOLATION: {reason}", "target": url, "blocked": True}
+
+    method = str(args.get("method") or "GET").upper()
+    marker = str(args.get("marker") or "").strip() or f"evil-{uuid.uuid4().hex[:8]}.example"
+    real_host = parsed.netloc
+
+    # build the shared body/identity args once; vectors only change one header
+    base_a: Dict[str, Any] = {"url": url, "method": method}
+    for k in ("json", "body", "data", "cookies", "cookie", "identity", "isolate"):
+        if args.get(k) is not None:
+            base_a[k] = args.get(k)
+
+    vectors_hit: List[Dict[str, Any]] = []
+    tested: List[str] = []
+    for label, header_name in _HOST_INJECT_VECTORS:
+        hv = f"host={marker}" if header_name == "Forwarded" else marker
+        a = dict(base_a)
+        # For X-* vectors keep the real Host (app still routes) and add the
+        # spoofed hint; for the Host vector, override Host outright.
+        extra = {header_name: hv}
+        if header_name != "Host":
+            extra["Host"] = real_host
+        a["headers"] = extra
+        res = _execute_curl(a, target, emit)
+        tested.append(label)
+        if not isinstance(res, dict) or res.get("error"):
+            continue
+        hits = _host_injection_hits(
+            marker, res.get("status_code"), res.get("headers") or {}, res.get("body_preview") or "")
+        for h in hits:
+            h["vector"] = label
+            vectors_hit.append(h)
+
+    # strongest first
+    _rank = {"high": 0, "low": 1}
+    vectors_hit.sort(key=lambda h: _rank.get(h.get("confidence"), 9))
+
+    if vectors_hit:
+        top = vectors_hit[0]
+        summary = (f"Host-header injection: marker host reflected via "
+                   f"{', '.join(sorted({h['vector'] for h in vectors_hit}))} "
+                   f"({top['where']}, {top['confidence']} confidence). "
+                   f"{top['impact']}.")
+        note = ("If this endpoint generates a link that reaches a user (password-reset email, "
+                "confirmation link), this is password-reset poisoning: request a reset for the victim "
+                "with the poisoned Host, then read the attacker-host access log for the leaked token. "
+                "If the reflection lands in a cacheable response, it's web-cache poisoning instead.")
+    else:
+        summary = (f"No Host-header injection seen: the marker host never came back in a redirect, "
+                   f"an absolute link, or a cookie domain across {len(tested)} vectors.")
+        note = ("The app didn't echo the Host into a link/redirect here. Try a genuinely link-generating "
+                "endpoint (forgot-password / email-confirmation POST) if you haven't, or a known "
+                "cacheable page for cache poisoning.")
+
+    return {
+        "status": "ok",
+        "url": url,
+        "marker_host": marker,
+        "vectors_tested": tested,
+        "hits": vectors_hit,
+        "summary": summary,
+        "note": note,
+    }
+
+
 def _execute_verify_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Runs an INDEPENDENT, code-level signal check for a disputed or about-
@@ -13724,6 +13888,36 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["url"]
         },
         executor=_execute_idor_probe
+    ),
+    "host_header_probe": ToolSpec(
+        name="host_header_probe",
+        description=(
+            "Tests an endpoint for HOST-HEADER INJECTION: re-sends the request with the host identity "
+            "(Host, X-Forwarded-Host, X-Host, X-Forwarded-Server, Forwarded, …) overridden to an "
+            "attacker-controlled marker, and flags every vector whose marker comes back in a redirect "
+            "(Location), an absolute link in the body, or a cookie Domain. This is the engine behind "
+            "PASSWORD-RESET-LINK POISONING (the reset email's link is built from the Host the app trusted — "
+            "poison it, request a reset for the victim, then read your host's access log for the leaked "
+            "token), WEB-CACHE POISONING, and some routing-based SSRF. Point it at a link-generating "
+            "endpoint — a 'forgot password' / password-reset POST is the classic — with `url` (+ "
+            "`method`/`body` for a POST). It sends to the REAL host on the wire (the marker only rides in a "
+            "header), so it never leaves scope. Advisory — confirm the end-to-end impact and record_finding "
+            "yourself. Same-host/scope checked."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Endpoint to test — ideally a link-generating one (password-reset / forgot-password / email-confirmation POST)."},
+                "method": {"type": "string", "description": "HTTP method (default GET; use POST for a reset form)."},
+                "body": {"type": "string", "description": "Request body for a POST (e.g. the forgot-password form fields)."},
+                "json": {"type": "object", "description": "JSON body for a POST, as an alternative to 'body'."},
+                "marker": {"type": "string", "description": "Override the injected attacker host (default a random evil-xxxx.example)."},
+                "identity": {"type": "string", "description": "Optional captured identity to send as."},
+                "isolate": {"type": "boolean", "description": "Suppress the auto-attached active session."},
+            },
+            "required": ["url"]
+        },
+        executor=_execute_host_header_probe
     ),
     "verify_finding": ToolSpec(
         name="verify_finding",

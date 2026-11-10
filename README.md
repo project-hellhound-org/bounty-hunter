@@ -69,7 +69,7 @@ flowchart TD
     CMD --> ORC["Orchestrator role<br/>selects and runs tools<br/>(native function-calling)"]
     ORC --> GATE{{"Scope Security Gate<br/>unconditionally blocks out-of-scope<br/>before any traffic leaves"}}
     GATE -. verifies binaries .-> TOOLS["Toolchain check<br/>subfinder / dnsx / naabu / httpx<br/>gowitness / ffuf / sqlmap / subzy"]
-    GATE == in scope ==> RECON["Active recon and exploitation<br/>85 scope-gated tools<br/>surgical HTTP, SPA spider, JS mining,<br/>injection, access-control, auth probes"]
+    GATE == in scope ==> RECON["Active recon and exploitation<br/>86 scope-gated tools<br/>surgical HTTP, SPA spider, JS mining,<br/>injection, access-control, auth probes"]
     RECON --> LEDGER[("Non-prunable Artifact Ledger<br/>tokens, credentials, cookies,<br/>crawl trees, screenshots")]
     RECON --> VERIFY["Per-finding verification<br/>verify_finding then record_finding<br/>(evidence-gated)"]
     LEDGER --> VERIFY
@@ -310,14 +310,14 @@ All actions can be triggered via slash commands or natural language:
 
 ## The Recon & Triage Arsenal
 
-Bounty Hunter coordinates **85 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
+Bounty Hunter coordinates **86 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
 
 | Category | Tools |
 | :--- | :--- |
 | **Passive & Active Recon** | `subfinder` `subdomain_sweep` `permute_subdomains` `resolve_candidates` `dns_bruteforce` `dig` `port_scan` `tls_cert_scan` `httpx` `nmap_service_scan` `wayback_urls` `gau_nuclei_sweep` `urlscan_recon` `google_dork` `otx_urls` `virustotal_lookup` `cloudscout` `wafbuster` |
 | **Crawling & Content Discovery** | `spider` `katana` `content_discovery` `fuzz_hunter` `vhost_fuzz` `js_miner` |
 | **Visual & Browser** | `browser_control` `save_auth_flow` `replay_auth_flow` `gowitness` |
-| **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `wpscan_scan` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `stealth` `403_bypass` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` `map_surface` `replay_request` `response_diff` `mass_assign_probe` `idor_probe` `race_test` `verify_finding` |
+| **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `wpscan_scan` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `stealth` `403_bypass` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` `map_surface` `replay_request` `response_diff` `mass_assign_probe` `idor_probe` `host_header_probe` `race_test` `verify_finding` |
 | **Takeover & Subdomain Health** | `takeover_scanner` `subzy` |
 | **Session, Scope & Workspace** | `cookie_inspector` `curl` `run_terminal_command` `set_target` `manage_scope` `manage_program` `listener` `parallel` `background_task` `check_tasks` `delegate` `self_audit` `recall_data` `profile` `update_plan` `recall_patterns` `capture_identity` `swap_session` `generate_hypotheses` `update_hypothesis` |
 | **HackerOne Program Intel** | `hackerone_policy` `hackerone_search` `hackerone_stats` |
