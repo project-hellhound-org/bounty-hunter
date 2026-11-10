@@ -35,7 +35,7 @@
 
 > [!WARNING]
 > ### ⚠️ Project Status & Active Development Notice
-> **Hellhound Bounty Hunter is currently under active development.** It's no longer purely a lab exercise — it's being run against real, authorized bug bounty programs alongside intentionally vulnerable CTF ranges (HackTheBox, CTFHub, PortSwigger Web Security Academy) and hardened local test environments, and that live-program testing is ongoing. **Recon is the strong suit** — asset discovery, crawling, JS/endpoint mining, and visual evidence capture consistently hold up well. The current weak point is further down the pipeline: **exploitation validation and vulnerability-identification accuracy** — confidently telling a real, confirmed bug apart from a false positive, and capturing solid enough evidence to prove it — is still being actively hardened. It is **not yet "fire and forget" on production targets**: review every finding before relying on it or submitting it. Use responsibly and strictly on authorized targets.
+> **Hellhound Bounty Hunter is under active development** and is run against real, authorized bug bounty programs alongside intentionally vulnerable ranges (PortSwigger Web Security Academy, HackTheBox, CTFHub) and hardened local environments. It now **solves Web Security Academy labs autonomously, end to end** across multiple classes — password-reset poisoning via host-header injection, exploiting an exposed-API-documentation endpoint to delete a user, reflected / stored / DOM-based XSS (confirmed by firing `alert()` in a real headless browser), and CORS — not just recon. **Exploitation validation has been materially hardened:** XSS findings are gated on real browser execution (a payload the browser proves didn't run is refused, not recorded), `verify_finding` runs class-specific live checks, and dismissed false positives can't silently re-appear. Tool-calling is native-function-calling-first and no longer dead-ends mid-generation on reasoning models. Still, it is **not yet "fire and forget" on production targets** — review every finding before relying on it or submitting it. Use responsibly and strictly on authorized targets.
 
 ---
 
@@ -310,20 +310,16 @@ All actions can be triggered via slash commands or natural language:
 
 ## The Recon & Triage Arsenal
 
-Bounty Hunter coordinates **86 tools** into a unified, scope-governed execution pipeline. Every tool is scope-gated and rate-limited where it matters, and the orchestrator picks the right one for the job — you rarely need to call one by name yourself.
+Bounty Hunter coordinates **86 scope-gated tools** into one execution pipeline. The orchestrator picks the right one for the job — you rarely call any by name. In brief, they cover:
 
-| Category | Tools |
-| :--- | :--- |
-| **Passive & Active Recon** | `subfinder` `subdomain_sweep` `permute_subdomains` `resolve_candidates` `dns_bruteforce` `dig` `port_scan` `tls_cert_scan` `httpx` `nmap_service_scan` `wayback_urls` `gau_nuclei_sweep` `urlscan_recon` `google_dork` `otx_urls` `virustotal_lookup` `cloudscout` `wafbuster` |
-| **Crawling & Content Discovery** | `spider` `katana` `content_discovery` `fuzz_hunter` `vhost_fuzz` `js_miner` |
-| **Visual & Browser** | `browser_control` `save_auth_flow` `replay_auth_flow` `gowitness` |
-| **Active Exploitation & Validation** | `sqlmap_scan` `hydra` `wpscan_scan` `jwt_forge` `graphql_probe` `cors_checker` `generate_cors_poc` `schema_fuzzer` `waf_evasion_probe` `stealth` `403_bypass` `js_static_analysis` `jsluice` `punycode_homoglyphs` `transport_auditor` `surface_auditor` `map_surface` `replay_request` `response_diff` `mass_assign_probe` `idor_probe` `host_header_probe` `race_test` `verify_finding` |
-| **Takeover & Subdomain Health** | `takeover_scanner` `subzy` |
-| **Session, Scope & Workspace** | `cookie_inspector` `curl` `run_terminal_command` `set_target` `manage_scope` `manage_program` `listener` `parallel` `background_task` `check_tasks` `delegate` `self_audit` `recall_data` `profile` `update_plan` `recall_patterns` `capture_identity` `swap_session` `generate_hypotheses` `update_hypothesis` |
-| **HackerOne Program Intel** | `hackerone_policy` `hackerone_search` `hackerone_stats` |
-| **Findings, Artifacts & Reporting** | `record_finding` `dismiss_finding` `reverify_findings` `remember_lesson` `export_report` `read_artifact` `save_file` `delete_file` `load_skill` |
+- **Recon** — subdomain/DNS enumeration, port & TLS scanning, passive URL harvesting (Wayback/OTX/urlscan/VirusTotal), cloud-asset discovery, WAF fingerprinting.
+- **Crawling & content discovery** — SPA spider, katana, content/vhost fuzzing, JS endpoint & secret mining.
+- **Browser & visual** — a persistent headless Playwright browser that runs real JS (how DOM/stored XSS is *proven*, not guessed), auth-flow capture/replay, gowitness screenshots.
+- **Exploitation & validation** — SQLi, XSS/SSRF/SSTI/CORS/IDOR probes with a live `verify_finding` check, JWT forging, GraphQL introspection, mass-assignment, host-header poisoning, 403-bypass, race conditions.
+- **Session & workspace** — identity capture/swap, scope & program management, an out-of-band `listener`, `parallel`/`background_task` execution, `delegate` sub-agents, hypotheses & campaign plans.
+- **Reporting** — finding recording with pre-submission re-verification and self-contained HTML export.
 
-Ask the agent itself ("what tools do you have for X?") for what any one of these actually does — asking beats a wall of description text here, and the answer always reflects the real, current tool list instead of a snapshot that can drift out of date.
+How they work: each runs behind the unconditional scope gate and rate limiter, writes evidence to the per-target artifact ledger, and feeds its result back to the orchestrator for the next decision. For the exact, live list and what any one does, just ask the agent (*"what tools do you have for X?"*) or run `self_audit` — that always reflects the real registry instead of a snapshot that drifts.
 
 ---
 
