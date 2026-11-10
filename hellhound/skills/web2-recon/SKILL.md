@@ -184,7 +184,7 @@ Rarely linked, frequently left on disk. `curl` the high-signal ones directly (al
 ```json
 {"tool": "curl", "args": {"url": "https://<host>/.env"}}
 {"tool": "curl", "args": {"url": "https://<host>/openapi.json"}}
-{"tool": "content_discovery", "args": {"url": "https://<host>"}}
+{"tool": "content_discovery", "args": {"url": "https://<host>", "wordlist": "sensitive"}}
 ```
 `.DS_Store` and `swagger.json`/`openapi.json` are especially high-ROI — the first enumerates a directory's true contents, the second hands you the entire API surface including unlinked endpoints.
 

@@ -274,7 +274,15 @@ def _execute_feroxbuster_content(args: Dict[str, Any], target: Target, emit: Any
         Path("/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt")
     ]
     wordlist = None
-    for wc in wordlist_candidates:
+    # Named wordlist shortcut: wordlist="sensitive"/"backup" runs the curated
+    # backup/config/source/leaked-file list, so a one-call content_discovery
+    # does the whole ROI file sweep (.env, .bak, .git, .DS_Store, swagger.json,
+    # db dumps, ...) instead of only generic directory names.
+    if str(args.get("wordlist") or "").strip().lower() in ("sensitive", "backup", "backups", "leaked"):
+        _sens = Path(hellhound.__file__).resolve().parent / "wordlists" / "web" / "backup-sensitive.txt"
+        if _sens.exists() and _sens.stat().st_size > 0:
+            wordlist = str(_sens)
+    for wc in (wordlist_candidates if wordlist is None else []):
         if wc.exists() and wc.stat().st_size > 0:
             wordlist = str(wc)
             break
@@ -441,7 +449,15 @@ def _execute_ffuf_content(args: Dict[str, Any], target: Target, emit: Any) -> Di
         Path("/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt")
     ]
     wordlist = None
-    for wc in wordlist_candidates:
+    # Named wordlist shortcut: wordlist="sensitive"/"backup" runs the curated
+    # backup/config/source/leaked-file list, so a one-call content_discovery
+    # does the whole ROI file sweep (.env, .bak, .git, .DS_Store, swagger.json,
+    # db dumps, ...) instead of only generic directory names.
+    if str(args.get("wordlist") or "").strip().lower() in ("sensitive", "backup", "backups", "leaked"):
+        _sens = Path(hellhound.__file__).resolve().parent / "wordlists" / "web" / "backup-sensitive.txt"
+        if _sens.exists() and _sens.stat().st_size > 0:
+            wordlist = str(_sens)
+    for wc in (wordlist_candidates if wordlist is None else []):
         if wc.exists() and wc.stat().st_size > 0:
             wordlist = str(wc)
             break
