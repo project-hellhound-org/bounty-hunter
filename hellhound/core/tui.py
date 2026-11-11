@@ -295,6 +295,8 @@ class HellhoundApp(App):
         self._assistant_buf = ""                         # accumulated reply text
         self._last_md_flush = 0.0                        # throttle timestamp
         self._sugg_nav = False  # True once the user arrow-navigates the dropdown
+        self._input_history: list = []   # submitted inputs, oldest-first (shell-style ↑/↓ recall)
+        self._hist_pos: Optional[int] = None
 
     # -- lifecycle --
     def compose(self) -> ComposeResult:
@@ -493,12 +495,46 @@ class HellhoundApp(App):
         return self.query_one(SuggestionBox)
 
     def action_sugg_next(self) -> None:
-        self._sugg_nav = True
-        self._suggest().move(1)
+        # Dropdown showing -> move selection down; otherwise shell-style history
+        # recall toward NEWER entries (down arrow).
+        if self._suggest().display:
+            self._sugg_nav = True
+            self._suggest().move(1)
+        else:
+            self._history_recall(+1)
 
     def action_sugg_prev(self) -> None:
-        self._sugg_nav = True
-        self._suggest().move(-1)
+        # Dropdown showing -> move selection up; otherwise recall OLDER history
+        # (up arrow), exactly like a terminal.
+        if self._suggest().display:
+            self._sugg_nav = True
+            self._suggest().move(-1)
+        else:
+            self._history_recall(-1)
+
+    def _history_recall(self, direction: int) -> None:
+        """Walk submitted-input history with ↑/↓ and load it into the prompt,
+        like a shell. ↑ (direction -1) goes older, ↓ (+1) newer; stepping past
+        the newest clears to a fresh empty line."""
+        hist = self._input_history
+        if not hist:
+            return
+        try:
+            inp = self.query_one("#prompt", Input)
+        except Exception:
+            return
+        if self._hist_pos is None:
+            self._hist_pos = len(hist)  # start just past the newest (the live line)
+        new_pos = self._hist_pos + direction
+        if new_pos < 0:
+            new_pos = 0
+        if new_pos >= len(hist):
+            self._hist_pos = None
+            inp.value = ""
+            return
+        self._hist_pos = new_pos
+        inp.value = hist[new_pos]
+        inp.cursor_position = len(inp.value)
 
     def action_sugg_accept(self) -> None:
         """Tab: fill the input with the highlighted suggestion."""
@@ -541,6 +577,12 @@ class HellhoundApp(App):
         if line.lower() in ("exit", "quit", ":q", ":q!", "/exit", "/quit"):
             self.exit()
             return
+
+        # Record for shell-style ↑/↓ recall (skip consecutive dupes), and reset
+        # the history cursor so the next ↑ starts from the newest entry.
+        if not self._input_history or self._input_history[-1] != line:
+            self._input_history.append(line)
+        self._hist_pos = None
 
         inp = self.query_one("#prompt", Input)
         inp.value = ""
