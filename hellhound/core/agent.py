@@ -8972,6 +8972,67 @@ def _execute_self_audit(args: Dict[str, Any], target: Target, emit: Any) -> Dict
     }
 
 
+# A bare "run self audit" / "what tools do you have" request. The orchestrator
+# occasionally truncates the tiny self_audit tool-call mid-JSON on a reasoning
+# model (a stochastic generation-length glitch the researcher kept hitting on the
+# TUI, and that no retry reliably clears). self_audit is a safe, no-arg, local
+# introspection call, so these requests are answered by running it DIRECTLY —
+# no orchestrator round-trip means no tool-call JSON that can be cut off.
+_SELF_AUDIT_RE = re.compile(
+    r"\bself[\s_\-]?audit\b"
+    r"|\bwhat\s+(?:tools|capabilit\w+)\b[^.?!]{0,30}\byou\b"
+    r"|\bwhat\s+can\s+you\s+do\b"
+    r"|\blist\s+(?:all\s+)?your\s+tools\b"
+    r"|\bshow\s+(?:me\s+)?your\s+(?:tools|arsenal|capabilit\w+)\b",
+    re.IGNORECASE)
+
+
+_NON_AUDIT_TASK_RE = re.compile(
+    r"\b(recon|scan|hunt|enumerate|crawl|fuzz|exploit|attack|probe|inject|"
+    r"subdomain|endpoint|then|spider|dork|map|target|vuln|payload)\b", re.I)
+
+
+def _is_bare_self_audit_request(text: str) -> bool:
+    """True when the whole message is essentially just 'run self audit' / 'what
+    tools do you have'. Rejected if it's long, or if it also names an actual
+    hunting task (recon/scan/enumerate/…), so a bigger request that merely
+    mentions self_audit still goes through the normal orchestrator loop."""
+    if not text:
+        return False
+    t = text.strip()
+    if len(t.split()) > 16 or _NON_AUDIT_TASK_RE.search(t):
+        return False
+    return bool(_SELF_AUDIT_RE.search(t))
+
+
+def _format_self_audit_answer(a: Dict[str, Any]) -> Optional[str]:
+    """Render a self_audit result dict into a clean, natural answer — no LLM, so
+    it can never truncate."""
+    if not isinstance(a, dict) or a.get("status") != "success":
+        return None
+    ident = a.get("identity", {}) or {}
+    models = a.get("models", {}) or {}
+    tools = a.get("tools", {}) or {}
+    skills = a.get("skills", {}) or {}
+    out = [f"**{ident.get('name', 'Bounty Hunter')}** — live self-audit (read from the registry, not memory):",
+           "",
+           f"- **Models:** orchestrator `{models.get('orchestrator', '?')}`, synthesizer `{models.get('synthesizer', '?')}`",
+           f"- **Tools:** {tools.get('count', 0)} registered · **Skills:** {skills.get('count', 0)} loaded",
+           ""]
+    if a.get("capabilities"):
+        out.append("**What I do:**")
+        out += [f"- {c}" for c in a["capabilities"]]
+        out.append("")
+    if a.get("known_limitations"):
+        out.append("**Known gaps:**")
+        out += [f"- {g}" for g in a["known_limitations"]]
+        out.append("")
+    names = tools.get("names") or []
+    if names:
+        out.append(f"**All {tools.get('count', len(names))} tools:** " + ", ".join(f"`{t}`" for t in names))
+    return "\n".join(out)
+
+
 def _execute_stealth(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Return a WAF-aware, browser-realistic, rotated header set for the active
@@ -13933,6 +13994,28 @@ If there is nothing worth generalizing, return an empty array: []"""
         # more often than not. This is checked once, here, before the loop
         # below ever runs — not just requested inside its prompt.
         _skip_orchestrator_loop = has_real_target and _confidently_conversational(original_user_text)
+
+        # Bulletproof fast-path for a bare "run self audit" / "what tools do you
+        # have" request: run self_audit DIRECTLY and format the result. This skips
+        # the orchestrator entirely, so the stochastic reasoning-preamble
+        # truncation that kept slicing the self_audit tool-call mid-JSON on the
+        # TUI (dead-ending with "got cut off… say continue") simply can't happen —
+        # there's no tool-call JSON to truncate. Local, read-only, no network.
+        if _is_bare_self_audit_request(original_user_text):
+            try:
+                _audit_answer = _format_self_audit_answer(_execute_self_audit({}, self.target, emit))
+            except Exception:
+                _audit_answer = None
+            if _audit_answer:
+                self.history.append({"role": "user", "content": original_user_text})
+                self.history.append({"role": "assistant", "content": _audit_answer})
+                try:
+                    self.target.state["history"] = self.history
+                    save_target(self.target)
+                except Exception:
+                    pass
+                self._last_turn_auto_continue = False
+                return _audit_answer
 
         # Build System Prompt with registered tools and current target scope
         #
