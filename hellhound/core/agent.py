@@ -11426,7 +11426,7 @@ def register_caido_tools(emit: Any = None) -> int:
 # AGENT REASONING & EXECUTION LOOP
 # ==========================================================
 
-def extract_path_scope(user_text: str) -> Optional[str]:
+def extract_path_scope(user_text: str, active_host: Optional[str] = None) -> Optional[str]:
     """
     If the user's task text names a specific URL (e.g. "...from this endpoint https://host/app"),
     return that first path segment (e.g. "/app") as the task's path scope.
@@ -11435,6 +11435,13 @@ def extract_path_scope(user_text: str) -> Optional[str]:
     different top-level paths on the same domain) — a task scoped to one endpoint should
     not wander into the others. Returns None if no explicit full URL path is present
     so an existing established target path scope is not accidentally overwritten by casual path mentions.
+
+    Only a URL on the ACTIVE target's OWN host narrows scope (pass active_host). A
+    URL to a DIFFERENT host — localhost / an internal SSRF target / a sibling
+    domain the objective describes ATTACKING — is an exploit target being named,
+    not a scope restriction; locking onto its path traps the agent off the real
+    surface (e.g. "reach http://localhost/admin and delete carlos" must NOT pin
+    scope to /admin on the lab host). Loopback/internal hosts never set scope.
     """
     if not user_text:
         return None
@@ -11444,10 +11451,19 @@ def extract_path_scope(user_text: str) -> Optional[str]:
         raw_url = m.group(0).rstrip(".,;:!?)>\"'")
         try:
             parsed = urlparse(raw_url)
-            path = parsed.path or ""
-            segments = [s.strip(".,;:!?)>\"'") for s in path.split("/") if s.strip(".,;:!?)>\"'")]
-            if segments:
-                return "/" + segments[0]
+            url_host = (parsed.hostname or "").lower()
+            _internal = (url_host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+                         or url_host.endswith(".internal") or url_host.endswith(".local")
+                         or url_host.startswith("169.254.") or url_host.startswith("10.")
+                         or url_host.startswith("192.168."))
+            _ah = (active_host or "").lower()
+            _host_ok = (not _ah) or (bool(url_host) and (
+                url_host == _ah or url_host.endswith("." + _ah) or _ah.endswith("." + url_host)))
+            if _host_ok and not _internal:
+                path = parsed.path or ""
+                segments = [s.strip(".,;:!?)>\"'") for s in path.split("/") if s.strip(".,;:!?)>\"'")]
+                if segments:
+                    return "/" + segments[0]
         except Exception:
             pass
 
@@ -15024,7 +15040,13 @@ INSTRUCTIONS:
                 emit.info(f"[*] Path scope ('{self._turn_path_scope}') lifted — testing the whole target again.")
             self._turn_path_scope = None
 
-        _new_scope = extract_path_scope(user_text)
+        _active_host_for_scope = None
+        if self.target:
+            try:
+                _active_host_for_scope, _ = normalize_host(self.target.host or self.target.name)
+            except Exception:
+                _active_host_for_scope = self.target.host or self.target.name
+        _new_scope = extract_path_scope(user_text, _active_host_for_scope)
         if _new_scope and _new_scope != self._turn_path_scope:
             self._turn_path_scope = _new_scope
             if emit and hasattr(emit, "info"):
