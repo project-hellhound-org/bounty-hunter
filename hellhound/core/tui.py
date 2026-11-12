@@ -22,6 +22,7 @@ is the supported Textual pattern for exactly this.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -58,6 +59,19 @@ def _summarize_args(args: Dict[str, Any], limit: int = 90) -> str:
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
+def _maybe_pretty_json(text: str) -> str:
+    """If text is a JSON object/array (a common API response body), indent it so
+    it's human-readable instead of a one-line blob. Otherwise return unchanged."""
+    t = text.strip()
+    if not (t[:1] in "{[" and t[-1:] in "}]"):
+        return text
+    try:
+        import json as _json
+        return _json.dumps(_json.loads(t), indent=2, ensure_ascii=False)
+    except Exception:
+        return text
+
+
 def _format_tool_result(tool_name: str, result: Any, cap: int = 6000) -> str:
     """Render a tool result into readable text for a collapsible card body.
 
@@ -89,7 +103,7 @@ def _format_tool_result(tool_name: str, result: Any, cap: int = 6000) -> str:
         if body:
             lines.append("")
             lines.append("Response body:")
-            lines.append(str(body)[:cap])
+            lines.append(_maybe_pretty_json(str(body))[:cap])
         if result.get("isolation_note"):
             lines.append("")
             lines.append(f"[isolation] {result['isolation_note']}")
@@ -133,6 +147,25 @@ class AssistantMessage(Static):
     @property
     def text(self) -> str:
         return self._buf
+
+
+_STATUS_RE = re.compile(r'^\s*\[(\d{3})\]\s*(.*)$')
+
+
+def _colorize_log(raw: str) -> str:
+    """Status-aware colouring for a live log line so a crawl reads at a glance:
+    2xx green, 3xx amber, 4xx orange, 5xx red; the URL/rest in gray. Returns Rich
+    markup; a line with no [NNN] prefix becomes a plain gray line."""
+    s = str(raw)
+    m = _STATUS_RE.match(s)
+    if not m:
+        return f"[#9aa0ac]{_rich_escape(s)}[/]"
+    code, rest = m.group(1), m.group(2)
+    c = int(code)
+    col = ("#4cc46a" if 200 <= c < 300 else
+           "#e0a030" if 300 <= c < 400 else
+           "#e0772d" if 400 <= c < 500 else "#e0554e")
+    return f"[{col}]\\[{code}][/] [#848b97]{_rich_escape(rest)}[/]"
 
 
 class LogLine(Static):
@@ -187,15 +220,38 @@ class ToolCard(Collapsible):
     """
 
     _LIVE_TAIL = 200  # rolling cap so a huge crawl can't make one card unbounded
+    # Mixed palette — red is the persona accent elsewhere, but a wall of red text
+    # is tiring, so cards read like a status line: white tool name, gray args,
+    # and a status-coloured glyph/suffix (amber running, green ok, red error).
+    _C_NAME = "#f0f2f5"
+    _C_ARGS = "#848b97"
+    _C_RUN = "#e0a030"
+    _C_OK = "#4cc46a"
+    _C_ERR = "#e0554e"
+
+    # Static assets (images/css/js/fonts) flood a crawl with noise — '[200]
+    # …/products/49.jpg' x200 — that buries the real endpoints. Count them
+    # instead of listing them.
+    _ASSET_RE = re.compile(r'\.(?:png|jpe?g|gif|svg|webp|ico|bmp|css|js|mjs|woff2?|ttf|otf|eot|map|mp4|webm|pdf)(?:\?|#|$)', re.I)
 
     def __init__(self, tool_name: str, args: Dict[str, Any]) -> None:
         self._tool_name = tool_name
         self._args_summary = _summarize_args(args)
         self._result_text = "running…"
         self._live_lines: list = []
+        self._asset_count = 0
         self._done = False
         self._body = Static("running…", markup=False)
-        super().__init__(self._body, title=f"● {tool_name}({self._args_summary})", collapsed=True)
+        # Running cards start EXPANDED (watch live work); they auto-collapse when
+        # the result lands, so the transcript settles into tidy done-cards.
+        super().__init__(self._body, title=self._mk_title("●", self._C_RUN, "running"), collapsed=False)
+
+    def _mk_title(self, glyph: str, glyph_color: str, suffix: str) -> str:
+        name = _rich_escape(self._tool_name)
+        args = _rich_escape(self._args_summary)
+        suf = f"  [{glyph_color}]{_rich_escape(suffix)}[/]" if suffix else ""
+        return (f"[{glyph_color}]{glyph}[/] [{self._C_NAME}]{name}[/]"
+                f"[{self._C_ARGS}]({args})[/]{suf}")
 
     def append_live(self, batch: str) -> None:
         """Fold a tool's live output (e.g. fuzz_hunter/spider '[200] <url>' lines)
@@ -204,24 +260,35 @@ class ToolCard(Collapsible):
         if self._done:
             return
         for ln in str(batch).split("\n"):
-            if ln.strip():
-                self._live_lines.append(ln)
+            ln = ln.strip()
+            if not ln:
+                continue
+            if self._ASSET_RE.search(ln):
+                self._asset_count += 1   # fold static-asset hits into a count
+                continue
+            self._live_lines.append(_colorize_log(ln))
         if len(self._live_lines) > self._LIVE_TAIL:
             self._live_lines = self._live_lines[-self._LIVE_TAIL:]
         n = len(self._live_lines)
-        self.title = f"● {self._tool_name}({self._args_summary}) · {n} line{'s' if n != 1 else ''}"
+        suffix = f"running · {n} hit{'s' if n != 1 else ''}"
+        if self._asset_count:
+            suffix += f" · {self._asset_count} assets"
+        self.title = self._mk_title("●", self._C_RUN, suffix)
+        body = list(self._live_lines)
+        if self._asset_count:
+            body.append(f"[#6b7280]· {self._asset_count} static assets (images, css, js) folded[/]")
         try:
-            self._body.update("\n".join(self._live_lines))
+            self._body.update(Content.from_markup("\n".join(body)))
         except Exception:
-            pass
+            self._body.update("\n".join(body))
 
     def set_result(self, result: Any) -> None:
         self._done = True
         ok = not (isinstance(result, dict) and (result.get("error") or result.get("blocked")))
-        glyph = "✓" if ok else "✗"
-        self.title = f"{glyph} {self._tool_name}({self._args_summary})"
+        self.title = self._mk_title("✓" if ok else "✗", self._C_OK if ok else self._C_ERR, "")
         self._result_text = _format_tool_result(self._tool_name, result)
         self._body.update(self._result_text)
+        self.collapsed = True   # tuck finished work away; click to re-open
 
 
 # ── Emit bridge ──────────────────────────────────────────────────────────────
@@ -314,9 +381,10 @@ class HellhoundApp(App):
     UserMessage { color: $text; background: #1a1d26; margin: 2 0 1 0; padding: 0 1; border-left: thick red; }
     AssistantMessage { margin: 1 0 0 0; padding: 0 1; }
     Markdown { margin: 1 0 2 0; padding: 0 1; background: #0b0d12; }
-    LogLine { color: $text-muted; margin: 0 0 1 1; }
+    LogLine { color: #9aa0ac; margin: 0 0 1 1; }
     ToolCard { margin: 0 0 0 1; border: none; background: #0b0d12; }
-    ToolCard > CollapsibleTitle { color: red; background: #0b0d12; }
+    ToolCard > CollapsibleTitle { color: #cdd2db; background: #0b0d12; }
+    ToolCard > CollapsibleTitle:hover { background: #1a1d26; }
     #working { height: 1; padding: 0 2; color: $text; }
     #suggest { height: auto; max-height: 10; margin: 0 1; border: round #7a2630; background: #141821; display: none; }
     #suggest > .option-list--option-highlighted { background: #5a1f27; color: $text; }
