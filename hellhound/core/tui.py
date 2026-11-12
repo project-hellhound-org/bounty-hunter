@@ -25,6 +25,7 @@ import os
 import re
 import threading
 import time
+from functools import partial
 from typing import Any, Callable, Dict, Optional
 
 from rich.markup import escape as _rich_escape
@@ -32,8 +33,10 @@ from rich.markup import escape as _rich_escape
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.command import Hit, Hits, Provider
 from textual.containers import Horizontal, VerticalScroll
 from textual.content import Content
+from textual.screen import ModalScreen
 from textual.widgets import Collapsible, Footer, Input, Markdown, OptionList, Static
 from textual.widgets.option_list import Option
 
@@ -428,12 +431,131 @@ class TextualEmit(PlainEmit):
     def restart_indicator(self, label: str = ""): pass
 
 
+# ── Findings browser (Ctrl+F) ─────────────────────────────────────────────────
+
+_SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "informational": 4}
+_SEV_COLOR = {"critical": "#e0554e", "high": "#e0772d", "medium": "#e0a030",
+              "low": "#4cc46a", "info": "#848b97", "informational": "#848b97"}
+
+
+class FindingCard(Collapsible):
+    """One recorded finding as a collapsible card — severity-tagged title,
+    expands to target + note + the captured repro evidence."""
+
+    def __init__(self, finding: Dict[str, Any]) -> None:
+        sev = str(finding.get("severity", "info")).lower().strip() or "info"
+        color = _SEV_COLOR.get(sev, "#848b97")
+        title = str(finding.get("type") or finding.get("kind") or "finding")
+        tgt = str(finding.get("target") or "")
+        note = str(finding.get("note") or "")
+        evidence = finding.get("raw_evidence") or []
+        label = Content.from_markup(
+            f"[{color}]● {_rich_escape(sev.upper()):<8}[/] [white]{_rich_escape(title)}[/]")
+        body_lines = []
+        if tgt:
+            body_lines.append(f"[#848b97]Target:[/] [#9aa0ac]{_rich_escape(tgt)}[/]")
+        if note:
+            body_lines.append(f"\n{_rich_escape(note)}")
+        if isinstance(evidence, list) and evidence:
+            body_lines.append("\n[#848b97]Evidence:[/]")
+            for e in evidence[:6]:
+                body_lines.append(f"[#6b7280]{_rich_escape(str(e)[:400])}[/]")
+        body = Static(Content.from_markup("\n".join(body_lines) or "[dim](no detail recorded)[/dim]"),
+                      markup=True)
+        super().__init__(body, title=label, collapsed=True)
+
+
+class FindingsScreen(ModalScreen):
+    """Ctrl+F: a browsable list of every finding recorded for the active target,
+    ordered by severity — click a card to read the full report + evidence."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss_screen", "Close", show=True),
+        Binding("q", "dismiss_screen", "Close", show=False),
+    ]
+    DEFAULT_CSS = """
+    FindingsScreen { align: center middle; background: $background 60%; }
+    #findings-box { width: 88%; height: 86%; background: #0d0f16; border: round #3a1318; padding: 1 2; }
+    #findings-head { height: auto; padding: 0 0 1 0; color: #cdd2db; }
+    #findings-body { height: 1fr; scrollbar-color: #5a1f27; }
+    FindingCard { margin: 0 0 1 0; }
+    FindingCard > CollapsibleTitle { color: #cdd2db; }
+    FindingCard > CollapsibleTitle:hover { background: #1a1d26; }
+    """
+
+    def __init__(self, findings: list, target_name: str) -> None:
+        super().__init__()
+        self._findings = list(findings or [])
+        self._target_name = target_name
+
+    def compose(self) -> ComposeResult:
+        from textual.containers import Vertical
+        ordered = sorted(self._findings,
+                         key=lambda f: _SEV_ORDER.get(str(f.get("severity", "info")).lower(), 5))
+        counts: Dict[str, int] = {}
+        for f in ordered:
+            s = str(f.get("severity", "info")).lower()
+            counts[s] = counts.get(s, 0) + 1
+        chips = "  ".join(
+            f"[{_SEV_COLOR.get(s, '#848b97')}]{counts[s]} {s}[/]"
+            for s in sorted(counts, key=lambda s: _SEV_ORDER.get(s, 5))
+        ) or "[dim]none[/dim]"
+        with Vertical(id="findings-box"):
+            yield Static(
+                Content.from_markup(
+                    f"[bold red]◆ Findings[/bold red] [dim]·[/dim] [white]{_rich_escape(str(self._target_name))}[/white]  "
+                    f"[dim]·[/dim] {chips}\n[dim]click a card to expand · Esc to close[/dim]"),
+                id="findings-head", markup=True)
+            with VerticalScroll(id="findings-body"):
+                if not ordered:
+                    yield Static("[dim]No findings recorded for this target yet.[/dim]", markup=True)
+                for f in ordered:
+                    yield FindingCard(f)
+
+    def action_dismiss_screen(self) -> None:
+        self.dismiss(None)
+
+
+# ── Command palette (Ctrl+P) ──────────────────────────────────────────────────
+
+class SlashCommandProvider(Provider):
+    """Feeds every registered hellhound slash command into Textual's Ctrl+P
+    palette — fuzzy-search by name/description, pick one and it drops into the
+    prompt ready for args (so /scope, /program switch, etc. are discoverable
+    without memorizing them)."""
+
+    async def search(self, query: str) -> Hits:
+        from hellhound.core.commands import COMMAND_REGISTRY
+        matcher = self.matcher(query)
+        uniq: Dict[str, Any] = {}
+        for cmd in COMMAND_REGISTRY.values():
+            uniq.setdefault(cmd.name, cmd)
+        for name in sorted(uniq):
+            cmd = uniq[name]
+            haystack = f"{name} {cmd.description or ''}"
+            if query.strip():
+                score = matcher.match(haystack)
+                if score <= 0:
+                    continue
+                display = matcher.highlight(name)
+            else:
+                score = 1.0
+                display = name
+            yield Hit(
+                score, display,
+                partial(self.app._palette_fill, name),
+                text=name,
+                help=(cmd.description or cmd.usage or "").strip() or None,
+            )
+
+
 # ── The app ──────────────────────────────────────────────────────────────────
 
 class HellhoundApp(App):
     """Claude Code-style interactive terminal for Hellhound."""
 
     TITLE = "HELLHOUND — Bounty Hunter"
+    COMMANDS = App.COMMANDS | {SlashCommandProvider}
     CSS = """
     Screen { background: #0b0d12; }
     #banner { height: auto; background: #0b0d12; }
@@ -461,6 +583,7 @@ class HellhoundApp(App):
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+y", "copy_last", "Copy last result", show=False),
         Binding("ctrl+b", "toggle_sidepanel", "Toggle live panel", show=False),
+        Binding("ctrl+f", "show_findings", "Findings", show=True),
         Binding("escape", "cancel_turn", "Cancel turn"),
         Binding("down", "sugg_next", show=False, priority=True),
         Binding("up", "sugg_prev", show=False, priority=True),
@@ -607,7 +730,7 @@ class HellhoundApp(App):
             "[bold red]Welcome back,[/bold red] [bold white]Researcher.[/bold white]",
             f"[red]Model:[/red] [white]{_rich_escape(who)}[/white]",
             target_line,
-            "[dim]Type[/dim] [bold red]/[/bold red] [dim]for commands,[/dim] [bold red]/help[/bold red] [dim]for all · ↑↓ history · Ctrl+Y copies last · Esc cancels · Ctrl+Q quits[/dim]",
+            "[dim]Type[/dim] [bold red]/[/bold red] [dim]for commands · Ctrl+P palette · Ctrl+F findings · ↑↓ history · Ctrl+Y copy · Esc cancel · Ctrl+Q quit[/dim]",
         ]
         return "\n".join(lines)
 
@@ -999,6 +1122,29 @@ class HellhoundApp(App):
         else:
             self._refresh_sidepanel()
             self.add_log_line("[dim]Live-work panel on (Ctrl+B to hide).[/dim]")
+
+    def _palette_fill(self, command_name: str) -> None:
+        """Ctrl+P palette picked a command — drop it into the prompt ready for
+        args rather than firing blind (most commands take arguments)."""
+        try:
+            inp = self.query_one("#prompt", Input)
+            inp.value = command_name + " "
+            inp.focus()
+            inp.cursor_position = len(inp.value)
+        except Exception:
+            pass
+
+    def action_show_findings(self) -> None:
+        """Ctrl+F: open the findings browser for the active target."""
+        findings = []
+        tname = self._initial_target
+        try:
+            if self._agent is not None and getattr(self._agent, "target", None):
+                findings = list(self._agent.target.findings or [])
+                tname = self._agent.target.name
+        except Exception:
+            pass
+        self.push_screen(FindingsScreen(findings, tname))
 
     def _reenable_input(self) -> None:
         try:
