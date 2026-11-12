@@ -426,7 +426,9 @@ class HellhoundApp(App):
     #banner { height: auto; background: #0b0d12; }
     #logo { width: auto; height: auto; color: red; padding: 0 2 0 1; }
     #baninfo { width: 1fr; height: auto; padding: 1 1 0 2; }
-    #transcript { height: 1fr; padding: 1 2; background: #0b0d12; scrollbar-background: #0b0d12; scrollbar-color: #5a1f27; }
+    #main { height: 1fr; }
+    #transcript { width: 1fr; height: 1fr; padding: 1 2; background: #0b0d12; scrollbar-background: #0b0d12; scrollbar-color: #5a1f27; }
+    #sidepanel { width: 34; height: 1fr; padding: 1 1; background: #0d0f16; border-left: solid #3a1318; display: none; }
     UserMessage { color: $text; background: #1a1d26; margin: 2 0 1 0; padding: 0 1; border-left: thick red; }
     AssistantMessage { margin: 1 0 0 0; padding: 0 1; }
     Markdown { margin: 1 0 2 0; padding: 0 1; background: #0b0d12; }
@@ -445,6 +447,7 @@ class HellhoundApp(App):
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+y", "copy_last", "Copy last result", show=False),
+        Binding("ctrl+b", "toggle_sidepanel", "Toggle live panel", show=False),
         Binding("escape", "cancel_turn", "Cancel turn"),
         Binding("down", "sugg_next", show=False, priority=True),
         Binding("up", "sugg_prev", show=False, priority=True),
@@ -488,7 +491,11 @@ class HellhoundApp(App):
             Static("", id="baninfo", markup=True),
             id="banner",
         )
-        yield VerticalScroll(id="transcript")
+        yield Horizontal(
+            VerticalScroll(id="transcript"),
+            Static("", id="sidepanel", markup=True),
+            id="main",
+        )
         yield WorkingIndicator(id="working")
         yield SuggestionBox()
         yield Input(placeholder="Ask Hellhound, or type /help … (type / for commands)", id="prompt")
@@ -695,6 +702,7 @@ class HellhoundApp(App):
         if self._active_cards:
             try:
                 self._active_cards[-1].append_live(batch)
+                self._refresh_sidepanel()
                 return
             except Exception:
                 pass
@@ -708,16 +716,52 @@ class HellhoundApp(App):
         if cards:
             try:
                 cards[-1].append_live(batch)
+                self._refresh_sidepanel()
                 return
             except Exception:
                 pass
         self.route_live_output(batch)
+
+    def _refresh_sidepanel(self) -> None:
+        """The right-docked 'Live work' panel: a compact roster of the tools
+        running RIGHT NOW (spider, fuzz_hunter, httpx…) with their progress, so
+        you can watch the background sweep on the side while the chat stays
+        readable. The full cards + results still land in the transcript. The
+        panel hides itself whenever nothing is running."""
+        if getattr(self, "_sidepanel_off", False):
+            return
+        try:
+            panel = self.query_one("#sidepanel", Static)
+        except Exception:
+            return
+        running = list(self._active_cards)
+        if not running:
+            panel.display = False
+            panel.update("")
+            return
+        lines = ["[bold #e0a030]▸ LIVE WORK[/]", ""]
+        for c in running:
+            name = _rich_escape(getattr(c, "_tool_name", "?"))
+            hits = len(getattr(c, "_live_lines", []))
+            assets = getattr(c, "_asset_count", 0)
+            meta = []
+            if hits:
+                meta.append(f"{hits} line{'s' if hits != 1 else ''}")
+            if assets:
+                meta.append(f"{assets} assets")
+            tail = f" [#848b97]· {' · '.join(meta)}[/]" if meta else ""
+            lines.append(f"[#4cc46a]●[/] [#f0f2f5]{name}[/]{tail}")
+        lines.append("")
+        lines.append(f"[#6b7280]{len(running)} tool{'s' if len(running) != 1 else ''} running[/]")
+        panel.display = True
+        panel.update("\n".join(lines))
 
     def start_tool_card(self, tool_name: str, args: Dict[str, Any]) -> None:
         card = ToolCard(tool_name, args)
         self._pending_cards.setdefault(tool_name, []).append(card)
         self._active_cards.append(card)
         self._mount(card)
+        self._refresh_sidepanel()
         # Pin the spinner to the running tool so you can see WHAT is running.
         try:
             self.query_one("#working", WorkingIndicator).set_label(f"Running {tool_name}")
@@ -739,6 +783,8 @@ class HellhoundApp(App):
             # Remember this card's copyable payload (repro command + result) so
             # Ctrl+Y grabs the exact request/response for a report.
             self._last_copyable = self._card_copy_text(tool_name, result)
+        # Drop this tool off the right-side 'Live work' roster.
+        self._refresh_sidepanel()
         # A new finding just landed -> tick the banner's live findings counter.
         if tool_name in ("record_finding",) and isinstance(result, dict) and "error" not in result:
             self.refresh_banner()
@@ -908,6 +954,20 @@ class HellhoundApp(App):
             self.add_log_line(f"[#4cc46a]Copied last result to clipboard ({n} lines).[/]")
         except Exception as exc:
             self.add_log_line(f"[dim]Copy failed: {exc}[/dim]")
+
+    def action_toggle_sidepanel(self) -> None:
+        """Ctrl+B: hide/show the right-side 'Live work' panel. Off = full-width
+        chat; on = watch the background sweep on the side while you read."""
+        self._sidepanel_off = not getattr(self, "_sidepanel_off", False)
+        if self._sidepanel_off:
+            try:
+                self.query_one("#sidepanel", Static).display = False
+            except Exception:
+                pass
+            self.add_log_line("[dim]Live-work panel hidden (Ctrl+B to show).[/dim]")
+        else:
+            self._refresh_sidepanel()
+            self.add_log_line("[dim]Live-work panel on (Ctrl+B to hide).[/dim]")
 
     def _reenable_input(self) -> None:
         try:
