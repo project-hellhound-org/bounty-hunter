@@ -394,6 +394,7 @@ class HellhoundApp(App):
 
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+y", "copy_last", "Copy last result", show=False),
         Binding("escape", "cancel_turn", "Cancel turn"),
         Binding("down", "sugg_next", show=False, priority=True),
         Binding("up", "sugg_prev", show=False, priority=True),
@@ -422,6 +423,7 @@ class HellhoundApp(App):
         self._cancel_event = threading.Event()
         self._pending_cards: Dict[str, list] = {}
         self._active_cards: list = []  # running ToolCards, newest last — live output folds into the top one
+        self._last_copyable: str = ""  # last tool card's repro+result, for Ctrl+Y copy
         self._assistant_md: Optional[Markdown] = None  # live-rendered reply
         self._assistant_buf = ""                         # accumulated reply text
         self._last_md_flush = 0.0                        # throttle timestamp
@@ -504,14 +506,22 @@ class HellhoundApp(App):
         except Exception:
             recent = "none yet"
 
+        finding_count = 0
+        try:
+            finding_count = len(self._agent.target.findings or [])
+        except Exception:
+            pass
+
         scope_str = "[bold red]Active Scope[/bold red]" if scope_active else "[dim]Default Scope[/dim]"
+        findings_str = (f"  [dim]·[/dim] [#4cc46a]◆ {finding_count} finding{'s' if finding_count != 1 else ''}[/]"
+                        if finding_count else "")
         who = (f"{model} ({provider})" if model else "—") + (f" · @{handle}" if handle else "")
         lines = [
             "[bold red]Welcome back,[/bold red] [bold white]Researcher.[/bold white]",
             f"[red]Model:[/red] [white]{_rich_escape(who)}[/white]",
-            f"[red]Target:[/red] [bold white]{_rich_escape(str(tname))}[/bold white]  [dim]·[/dim] {scope_str}",
+            f"[red]Target:[/red] [bold white]{_rich_escape(str(tname))}[/bold white]  [dim]·[/dim] {scope_str}{findings_str}",
             f"[red]Recent:[/red] [white]{_rich_escape(recent)}[/white]",
-            "[dim]Type[/dim] [bold red]/[/bold red] [dim]for commands,[/dim] [bold red]/help[/bold red] [dim]for all · Esc cancels · Ctrl+Q quits[/dim]",
+            "[dim]Type[/dim] [bold red]/[/bold red] [dim]for commands,[/dim] [bold red]/help[/bold red] [dim]for all · ↑↓ history · Ctrl+Y copies last · Esc cancels · Ctrl+Q quits[/dim]",
         ]
         return "\n".join(lines)
 
@@ -657,11 +667,31 @@ class HellhoundApp(App):
                 card.set_result(result)
             except Exception:
                 pass
+            # Remember this card's copyable payload (repro command + result) so
+            # Ctrl+Y grabs the exact request/response for a report.
+            self._last_copyable = self._card_copy_text(tool_name, result)
+        # A new finding just landed -> tick the banner's live findings counter.
+        if tool_name in ("record_finding",) and isinstance(result, dict) and "error" not in result:
+            self.refresh_banner()
         # Back to the rotating phrases between tools.
         try:
             self.query_one("#working", WorkingIndicator).set_label("")
         except Exception:
             pass
+
+    @staticmethod
+    def _card_copy_text(tool_name: str, result: Any) -> str:
+        """Plain-text payload for Ctrl+Y: the repro command if the tool captured
+        one (curl), plus the readable result body."""
+        parts = []
+        if isinstance(result, dict):
+            repro = result.get("curl_repro") or result.get("command") or result.get("repro")
+            if repro:
+                parts.append(str(repro))
+        body = _format_tool_result(tool_name, result)
+        if body:
+            parts.append(body)
+        return "\n\n".join(parts) if parts else f"{tool_name}: (no copyable output)"
 
     # -- autocomplete wiring --
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -796,6 +826,19 @@ class HellhoundApp(App):
             return
         self._cancel_event.set()
         self.add_log_line("[bold orange1][!][/bold orange1] cancel requested — winding down this turn…")
+
+    def action_copy_last(self) -> None:
+        """Ctrl+Y: copy the last tool card's repro command + result to the system
+        clipboard — grab the exact request/response for a report in one key."""
+        if not self._last_copyable:
+            self.add_log_line("[dim]Nothing to copy yet — run a tool first.[/dim]")
+            return
+        try:
+            self.copy_to_clipboard(self._last_copyable)
+            n = self._last_copyable.count("\n") + 1
+            self.add_log_line(f"[#4cc46a]Copied last result to clipboard ({n} lines).[/]")
+        except Exception as exc:
+            self.add_log_line(f"[dim]Copy failed: {exc}[/dim]")
 
     def _reenable_input(self) -> None:
         try:
