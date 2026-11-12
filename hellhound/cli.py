@@ -65,14 +65,14 @@ def _configure_logging():
 @click.pass_context
 def cli(ctx, print_cmd, json_output, classic):
     """
-    HELLHOUND — Autonomous bug bounty recon & triage assistant
+    BEAST (Bounty Hunter) — Project Hellhound's autonomous bug bounty recon & triage AI
 
     Run without arguments to launch the interactive chat console.
 
-      hellhound                     → interactive Textual TUI
-      hellhound --classic           → classic prompt_toolkit console
-      hellhound --print "/scope show --json"
-      hellhound -p "/recon example.com"
+      beast                     → interactive Textual TUI
+      beast --classic           → classic prompt_toolkit console
+      beast --print "/scope show --json"
+      beast -p "/recon example.com"
     """
     if print_cmd:
         _execute_headless(print_cmd, json_output)

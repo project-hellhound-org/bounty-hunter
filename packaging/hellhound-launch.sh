@@ -23,7 +23,7 @@
 set -f  # no globbing needed anywhere below
 
 PREF_FILE="$HOME/.hellhound/terminal_preference"
-CMD="hellhound"
+CMD="beast"
 
 # A reasonable starting geometry for emulators that support it, so the
 # window doesn't open tiny by default the way the raw DE fallback did.

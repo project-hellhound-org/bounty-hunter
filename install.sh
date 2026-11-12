@@ -103,7 +103,7 @@ if [ ! -f "setup.py" ]; then
 fi
 
 PROJECT_ROOT="$(pwd)"
-VENV_DIR="$HOME/.hellhound-env"
+VENV_DIR="$HOME/.beast-env"
 
 # Detect shell rc file
 if [ "$(basename "$SHELL")" = "zsh" ]; then
@@ -164,7 +164,7 @@ if ! _pip_install_with_retry -e "$PROJECT_ROOT"; then
 fi
 stop_animation
 success "HELLHOUND core engine installed"
-info "Interactive Textual TUI ready — run 'hellhound' for it, or 'hellhound --classic' for the classic console."
+info "Interactive Textual TUI ready — run 'beast' for it, or 'beast --classic' for the classic console."
 
 # ── 4. Playwright (Spider-style handling) ──────────────
 stop_animation
@@ -269,25 +269,36 @@ fi
 # ── 5. System Integration ──────────────────────────────
 start_animation "FINALIZING INTEGRATION"
 
-# Alias integration
-ALIAS_LINE="alias hellhound='$VENV_DIR/bin/hellhound'"
-if grep -qF "alias hellhound=" "$SHELL_RC" 2>/dev/null; then
-    sed -i "s|alias hellhound=.*|$ALIAS_LINE|" "$SHELL_RC"
+# Alias integration — `beast` is the command; keep a `hellhound` alias for
+# back-compat so existing muscle memory / scripts still work.
+ALIAS_LINE="alias beast='$VENV_DIR/bin/beast'"
+if grep -qF "alias beast=" "$SHELL_RC" 2>/dev/null; then
+    sed -i "s|alias beast=.*|$ALIAS_LINE|" "$SHELL_RC"
 else
     echo "" >> "$SHELL_RC"
-    echo "# HELLHOUND" >> "$SHELL_RC"
+    echo "# BEAST (Project Hellhound — Bounty Hunter)" >> "$SHELL_RC"
     echo "$ALIAS_LINE" >> "$SHELL_RC"
 fi
+# Back-compat alias (old name)
+HH_ALIAS_LINE="alias hellhound='$VENV_DIR/bin/beast'"
+if grep -qF "alias hellhound=" "$SHELL_RC" 2>/dev/null; then
+    sed -i "s|alias hellhound=.*|$HH_ALIAS_LINE|" "$SHELL_RC"
+else
+    echo "$HH_ALIAS_LINE" >> "$SHELL_RC"
+fi
 
-# Local bin symlink
+# Local bin symlink (beast primary + hellhound back-compat)
 mkdir -p "$HOME/.local/bin"
-ln -sf "$VENV_DIR/bin/hellhound" "$HOME/.local/bin/hellhound"
+ln -sf "$VENV_DIR/bin/beast" "$HOME/.local/bin/beast"
+ln -sf "$VENV_DIR/bin/beast" "$HOME/.local/bin/hellhound"
 
 # Global bin symlink (if sudo available)
 if [ "$EUID" -eq 0 ]; then
-    ln -sf "$VENV_DIR/bin/hellhound" "/usr/local/bin/hellhound"
+    ln -sf "$VENV_DIR/bin/beast" "/usr/local/bin/beast"
+    ln -sf "$VENV_DIR/bin/beast" "/usr/local/bin/hellhound"
 elif sudo -n true 2>/dev/null; then
-    sudo ln -sf "$VENV_DIR/bin/hellhound" "/usr/local/bin/hellhound" 2>/dev/null || true
+    sudo ln -sf "$VENV_DIR/bin/beast" "/usr/local/bin/beast" 2>/dev/null || true
+    sudo ln -sf "$VENV_DIR/bin/beast" "/usr/local/bin/hellhound" 2>/dev/null || true
 fi
 
 chmod +x "$PROJECT_ROOT/update.sh"

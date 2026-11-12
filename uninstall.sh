@@ -45,11 +45,14 @@ for arg in "$@"; do
     esac
 done
 
-VENV_DIR="$HOME/.hellhound-env"
+VENV_DIR="$HOME/.beast-env"
+LEGACY_VENV_DIR="$HOME/.hellhound-env"   # pre-rename venv, remove if present
 HELLHOUND_HOME="$HOME/.hellhound"
 SRC_DIR="$HOME/.hellhound-src"
-LOCAL_BIN_LINK="$HOME/.local/bin/hellhound"
-GLOBAL_BIN_LINK="/usr/local/bin/hellhound"
+LOCAL_BIN_LINK="$HOME/.local/bin/beast"
+LEGACY_LOCAL_BIN_LINK="$HOME/.local/bin/hellhound"
+GLOBAL_BIN_LINK="/usr/local/bin/beast"
+LEGACY_GLOBAL_BIN_LINK="/usr/local/bin/hellhound"
 DESKTOP_FILE="$HOME/.local/share/applications/hellhound.desktop"
 DATA_ICON_DIR="$HOME/.local/share/hellhound"
 ICON_FILE="$HOME/.local/share/icons/hellhound.png"
@@ -95,24 +98,30 @@ if [ "$YES" -ne 1 ]; then
     fi
 fi
 
-# ── Remove venv ────────────────────────────────────────
-if [ -d "$VENV_DIR" ]; then
-    rm -rf "$VENV_DIR" && success "Removed virtual environment: $VENV_DIR"
-fi
-
-# ── Remove symlinks ─────────────────────────────────────
-if [ -L "$LOCAL_BIN_LINK" ] || [ -e "$LOCAL_BIN_LINK" ]; then
-    rm -f "$LOCAL_BIN_LINK" && success "Removed symlink: $LOCAL_BIN_LINK"
-fi
-if [ -L "$GLOBAL_BIN_LINK" ] || [ -e "$GLOBAL_BIN_LINK" ]; then
-    if [ "$EUID" -eq 0 ]; then
-        rm -f "$GLOBAL_BIN_LINK" && success "Removed symlink: $GLOBAL_BIN_LINK"
-    elif sudo -n true 2>/dev/null; then
-        sudo rm -f "$GLOBAL_BIN_LINK" && success "Removed symlink: $GLOBAL_BIN_LINK"
-    else
-        warn "Skipped $GLOBAL_BIN_LINK — re-run with sudo to remove it, or: sudo rm -f $GLOBAL_BIN_LINK"
+# ── Remove venv (new + legacy) ──────────────────────────
+for _venv in "$VENV_DIR" "$LEGACY_VENV_DIR"; do
+    if [ -d "$_venv" ]; then
+        rm -rf "$_venv" && success "Removed virtual environment: $_venv"
     fi
-fi
+done
+
+# ── Remove symlinks (beast + legacy hellhound) ──────────
+for _link in "$LOCAL_BIN_LINK" "$LEGACY_LOCAL_BIN_LINK"; do
+    if [ -L "$_link" ] || [ -e "$_link" ]; then
+        rm -f "$_link" && success "Removed symlink: $_link"
+    fi
+done
+for _glink in "$GLOBAL_BIN_LINK" "$LEGACY_GLOBAL_BIN_LINK"; do
+    if [ -L "$_glink" ] || [ -e "$_glink" ]; then
+        if [ "$EUID" -eq 0 ]; then
+            rm -f "$_glink" && success "Removed symlink: $_glink"
+        elif sudo -n true 2>/dev/null; then
+            sudo rm -f "$_glink" && success "Removed symlink: $_glink"
+        else
+            warn "Skipped $_glink — re-run with sudo to remove it, or: sudo rm -f $_glink"
+        fi
+    fi
+done
 
 # ── Remove desktop integration ──────────────────────────
 [ -f "$DESKTOP_FILE" ] && rm -f "$DESKTOP_FILE" && success "Removed desktop entry: $DESKTOP_FILE"
@@ -124,14 +133,16 @@ fi
 
 # ── Remove shell aliases ────────────────────────────────
 if [ -f "$SHELL_RC" ]; then
-    if grep -qF "alias hellhound=" "$SHELL_RC" 2>/dev/null || grep -qF "alias hellhound-gui=" "$SHELL_RC" 2>/dev/null; then
-        cp "$SHELL_RC" "$SHELL_RC.hellhound-uninstall.bak"
+    if grep -qE "alias (beast|hellhound)(-gui)?=" "$SHELL_RC" 2>/dev/null; then
+        cp "$SHELL_RC" "$SHELL_RC.beast-uninstall.bak"
         sed -i \
             -e "/^# HELLHOUND$/d" \
+            -e "/^# BEAST /d" \
+            -e "/^alias beast=/d" \
             -e "/^alias hellhound=/d" \
             -e "/^alias hellhound-gui=/d" \
             "$SHELL_RC"
-        success "Removed hellhound aliases from $SHELL_RC (backup: $SHELL_RC.hellhound-uninstall.bak)"
+        success "Removed beast/hellhound aliases from $SHELL_RC (backup: $SHELL_RC.beast-uninstall.bak)"
     fi
 fi
 

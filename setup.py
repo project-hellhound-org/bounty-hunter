@@ -22,8 +22,9 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            # This makes `hellhound` a real system command after install.
-            # Points to hellhound/cli.py → main()
+            # `beast` is the primary command (the tool's nickname); `hellhound`
+            # stays as a back-compat alias. Both point to hellhound/cli.py → main().
+            "beast = hellhound.cli:main",
             "hellhound = hellhound.cli:main",
         ]
     },

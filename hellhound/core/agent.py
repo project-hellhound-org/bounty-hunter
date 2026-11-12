@@ -8937,6 +8937,7 @@ def _execute_self_audit(args: Dict[str, Any], target: Target, emit: Any) -> Dict
         "status": "success",
         "identity": {
             "name": "Bounty Hunter",
+            "nickname": "Beast",
             "project": "Project Hellhound",
             "researcher": cfg.get("researcher_handle") or "unset",
         },

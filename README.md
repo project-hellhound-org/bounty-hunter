@@ -52,8 +52,8 @@
 It features **persistent target memory and an automated artifact blackboard**—harvested tokens, credentials, session cookies, open ports, crawl trees, visual screenshots, and triage notes are automatically retained in isolated per-target workspaces (`~/.hellhound/targets/<target>/`) so hunts seamlessly resume across sessions without token loss or "lost-in-the-middle" reasoning drops.
 
 Works across two flexible interfaces:
-- **Interactive Terminal**: An interactive terminal environment with real-time token streaming, live progress feedback, and inline command autocompletion (`hellhound`).
-- **Headless CLI Runner**: Direct one-line command execution for quick scripts and CI/CD pipelines (`hellhound -p "prompt"`).
+- **Interactive Terminal**: An interactive terminal environment with real-time token streaming, live progress feedback, and inline command autocompletion (`beast`).
+- **Headless CLI Runner**: Direct one-line command execution for quick scripts and CI/CD pipelines (`beast -p "prompt"`).
 
 ---
 
@@ -157,10 +157,10 @@ source ~/.bashrc   # or source ~/.zshrc
 ```
 
 The automated installer will:
-- Set up an isolated Python virtual environment at `~/.hellhound-env`.
+- Set up an isolated Python virtual environment at `~/.beast-env`.
 - Mount the headless browser & Playwright SPA engine with all system dependencies.
 - Verify and install the offensive toolchain (`gowitness`, `subfinder`, `httpx`, `dnsx`, `naabu`, `ffuf`, `alterx`, `tlsx`, `shuffledns`, `subzy`).
-- Create a global `hellhound` command symlink.
+- Create a global `beast` command symlink.
 
 ---
 
@@ -175,7 +175,7 @@ export NVIDIA_API_KEY="nvapi-your-key-here"
 ```
 3. Inside Bounty Hunter, select Nemotron or Llama 3.3:
 ```bash
-hellhound
+beast
 > /model orchestrator nvidia nvidia/nemotron-3-ultra-550b-a55b
 > /model synthesizer nvidia nvidia/nemotron-3-ultra-550b-a55b
 ```
@@ -215,7 +215,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull qwen2.5:32b-instruct-q4_0
 
 # 3. Connect inside Bounty Hunter
-hellhound
+beast
 > /model orchestrator ollama qwen2.5:32b-instruct-q4_0
 > /model synthesizer ollama qwen2.5:32b-instruct-q4_0
 ```
@@ -229,7 +229,7 @@ tools, alongside its own built-in recon arsenal. Both are configured
 inside the console with one command each — no manual config editing:
 
 ```bash
-hellhound
+beast
 > /mcp burp http://127.0.0.1:9876   # auto-detects Burp's MCP transport
 > /mcp caido http://localhost:8080  # uses caido-mcp-server if installed, else falls back to built-in GraphQL
 > /mcp                              # shows current config + live status for both
@@ -246,7 +246,7 @@ table for each): [Burp Suite MCP Setup](docs/mcp-burp-setup.md) ·
 ### 5. Health Check & Tool Verification
 Verify that your environment, AI models, and binary tools are fully connected:
 ```bash
-hellhound
+beast
 > /setup
 > /setup tools
 ```
@@ -270,28 +270,28 @@ Every tool in the arsenal that needs one is self-describing this way — run `/s
 ### 1. Interactive Terminal
 Launch the interactive terminal console with live autocomplete and syntax highlighting:
 ```bash
-hellhound
+beast
 ```
 
 ### 2. Headless CLI Automation
 Run one-off prompts and scripted pipeline jobs directly:
 ```bash
 # Scoped reconnaissance against a domain
-hellhound -p "recon targetcorp.example"
+beast -p "recon targetcorp.example"
 
 # Say what you actually want done — the agent picks the right skill and
 # recon depth (active vs. passive) itself, it isn't hardcoded off the domain name
-hellhound -p "target is https://lab.ctfio.com and creds user:pass, takeover admin account"
+beast -p "target is https://lab.ctfio.com and creds user:pass, takeover admin account"
 
 # Direct slash command execution with JSON output
-hellhound -p "/hunt target.com --json"
+beast -p "/hunt target.com --json"
 ```
 
 ### 3. Never used it before? Your first hunt in 4 steps
 
 No prior security tooling knowledge needed — you talk to it in plain English.
 
-1. **Launch it** — type `hellhound`. You land in the interactive terminal.
+1. **Launch it** — type `beast`. You land in the interactive terminal.
 2. **Point it at a target, in plain words** — no flags, no tool names:
    > `scan example.com for common web vulnerabilities`
 
