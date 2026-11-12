@@ -34,8 +34,14 @@
 ---
 
 > [!WARNING]
-> ### ⚠️ Project Status & Active Development Notice
-> **Hellhound Bounty Hunter is under active development** and is run against real, authorized bug bounty programs alongside intentionally vulnerable ranges (PortSwigger Web Security Academy, HackTheBox, CTFHub) and hardened local environments. It now **solves Web Security Academy labs autonomously, end to end** across multiple classes — password-reset poisoning via host-header injection, exploiting an exposed-API-documentation endpoint to delete a user, reflected / stored / DOM-based XSS (confirmed by firing `alert()` in a real headless browser), and CORS — not just recon. **Exploitation validation has been materially hardened:** XSS findings are gated on real browser execution (a payload the browser proves didn't run is refused, not recorded), `verify_finding` runs class-specific live checks, and dismissed false positives can't silently re-appear. Tool-calling is native-function-calling-first and no longer dead-ends mid-generation on reasoning models. Still, it is **not yet "fire and forget" on production targets** — review every finding before relying on it or submitting it. Use responsibly and strictly on authorized targets.
+> ### ⚠️ Project Status — Where It Actually Stands
+> **Hellhound Bounty Hunter is under active development.** Here's an honest read of how it performs across the environments it's run against, so you know what to expect before you point it at anything:
+>
+> - **PortSwigger Web Security Academy labs** — solves them **autonomously, end to end**, across multiple vulnerability classes: password-reset poisoning via host-header injection, deleting a user through an exposed API-documentation endpoint, reflected / stored / DOM-based XSS (confirmed by firing a real `alert()` in a headless browser), CORS, and SSRF. Not just recon — the full exploit.
+> - **Hardened & intentionally-vulnerable ranges** (HackTheBox, CTFHub, local hardened labs) — recon, foothold, and exploitation hold up well.
+> - **Real, authorized bug-bounty programs** — strong at recon, scoping, and triage; it surfaces and verifies genuine issues. But it is **not yet "fire and forget"** on production targets — **review every finding before you rely on it or submit it.**
+>
+> What it reports is meant to be a *confirmed* bug, not a guess: XSS has to actually execute in a browser to be recorded, `verify_finding` runs class-specific live checks, and a dismissed false positive can't silently reappear. Use responsibly and strictly on authorized targets.
 
 ---
 
@@ -281,6 +287,20 @@ hellhound -p "target is https://lab.ctfio.com and creds user:pass, takeover admi
 hellhound -p "/hunt target.com --json"
 ```
 
+### 3. Never used it before? Your first hunt in 4 steps
+
+No prior security tooling knowledge needed — you talk to it in plain English.
+
+1. **Launch it** — type `hellhound`. You land in the interactive terminal.
+2. **Point it at a target, in plain words** — no flags, no tool names:
+   > `scan example.com for common web vulnerabilities`
+
+   It sets the target, chooses how deep to go, and starts. *(Only ever test targets you're authorized to — see [Scope Policy](#scope-policy--legal-compliance) below.)*
+3. **Watch it work** — long scans appear as live cards on the right. Press **`Ctrl+P`** any time to browse every command, **`Ctrl+F`** to see findings so far.
+4. **Review what it found** — run `/report` for a self-contained HTML report. **Always read a finding before you trust or submit it.**
+
+> **Working a real program with many in-scope domains?** Group them once: `/program create acme example.com,api.example.com`, then `/program select acme` to enter it and `/list` to see its hosts. Everything you do from then on is saved under that program. Not sure what a command does? **`Ctrl+P`** fuzzy-searches them all.
+
 ---
 
 ## Commands
@@ -296,7 +316,8 @@ All actions can be triggered via slash commands or natural language:
 | `/scan` | `/strike` | Execute a specific discovery or audit module | `/scan <module> [target] [key=val...]` |
 | `/howl` | `/correlate`, `/graph` | Correlate discoveries or generate visual attack graph | `/howl [--graph] [target]` |
 | `/scope` | `/rules` | View, clear, or configure program scope rules | `/scope [show \| clear \| <rules_text>]` |
-| `/program` | `/programs`, `/engagement` | Group several in-scope domains of one engagement under a shared scope | `/program [show \| list \| create <name> [domains] \| add <domain...> \| scope <text> \| rename <old> <new>]` |
+| `/program` | `/programs`, `/engagement` | Group an engagement's in-scope domains under one shared scope; select/switch between them; mark private | `/program [select \| switch <name> [host] \| list [all] \| create <name> [domains] \| add <domain...> \| scope <text> \| private \| public \| rename <old> <new>]` |
+| `/list` | `/ls`, `/hosts` | Metasploit-style view of the **current** program — its worked targets + in-scope hosts you can jump to | `/list` |
 | `/output` | `/tail`, `/show-output` | Show the full captured output of the last long-running tool call | `/output [stderr] [N]` |
 | `/skills` | `/skill` | Search or list loaded methodology skills & checklists | `/skills [query] [--json]` |
 | `/model` | `/ai` | Inspect/switch active model for orchestrator/synthesizer | `/model [orchestrator\|synthesizer] <model-id>` |
@@ -370,11 +391,17 @@ Highlights of recent work (full history in [CHANGELOG.md](CHANGELOG.md)):
 
 ## Roadmap — What's Next
 
-The real gap between "runs tools well" and "hunts like a pro" is architecture, not more tools. Open, in rough priority (fuller reasoning in [CHANGELOG.md](CHANGELOG.md)):
+The real gap between "runs tools well" and "hunts like a pro" is architecture, not more tools. Fuller reasoning in [CHANGELOG.md](CHANGELOG.md).
 
-1. **Scriptable-browser request/response interception** — record/replay already landed; interception is what's left.
-2. **Burp/Caido ↔ identity bridge** — push/pull sessions through the already-integrated MCP tools.
-3. **Passive → active intel fusion** — CT logs / Wayback / gau / OTX deduped straight into probing; JS sourcemap → secrets → endpoints → fuzzer.
+**Already landed** (was on this list, now shipped):
+- Passive recon surface — Wayback, OTX, urlscan, `gau` → `nuclei`, and CT-log subdomain sweeps are live tools.
+- Scriptable browser with record/replay of auth flows (`save_auth_flow` / `replay_auth_flow`) and live request observation.
+- Native-function-calling tool execution across every provider.
+
+**Open, in rough priority:**
+1. **Browser request *interception*** — the browser already observes traffic; modifying or blocking requests mid-flight is what's left.
+2. **Burp/Caido ↔ identity bridge** — push/pull live sessions through the already-integrated MCP tools.
+3. **Passive → active fusion** — the passive tools exist; wiring their output *automatically* into the probing/fuzzing loop (dedup, JS sourcemap → secrets → endpoints → fuzzer) is the remaining glue.
 4. **A playbook engine** — conditional branching workflows, not just sequential tool chaining.
 
 ---
