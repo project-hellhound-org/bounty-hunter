@@ -1278,28 +1278,41 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
             emit.warn(msg)
             return {"status": "not_found", "program": prog_name, "message": msg}
         domains = list_program_targets(prog_name)
-        if not domains:
-            msg = f"Program '{record.get('display_name', prog_name)}' has no domains attached yet. Add one with: /program add <domain>"
+        # You can also jump to any CONCRETE in-scope host of the program, even
+        # one you haven't worked yet — it gets instantiated + attached on switch
+        # (wildcards like *.foo.com are scope patterns, not switchable hosts).
+        _in_scope = (record.get("scope_rules") or {}).get("in_scope", [])
+        concrete_scope = [d for d in _in_scope if d and not d.startswith("*")]
+        switchable = list(dict.fromkeys(list(domains) + concrete_scope))
+        if not switchable:
+            msg = f"Program '{record.get('display_name', prog_name)}' has no domains attached or in scope yet. Add one with: /program add <domain>"
             emit.warn(msg)
             return {"status": "error", "error": "empty_program", "program": record["name"], "message": msg}
 
         requested_domain = clean_args[2].strip().lower() if len(clean_args) > 2 else None
         if requested_domain:
-            if requested_domain not in domains:
-                msg = f"'{requested_domain}' isn't part of program '{record.get('display_name', prog_name)}'. Domains: {', '.join(domains)}"
+            if requested_domain not in switchable:
+                msg = f"'{requested_domain}' isn't in program '{record.get('display_name', prog_name)}' scope. See /list for its hosts."
                 emit.warn(msg)
-                return {"status": "error", "error": "domain_not_in_program", "program": record["name"], "domains": domains, "message": msg}
+                return {"status": "error", "error": "domain_not_in_program", "program": record["name"], "domains": switchable, "message": msg}
             chosen = requested_domain
-        elif len(domains) == 1:
-            chosen = domains[0]
+            # First time landing on an in-scope host that was never worked →
+            # attach it so it shows up as a target of the program from now on.
+            if chosen not in domains:
+                try:
+                    attach_target_to_program(create_or_load_target(chosen), prog_name)
+                    domains = list_program_targets(prog_name)
+                except Exception:
+                    pass
+        elif len(switchable) == 1:
+            chosen = switchable[0]
         else:
-            # More than one domain and none specified — this is exactly the
-            # "which chat window inside this session" choice; surface the
-            # list rather than guessing, same as /program show already does.
-            emit.info(f"Program '{record.get('display_name', prog_name)}' has {len(domains)} domains — pick one:")
-            emit.info(", ".join(domains))
+            # Several hosts and none specified — surface them rather than
+            # guessing (same "which host inside this program" choice /list shows).
+            emit.info(f"Program '{record.get('display_name', prog_name)}' has {len(switchable)} in-scope host(s) — pick one (or /list for the full view):")
+            emit.info(", ".join(switchable[:30]) + (" …" if len(switchable) > 30 else ""))
             emit.info(f"  /program switch {prog_name} <domain>")
-            return {"status": "ambiguous", "program": record["name"], "domains": domains}
+            return {"status": "ambiguous", "program": record["name"], "domains": switchable}
 
         session_context["target"] = chosen
         target_obj = create_or_load_target(chosen)
@@ -1337,6 +1350,88 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
     msg = f"Unknown /program subcommand '{verb}'. Usage: /program [show [name] | list [all] | create <name> [domains] | add <domain...> | attach <domain...> | scope <policy text> | switch <name> [domain] | rename <old> <new> | private [name] | public [name]]"
     emit.warn(msg)
     return {"status": "error", "error": "unknown_subcommand", "message": msg}
+
+
+def handle_list(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """Metasploit-workspace-style view of the program you're IN — its worked
+    targets and in-scope hosts, so you can see the engagement's attack surface
+    and jump between hosts. `/program list` lists the programs themselves (the
+    workspaces); `/list` shows the contents of the one selected right now."""
+    from hellhound.core.tasks import (
+        load_program, create_or_load_target, sanitize_target_name,
+        list_programs, is_program_private,
+    )
+    is_json = "--json" in args or getattr(emit, "json_mode", False)
+    target_name = sanitize_target_name(session_context.get("target") or "default")
+    target_obj = create_or_load_target(target_name) if target_name != "default" else None
+    prog_name = getattr(target_obj, "program", "") if target_obj else ""
+
+    if not prog_name:
+        visible = [p for p in list_programs() if not is_program_private(p)]
+        if not is_json:
+            emit.info("[dim]No program selected — scratch session, nothing is being saved.[/dim]")
+            if visible:
+                emit.info(f"Programs you can enter ({len(visible)}): [bold]{', '.join(visible)}[/bold]")
+                emit.info("  Enter one with: [bold red]/program switch <name>[/bold red]")
+            else:
+                emit.info("No programs yet. Create one with: /program create <name> [domain1,domain2,...]")
+        return {"status": "no_program", "programs": visible}
+
+    record = load_program(prog_name) or {}
+    rules = record.get("scope_rules") or {}
+    # Scope can live on the program record OR (for older/target-first setups) on
+    # the active target itself — fall back so /list never shows an empty scope
+    # the engagement clearly has.
+    if not rules.get("in_scope") and target_obj is not None:
+        tr = getattr(target_obj, "scope_rules", None)
+        if tr is not None and getattr(tr, "in_scope", None):
+            rules = tr.to_dict() if hasattr(tr, "to_dict") else rules
+    in_scope = rules.get("in_scope", [])
+    out_scope = rules.get("out_scope", [])
+    disallowed = rules.get("disallowed", [])
+    attached = record.get("targets", [])
+    concrete = [d for d in in_scope if d and not d.startswith("*")]
+    wildcards = [d for d in in_scope if d and d.startswith("*")]
+    unworked = [d for d in concrete if d not in attached]
+
+    if not is_json:
+        disp = record.get("display_name", prog_name)
+        emit.info(f"[bold cyan]{disp}[/bold cyan] [dim]({prog_name})[/dim]  "
+                  f"[dim]·[/dim] [#4cc46a]{len(in_scope)} in-scope[/] "
+                  f"[dim]·[/dim] [#e0772d]{len(out_scope)} out[/] "
+                  f"[dim]·[/dim] {len(disallowed)} disallowed")
+        emit.info("")
+        emit.info(f"[bold]Targets worked ({len(attached)})[/bold] [dim]— ► = active, ◆ = findings[/dim]")
+        if attached:
+            for d in attached:
+                active = d == target_name
+                mark = "[#4cc46a]►[/]" if active else " "
+                fc = 0
+                try:
+                    fc = len(create_or_load_target(d).findings or [])
+                except Exception:
+                    pass
+                fcs = f"  [#4cc46a]◆ {fc}[/]" if fc else ""
+                emit.info(f"  {mark} [white]{d}[/white]{fcs}")
+        else:
+            emit.info("  [dim](none worked yet)[/dim]")
+        if unworked:
+            emit.info("")
+            emit.info(f"[bold]In-scope hosts not yet worked ({len(unworked)})[/bold] "
+                      f"[dim]— /program switch {prog_name} <host> to jump in[/dim]")
+            emit.info("  [#9aa0ac]" + "  ".join(unworked[:40]) + ("  …" if len(unworked) > 40 else "") + "[/]")
+        if wildcards:
+            emit.info("")
+            emit.info(f"[dim]Wildcard scope ({len(wildcards)}): {', '.join(wildcards)}[/dim]")
+        if out_scope:
+            emit.info("")
+            emit.info(f"[#e0772d]Out-of-scope ({len(out_scope)}):[/] [dim]{', '.join(out_scope[:20])}"
+                      + ("  …" if len(out_scope) > 20 else "") + "[/dim]")
+    return {
+        "status": "success", "program": prog_name, "active_target": target_name,
+        "targets": attached, "in_scope": in_scope, "out_scope": out_scope,
+        "disallowed": disallowed,
+    }
 
 
 def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
@@ -2934,6 +3029,15 @@ register_command(Command(
     usage="/scope [show | clear | in <host...> | out <host...> | disallow <rule...> | <pasted program policy text>]",
     category="config",
     handler=handle_scope
+))
+
+register_command(Command(
+    name="/list",
+    aliases=["/ls", "/hosts"],
+    description="Metasploit-style view of the CURRENT program: its worked targets + in-scope hosts you can jump to (vs /program list, which lists the programs themselves)",
+    usage="/list [--json]",
+    category="config",
+    handler=handle_list
 ))
 
 register_command(Command(
