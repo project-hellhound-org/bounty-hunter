@@ -139,6 +139,14 @@ The automated installer will:
 
 ### 3. AI Backend Configuration
 
+Beast runs two roles — an **Orchestrator** (selects/runs tools) and a **Synthesizer** (writes the researcher-facing report). You point each at a model with `/model orchestrator <provider> <id>` and `/model synthesizer <provider> <id>` (or `/model both <provider> <id>` to set both at once). Pick a provider below.
+
+> [!TIP]
+> ### 💡 Which model should I use?
+> - **Free (recommended):** **NVIDIA NIM** — one free API key works against *any* model it serves (`nvidia/nemotron-3-ultra-550b-a55b`, `meta/llama-3.3-70b-instruct`, …; browse current IDs at [build.nvidia.com/models](https://build.nvidia.com/models), NVIDIA periodically retires old ones). Generous free credits, frontier-class reasoning, zero local GPU.
+> - **Paid:** Anthropic **Claude 3.5 Sonnet**, Google **Gemini 2.0 Flash / Pro**, or **OpenAI GPT-4o**.
+> - **Local (Ollama):** 32B+ models (`qwen2.5:32b`, `deepseek-r1:32b`) — small local models under 14B struggle with multi-stage IDOR chaining and strict JSON tool-calling.
+
 #### A. Free Cloud AI via NVIDIA NIM (Strongly Recommended for Free Users)
 Get free API credits and frontier-class 120B model inference with zero local GPU requirements:
 1. Sign up at [build.nvidia.com](https://build.nvidia.com/) to obtain your free API key.
@@ -235,33 +243,6 @@ A few recon tools call external services that need their own free API key (separ
 > /setup set-key <tool> <api_key>
 ```
 Every tool in the arsenal that needs one is self-describing this way — run `/setup` any time to see current status rather than hunting through docs for which key goes where.
-
----
-
-## AI Model Routing & Recommended Providers
-
-*(Now that it's installed — these `/model` commands run inside Beast.)* Autonomous exploitation and multi-step attack chaining need models with high reasoning fidelity, reliable JSON tool execution, and complex state tracking. Beast runs two roles — an **Orchestrator** (selects/runs tools) and a **Synthesizer** (writes the researcher-facing report) — and you can point each at its own model.
-
-> [!TIP]
-> ### 💡 Recommended AI Providers (Free & Paid)
-> - **For Free Users (Strongly Recommended)**: Use **NVIDIA NIM** (one free API key works against ANY model NIM serves — e.g. `nvidia/nemotron-3-ultra-550b-a55b` or `meta/llama-3.3-70b-instruct`; browse current model IDs at [build.nvidia.com/models](https://build.nvidia.com/models), NVIDIA periodically retires old ones). NVIDIA provides **generous free API credits** with access to massive frontier models, delivering high-speed inference and exceptional reasoning at zero cost.
-> - **For Paid API Users**: Use **Anthropic Claude 3.5 Sonnet**, **Google Gemini 2.0 Flash / Pro**, or **OpenAI GPT-4o**.
-> - **Local Models (Ollama)**: While supported for fully offline environments, small local models (SLMs under 14B) may struggle with nuanced multi-stage IDOR chaining and complex JSON schema adherence. For local setups, 32B+ models (e.g. `qwen2.5:32b` or `deepseek-r1:32b`) are recommended if hardware permits.
-
-```bash
-# Inspect active model routing status
-> /model
-
-# Configure NVIDIA NIM (one key, any model it serves)
-> /model orchestrator nvidia nvidia/nemotron-3-ultra-550b-a55b
-> /model synthesizer nvidia nvidia/nemotron-3-ultra-550b-a55b
-> # Any other NIM model ID works too — the same API key covers all of them:
-> /model synthesizer nvidia <any-model-id-from-build.nvidia.com/models>
-
-# Or configure Claude / Gemini for advanced cloud reasoning
-> /model synthesizer anthropic claude-3-5-sonnet
-> /model synthesizer gemini gemini-2.0-flash
-```
 
 ---
 
