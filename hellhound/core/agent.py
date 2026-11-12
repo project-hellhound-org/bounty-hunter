@@ -13036,9 +13036,36 @@ If there is nothing worth generalizing, return an empty array: []"""
 
         results: List[Optional[Dict[str, Any]]] = [None] * len(norm)
 
+        # Tag each concurrent sub-tool's LIVE output (emit.info) with its tool so
+        # the UI streams it into THAT tool's own card instead of folding all three
+        # into the newest one — tool_start/tool_result/cancelled and everything
+        # else pass straight through to the real emit (cards, scope gate, cancel
+        # all unchanged). A UI without per-tool routing just gets normal info().
+        class _TaggedEmit:
+            def __init__(self, real, tool):
+                self._real = real
+                self._tool = tool
+
+            def info(self, msg, *a, **k):
+                r = self._real
+                if r is not None and hasattr(r, "route_live_for"):
+                    r.route_live_for(self._tool, msg)
+                elif r is not None and hasattr(r, "info"):
+                    r.info(msg)
+
+            def __call__(self, msg):
+                self.info(msg)
+
+            def _send(self, msg):
+                self.info(msg)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
         def _run(i: int, tool: str, a: Dict[str, Any]):
             try:
-                results[i] = {"tool": tool, "result": self.execute_tool_call(tool, a, emit)}
+                sub_emit = _TaggedEmit(emit, tool) if emit is not None else emit
+                results[i] = {"tool": tool, "result": self.execute_tool_call(tool, a, sub_emit)}
             except Exception as e:
                 results[i] = {"tool": tool, "error": f"{type(e).__name__}: {e}"}
 

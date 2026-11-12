@@ -150,6 +150,14 @@ class AssistantMessage(Static):
 
 
 _STATUS_RE = re.compile(r'^\s*\[(\d{3})\]\s*(.*)$')
+_CODE_FENCE_RE = re.compile(r'```[^\n]*\n(.*?)```', re.DOTALL)
+
+
+def _extract_code_blocks(text: str) -> str:
+    """The code inside a reply's fenced ```blocks``` — what you'd actually want
+    to copy and run. Joined with blank lines when there are several."""
+    blocks = [b.strip() for b in _CODE_FENCE_RE.findall(text or "") if b.strip()]
+    return "\n\n".join(blocks)
 
 
 def _colorize_log(raw: str) -> str:
@@ -316,8 +324,35 @@ class TextualEmit(PlainEmit):
         super().__init__()
         self._app = app
         self._buf: list = []
+        self._tag_buf: dict = {}   # per-tool buffers for parallel per-tool streaming
         self._buf_lock = threading.Lock()
         self._last_flush = 0.0
+
+    def route_live_for(self, tool_name: str, msg) -> None:
+        """Per-tool live routing used by _execute_parallel's tagged emits: each
+        concurrent sub-tool's output is coalesced into ITS OWN card (not the
+        most-recent), so httpx/fuzz_hunter/spider stream side by side."""
+        flush_now = False
+        with self._buf_lock:
+            buf = self._tag_buf.setdefault(tool_name, [])
+            buf.append(str(msg))
+            if len(buf) >= self._FLUSH_MAX or (time.monotonic() - self._last_flush) >= self._FLUSH_INTERVAL:
+                flush_now = True
+        if flush_now:
+            self._flush_tag(tool_name)
+
+    def _flush_tag(self, tool_name: str) -> None:
+        with self._buf_lock:
+            lines = self._tag_buf.get(tool_name) or []
+            if not lines:
+                return
+            self._tag_buf[tool_name] = []
+            self._last_flush = time.monotonic()
+            batch = "\n".join(lines)
+        try:
+            self._app.call_from_thread(self._app.append_to_tool_card, tool_name, batch)
+        except Exception:
+            pass
 
     def _flush(self):
         with self._buf_lock:
@@ -362,10 +397,15 @@ class TextualEmit(PlainEmit):
 
     def tool_result(self, tool_name: str, result: Any):
         self._flush()
+        self._flush_tag(tool_name)   # drain this tool's per-tool stream before it closes
         try:
             self._app.call_from_thread(self._app.finish_tool_card, tool_name, result)
         except Exception:
             pass
+
+    def _flush_all_tags(self) -> None:
+        for t in list(self._tag_buf.keys()):
+            self._flush_tag(t)
 
     # No-op spinner/progress hooks the agent may call — the UI shows liveness
     # via the input state and the streaming response, so these are silent.
@@ -639,6 +679,12 @@ class HellhoundApp(App):
             self._assistant_md = None
         elif final:
             self._mount(Markdown(final))
+        # If the reply contained code blocks, Ctrl+Y should grab the CODE (the
+        # exact command the beast handed you) — a terminal can't put a copy
+        # button on a code block, so the keybinding is the copy affordance.
+        code = _extract_code_blocks(final)
+        if code:
+            self._last_copyable = code
         self._assistant_buf = ""
 
     def route_live_output(self, batch: str) -> None:
@@ -652,6 +698,19 @@ class HellhoundApp(App):
             except Exception:
                 pass
         self.add_log_line(batch)
+
+    def append_to_tool_card(self, tool_name: str, batch: str) -> None:
+        """Append live output to a SPECIFIC tool's card (parallel per-tool
+        streaming). Falls back to the active-card router if that tool has no
+        running card."""
+        cards = self._pending_cards.get(tool_name)
+        if cards:
+            try:
+                cards[-1].append_live(batch)
+                return
+            except Exception:
+                pass
+        self.route_live_output(batch)
 
     def start_tool_card(self, tool_name: str, args: Dict[str, Any]) -> None:
         card = ToolCard(tool_name, args)
@@ -939,7 +998,8 @@ class HellhoundApp(App):
         except Exception as e:  # never let a turn crash the whole app
             self.call_from_thread(self.add_log_line, f"[bold red][✗][/bold red] turn error: {type(e).__name__}: {e}")
         finally:
-            emit._flush()  # push any trailing coalesced log lines before wrap-up
+            emit._flush()          # push any trailing coalesced log lines before wrap-up
+            emit._flush_all_tags()  # and any trailing per-tool (parallel) stream lines
             if _looks_like_command(line):
                 self.call_from_thread(self.finalize_assistant_message, final_text)
             elapsed = time.monotonic() - t0
