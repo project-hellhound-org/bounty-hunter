@@ -186,14 +186,37 @@ class ToolCard(Collapsible):
     Expanded: the real request/response / result body.
     """
 
+    _LIVE_TAIL = 200  # rolling cap so a huge crawl can't make one card unbounded
+
     def __init__(self, tool_name: str, args: Dict[str, Any]) -> None:
         self._tool_name = tool_name
         self._args_summary = _summarize_args(args)
         self._result_text = "running…"
+        self._live_lines: list = []
+        self._done = False
         self._body = Static("running…", markup=False)
         super().__init__(self._body, title=f"● {tool_name}({self._args_summary})", collapsed=True)
 
+    def append_live(self, batch: str) -> None:
+        """Fold a tool's live output (e.g. fuzz_hunter/spider '[200] <url>' lines)
+        INTO this card instead of the flat transcript, so it's collapsible with
+        the tool and the transcript stays clean. No-op once the result has landed."""
+        if self._done:
+            return
+        for ln in str(batch).split("\n"):
+            if ln.strip():
+                self._live_lines.append(ln)
+        if len(self._live_lines) > self._LIVE_TAIL:
+            self._live_lines = self._live_lines[-self._LIVE_TAIL:]
+        n = len(self._live_lines)
+        self.title = f"● {self._tool_name}({self._args_summary}) · {n} line{'s' if n != 1 else ''}"
+        try:
+            self._body.update("\n".join(self._live_lines))
+        except Exception:
+            pass
+
     def set_result(self, result: Any) -> None:
+        self._done = True
         ok = not (isinstance(result, dict) and (result.get("error") or result.get("blocked")))
         glyph = "✓" if ok else "✗"
         self.title = f"{glyph} {self._tool_name}({self._args_summary})"
@@ -237,7 +260,7 @@ class TextualEmit(PlainEmit):
             self._buf.clear()
             self._last_flush = time.monotonic()
         try:
-            self._app.call_from_thread(self._app.add_log_line, batch)
+            self._app.call_from_thread(self._app.route_live_output, batch)
         except Exception:
             pass
 
@@ -330,6 +353,7 @@ class HellhoundApp(App):
         self._dispatch_fn = dispatch_fn
         self._cancel_event = threading.Event()
         self._pending_cards: Dict[str, list] = {}
+        self._active_cards: list = []  # running ToolCards, newest last — live output folds into the top one
         self._assistant_md: Optional[Markdown] = None  # live-rendered reply
         self._assistant_buf = ""                         # accumulated reply text
         self._last_md_flush = 0.0                        # throttle timestamp
@@ -530,9 +554,22 @@ class HellhoundApp(App):
             self._mount(Markdown(final))
         self._assistant_buf = ""
 
+    def route_live_output(self, batch: str) -> None:
+        """A tool's live output goes INTO its card (collapsible, Claude-Code
+        style) when one is running; only genuinely top-level status lines (no
+        tool active) land in the flat transcript."""
+        if self._active_cards:
+            try:
+                self._active_cards[-1].append_live(batch)
+                return
+            except Exception:
+                pass
+        self.add_log_line(batch)
+
     def start_tool_card(self, tool_name: str, args: Dict[str, Any]) -> None:
         card = ToolCard(tool_name, args)
         self._pending_cards.setdefault(tool_name, []).append(card)
+        self._active_cards.append(card)
         self._mount(card)
         # Pin the spinner to the running tool so you can see WHAT is running.
         try:
@@ -544,6 +581,10 @@ class HellhoundApp(App):
         stack = self._pending_cards.get(tool_name)
         if stack:
             card = stack.pop(0)
+            try:
+                self._active_cards.remove(card)
+            except ValueError:
+                pass
             try:
                 card.set_result(result)
             except Exception:
