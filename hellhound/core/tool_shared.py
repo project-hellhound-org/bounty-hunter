@@ -148,12 +148,24 @@ def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
         while True:
             elapsed = time.monotonic() - start
             remaining = timeout - elapsed
-            if remaining <= 0:
+            # True cancel: the researcher hitting Esc flips the UI's cancel flag,
+            # exposed through the emit (emit.cancelled()); threading it via the
+            # emit — which already reaches every tool — means a running
+            # subprocess (feroxbuster/sqlmap/spider) actually gets KILLED within a
+            # couple of seconds instead of ignoring Esc until its full timeout.
+            _cancelled = bool(emit is not None and getattr(emit, "cancelled", None) and emit.cancelled())
+            if remaining <= 0 or _cancelled:
                 proc.kill()
                 try:
                     proc.wait(timeout=5)
                 except Exception:
                     pass
+                if _cancelled:
+                    t_out.join(timeout=2)
+                    t_err.join(timeout=2)
+                    with _lock:
+                        _ps, _pe = ''.join(stdout_lines), ''.join(stderr_lines)
+                    return subprocess.CompletedProcess(cmd, -15, _ps, _pe)
                 # CAUGHT IN THE WILD (sqlmap on result.gujaratuniversity.ac.in):
                 # a long-running tool that confirms injectability and
                 # enumerates DB names BEFORE hitting the wall clock still had
@@ -174,7 +186,7 @@ def _run_cmd_with_heartbeat(cmd, timeout: int, emit: Any, label: str,
                     partial_stderr = ''.join(stderr_lines)
                 raise subprocess.TimeoutExpired(cmd, timeout, output=partial_stdout, stderr=partial_stderr)
             try:
-                proc.wait(timeout=min(heartbeat_interval, remaining))
+                proc.wait(timeout=min(heartbeat_interval, remaining, 2))
                 # Process finished — give the reader threads a brief moment
                 # to drain any last buffered bytes/EOF, then assemble the
                 # same (stdout, stderr) string shape communicate() used to

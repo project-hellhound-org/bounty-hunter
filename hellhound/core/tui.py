@@ -344,6 +344,15 @@ class TextualEmit(PlainEmit):
         if msg and str(msg).strip():
             self._send(msg)
 
+    def cancelled(self) -> bool:
+        """Surfaced to _run_cmd_with_heartbeat so a running subprocess
+        (feroxbuster/sqlmap/spider) gets killed the moment Esc flips the UI's
+        cancel flag — true cancel, not 'wait for the timeout'."""
+        try:
+            return bool(self._app._cancel_event.is_set())
+        except Exception:
+            return False
+
     def tool_start(self, tool_name: str, args: dict):
         self._flush()  # keep buffered log lines ordered ahead of this card
         try:
