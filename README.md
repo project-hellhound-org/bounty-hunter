@@ -2,9 +2,9 @@
   <img src="Images/hellhound.gif" alt="Hellhound Bounty Hunter Animation" width="100%"/>
 </p>
 
-<h1 align="center">HELLHOUND : BOUNTY HUNTER</h1>
+<h1 align="center">BOUNTY HUNTER</h1>
 <p align="center">
-  <b>Autonomous AI Bug Bounty & Penetration Testing Framework by Project Hellhound</b>
+  <b>Autonomous AI Bug Bounty & Penetration Testing Framework — runs as <code>beast</code>, built by Project Hellhound</b>
   <br>
   <i>Target enumeration, two-tier neural reasoning, 30 methodology skills, persistent artifact blackboard, live SPA crawling, visual evidence capture, and zero-bypass scope guardrails — from recon to submission-ready report.</i>
 </p>
@@ -35,7 +35,7 @@
 
 > [!WARNING]
 > ### ⚠️ Project Status — Where It Actually Stands
-> **Hellhound Bounty Hunter is under active development.** Here's an honest read of how it performs across the environments it's run against, so you know what to expect before you point it at anything:
+> **Bounty Hunter — "Beast" — is under active development.** Here's an honest read of how it performs across the environments it's run against, so you know what to expect before you point it at anything:
 >
 > - **PortSwigger Web Security Academy labs** — solves them **autonomously, end to end**, across multiple vulnerability classes: password-reset poisoning via host-header injection, deleting a user through an exposed API-documentation endpoint, reflected / stored / DOM-based XSS (confirmed by firing a real `alert()` in a headless browser), CORS, and SSRF. Not just recon — the full exploit.
 > - **Hardened & intentionally-vulnerable ranges** (HackTheBox, CTFHub, local hardened labs) — recon, foothold, and exploitation hold up well.
@@ -96,33 +96,6 @@ flowchart TD
 - **Harvested Artifact Ledger**: Harvested credentials, tokens, session cookies, and delegation endpoints are automatically captured into a structured, non-prunable blackboard and pinned to every turn.
 - **Missing Tool Grace**: External tool dependencies are verified on-demand—missing binaries trigger guided installation prompts rather than crashing.
 - **Persistent Workspace State**: Target assets, screenshots, history, and extracted findings are stored automatically in isolated target workspaces.
-
----
-
-## AI Model Routing & Recommended Providers
-
-Autonomous vulnerability exploitation and multi-step attack chaining require models with high reasoning fidelity, reliable JSON tool execution, and complex state tracking.
-
-> [!TIP]
-> ### 💡 Recommended AI Providers (Free & Paid)
-> - **For Free Users (Strongly Recommended)**: Use **NVIDIA NIM** (one free API key works against ANY model NIM serves — e.g. `nvidia/nemotron-3-ultra-550b-a55b` or `meta/llama-3.3-70b-instruct`; browse current model IDs at [build.nvidia.com/models](https://build.nvidia.com/models), NVIDIA periodically retires old ones). NVIDIA provides **generous free API credits** with access to massive frontier models, delivering high-speed inference and exceptional reasoning at zero cost.
-> - **For Paid API Users**: Use **Anthropic Claude 3.5 Sonnet**, **Google Gemini 2.0 Flash / Pro**, or **OpenAI GPT-4o**.
-> - **Local Models (Ollama)**: While supported for fully offline environments, small local models (SLMs under 14B) may struggle with nuanced multi-stage IDOR chaining and complex JSON schema adherence. For local setups, 32B+ models (e.g. `qwen2.5:32b` or `deepseek-r1:32b`) are recommended if hardware permits.
-
-```bash
-# Inspect active model routing status
-> /model
-
-# Configure NVIDIA NIM (Recommended Free Tier - Ultra Fast 120B Reasoning)
-> /model orchestrator nvidia nvidia/nemotron-3-ultra-550b-a55b
-> /model synthesizer nvidia nvidia/nemotron-3-ultra-550b-a55b
-> # Any other NIM model ID works too — the same API key covers all of them:
-> /model synthesizer nvidia <any-model-id-from-build.nvidia.com/models>
-
-# Or configure Claude / Gemini for advanced cloud reasoning
-> /model synthesizer anthropic claude-3-5-sonnet
-> /model synthesizer gemini gemini-2.0-flash
-```
 
 ---
 
@@ -262,6 +235,33 @@ A few recon tools call external services that need their own free API key (separ
 > /setup set-key <tool> <api_key>
 ```
 Every tool in the arsenal that needs one is self-describing this way — run `/setup` any time to see current status rather than hunting through docs for which key goes where.
+
+---
+
+## AI Model Routing & Recommended Providers
+
+*(Now that it's installed — these `/model` commands run inside Beast.)* Autonomous exploitation and multi-step attack chaining need models with high reasoning fidelity, reliable JSON tool execution, and complex state tracking. Beast runs two roles — an **Orchestrator** (selects/runs tools) and a **Synthesizer** (writes the researcher-facing report) — and you can point each at its own model.
+
+> [!TIP]
+> ### 💡 Recommended AI Providers (Free & Paid)
+> - **For Free Users (Strongly Recommended)**: Use **NVIDIA NIM** (one free API key works against ANY model NIM serves — e.g. `nvidia/nemotron-3-ultra-550b-a55b` or `meta/llama-3.3-70b-instruct`; browse current model IDs at [build.nvidia.com/models](https://build.nvidia.com/models), NVIDIA periodically retires old ones). NVIDIA provides **generous free API credits** with access to massive frontier models, delivering high-speed inference and exceptional reasoning at zero cost.
+> - **For Paid API Users**: Use **Anthropic Claude 3.5 Sonnet**, **Google Gemini 2.0 Flash / Pro**, or **OpenAI GPT-4o**.
+> - **Local Models (Ollama)**: While supported for fully offline environments, small local models (SLMs under 14B) may struggle with nuanced multi-stage IDOR chaining and complex JSON schema adherence. For local setups, 32B+ models (e.g. `qwen2.5:32b` or `deepseek-r1:32b`) are recommended if hardware permits.
+
+```bash
+# Inspect active model routing status
+> /model
+
+# Configure NVIDIA NIM (one key, any model it serves)
+> /model orchestrator nvidia nvidia/nemotron-3-ultra-550b-a55b
+> /model synthesizer nvidia nvidia/nemotron-3-ultra-550b-a55b
+> # Any other NIM model ID works too — the same API key covers all of them:
+> /model synthesizer nvidia <any-model-id-from-build.nvidia.com/models>
+
+# Or configure Claude / Gemini for advanced cloud reasoning
+> /model synthesizer anthropic claude-3-5-sonnet
+> /model synthesizer gemini gemini-2.0-flash
+```
 
 ---
 

@@ -14285,6 +14285,26 @@ If there is nothing worth generalizing, return an empty array: []"""
             artifact_header = f"\n{artifact_ledger}\n" if artifact_ledger else ""
 
             intel_parts = []
+            # The ACTUAL status codes the server returned on recent requests —
+            # pinned into context so the model can't narrate a 200 for an
+            # endpoint it really got a 401/403 on (the JWT-lab fabrication:
+            # /admin + /admin/delete both 401, but it reported "200, deleted,
+            # solved"). Reality on the wire beats whatever the model remembers.
+            recent_resps = []
+            for _e in reversed((self.target.state.get("curl_evidence_log") or [])[-12:]):
+                if not isinstance(_e, dict):
+                    continue
+                _st = _status_from_raw(_e.get("raw", ""))
+                if _st is None:
+                    continue
+                _u = _e.get("url", "") or ""
+                _p = _u.split(".net", 1)[-1] if ".net" in _u else _u
+                recent_resps.append(f"  - {_e.get('method', 'GET')} {_p[:70]} -> {_st}")
+            if recent_resps:
+                intel_parts.append(
+                    "ACTUAL RECENT HTTP RESPONSES (what the server really returned — cite THESE; "
+                    "never claim a status, an access, or a deletion the codes here don't show):\n"
+                    + "\n".join(recent_resps))
             if known_eps:
                 intel_parts.append("Endpoints already discovered:\n" + "\n".join(f"  - {e}" for e in known_eps))
             if known_params:

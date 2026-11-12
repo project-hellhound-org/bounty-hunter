@@ -186,6 +186,7 @@ Many insecure JWT verification implementations accept tokens signed with the `no
    - Filter-bypass variants: `{"alg": "None"}`, `{"alg": "NONE"}`, `{"alg": "nOnE"}`
 2. **Forge Privileged Payload:**
    - Set identity to harvested staff/administrator identity or elevate role parameters (e.g. `{"sub": "<harvested_admin_username>", "email": "<harvested_admin_email>", "role": "admin", "admin": true, "isAdmin": true, "exp": 9999999999}`).
+   - > **CRITICAL — forge the PRIVILEGED identity, never the victim's.** The user you must *act upon* (delete, read, impersonate — e.g. `carlos`) is NOT the identity you put in `sub`. Forging `sub: "carlos"` just makes you *be* carlos, a normal user with no admin rights — `/admin` will return **401**. To delete `carlos` you must first BECOME the administrator: forge `sub: "administrator"` (the real privileged username — often `administrator` on PortSwigger, or whatever you harvested), hit `/admin` and confirm a real **2xx** with the admin panel, THEN issue `/admin/delete?username=carlos`. Objective "delete carlos" ⇒ identity to forge = `administrator`, target of the action = `carlos`. Keep the two straight.
 3. **Assemble Unsigned JWT:**
    - Base64url-encode Header and Payload (replacing `+` with `-`, `/` with `_`, and stripping all `=` padding).
    - Concatenate Header and Payload with a trailing dot and **NO** signature:
