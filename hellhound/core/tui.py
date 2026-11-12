@@ -150,6 +150,19 @@ class AssistantMessage(Static):
 
 
 _STATUS_RE = re.compile(r'^\s*\[(\d{3})\]\s*(.*)$')
+
+# Only these genuinely long-running sweeps earn a slot in the right-side 'Live
+# work' panel — an instant curl/read/record would just flash in and vanish,
+# duplicating the transcript card for a split second. Fast tools still get their
+# normal collapsible card in the chat; they just don't touch the side roster.
+_PANEL_TOOLS = frozenset({
+    "spider", "crawl_scan", "fuzz_hunter", "content_discovery", "vhost_fuzz",
+    "schema_fuzzer", "sqlmap_scan", "nmap_service_scan", "port_scan",
+    "subdomain_sweep", "subfinder", "dns_bruteforce", "katana", "httpx",
+    "gau_nuclei_sweep", "gowitness", "map_surface", "mass_assign_probe",
+    "takeover_scanner", "tls_cert_scan", "urlscan_recon", "wpscan_scan",
+    "recon_scan", "execute_parallel",
+})
 _CODE_FENCE_RE = re.compile(r'```[^\n]*\n(.*?)```', re.DOTALL)
 
 
@@ -535,17 +548,29 @@ class HellhoundApp(App):
         scope status, recent targets — minus the redundant product name (the
         logo already says who this is)."""
         tname = self._initial_target
-        scope_active = False
+        in_n = out_n = 0
+        program = ""
+        no_program = False
         try:
             if self._agent is not None and getattr(self._agent, "target", None):
-                tname = self._agent.target.name
-                rules = getattr(self._agent.target, "scope_rules", None)
-                scope_active = bool(rules and getattr(rules, "in_scope", None))
+                tgt = self._agent.target
+                tname = tgt.name
+                program = str(getattr(tgt, "program", "") or "")
+                rules = getattr(tgt, "scope_rules", None)
+                if rules is not None:
+                    _in = getattr(rules, "in_scope", None)
+                    _out = getattr(rules, "out_scope", None)
+                    # scope_rules is a ScopeRules object, but tolerate a raw dict
+                    if _in is None and isinstance(rules, dict):
+                        _in, _out = rules.get("in_scope"), rules.get("out_scope")
+                    in_n = len(_in or [])
+                    out_n = len(_out or [])
+                # "no program selected" = the neutral default scratch target
+                no_program = (str(tname) == "default")
         except Exception:
             pass
 
         model = provider = handle = ""
-        recent = ""
         try:
             from hellhound.core.ai_utils import load_config
             cfg = load_config()
@@ -556,12 +581,6 @@ class HellhoundApp(App):
             handle = str(cfg.get("researcher_handle", "") or "")
         except Exception:
             pass
-        try:
-            from hellhound.core.tasks import list_targets
-            others = [t for t in list_targets(exclude_default=True) if t != tname][:3]
-            recent = ", ".join(others) if others else "none yet"
-        except Exception:
-            recent = "none yet"
 
         finding_count = 0
         try:
@@ -569,15 +588,25 @@ class HellhoundApp(App):
         except Exception:
             pass
 
-        scope_str = "[bold red]Active Scope[/bold red]" if scope_active else "[dim]Default Scope[/dim]"
-        findings_str = (f"  [dim]·[/dim] [#4cc46a]◆ {finding_count} finding{'s' if finding_count != 1 else ''}[/]"
-                        if finding_count else "")
+        # Make the configured scope VISIBLE (counts), not just a status word — and
+        # show nothing-saved clearly when no program is selected yet.
+        if no_program:
+            target_line = ("[red]Program:[/red] [dim]none — scratch chat, nothing saved. "
+                           "[/dim][dim]Select one with[/dim] [bold red]/program switch <name>[/bold red]")
+        else:
+            prog_str = f"[bold white]{_rich_escape(program)}[/bold white]" if program else f"[bold white]{_rich_escape(str(tname))}[/bold white]"
+            if in_n:
+                scope_str = f"[#4cc46a]{in_n} in-scope[/]" + (f" [dim]·[/dim] [#e0772d]{out_n} out[/]" if out_n else "")
+            else:
+                scope_str = "[dim]no scope set[/dim]"
+            findings_str = (f"  [dim]·[/dim] [#4cc46a]◆ {finding_count} finding{'s' if finding_count != 1 else ''}[/]"
+                            if finding_count else "")
+            target_line = f"[red]Program:[/red] {prog_str}  [dim]·[/dim] {scope_str}{findings_str}"
         who = (f"{model} ({provider})" if model else "—") + (f" · @{handle}" if handle else "")
         lines = [
             "[bold red]Welcome back,[/bold red] [bold white]Researcher.[/bold white]",
             f"[red]Model:[/red] [white]{_rich_escape(who)}[/white]",
-            f"[red]Target:[/red] [bold white]{_rich_escape(str(tname))}[/bold white]  [dim]·[/dim] {scope_str}{findings_str}",
-            f"[red]Recent:[/red] [white]{_rich_escape(recent)}[/white]",
+            target_line,
             "[dim]Type[/dim] [bold red]/[/bold red] [dim]for commands,[/dim] [bold red]/help[/bold red] [dim]for all · ↑↓ history · Ctrl+Y copies last · Esc cancels · Ctrl+Q quits[/dim]",
         ]
         return "\n".join(lines)
@@ -734,7 +763,9 @@ class HellhoundApp(App):
             panel = self.query_one("#sidepanel", Static)
         except Exception:
             return
-        running = list(self._active_cards)
+        # Only long-running sweeps belong on the roster (a curl would flash).
+        running = [c for c in self._active_cards
+                   if getattr(c, "_tool_name", "") in _PANEL_TOOLS]
         if not running:
             panel.display = False
             panel.update("")

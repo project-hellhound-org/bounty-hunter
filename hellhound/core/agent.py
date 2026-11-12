@@ -12205,6 +12205,7 @@ class Agent:
 
     def __init__(self, target: Optional[Target] = None):
         self.target = target or create_or_load_target("default")
+        self._program_switch_notice = ""  # one-shot "you switched programs" note for the next turn's prompt
         self.history: List[Dict[str, str]] = self.target.state.get("history") or []
         if not isinstance(self.history, list):
             self.history = []
@@ -12520,8 +12521,27 @@ If there is nothing worth generalizing, return an empty array: []"""
         return tools
 
     def set_target(self, target_name: str) -> Target:
+        _prev_name = getattr(self.target, "name", None)
         self._finalize_target_lessons()  # mine lessons from the outgoing target before its history is replaced
         self.target = create_or_load_target(target_name)
+        # Remind the AI, once, that the engagement (and its save-folder) changed —
+        # so after a /program switch it knows findings/artifacts now file under the
+        # NEW program's bucket, not the one it was just working. The per-turn
+        # TARGET/SCOPE header already updates; this makes the handoff explicit.
+        _new_name = self.target.name
+        if _new_name != _prev_name and _new_name != "default":
+            _prog = str(getattr(self.target, "program", "") or "")
+            _bucket = _prog or _new_name
+            self._program_switch_notice = (
+                f"PROGRAM SWITCH: you are now working '{_bucket}'"
+                + (f" (current host {_new_name})" if _prog and _new_name != _prog else "")
+                + f". From here on, every finding, note, and artifact you record saves under THIS "
+                  f"program's own folder (~/.hellhound/targets/{_new_name}) — fully separate from the "
+                  f"previous engagement. The SCOPE below is this program's scope; don't carry over hosts, "
+                  f"creds, or assumptions from the last one."
+            )
+        elif _new_name == "default":
+            self._program_switch_notice = ""
         self.history = self.target.state.get("history") or []
         if not isinstance(self.history, list):
             self.history = []
@@ -14275,12 +14295,20 @@ If there is nothing worth generalizing, return an empty array: []"""
             if self._turn_path_scope:
                 path_rule = f"\n8. CRITICAL: The active application is scoped strictly to '{self._turn_path_scope}'. All tool URLs MUST start with 'https://{self._display_host}{self._turn_path_scope}/...' (e.g. 'https://{self._display_host}{self._turn_path_scope}/dashboard' or 'https://{self._display_host}{self._turn_path_scope}/api/auth/login'). Never query out-of-scope paths."
 
+            _prog = str(getattr(self.target, "program", "") or "")
+            program_line = (f"\nPROGRAM: {_prog} (this engagement's findings/artifacts file under this program's bucket)"
+                            if _prog else "")
+            switch_line = ""
+            if getattr(self, "_program_switch_notice", ""):
+                switch_line = f"\n{self._program_switch_notice}"
+                self._program_switch_notice = ""  # one-shot: surface the handoff once, then stop
+
             return f"""\
 You are HELLHOUND Orchestrator. Your sole job is to evaluate if a tool should be executed next or if tool execution is complete.
 
 NON-NEGOTIABLE, before anything else in this prompt: every response you give is EITHER pure tool-call JSON (`{{"tool": ..., "args": ...}}`, nothing else — no lead-in sentence, no "let me...", no "I'll now...") OR the literal word DONE. Never describe an action you're about to take in prose — describing it is not doing it, and the person you're working for gets nothing if you only narrate. If you find yourself writing "let me", "I'll", "I will now", "I need to", "I should", "First I", "Starting with", "Let me check", "Let me run", "proceed to", or any other forward-looking action language — stop, delete that sentence, and emit the JSON instead. Any response that contains English prose describing a planned action WITHOUT a JSON tool-call block is treated as a FAILURE and will be discarded. The full rules below explain HOW to decide what to do; this line governs the actual shape of every single response regardless of what those rules say.
 
-TARGET: {self._display_host}
+TARGET: {self._display_host}{program_line}{switch_line}
 RESEARCHER MISSION & OBJECTIVE: {original_user_text}
 SCOPE: {scope_summary}{path_scope_prompt}{escalation_prompt}
 {artifact_header}
