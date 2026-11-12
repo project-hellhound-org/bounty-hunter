@@ -6926,6 +6926,73 @@ def _execute_verify_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     }
 
 
+# ── Anti-hallucination: a privileged-access claim must match the real responses ──
+# The failure this kills (caught on a PortSwigger JWT lab): the model forged a
+# token, every /admin and /admin/delete request it sent came back 401, and it
+# then recorded a CRITICAL "administrator access — user deleted, lab solved"
+# finding with a verification_note claiming "HTTP 200 success." The old gate only
+# checked the note was non-boilerplate; it never checked the note against the
+# byte-for-byte responses the tools actually captured. This does.
+_PRIV_CLAIM_RE = re.compile(
+    r'\b(admin(istrator)?|deleted?|deletion|remove[sd]?|took\s+over|take[-\s]?over|'
+    r'account\s+takeover|escalat\w*|privileg\w*|superuser|root\s+access|full\s+control|'
+    r'solved|carlos\s+(is\s+)?deleted)\b', re.I)
+_PRIV_ENDPOINT_RE = re.compile(
+    r'/(admin|manage|internal|console|superuser|delete|remove|promote|'
+    r'privilege|role[s]?/|users?/\d)', re.I)
+_ACCESS_CLAIM_KINDS = {
+    "auth_bypass", "authentication_bypass", "access_control", "broken_access_control",
+    "idor", "privilege_escalation", "privesc", "privilege-escalation", "account_takeover",
+    "authorization", "forced_browsing", "broken_auth", "jwt", "jwt_forgery",
+}
+
+
+def _status_from_raw(raw: str) -> Optional[int]:
+    """Pull the real HTTP status out of a captured request/response blob."""
+    m = re.search(r'HTTP/\d(?:\.\d)?\s+(\d{3})', raw or "")
+    return int(m.group(1)) if m else None
+
+
+def _privileged_access_corroborated(target: Target, request_ref: str, claim_text: str):
+    """For a finding that CLAIMS privileged access or a state change, check the
+    captured evidence log for the privileged endpoints it depends on.
+    Returns (verdict, summary):
+      verdict True  — at least one privileged/state-change endpoint really returned 2xx
+      verdict False — privileged endpoints were hit but ALL came back 401/403/redirect-to-login
+      verdict None  — nothing privileged captured / unparseable -> don't gate
+    """
+    if not hasattr(target, "state") or not isinstance(target.state, dict):
+        return None, ""
+    log = target.state.get("curl_evidence_log") or []
+    ref_l = (request_ref or "").strip().lower()
+    seen = {}
+    for e in log:
+        if not isinstance(e, dict):
+            continue
+        url = e.get("url", "") or ""
+        raw = e.get("raw", "") or ""
+        is_priv = bool(_PRIV_ENDPOINT_RE.search(url)) or (ref_l and ref_l in url.lower())
+        if not is_priv:
+            continue
+        st = _status_from_raw(raw)
+        if st is None:
+            continue
+        loc = re.search(r'[Ll]ocation:\s*(\S+)', raw)
+        # a 3xx bounce to /login|/auth is an auth FAILURE, not a success
+        if 300 <= st < 400 and loc and re.search(r'/(login|auth|signin|sso)', loc.group(1), re.I):
+            st = 401
+        path = url.split(".net", 1)[-1] if ".net" in url else url
+        seen[path[:60]] = st  # last status per endpoint
+    if not seen:
+        return None, ""
+    summary = ", ".join(f"{p} → {s}" for p, s in seen.items())
+    if any(200 <= s < 300 for s in seen.values()):
+        return True, summary
+    if all(s in (401, 403) or 300 <= s < 400 for s in seen.values()):
+        return False, summary
+    return None, summary
+
+
 def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Logs a finding YOU have already confirmed (not a guess or a plan) into
@@ -7073,6 +7140,35 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
                     f"actually confirmed, don't relabel the vuln class to dodge this gate."
                 ),
             }
+
+    # ANTI-HALLUCINATION GATE — the claim must not contradict the captured
+    # responses. For an access/auth/privilege finding at high/critical whose
+    # text asserts privileged access or a state change (admin / deletion /
+    # takeover / "solved"), cross-check the REAL status codes the tools logged
+    # for those endpoints. If every privileged request actually came back
+    # 401/403 (or bounced to /login), the "confirmed" claim is fabricated — the
+    # exact JWT-lab failure where /admin and /admin/delete both returned 401 but
+    # the model recorded "administrator access, carlos deleted, lab solved."
+    if kind in _ACCESS_CLAIM_KINDS and severity in ("critical", "high"):
+        _claim_text = f"{title} {note} {str(args.get('verification_note', ''))}"
+        if _PRIV_CLAIM_RE.search(_claim_text):
+            _corrob, _status_summary = _privileged_access_corroborated(target, request_ref, _claim_text)
+            if _corrob is False:
+                return {
+                    "status": "blocked_claim_contradicts_evidence",
+                    "note": (
+                        f"Not recording this — the claim asserts privileged access or a state change "
+                        f"(admin / deletion / takeover), but YOUR OWN captured responses to those endpoints "
+                        f"contradict it: [{_status_summary}]. A {severity} '{kind}' cannot be 'confirmed' when "
+                        f"every privileged request came back 401/403 (or redirected to /login). Record only "
+                        f"what the evidence actually supports: if a forged token/altered request let you VIEW "
+                        f"another user's page (a real but lower-severity issue) you have a 2xx for THAT — record "
+                        f"that, at that severity, citing its real response. Do NOT inflate it to admin takeover "
+                        f"or claim a deletion/solve the server returned 401 for. If you truly gained privileged "
+                        f"access, re-send the privileged request and capture a genuine 2xx FIRST, then record."
+                    ),
+                    "captured_privileged_statuses": _status_summary,
+                }
 
     # Dedup: the storage layer's own dedup keys on the WHOLE finding dict,
     # which differs any time the title is reworded even slightly — this let
