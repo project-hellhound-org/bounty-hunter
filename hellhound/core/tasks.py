@@ -3,7 +3,7 @@ hellhound/core/tasks.py
 
 Persistent per-target task management.
 Stores target context, scope rules, summaries, timestamps, notes, and findings
-in ~/.hellhound/targets/<target>/task.json.
+in ~/.beast/targets/<target>/task.json.
 """
 
 from dataclasses import dataclass, field
@@ -51,7 +51,7 @@ def redact_sensitive_dict_keys(d: Any) -> Any:
 
 
 def _get_targets_dir() -> str:
-    base = os.path.expanduser("~/.hellhound/targets")
+    base = os.path.expanduser("~/.beast/targets")
     os.makedirs(base, exist_ok=True)
     return base
 
@@ -270,7 +270,7 @@ def list_targets(exclude_default: bool = True) -> List[str]:
 # every attached Target's own scope_rules in sync with it.
 
 def _get_programs_dir() -> str:
-    base = os.path.expanduser("~/.hellhound/programs")
+    base = os.path.expanduser("~/.beast/programs")
     os.makedirs(base, exist_ok=True)
     return base
 
@@ -298,7 +298,7 @@ def get_program_path(program_name: str) -> str:
 def _ensure_program_target_link(program_safe_name: str, target_name: str) -> None:
     """
     CAUGHT IN THE WILD (2026-10): every target attached to a program still
-    lived ONLY at the flat ~/.hellhound/targets/<name>/ path — /program
+    lived ONLY at the flat ~/.beast/targets/<name>/ path — /program
     tagged a Target's `.program` field and listed it in program.json, but
     nothing ever gave the program its own directory tree with each
     in-scope subdomain visibly organized underneath it, which is what the
@@ -312,9 +312,9 @@ def _ensure_program_target_link(program_safe_name: str, target_name: str) -> Non
     in the codebase already reads/writes via get_target_path() /
     _get_targets_dir(), this creates a symlink:
 
-        ~/.hellhound/programs/<program>/targets/<target> -> ~/.hellhound/targets/<target>
+        ~/.beast/programs/<program>/targets/<target> -> ~/.beast/targets/<target>
 
-    so `ls ~/.hellhound/programs/<program>/targets/` shows exactly the
+    so `ls ~/.beast/programs/<program>/targets/` shows exactly the
     "separate directory inside the program directory" per subdomain the
     researcher wants, always reflecting that target's live data (no stale
     copies to keep in sync), while every existing create_or_load_target/

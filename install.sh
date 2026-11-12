@@ -364,9 +364,9 @@ else
                 fi
             fi
 
-            # Set orchestrator_model in ~/.hellhound/config.json for fast local tool routing
-            mkdir -p "$HOME/.hellhound"
-            CONFIG_FILE="$HOME/.hellhound/config.json"
+            # Set orchestrator_model in ~/.beast/config.json for fast local tool routing
+            mkdir -p "$HOME/.beast"
+            CONFIG_FILE="$HOME/.beast/config.json"
             python3 -c "
 import json, os
 p = '$CONFIG_FILE'

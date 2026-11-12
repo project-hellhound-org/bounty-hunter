@@ -210,10 +210,10 @@ _WORDLIST_SEARCH_ROOTS = [
 def _decompress_if_gz(path: Path) -> Path:
     """Kali ships rockyou.txt as rockyou.txt.gz; most fuzzing tools (ffuf,
     shuffledns) can't read gzip directly. Decompress once into a cached
-    plaintext copy under ~/.hellhound/wordlist_cache and reuse it after."""
+    plaintext copy under ~/.beast/wordlist_cache and reuse it after."""
     if path.suffix != ".gz":
         return path
-    cache_dir = Path.home() / ".hellhound" / "wordlist_cache"
+    cache_dir = Path.home() / ".beast" / "wordlist_cache"
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         dest = cache_dir / path.stem  # strips the .gz
@@ -1081,7 +1081,7 @@ def _execute_manage_program(args: Dict[str, Any], target: Target, emit: Any) -> 
 def _execute_save_file(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Write text content to a file under this target's own workspace
-    (~/.hellhound/targets/<target>/raw/) — e.g. "save the resolved
+    (~/.beast/targets/<target>/raw/) — e.g. "save the resolved
     subdomains to a text file" after a recon pass. Deliberately NOT an
     arbitrary-path file writer: the filename is sanitized to a bare name
     (no directories, no traversal) and the write is containment-checked
@@ -1108,7 +1108,7 @@ def _execute_save_file(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
         return {"error": f"Invalid filename: {filename!r}"}
 
     target_name = target.name if (target and target.name) else "default"
-    raw_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}/raw")).resolve()
+    raw_dir = Path(os.path.expanduser(f"~/.beast/targets/{target_name}/raw")).resolve()
     raw_dir.mkdir(parents=True, exist_ok=True)
     out_path = (raw_dir / safe_name).resolve()
     if not str(out_path).startswith(str(raw_dir)):
@@ -1156,7 +1156,7 @@ def _execute_delete_file(args: Dict[str, Any], target: Target, emit: Any) -> Dic
         return {"error": f"Invalid filename: {filename!r}"}
 
     target_name = target.name if (target and target.name) else "default"
-    target_root = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}")).resolve()
+    target_root = Path(os.path.expanduser(f"~/.beast/targets/{target_name}")).resolve()
     # save_file only ever writes into raw/, but a researcher could point at
     # a file anywhere under this target's own tree (e.g. screenshots/) —
     # search raw/ first (the common case) then the target root itself,
@@ -1247,7 +1247,7 @@ def _execute_generate_cors_poc(args: Dict[str, Any], target: Target, emit: Any) 
         return {"error": "CorsPoC.html template has changed shape — couldn't locate the target-URL input to pre-fill."}
 
     target_name = sanitize_target_name(target.name)
-    out_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}/reports"))
+    out_dir = Path(os.path.expanduser(f"~/.beast/targets/{target_name}/reports"))
     out_dir.mkdir(parents=True, exist_ok=True)
     safe_host = re.sub(r"[^a-zA-Z0-9._-]", "_", urlparse(url).netloc or url)[:80]
     out_path = out_dir / f"cors_poc_{safe_host}_{int(time.time())}.html"
@@ -3482,13 +3482,13 @@ _PATTERN_DB_SINGLETON: Optional[PatternDB] = None
 
 
 def _get_pattern_db() -> PatternDB:
-    """Lazily-constructed, process-wide PatternDB over ~/.hellhound/patterns.jsonl
+    """Lazily-constructed, process-wide PatternDB over ~/.beast/patterns.jsonl
     — see hellhound/memory/pattern_db.py. One instance per process keeps its
     in-memory dedup-key cache warm across calls instead of re-reading the
     whole file on every save."""
     global _PATTERN_DB_SINGLETON
     if _PATTERN_DB_SINGLETON is None:
-        _PATTERN_DB_SINGLETON = PatternDB(os.path.expanduser("~/.hellhound/patterns.jsonl"))
+        _PATTERN_DB_SINGLETON = PatternDB(os.path.expanduser("~/.beast/patterns.jsonl"))
     return _PATTERN_DB_SINGLETON
 
 
@@ -7719,7 +7719,7 @@ def _auto_save_finding_report(
         return None
     try:
         target_name = target.name if (target and target.name) else "default"
-        reports_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}/reports"))
+        reports_dir = Path(os.path.expanduser(f"~/.beast/targets/{target_name}/reports"))
         reports_dir.mkdir(parents=True, exist_ok=True)
 
         color = _SEVERITY_COLOR.get(severity, "#8a8f98")
@@ -7838,14 +7838,14 @@ def _resolve_report_evidence_path(target: Target, ref: str) -> Optional[Path]:
     finding or evidence card) to an actual file under this target's own
     storage directory. Accepts a bare filename, a path relative to the
     target dir, or an absolute path — but only ever returns a path that is
-    strictly inside ~/.hellhound/targets/<target>/, the same containment
+    strictly inside ~/.beast/targets/<target>/, the same containment
     rule read_artifact enforces, so a report can never be tricked into
     embedding an arbitrary file off the target's own storage.
     """
     if not ref:
         return None
     target_name = target.name if (target and target.name) else "default"
-    base_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}")).resolve()
+    base_dir = Path(os.path.expanduser(f"~/.beast/targets/{target_name}")).resolve()
     candidates = [
         Path(os.path.expanduser(ref)),
         base_dir / ref,
@@ -8498,7 +8498,7 @@ function hhCopy(id, btn) {{
 </body></html>"""
 
     target_name = target.name if (target and target.name) else "default"
-    reports_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_name}/reports"))
+    reports_dir = Path(os.path.expanduser(f"~/.beast/targets/{target_name}/reports"))
     reports_dir.mkdir(parents=True, exist_ok=True)
     # Filename carries the target name, not just a timestamp — a report
     # pulled out of its target folder (attached to an email, dropped in a
@@ -8797,7 +8797,7 @@ _RECALL_CATEGORIES = {
     "hypotheses": "state",
     "browser_flows": "state",
     "findings": "findings",  # lives on target.findings, not target.state
-    "raw_artifacts": "raw_search",  # full-text search over ~/.hellhound/targets/<target>/raw/*.txt
+    "raw_artifacts": "raw_search",  # full-text search over ~/.beast/targets/<target>/raw/*.txt
 }
 
 # How much context (chars) to keep on each side of a match when returning a
@@ -8812,7 +8812,7 @@ _RAW_SEARCH_MAX_MATCHES_PER_FILE = 10
 def _search_raw_artifacts(target: Target, query: str, limit: int = 50, regex: bool = False) -> Dict[str, Any]:
     """
     Full-text search across every raw artifact file saved for this target
-    (~/.hellhound/targets/<target>/raw/*.txt -- the same files read_artifact
+    (~/.beast/targets/<target>/raw/*.txt -- the same files read_artifact
     reads line-ranges from). Fixes the "find that one curl from 20 turns
     ago" complaint: recall_data's other categories only cover predefined,
     structured state; this is the free-text fallback for everything that
@@ -8823,7 +8823,7 @@ def _search_raw_artifacts(target: Target, query: str, limit: int = 50, regex: bo
     read_artifact the exact offset instead of guessing.
     """
     target_name = target.name if (target and hasattr(target, "name") and target.name) else "default"
-    raw_dir = os.path.realpath(os.path.expanduser(f"~/.hellhound/targets/{target_name}/raw"))
+    raw_dir = os.path.realpath(os.path.expanduser(f"~/.beast/targets/{target_name}/raw"))
     if not os.path.isdir(raw_dir):
         return {
             "status": "success",
@@ -9333,7 +9333,7 @@ def _execute_read_artifact(args: Dict[str, Any], target: Target, emit: Any) -> D
         length = 200
 
     target_name = target.name if (target and hasattr(target, "name") and target.name) else "default"
-    base_dir = os.path.realpath(os.path.expanduser(f"~/.hellhound/targets/{target_name}/raw"))
+    base_dir = os.path.realpath(os.path.expanduser(f"~/.beast/targets/{target_name}/raw"))
     abs_path = os.path.realpath(os.path.expanduser(path))
 
     # Path traversal validation: path must be strictly within target's raw/ directory
@@ -9375,11 +9375,11 @@ def _execute_read_artifact(args: Dict[str, Any], target: Target, emit: Any) -> D
 TOOL_REGISTRY: Dict[str, ToolSpec] = {
     "read_artifact": ToolSpec(
         name="read_artifact",
-        description="Read a line-range slice of a raw tool output artifact saved to target storage (~/.hellhound/targets/<target>/raw/). Use this tool when previous tool output was truncated (indicated by [FULL OUTPUT SAVED: ...]) and you need to inspect a specific line range or middle section of the output.",
+        description="Read a line-range slice of a raw tool output artifact saved to target storage (~/.beast/targets/<target>/raw/). Use this tool when previous tool output was truncated (indicated by [FULL OUTPUT SAVED: ...]) and you need to inspect a specific line range or middle section of the output.",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Full file path of the saved raw artifact (e.g. ~/.hellhound/targets/example.com/raw/spider_20260828T120000.txt)."},
+                "path": {"type": "string", "description": "Full file path of the saved raw artifact (e.g. ~/.beast/targets/example.com/raw/spider_20260828T120000.txt)."},
                 "offset": {"type": "integer", "description": "Starting line number (0-indexed). Default is 0.", "default": 0},
                 "length": {"type": "integer", "description": "Number of lines to read. Default is 200.", "default": 200}
             },
@@ -10069,7 +10069,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "gowitness": ToolSpec(
         name="gowitness",
-        description="Capture high-fidelity visual web screenshots of URLs or endpoints using gowitness. Captures the FULL scrollable page by default (not just the visible viewport) so evidence below the fold — a patient records table, admin secrets, anything further down the page — isn't cut off. Automatically saves screenshots to target workspace (~/.hellhound/targets/<target>/screenshots/) and indexes them into target investigation memory & visual evidence cards. Supports session cookies & custom headers to screenshot authenticated member portals and admin dashboards for vulnerability PoC.",
+        description="Capture high-fidelity visual web screenshots of URLs or endpoints using gowitness. Captures the FULL scrollable page by default (not just the visible viewport) so evidence below the fold — a patient records table, admin secrets, anything further down the page — isn't cut off. Automatically saves screenshots to target workspace (~/.beast/targets/<target>/screenshots/) and indexes them into target investigation memory & visual evidence cards. Supports session cookies & custom headers to screenshot authenticated member portals and admin dashboards for vulnerability PoC.",
         parameters={
             "type": "object",
             "properties": {
@@ -10978,7 +10978,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "— propagates to every target already attached), 'show' or 'list' (list the "
             "program's targets and scope). Each domain attached gets its own real target (own "
             "findings/session) AND shows up as its own subdirectory under "
-            "~/.hellhound/programs/<program>/targets/ (a live symlink to its real target "
+            "~/.beast/programs/<program>/targets/ (a live symlink to its real target "
             "directory) — so the program folder always reflects every in-scope domain attached "
             "to it without any file-copying. After creating/adding domains, switch to a "
             "specific one with the set_target tool using that domain's name to actually work on "
@@ -11302,7 +11302,7 @@ def _make_mcp_executor(call_fn: Callable[..., Dict[str, Any]]) -> Callable[[Dict
 
 def register_mcp_servers(emit: Any = None) -> int:
     """
-    Reads mcp_servers from config (~/.hellhound/config.json's "mcp_servers"
+    Reads mcp_servers from config (~/.beast/config.json's "mcp_servers"
     key — see ai_utils.load_config), connects to each configured server,
     and registers every tool it exposes into TOOL_REGISTRY under the name
     'mcp_<server>_<tool>' (prefixed so e.g. Burp's own 'send_to_repeater'
@@ -12537,7 +12537,7 @@ If there is nothing worth generalizing, return an empty array: []"""
                 f"PROGRAM SWITCH: you are now working '{_bucket}'"
                 + (f" (current host {_new_name})" if _prog and _new_name != _prog else "")
                 + f". From here on, every finding, note, and artifact you record saves under THIS "
-                  f"program's own folder (~/.hellhound/targets/{_new_name}) — fully separate from the "
+                  f"program's own folder (~/.beast/targets/{_new_name}) — fully separate from the "
                   f"previous engagement. The SCOPE below is this program's scope; don't carry over hosts, "
                   f"creds, or assumptions from the last one."
             )
@@ -12725,7 +12725,7 @@ If there is nothing worth generalizing, return an empty array: []"""
         — this is the general-purpose version for ANY lesson the
         researcher wants kept, whether or not a finding was ever
         recorded. It writes to TWO places at once:
-          1. The cross-target lessons store (~/.hellhound/lessons.json,
+          1. The cross-target lessons store (~/.beast/lessons.json,
              via add_lesson) — so a DIFFERENT target with a similar tech
              signature benefits from this later, same as dismiss_finding's
              automatic write.
@@ -12929,7 +12929,7 @@ If there is nothing worth generalizing, return an empty array: []"""
                         "role": "user",
                         "content": f"[NOTE: {dropped} earlier tool call(s)/message(s) from this turn were omitted "
                                     f"here to keep the request size sane. Full outputs remain saved under "
-                                    f"~/.hellhound/targets/<target>/raw/ if needed.]"
+                                    f"~/.beast/targets/<target>/raw/ if needed.]"
                     })
 
             combined = recent_prior + current_turn_history
@@ -12953,7 +12953,7 @@ If there is nothing worth generalizing, return an empty array: []"""
 
                     saved_msg = ""
                     try:
-                        raw_dir = os.path.expanduser(f"~/.hellhound/targets/{target_name}/raw")
+                        raw_dir = os.path.expanduser(f"~/.beast/targets/{target_name}/raw")
                         os.makedirs(raw_dir, exist_ok=True)
                         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
                         filename = f"{tool_name}_{timestamp}.txt"
@@ -13903,7 +13903,7 @@ If there is nothing worth generalizing, return an empty array: []"""
 
         # ── MCP server registration (Burp, Caido, anything else configured) ──
         # One-time, process-wide, best-effort: connects to every server
-        # listed under "mcp_servers" in ~/.hellhound/config.json and merges
+        # listed under "mcp_servers" in ~/.beast/config.json and merges
         # its tools into TOOL_REGISTRY (see register_mcp_servers()). Done
         # here rather than in __init__ because __init__ never receives an
         # emit — doing it on the first real turn instead means a connected

@@ -4,7 +4,7 @@ hellhound/core/skills.py
 Skill-Aware Reasoning System for HELLHOUND Bug Bounty Framework.
 Discovers, indexes, searches, and loads methodology skills from:
   1. Shipped skills: `hellhound/skills/`
-  2. User custom skills: `~/.hellhound/skills/` (user skills override shipped skills)
+  2. User custom skills: `~/.beast/skills/` (user skills override shipped skills)
 
 Provides lightweight metadata discovery, term-based relevance search,
 phase/triage-aware routing, model-adaptive context injection, and reference loading.
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Base directories for skill discovery
 BUNDLED_SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
-USER_SKILLS_DIR = Path.home() / ".hellhound" / "skills"
+USER_SKILLS_DIR = Path.home() / ".beast" / "skills"
 
 
 @dataclass
@@ -80,9 +80,9 @@ def _parse_yaml_frontmatter(content: str) -> Tuple[Dict[str, str], str]:
 
 def discover_skills() -> Dict[str, SkillMeta]:
     """
-    Scans `hellhound/skills/` and `~/.hellhound/skills/` for `*/SKILL.md` files.
+    Scans `hellhound/skills/` and `~/.beast/skills/` for `*/SKILL.md` files.
     Parses ONLY YAML frontmatter (name, description) to maintain lightweight overhead.
-    User-defined skills (~/.hellhound/skills/) override bundled ones of the same name.
+    User-defined skills (~/.beast/skills/) override bundled ones of the same name.
     """
     registry: Dict[str, SkillMeta] = {}
 
@@ -111,7 +111,7 @@ def discover_skills() -> Dict[str, SkillMeta]:
                     except Exception as e:
                         logger.warning(f"Error reading skill {skill_file}: {e}")
 
-    # 2. User skills (~/.hellhound/skills/)
+    # 2. User skills (~/.beast/skills/)
     if USER_SKILLS_DIR.exists() and USER_SKILLS_DIR.is_dir():
         for skill_dir in USER_SKILLS_DIR.iterdir():
             if skill_dir.is_dir():

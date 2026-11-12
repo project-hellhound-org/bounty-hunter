@@ -307,7 +307,7 @@ class HellhoundCompleter(Completer):
             # Every other argument-taking command above suggests its valid
             # values from a hardcoded list — targets are the one case where
             # the valid values are dynamic (whatever's actually saved under
-            # ~/.hellhound/targets/), so this reads that directory live
+            # ~/.beast/targets/), so this reads that directory live
             # instead of requiring the researcher to remember/retype a
             # domain they already engaged. exclude_default=False on purpose:
             # unlike the banner's "recent engagements" strip, the completer
@@ -357,7 +357,7 @@ def render_banner_card(target_name: Optional[str] = None):
     handle = cfg.get("researcher_handle", "")
     handle_str = f" • @{handle}" if handle else " • Hunter"
 
-    # Targets & activity - read dynamically from ~/.hellhound/targets/
+    # Targets & activity - read dynamically from ~/.beast/targets/
     targets = list_targets(exclude_default=True)
     curr_target = target_name or (targets[0] if targets else "default")
     t_obj = create_or_load_target(curr_target)
@@ -457,7 +457,7 @@ def prompt_user_input(agent, session=None, history_file: Optional[str] = None) -
     if isinstance(session, FileHistory):
         history = session
     else:
-        hist_path = history_file or os.path.expanduser("~/.hellhound_history")
+        hist_path = history_file or os.path.expanduser("~/.beast_history")
         history = FileHistory(hist_path)
 
     kb = KeyBindings()
@@ -948,7 +948,7 @@ def start_chat_session(initial_target: Optional[str] = None):
     agent = get_agent(target)
 
     # Configure persistent history
-    history_file = os.path.expanduser("~/.hellhound_history")
+    history_file = os.path.expanduser("~/.beast_history")
     history = FileHistory(history_file)
 
     # ── Warmup: pre-load Ollama model in background while banner renders ──

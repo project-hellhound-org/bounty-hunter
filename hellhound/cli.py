@@ -29,7 +29,7 @@ def _configure_logging():
     import logging
     from pathlib import Path
 
-    log_dir = Path.home() / ".hellhound" / "logs"
+    log_dir = Path.home() / ".beast" / "logs"
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         handler = logging.FileHandler(log_dir / "hellhound.log", encoding="utf-8")
@@ -181,7 +181,7 @@ def terminal_set(name):
             f"preference anyway in case it's installed later.", fg="yellow"
         ))
 
-    pref_dir = Path.home() / ".hellhound"
+    pref_dir = Path.home() / ".beast"
     pref_dir.mkdir(parents=True, exist_ok=True)
     (pref_dir / "terminal_preference").write_text(name.strip() + "\n")
     click.echo(f"[+] Desktop launcher will now open HELLHOUND in: {name}")
@@ -191,7 +191,7 @@ def terminal_set(name):
 def terminal_show():
     """Show the currently configured terminal preference."""
     from pathlib import Path
-    pref_file = Path.home() / ".hellhound" / "terminal_preference"
+    pref_file = Path.home() / ".beast" / "terminal_preference"
     if pref_file.exists() and pref_file.read_text().strip():
         click.echo(pref_file.read_text().strip())
     else:
@@ -202,7 +202,7 @@ def terminal_show():
 def terminal_clear():
     """Clear the saved terminal preference and go back to auto-detect."""
     from pathlib import Path
-    pref_file = Path.home() / ".hellhound" / "terminal_preference"
+    pref_file = Path.home() / ".beast" / "terminal_preference"
     if pref_file.exists():
         pref_file.unlink()
     click.echo("[+] Cleared — desktop launcher will auto-detect a terminal.")

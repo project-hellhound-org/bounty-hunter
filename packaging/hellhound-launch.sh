@@ -8,7 +8,7 @@
 # picks the terminal explicitly:
 #
 #   1. $HELLHOUND_TERMINAL env var, if set (one-off override)
-#   2. ~/.hellhound/terminal_preference, if set (persistent, via
+#   2. ~/.beast/terminal_preference, if set (persistent, via
 #      `hellhound terminal set <name>`)
 #   3. First terminal found from a priority list of common emulators
 #   4. x-terminal-emulator (Debian/Ubuntu alternatives system)
@@ -22,7 +22,7 @@
 
 set -f  # no globbing needed anywhere below
 
-PREF_FILE="$HOME/.hellhound/terminal_preference"
+PREF_FILE="$HOME/.beast/terminal_preference"
 CMD="beast"
 
 # A reasonable starting geometry for emulators that support it, so the

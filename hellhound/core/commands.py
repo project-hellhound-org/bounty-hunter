@@ -1030,7 +1030,7 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
                                 CURRENT target to it, plus any extra comma-separated
                                 in-scope domains given (each becomes its own real
                                 target, created if it doesn't exist yet) — creates
-                                the program's folder under ~/.hellhound/programs/
+                                the program's folder under ~/.beast/programs/
     add <domain...>          — add more in-scope domain(s) to the CURRENT target's
                                 program (comma-separated or space-separated) — the
                                 current target must already belong to one; run
@@ -1038,9 +1038,9 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
     attach <domain...>       — alias for 'add': attaches an existing (or brand-new)
                                 target to the CURRENT target's program by domain
                                 name. Each attached target keeps its own real recon
-                                data at ~/.hellhound/targets/<domain>/ AND gets a
+                                data at ~/.beast/targets/<domain>/ AND gets a
                                 browsable directory for it under
-                                ~/.hellhound/programs/<program>/targets/<domain>/ —
+                                ~/.beast/programs/<program>/targets/<domain>/ —
                                 so every in-scope subdomain of the program shows up
                                 as its own separate directory inside the program's
                                 directory, instead of scattered flat sibling folders.
@@ -1235,7 +1235,7 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
         if not is_json:
             verb_past = "Attached" if verb == "attach" else "Added"
             emit.success(f"{verb_past} {len(added)} domain(s) to program '{prog_name}': {', '.join(added)}")
-            emit.info(f"  Each now has its own directory under ~/.hellhound/programs/{prog_name}/targets/")
+            emit.info(f"  Each now has its own directory under ~/.beast/programs/{prog_name}/targets/")
         return {"status": "success", "action": "attached", "program": prog_name, "domains_added": added}
 
     if verb == "scope":
@@ -1861,7 +1861,7 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
     /mcp caido remove               — remove the Caido entry from config (either integration)
     /mcp test                       — re-test whatever's currently configured, without changing it
 
-    Writes directly into ~/.hellhound/config.json via load_config()/save_config()
+    Writes directly into ~/.beast/config.json via load_config()/save_config()
     (a plain read-modify-write of the whole file, so any other keys already in
     there — ai_provider, api_keys, scope, etc. — are preserved untouched) so a
     researcher never has to hand-edit JSON to wire up Burp or Caido. Every
@@ -3205,7 +3205,7 @@ def handle_uninstall(args: List[str], session_context: Dict[str, Any], emit: Any
         "desktop_entry": home / ".local" / "share" / "applications" / "hellhound.desktop",
         "icon_assets": home / ".local" / "share" / "hellhound",
         "icon_file": home / ".local" / "share" / "icons" / "hellhound.png",
-        "config_and_data": home / ".hellhound",
+        "config_and_data": home / ".beast",
     }
     existing = {k: str(v) for k, v in plan.items() if v.exists() or v.is_symlink()}
 

@@ -2,7 +2,7 @@
 hellhound/memory/investigation.py
 
 Structured investigation memory built on top of the existing
-hellhound.core.tasks.Target (~/.hellhound/targets/<target>/task.json).
+hellhound.core.tasks.Target (~/.beast/targets/<target>/task.json).
 
 This module does NOT introduce a new storage system. It extends the
 existing `target.state` dict with a richer, deduplicated schema and

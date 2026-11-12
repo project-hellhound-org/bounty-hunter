@@ -434,7 +434,7 @@ def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     if custom_dir:
         screenshots_dir = Path(os.path.expanduser(custom_dir)).resolve()
     else:
-        screenshots_dir = Path(os.path.expanduser(f"~/.hellhound/targets/{target_safe_name}/screenshots")).resolve()
+        screenshots_dir = Path(os.path.expanduser(f"~/.beast/targets/{target_safe_name}/screenshots")).resolve()
 
     screenshots_dir.mkdir(parents=True, exist_ok=True)
 

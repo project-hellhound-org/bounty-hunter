@@ -12,7 +12,7 @@ that's possible here, since there's no way to fine-tune the underlying
 cloud model. Instead, HELLHOUND keeps its own external notes and feeds the
 relevant ones back into the prompt when a similar situation comes up again.
 
-Storage: a single flat JSON file at ~/.hellhound/lessons.json, global across
+Storage: a single flat JSON file at ~/.beast/lessons.json, global across
 every target. Each entry is a short, structured record — not a transcript —
 so this file stays small and the retrieval step (find_relevant_lessons) stays
 a cheap local keyword match, never another LLM call.
@@ -30,7 +30,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-_LESSONS_PATH = os.path.expanduser("~/.hellhound/lessons.json")
+_LESSONS_PATH = os.path.expanduser("~/.beast/lessons.json")
 _MAX_LESSONS = 500  # hard ceiling on stored entries — oldest pruned beyond this
 
 

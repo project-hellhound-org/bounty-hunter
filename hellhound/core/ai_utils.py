@@ -12,7 +12,7 @@ from typing import Optional, Dict, Any, List, Tuple, Callable, Union
 logger = logging.getLogger("hellhound.ai_utils")
 
 # Path to persistent Hellhound configuration
-CONFIG_DIR = Path.home() / ".hellhound"
+CONFIG_DIR = Path.home() / ".beast"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # Default NVIDIA NIM model used when nothing else is configured. NVIDIA
@@ -110,7 +110,7 @@ class _StreamingThinkFilter:
             self.buf = ""
 
 def load_config() -> Dict[str, Any]:
-    """Loads persistent Hellhound configuration from ~/.hellhound/config.json."""
+    """Loads persistent Hellhound configuration from ~/.beast/config.json."""
     default_config: Dict[str, Any] = {
         "ai_provider": "ollama",
         "ai_model": "",
@@ -130,7 +130,7 @@ def load_config() -> Dict[str, Any]:
         # typical batch (4-6 tool calls) or a multi-finding synthesizer
         # write-up real headroom to finish in one response instead of
         # getting truncated and needing "continue". Still overridable via
-        # ~/.hellhound/config.json if a provider/budget needs it tighter.
+        # ~/.beast/config.json if a provider/budget needs it tighter.
         "max_response_tokens": 16384,
         # Whether tool calls may be parsed out of TEXT content (the regex/brace-
         # scan fallback) on top of native tool_calls. "auto" (default): off for a
@@ -209,7 +209,7 @@ def load_config() -> Dict[str, Any]:
         return default_config
 
 def save_config(config: Dict[str, Any]) -> bool:
-    """Saves persistent Hellhound configuration to ~/.hellhound/config.json."""
+    """Saves persistent Hellhound configuration to ~/.beast/config.json."""
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -311,7 +311,7 @@ REPORTING STRATEGY: (Low/Medium/High/Critical)
 """
 
 CHAT_PERSONA_SLM = """\
-You are Bounty Hunter — nickname "Beast" (you launch as the command `beast`, and the researcher calls you Beast). Built under Project Hellhound by the researcher (handle: l4zz3rj0d): if asked your name, you're Bounty Hunter (Beast for short); Hellhound is the project that built you, l4zz3rj0d is who built you.
+You are Bounty Hunter — nickname "Beast," which is what the researcher calls you. Built under Project Hellhound by the researcher (handle: l4zz3rj0d): if asked your name, you're Bounty Hunter (Beast for short); Hellhound is the project that built you, l4zz3rj0d is who built you.
 For casual conversation: respond naturally and conversationally in 1-3 sentences max.
 """
 
@@ -326,12 +326,11 @@ facts. You verify before you agree; you don't take a claim, a number, or a
 check it against what the evidence actually shows and say so if it doesn't
 hold up.
 
-IDENTITY: If asked your name, you are Bounty Hunter — nickname "Beast"
-(you launch as the command `beast`, and the researcher usually just calls you
-Beast; wear it, it's earned). Never answer "Hellhound" to the name question:
-Project Hellhound is the codebase/project/org that built you, not your name —
-the distinction matters, keep it straight (org: Project Hellhound · tool:
-Bounty Hunter · you, day to day: Beast). You
+IDENTITY: If asked your name, you are Bounty Hunter — nickname "Beast,"
+which is what the researcher calls you; wear it, it's earned. Never answer
+"Hellhound" to the name question: Project Hellhound is the codebase/project/org
+that built you, not your name — the distinction matters, keep it straight (org:
+Project Hellhound · tool: Bounty Hunter · you, day to day: Beast). You
 were built by the researcher you're working with now, handle l4zz3rj0d —
 they're your creator, the one who put you together and keeps extending you
 (not just "the user using a tool"). Wear that the way a built thing would:

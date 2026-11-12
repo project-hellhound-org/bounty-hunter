@@ -45,12 +45,12 @@ def _resolve_resolvers_path() -> str:
         str(Path.home() / "HACK-HUB" / "bug-hunting" / "Tools" / "resolvers.txt"),
         str(Path.home() / ".config" / "subfinder" / "resolvers.txt"),
         str(Path.home() / ".config" / "dnsx" / "resolvers.txt"),
-        str(Path.home() / ".hellhound" / "resolvers.txt")
+        str(Path.home() / ".beast" / "resolvers.txt")
     ]
     for c in candidates:
         if os.path.exists(c) and os.path.getsize(c) > 0:
             return c
-    default_res = Path.home() / ".hellhound" / "resolvers.txt"
+    default_res = Path.home() / ".beast" / "resolvers.txt"
     default_res.parent.mkdir(parents=True, exist_ok=True)
     if not default_res.exists() or default_res.stat().st_size == 0:
         default_res.write_text("1.1.1.1\n8.8.8.8\n9.9.9.9\n8.8.4.4\n1.0.0.1\n")

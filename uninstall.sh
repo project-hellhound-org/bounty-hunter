@@ -7,7 +7,7 @@
 #  Usage:
 #    ./uninstall.sh                 # interactive, asks for confirmation
 #    ./uninstall.sh --yes           # skip confirmation prompt
-#    ./uninstall.sh --keep-data     # keep ~/.hellhound (config, targets, findings)
+#    ./uninstall.sh --keep-data     # keep ~/.beast (config, targets, findings)
 #    ./uninstall.sh --purge-tools   # also remove gowitness binary installed by install.sh
 #    ./uninstall.sh --purge-source  # also remove ~/.hellhound-src (bootstrap clone, if any)
 # ══════════════════════════════════════════════════════
@@ -47,7 +47,7 @@ done
 
 VENV_DIR="$HOME/.beast-env"
 LEGACY_VENV_DIR="$HOME/.hellhound-env"   # pre-rename venv, remove if present
-HELLHOUND_HOME="$HOME/.hellhound"
+HELLHOUND_HOME="$HOME/.beast"
 SRC_DIR="$HOME/.hellhound-src"
 LOCAL_BIN_LINK="$HOME/.local/bin/beast"
 LEGACY_LOCAL_BIN_LINK="$HOME/.local/bin/hellhound"
