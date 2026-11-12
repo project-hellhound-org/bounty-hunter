@@ -212,27 +212,57 @@ class TextualEmit(PlainEmit):
     tool_result / __call__ get their own widget-aware handling.
     """
 
+    # Live tool output (fuzz_hunter/spider emit HUNDREDS of "[200] <url>" lines)
+    # used to be one synchronous call_from_thread PER LINE — each marshaling onto
+    # the UI thread and mounting a widget — which saturated the event loop and
+    # starved key handling, so Ctrl+Q/Esc/typing froze during a big crawl. These
+    # lines are now coalesced into throttled batches (one UI update per ~120ms, or
+    # once 40 lines pile up), cutting the UI-thread pressure by 1-2 orders of
+    # magnitude and keeping the TUI responsive.
+    _FLUSH_INTERVAL = 0.12
+    _FLUSH_MAX = 40
+
     def __init__(self, app: "HellhoundApp") -> None:
         super().__init__()
         self._app = app
+        self._buf: list = []
+        self._buf_lock = threading.Lock()
+        self._last_flush = 0.0
 
-    def _send(self, msg):  # noqa: D401 - overrides PlainEmit
+    def _flush(self):
+        with self._buf_lock:
+            if not self._buf:
+                return
+            batch = "\n".join(self._buf)
+            self._buf.clear()
+            self._last_flush = time.monotonic()
         try:
-            self._app.call_from_thread(self._app.add_log_line, str(msg))
+            self._app.call_from_thread(self._app.add_log_line, batch)
         except Exception:
             pass
+
+    def _send(self, msg):  # noqa: D401 - overrides PlainEmit
+        flush_now = False
+        with self._buf_lock:
+            self._buf.append(str(msg))
+            if len(self._buf) >= self._FLUSH_MAX or (time.monotonic() - self._last_flush) >= self._FLUSH_INTERVAL:
+                flush_now = True
+        if flush_now:
+            self._flush()
 
     def __call__(self, msg):
         if msg and str(msg).strip():
             self._send(msg)
 
     def tool_start(self, tool_name: str, args: dict):
+        self._flush()  # keep buffered log lines ordered ahead of this card
         try:
             self._app.call_from_thread(self._app.start_tool_card, tool_name, dict(args or {}))
         except Exception:
             pass
 
     def tool_result(self, tool_name: str, result: Any):
+        self._flush()
         try:
             self._app.call_from_thread(self._app.finish_tool_card, tool_name, result)
         except Exception:
@@ -277,6 +307,15 @@ class HellhoundApp(App):
         Binding("down", "sugg_next", show=False, priority=True),
         Binding("up", "sugg_prev", show=False, priority=True),
         Binding("tab", "sugg_accept", show=False, priority=True),
+        # The input box always holds keyboard focus (so you can type without
+        # clicking first), which means plain Up/Down never reach the
+        # transcript — they're claimed above for suggestion-nav/history
+        # recall. Without an explicit binding, the ONLY way to review earlier
+        # output is the mouse wheel, which doesn't exist over an SSH session
+        # without mouse reporting. PageUp/PageDown give a keyboard path to
+        # the same scrolling the mouse wheel already does.
+        Binding("pageup", "scroll_transcript_up", "Scroll transcript up", show=False, priority=True),
+        Binding("pagedown", "scroll_transcript_down", "Scroll transcript down", show=False, priority=True),
     ]
 
     def __init__(
@@ -391,9 +430,31 @@ class HellhoundApp(App):
             pass
 
     # -- transcript mutations (always called on the UI thread) --
-    def _mount(self, widget) -> None:
-        self.query_one("#transcript", VerticalScroll).mount(widget)
-        self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
+    def _is_pinned_to_bottom(self) -> bool:
+        """True if the transcript is scrolled all the way down (or has no
+        overflow yet). Checked BEFORE mutating the transcript, since adding
+        content changes max_scroll_y and would make the check meaningless
+        if read after."""
+        try:
+            return self.query_one("#transcript", VerticalScroll).is_vertical_scroll_end
+        except Exception:
+            return True
+
+    def _mount(self, widget, force_scroll: bool = False) -> None:
+        # Classic-REPL parity fix: only auto-scroll to the bottom if the
+        # researcher was already pinned there (or this is their own action,
+        # force_scroll=True). Otherwise, a reply streaming in below keeps
+        # yanking the view back down every ~100ms the moment they scroll up
+        # mid-stream to re-read something earlier — they'd have to wait for
+        # the whole turn to finish before they could look back. Checking
+        # pinned-state BEFORE the mount (not after) matters: mounting new
+        # content grows max_scroll_y, which would make an "already at the
+        # bottom" researcher look un-pinned if checked afterward.
+        transcript = self.query_one("#transcript", VerticalScroll)
+        pinned = force_scroll or transcript.is_vertical_scroll_end
+        transcript.mount(widget)
+        if pinned:
+            transcript.scroll_end(animate=False)
 
     def add_log_line(self, msg: str) -> None:
         msg = str(msg)
@@ -404,8 +465,11 @@ class HellhoundApp(App):
         self._mount(LogLine(content, raw=msg))
 
     def add_user_message(self, text: str) -> None:
+        # Sending your own message always jumps you to the latest content,
+        # like any chat app — this is the one case that should override a
+        # scrolled-up position, since it's the researcher's own action.
         # Literal Content so brackets in the user's own text never parse as markup.
-        self._mount(UserMessage(Content(f"❯ {text}")))
+        self._mount(UserMessage(Content(f"❯ {text}")), force_scroll=True)
 
     def new_assistant_message(self) -> Markdown:
         # Reply renders LIVE into a Markdown widget as tokens stream in
@@ -426,11 +490,18 @@ class HellhoundApp(App):
         # fast token stream but still visibly renders as it arrives.
         if now - self._last_md_flush >= 0.1:
             self._last_md_flush = now
+            # Read pinned-state BEFORE re-rendering the markdown — growing the
+            # reply's rendered height changes max_scroll_y, same reasoning as
+            # _mount() above. A researcher who scrolled up to re-read an
+            # earlier message stays put; only a pinned-to-bottom researcher
+            # tracks the live stream automatically.
+            pinned = self._is_pinned_to_bottom()
             try:
                 self._assistant_md.update(self._assistant_buf)
             except Exception:
                 pass
-            self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
+            if pinned:
+                self.query_one("#transcript", VerticalScroll).scroll_end(animate=False)
 
     def finalize_assistant_message(self, text: Optional[str]) -> None:
         # Prefer the authoritative cleaned return value (text) over the raw
@@ -456,7 +527,7 @@ class HellhoundApp(App):
                     pass
             self._assistant_md = None
         elif final:
-            self.query_one("#transcript", VerticalScroll).mount(Markdown(final))
+            self._mount(Markdown(final))
         self._assistant_buf = ""
 
     def start_tool_card(self, tool_name: str, args: Dict[str, Any]) -> None:
@@ -596,6 +667,18 @@ class HellhoundApp(App):
             pass
         self.run_turn(line)
 
+    def action_scroll_transcript_up(self) -> None:
+        try:
+            self.query_one("#transcript", VerticalScroll).scroll_page_up()
+        except Exception:
+            pass
+
+    def action_scroll_transcript_down(self) -> None:
+        try:
+            self.query_one("#transcript", VerticalScroll).scroll_page_down()
+        except Exception:
+            pass
+
     def action_cancel_turn(self) -> None:
         # Esc first dismisses the dropdown if it's open, otherwise cancels the turn.
         box = self._suggest()
@@ -695,6 +778,7 @@ class HellhoundApp(App):
         except Exception as e:  # never let a turn crash the whole app
             self.call_from_thread(self.add_log_line, f"[bold red][✗][/bold red] turn error: {type(e).__name__}: {e}")
         finally:
+            emit._flush()  # push any trailing coalesced log lines before wrap-up
             if _looks_like_command(line):
                 self.call_from_thread(self.finalize_assistant_message, final_text)
             elapsed = time.monotonic() - t0
