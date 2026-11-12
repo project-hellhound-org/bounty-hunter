@@ -430,6 +430,7 @@ class HellhoundApp(App):
     UserMessage { color: $text; background: #1a1d26; margin: 2 0 1 0; padding: 0 1; border-left: thick red; }
     AssistantMessage { margin: 1 0 0 0; padding: 0 1; }
     Markdown { margin: 1 0 2 0; padding: 0 1; background: #0b0d12; }
+    MarkdownFence { background: #1b1f29; color: #e6e9ef; margin: 1 0; padding: 1 2; border-left: thick #5a1f27; }
     LogLine { color: #9aa0ac; margin: 0 0 1 1; }
     ToolCard { margin: 0 0 0 1; border: none; background: #0b0d12; }
     ToolCard > CollapsibleTitle { color: #cdd2db; background: #0b0d12; }
