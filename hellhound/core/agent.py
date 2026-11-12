@@ -6964,15 +6964,18 @@ def _privileged_access_corroborated(target: Target, request_ref: str, claim_text
     if not hasattr(target, "state") or not isinstance(target.state, dict):
         return None, ""
     log = target.state.get("curl_evidence_log") or []
-    ref_l = (request_ref or "").strip().lower()
     seen = {}
     for e in log:
         if not isinstance(e, dict):
             continue
         url = e.get("url", "") or ""
         raw = e.get("raw", "") or ""
-        is_priv = bool(_PRIV_ENDPOINT_RE.search(url)) or (ref_l and ref_l in url.lower())
-        if not is_priv:
+        # ONLY genuinely privileged/state-change endpoints corroborate a
+        # privileged claim. Deliberately NOT the finding's own request_ref: a
+        # 200 on /my-account?id=carlos is an account VIEW, not admin access —
+        # counting it here is exactly what let the fabricated "Administrator
+        # access" finding through while every real /admin request was a 401.
+        if not _PRIV_ENDPOINT_RE.search(url):
             continue
         st = _status_from_raw(raw)
         if st is None:
