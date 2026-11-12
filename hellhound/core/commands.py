@@ -1061,6 +1061,7 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
     from hellhound.core.tasks import (
         attach_target_to_program, set_program_scope, load_program,
         sanitize_program_name, list_programs, list_program_targets,
+        set_program_private, is_program_private,
     )
 
     is_json = "--json" in args or getattr(emit, "json_mode", False)
@@ -1105,10 +1106,40 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
         names = list_programs()
         if not is_json:
             if names:
-                emit.info(f"Programs ({len(names)}): {', '.join(names)}")
+                # Redact private programs so their names can't leak on a stream —
+                # '/program list all' (or 'reveal') shows them when you're alone.
+                reveal = any(a.lower() in ("all", "reveal", "--reveal") for a in clean_args[1:])
+                shown, hidden = [], 0
+                for n in names:
+                    if is_program_private(n) and not reveal:
+                        hidden += 1
+                    else:
+                        shown.append(n)
+                body = ", ".join(shown) if shown else "none visible"
+                tail = f"  [dim](+{hidden} 🔒 private — /program list all to reveal)[/dim]" if hidden else ""
+                emit.info(f"Programs ({len(names)}): {body}{tail}")
             else:
                 emit.info("No programs created yet. Use: /program create <name> [domain1,domain2,...]")
         return {"status": "success", "programs": names}
+
+    if verb in ("private", "public", "redact", "reveal-program", "unhide"):
+        want_private = verb in ("private", "redact")
+        prog_name = clean_args[1] if len(clean_args) > 1 else (getattr(target_obj, "program", "") if target_obj else "")
+        if not prog_name:
+            msg = "No program specified and the active target isn't attached to one. Usage: /program private [name]"
+            if not is_json:
+                emit.warn(msg)
+            return {"status": "no_program", "message": msg}
+        record = set_program_private(prog_name, want_private)
+        if record is None:
+            msg = f"No program named '{prog_name}' exists yet. See: /program list"
+            if not is_json:
+                emit.warn(msg)
+            return {"status": "not_found", "program": prog_name, "message": msg}
+        state = "private 🔒 (hidden from lists/autocomplete)" if want_private else "public (visible again)"
+        if not is_json:
+            emit.info(f"Program '[bold]{sanitize_program_name(prog_name)}[/bold]' is now {state}.")
+        return {"status": "success", "program": sanitize_program_name(prog_name), "private": want_private}
 
     if verb == "create":
         if len(clean_args) < 2:
@@ -1303,7 +1334,7 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
             )
         return {"status": "success", "action": "renamed", **result}
 
-    msg = f"Unknown /program subcommand '{verb}'. Usage: /program [show [name] | list | create <name> [domains] | add <domain...> | attach <domain...> | scope <policy text> | switch <name> [domain] | rename <old> <new>]"
+    msg = f"Unknown /program subcommand '{verb}'. Usage: /program [show [name] | list [all] | create <name> [domains] | add <domain...> | attach <domain...> | scope <policy text> | switch <name> [domain] | rename <old> <new> | private [name] | public [name]]"
     emit.warn(msg)
     return {"status": "error", "error": "unknown_subcommand", "message": msg}
 
@@ -2909,7 +2940,7 @@ register_command(Command(
     name="/program",
     aliases=["/programs", "/engagement"],
     description="Group several in-scope domains of one bug-bounty program/engagement under a shared scope (each domain keeps its own findings/session) — entirely optional, never triggered automatically by /target",
-    usage="/program [show [name] | list | create <name> [domain1,domain2,...] | add <domain...> | attach <domain...> | scope <policy text>]",
+    usage="/program [show [name] | list [all] | create <name> [domain1,domain2,...] | add <domain...> | attach <domain...> | scope <policy text> | private [name] | public [name]]",
     category="config",
     handler=handle_program
 ))

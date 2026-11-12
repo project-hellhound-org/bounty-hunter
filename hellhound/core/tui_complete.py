@@ -65,6 +65,8 @@ _PROGRAM_VERBS = [
     ("scope", "Set/replace the whole program's scope"),
     ("switch", "Switch the active session into a program (pick a domain)"),
     ("rename", "Rename a program (fix a typo'd name)"),
+    ("private", "Hide this program's name from lists/autocomplete (stream-safe)"),
+    ("public", "Make a private program visible again"),
 ]
 
 
@@ -118,8 +120,10 @@ def compute_suggestions(text: str, limit: int = 40) -> List[Suggestion]:
     if cmd_name in ("/target", "/targets"):
         out: List[Suggestion] = []
         try:
-            from hellhound.core.tasks import list_targets, _get_targets_dir
+            from hellhound.core.tasks import list_targets, _get_targets_dir, is_target_private
             for name in list_targets(exclude_default=False):
+                if is_target_private(name):
+                    continue  # private engagement — don't surface its domain on screen
                 meta = "saved target"
                 try:
                     mtime = os.path.getmtime(os.path.join(_get_targets_dir(), name, "task.json"))
@@ -137,8 +141,8 @@ def compute_suggestions(text: str, limit: int = 40) -> List[Suggestion]:
     # dynamic: program sub-verbs + program names
     if cmd_name in ("/program", "/programs", "/engagement"):
         try:
-            from hellhound.core.tasks import list_programs
-            progs = list_programs()
+            from hellhound.core.tasks import list_programs, is_program_private
+            progs = [p for p in list_programs() if not is_program_private(p)]
         except Exception:
             progs = []
         arg_tokens = tokens[1:]

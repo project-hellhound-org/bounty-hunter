@@ -412,6 +412,44 @@ def list_programs() -> List[str]:
     return sorted(out)
 
 
+def set_program_private(program_name: str, private: bool = True) -> Optional[Dict[str, Any]]:
+    """Mark a program private (redacted from on-screen lists) or public again.
+    A private engagement's name is hidden behind a lock placeholder in
+    `/program list` and in the command autocomplete, so it can't leak onto a
+    streamer's screen or a shared recording — you can still switch to it by
+    typing its exact name. Returns the updated record, or None if no such
+    program exists."""
+    record = load_program(program_name)
+    if record is None:
+        return None
+    record["private"] = bool(private)
+    _save_program(record)
+    return record
+
+
+def is_program_private(program_name: str) -> bool:
+    """True if this program is flagged private (hide its name in displays)."""
+    try:
+        record = load_program(program_name)
+    except Exception:
+        return False
+    return bool(record and record.get("private"))
+
+
+def is_target_private(target_name: str) -> bool:
+    """True if this target belongs to a program flagged private — so its domain
+    name is hidden from autocomplete/lists too, not just the program name."""
+    try:
+        path = os.path.join(_get_targets_dir(), sanitize_target_name(target_name), "task.json")
+        if not os.path.isfile(path):
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            prog = (json.load(f) or {}).get("program")
+        return bool(prog) and is_program_private(prog)
+    except Exception:
+        return False
+
+
 def attach_target_to_program(target: Target, program_name: str) -> Target:
     """
     Tags `target` as belonging to `program_name` and, if that program
