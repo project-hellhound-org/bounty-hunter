@@ -1266,9 +1266,14 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
         # of remembering its domain and running /target by hand. This makes
         # a program behave like a chat app's session list: pick the program,
         # then (if it has more than one domain) pick which domain inside it
-        # to land the active session on.
+        # to land the active session on. 'select'/'switch' are the same action —
+        # we just phrase it as SELECT when you're coming from a fresh scratch
+        # session (nothing was active) and SWITCH when you're leaving another
+        # program, so the wording matches what actually happened.
+        _prior_program = getattr(target_obj, "program", "") if target_obj else ""
+        _verb_word = "switch" if _prior_program else "select"
         if len(clean_args) < 2:
-            msg = "Usage: /program switch <name> [domain]  (jumps the active session into that program; add a domain to land on a specific one)"
+            msg = f"Usage: /program {_verb_word} <name> [host]  (points the active session at that program; add a host to land on a specific one)"
             emit.warn(msg)
             return {"status": "error", "error": "missing_name", "message": msg}
         prog_name = clean_args[1]
@@ -1318,12 +1323,13 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
         target_obj = create_or_load_target(chosen)
         session_context["scope_rules"] = target_obj.scope_rules
         if not is_json:
-            emit.success(f"Switched into program '{record.get('display_name', prog_name)}' → active target: [bold cyan]{chosen}[/bold cyan]")
+            _done_word = "Switched to" if _prior_program else "Selected"
+            emit.success(f"{_done_word} program '{record.get('display_name', prog_name)}' → active target: [bold cyan]{chosen}[/bold cyan]")
             others = [d for d in domains if d != chosen]
             if others:
-                emit.info(f"Other domain(s) in this program: {', '.join(others)} — /program switch {prog_name} <domain> to jump between them")
+                emit.info(f"Other host(s) in this program: {', '.join(others)} — /program switch {prog_name} <host> to jump between them")
         return {
-            "status": "success", "action": "switch", "program": record["name"],
+            "status": "success", "action": ("switch" if _prior_program else "select"), "program": record["name"],
             "target": chosen, "domains": domains,
             "scope_rules": target_obj.scope_rules.to_dict() if hasattr(target_obj.scope_rules, "to_dict") else {},
         }
@@ -1372,7 +1378,7 @@ def handle_list(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
             emit.info("[dim]No program selected — scratch session, nothing is being saved.[/dim]")
             if visible:
                 emit.info(f"Programs you can enter ({len(visible)}): [bold]{', '.join(visible)}[/bold]")
-                emit.info("  Enter one with: [bold red]/program switch <name>[/bold red]")
+                emit.info("  Enter one with: [bold red]/program select <name>[/bold red]")
             else:
                 emit.info("No programs yet. Create one with: /program create <name> [domain1,domain2,...]")
         return {"status": "no_program", "programs": visible}

@@ -63,7 +63,8 @@ _PROGRAM_VERBS = [
     ("add", "Add domain(s) to the active program"),
     ("attach", "Attach the current target to its program"),
     ("scope", "Set/replace the whole program's scope"),
-    ("switch", "Switch the active session into a program (pick a domain)"),
+    ("select", "Select a program to work (use when none is active yet)"),
+    ("switch", "Switch the active session to another program/host"),
     ("rename", "Rename a program (fix a typo'd name)"),
     ("private", "Hide this program's name from lists/autocomplete (stream-safe)"),
     ("public", "Make a private program visible again"),
@@ -152,7 +153,7 @@ def compute_suggestions(text: str, limit: int = 40) -> List[Suggestion]:
         # verb already chosen; for show/rename/scope/switch suggest existing
         # program names as the second token.
         verb = arg_tokens[0].lower()
-        if verb in ("show", "rename", "scope", "switch") and (
+        if verb in ("show", "rename", "scope", "switch", "select", "use", "open", "private", "public") and (
             len(arg_tokens) == 1 or (len(arg_tokens) == 2 and not text.endswith(" "))
         ):
             return [mk(p, "existing program") for p in progs if _match(p, word)][:limit]
@@ -160,14 +161,19 @@ def compute_suggestions(text: str, limit: int = 40) -> List[Suggestion]:
         # the already-chosen program — so walking Tab -> Tab goes program,
         # then domain, then Enter switches: the click-a-session-window flow
         # the researcher expects, done via the keyboard.
-        if verb == "switch" and len(arg_tokens) >= 2:
+        if verb in ("switch", "select", "use", "open") and len(arg_tokens) >= 2:
             prog_name = arg_tokens[1]
             try:
-                from hellhound.core.tasks import list_program_targets
-                doms = list_program_targets(prog_name)
+                from hellhound.core.tasks import list_program_targets, load_program
+                doms = list(list_program_targets(prog_name))
+                # also offer concrete in-scope hosts you haven't worked yet
+                rec = load_program(prog_name) or {}
+                for d in (rec.get("scope_rules") or {}).get("in_scope", []):
+                    if d and not d.startswith("*") and d not in doms:
+                        doms.append(d)
             except Exception:
                 doms = []
-            return [mk(d, "domain in this program — Enter switches to it") for d in doms if _match(d, word)][:limit]
+            return [mk(d, "host in this program — Enter lands on it") for d in doms if _match(d, word)][:limit]
         return []
 
     # static subcommand tables

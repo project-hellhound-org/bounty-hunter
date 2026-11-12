@@ -592,7 +592,7 @@ class HellhoundApp(App):
         # show nothing-saved clearly when no program is selected yet.
         if no_program:
             target_line = ("[red]Program:[/red] [dim]none — scratch chat, nothing saved. "
-                           "[/dim][dim]Select one with[/dim] [bold red]/program switch <name>[/bold red]")
+                           "[/dim][dim]Select one with[/dim] [bold red]/program select <name>[/bold red]")
         else:
             prog_str = f"[bold white]{_rich_escape(program)}[/bold white]" if program else f"[bold white]{_rich_escape(str(tname))}[/bold white]"
             if in_n:
