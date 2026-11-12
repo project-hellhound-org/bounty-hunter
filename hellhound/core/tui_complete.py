@@ -55,7 +55,7 @@ _SUBCOMMANDS = {
     ],
 }
 
-# /program sub-verbs (now includes rename/edit).
+# /program sub-verbs (now includes rename/edit/switch).
 _PROGRAM_VERBS = [
     ("show", "Show a program's attached targets + scope"),
     ("list", "List every program created so far"),
@@ -63,6 +63,7 @@ _PROGRAM_VERBS = [
     ("add", "Add domain(s) to the active program"),
     ("attach", "Attach the current target to its program"),
     ("scope", "Set/replace the whole program's scope"),
+    ("switch", "Switch the active session into a program (pick a domain)"),
     ("rename", "Rename a program (fix a typo'd name)"),
 ]
 
@@ -144,10 +145,25 @@ def compute_suggestions(text: str, limit: int = 40) -> List[Suggestion]:
         # first arg -> suggest the verb
         if len(arg_tokens) == 0 or (len(arg_tokens) == 1 and not text.endswith(" ")):
             return [mk(v, m) for v, m in _PROGRAM_VERBS if _match(v, word)][:limit]
-        # verb already chosen; for show/rename/scope suggest existing program names
+        # verb already chosen; for show/rename/scope/switch suggest existing
+        # program names as the second token.
         verb = arg_tokens[0].lower()
-        if verb in ("show", "rename", "scope"):
+        if verb in ("show", "rename", "scope", "switch") and (
+            len(arg_tokens) == 1 or (len(arg_tokens) == 2 and not text.endswith(" "))
+        ):
             return [mk(p, "existing program") for p in progs if _match(p, word)][:limit]
+        # 'switch' takes an optional THIRD token — the specific domain inside
+        # the already-chosen program — so walking Tab -> Tab goes program,
+        # then domain, then Enter switches: the click-a-session-window flow
+        # the researcher expects, done via the keyboard.
+        if verb == "switch" and len(arg_tokens) >= 2:
+            prog_name = arg_tokens[1]
+            try:
+                from hellhound.core.tasks import list_program_targets
+                doms = list_program_targets(prog_name)
+            except Exception:
+                doms = []
+            return [mk(d, "domain in this program — Enter switches to it") for d in doms if _match(d, word)][:limit]
         return []
 
     # static subcommand tables

@@ -468,8 +468,19 @@ def handle_scan(args: List[str], session_context: Dict[str, Any], emit: Any,
 # real budget — turning "do a batch, report back" into "run the whole engagement".
 _HUNT_DONE_RE = re.compile(r"\bENGAGEMENT\s+COMPLETE\b", re.I)
 _HUNT_PENDING_RE = re.compile(
-    r"next steps?|what'?s left|haven'?t (?:yet|tested)|in progress|i'?ll (?:start|now|continue)|"
-    r"still (?:need|to)|remaining|left to test|to be tested|let me continue|moving on to|"
+    # Qualified, testing-specific phrasing only — bare trigger words like a lone
+    # "remaining" or "next steps?" false-positive on ordinary finished-report
+    # prose ("remaining risk after remediation", "Next steps for the client's
+    # engineering team"). Each alternative below requires the pending-work
+    # context (testing/checking a class, endpoint, or target) in the same
+    # phrase, not just an isolated word, so completed reports stop tripping
+    # the stall detector while genuine "still working" signals still match.
+    r"next steps?,? (?:is|are|include|will be) to (?:test|check|verify|confirm|probe|try)|"
+    r"what'?s left to test|haven'?t (?:yet|tested)|(?:tests?|checks?) (?:is|are) (?:still )?in progress|"
+    r"i'?ll (?:start|now|continue) (?:testing|checking|probing|with|by)?|"
+    r"still (?:need|have)? ?to (?:test|check|verify|try|probe)|"
+    r"(?:tests?|endpoints?|classes?|checks?) (?:remaining|still (?:pending|untested))|"
+    r"left to test|(?:still )?to be tested|let me continue(?: testing| with)?|moving on to (?:test|the next)|"
     # a generation-length truncation mid-tool-call is NOT a deliberate stop — the
     # model intended more tool calls and got cut off, so the loop must continue
     # (Claude-Code-style) instead of ending on a "say continue" dead-end.
@@ -999,7 +1010,7 @@ def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) ->
 
 def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
-    /program [show [name] | list | create <name> [domain1,domain2,...] | add <domain...> | attach <domain...> | scope <policy text>]
+    /program [show [name] | list | create <name> [domain1,domain2,...] | add <domain...> | attach <domain...> | scope <policy text> | switch <name> [domain]]
 
     For a bug-bounty PROGRAM/engagement with several in-scope domains
     (e.g. "AGOV" shipping a.gov.sg, b.gov.sg, c.gov.sg) — groups them
@@ -1040,6 +1051,12 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
                                 program in one shot, instead of repeating /scope on
                                 each domain by hand. Applies to the CURRENT target's
                                 program.
+    switch <name> [domain]  — jump the ACTIVE session into this program, like
+                                picking a session in a chat app. With no domain and
+                                the program has exactly one, switches straight to
+                                it; with several, lists them so you can pick
+                                ('/program switch <name> <domain>'). Aliases:
+                                select/use/open.
     """
     from hellhound.core.tasks import (
         attach_target_to_program, set_program_scope, load_program,
@@ -1210,6 +1227,63 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
             emit.info(f"  Disallowed: {rules.get('disallowed', [])}")
         return {"status": "success", "action": "scope_updated", **result}
 
+    if verb in ("switch", "select", "use", "open"):
+        # Session-switcher UX: a program groups several domains under one
+        # shared engagement/scope (exactly how a real bug-bounty program
+        # works — one policy, many in-scope hosts), but until now there was
+        # no way to actually MOVE the active session into one of them short
+        # of remembering its domain and running /target by hand. This makes
+        # a program behave like a chat app's session list: pick the program,
+        # then (if it has more than one domain) pick which domain inside it
+        # to land the active session on.
+        if len(clean_args) < 2:
+            msg = "Usage: /program switch <name> [domain]  (jumps the active session into that program; add a domain to land on a specific one)"
+            emit.warn(msg)
+            return {"status": "error", "error": "missing_name", "message": msg}
+        prog_name = clean_args[1]
+        record = load_program(prog_name)
+        if not record:
+            msg = f"No program named '{prog_name}' exists yet. See: /program list"
+            emit.warn(msg)
+            return {"status": "not_found", "program": prog_name, "message": msg}
+        domains = list_program_targets(prog_name)
+        if not domains:
+            msg = f"Program '{record.get('display_name', prog_name)}' has no domains attached yet. Add one with: /program add <domain>"
+            emit.warn(msg)
+            return {"status": "error", "error": "empty_program", "program": record["name"], "message": msg}
+
+        requested_domain = clean_args[2].strip().lower() if len(clean_args) > 2 else None
+        if requested_domain:
+            if requested_domain not in domains:
+                msg = f"'{requested_domain}' isn't part of program '{record.get('display_name', prog_name)}'. Domains: {', '.join(domains)}"
+                emit.warn(msg)
+                return {"status": "error", "error": "domain_not_in_program", "program": record["name"], "domains": domains, "message": msg}
+            chosen = requested_domain
+        elif len(domains) == 1:
+            chosen = domains[0]
+        else:
+            # More than one domain and none specified — this is exactly the
+            # "which chat window inside this session" choice; surface the
+            # list rather than guessing, same as /program show already does.
+            emit.info(f"Program '{record.get('display_name', prog_name)}' has {len(domains)} domains — pick one:")
+            emit.info(", ".join(domains))
+            emit.info(f"  /program switch {prog_name} <domain>")
+            return {"status": "ambiguous", "program": record["name"], "domains": domains}
+
+        session_context["target"] = chosen
+        target_obj = create_or_load_target(chosen)
+        session_context["scope_rules"] = target_obj.scope_rules
+        if not is_json:
+            emit.success(f"Switched into program '{record.get('display_name', prog_name)}' → active target: [bold cyan]{chosen}[/bold cyan]")
+            others = [d for d in domains if d != chosen]
+            if others:
+                emit.info(f"Other domain(s) in this program: {', '.join(others)} — /program switch {prog_name} <domain> to jump between them")
+        return {
+            "status": "success", "action": "switch", "program": record["name"],
+            "target": chosen, "domains": domains,
+            "scope_rules": target_obj.scope_rules.to_dict() if hasattr(target_obj.scope_rules, "to_dict") else {},
+        }
+
     if verb in ("rename", "edit"):
         from hellhound.core.tasks import rename_program
         rest = clean_args[1:]
@@ -1229,7 +1303,7 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
             )
         return {"status": "success", "action": "renamed", **result}
 
-    msg = f"Unknown /program subcommand '{verb}'. Usage: /program [show [name] | list | create <name> [domains] | add <domain...> | attach <domain...> | scope <policy text> | rename <old> <new>]"
+    msg = f"Unknown /program subcommand '{verb}'. Usage: /program [show [name] | list | create <name> [domains] | add <domain...> | attach <domain...> | scope <policy text> | switch <name> [domain] | rename <old> <new>]"
     emit.warn(msg)
     return {"status": "error", "error": "unknown_subcommand", "message": msg}
 
