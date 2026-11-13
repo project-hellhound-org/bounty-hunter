@@ -13355,9 +13355,25 @@ If there is nothing worth generalizing, return an empty array: []"""
             except Exception as e:
                 results[i] = {"tool": tool, "error": f"{type(e).__name__}: {e}"}
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(norm)), thread_name_prefix="hh-par") as ex:
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(norm)), thread_name_prefix="hh-par")
+        _par_cancelled = False
+        try:
             futs = [ex.submit(_run, i, t, a) for i, (t, a) in enumerate(norm)]
-            concurrent.futures.wait(futs, timeout=600)
+            _deadline = time.monotonic() + 600
+            while True:
+                _done, _pending = concurrent.futures.wait(futs, timeout=1.0)
+                if not _pending or time.monotonic() > _deadline:
+                    break
+                # Honor Esc/cancel — the researcher must be able to stop a long
+                # parallel sweep instead of being pinned for the full 600s (seen
+                # on KWO: a parallel spider/katana ran 20+ min ignoring cancel).
+                if emit is not None and getattr(emit, "cancelled", None) and emit.cancelled():
+                    _par_cancelled = True
+                    break
+        finally:
+            # On cancel, return control NOW — don't block on in-flight sub-tools;
+            # cancel_futures drops any that never started.
+            ex.shutdown(wait=not _par_cancelled, cancel_futures=True)
 
         return {
             "status": "success",
@@ -13986,6 +14002,19 @@ If there is nothing worth generalizing, return an empty array: []"""
             # Auto-extract & persist harvested security artifacts (tokens, passwords, session cookies, keys)
             try:
                 harvested = extract_and_store_artifacts(tool_name, args, result, self.target, turn_number=getattr(self, "_current_turn", len(self.history)))
+                # A real leak needs a real secret-looking VALUE. A tool's own
+                # metric fields (passive_subdomains_found='0', secrets_found_in_
+                # minified_js='0') are COUNTS, not credentials — firing a
+                # "you harvested credentials/tokens!" alert on a count of ZERO
+                # was making the model hallucinate secrets that don't exist
+                # (seen on the KWO recon run). Keep only values that actually
+                # look like a token/key/URL/credential.
+                def _looks_like_real_secret(v):
+                    s = str(v or "").strip()
+                    if not s or s.isdigit() or s.lower() in ("true", "false", "none", "null", "-"):
+                        return False
+                    return len(s) >= 8 or "://" in s or "@" in s
+                harvested = [a for a in (harvested or []) if _looks_like_real_secret(a.get("value"))]
                 if harvested and isinstance(result, dict):
                     result["harvested_security_artifacts"] = harvested
                     if "LEAK_ALERT" not in result:

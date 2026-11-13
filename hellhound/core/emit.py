@@ -85,7 +85,7 @@ class PlainEmit:
         self._send(msg)
 
     def info(self, msg):
-        self._send(f"[bold red][*][/bold red] {msg}")
+        self._send(f"· {msg}")
 
     def warn(self, msg):
         self._send(f"[bold orange1][!][/bold orange1] {msg}")
@@ -101,7 +101,7 @@ class PlainEmit:
     def tool_start(self, tool_name: str, args: dict):
         """Emits start of tool execution."""
         args_str = ", ".join(f"{k}={repr(v)}" for k, v in (args or {}).items())
-        self._send(f"[bold red][*][/bold red] Executing tool: [bold white]{tool_name}[/bold white]({args_str})")
+        self._send(f"· Executing tool: [bold white]{tool_name}[/bold white]({args_str})")
 
     def tool_result(self, tool_name: str, result: any):
         """Emits tool execution result."""
