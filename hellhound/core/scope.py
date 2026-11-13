@@ -36,6 +36,23 @@ MODULE_RISK_MAP = {
     "gaunucleisweep": ["no-fuzzing", "no-dos", "no-automated-scanners"],
     # nmap --script vuln,default is an active vulnerability-scanning sweep.
     "nmapservicescan": ["no-dos", "no-automated-scanners"],
+    # Active, TARGET-HITTING discovery / fuzzing / scanning — the activity a
+    # "no automated scanners touching the target, manual low-impact only, strict
+    # RPS" program forbids. Tagged so disallowing no-automated-scanners /
+    # no-fuzzing / no-brute-force at the scope gate actually BLOCKS them.
+    # DELIBERATELY NOT tagged: passive, OSINT-only enumeration — subfinder,
+    # subdomain_sweep (subfinder+dnsx), wayback_urls, otx_urls, urlscan_recon —
+    # they query third-party sources / DNS and never send traffic to the target,
+    # so they stay allowed even under these restrictions. Only tools that put
+    # automated load ON the target's own infrastructure are listed here.
+    "dnsbruteforce": ["no-brute-force", "no-automated-scanners"],
+    "contentdiscovery": ["no-fuzzing", "no-brute-force", "no-automated-scanners"],
+    "vhostfuzz": ["no-fuzzing", "no-automated-scanners"],
+    "schemafuzzer": ["no-fuzzing", "no-automated-scanners"],
+    "portscan": ["no-dos", "no-automated-scanners"],
+    "takeoverscanner": ["no-automated-scanners"],
+    "wpscanscan": ["no-automated-scanners"],
+    "sqlmapscan": ["no-automated-scanners"],
 }
 
 
