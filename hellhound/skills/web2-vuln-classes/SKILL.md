@@ -274,7 +274,7 @@ POST /cart       {"productId":1,"price":"0.01"}  → "excessive trust in client-
 POST /checkout   {"total":1}                      → pay 1 instead of the real total
 POST /cart       {"quantity":-1}                  → negative quantity credits the balance
 ```
-A server that **re-derives** the value server-side is safe; one that **echoes back what you sent** (your posted price appears in the cart/total) is vulnerable. This is the single most common "buy it for less / become admin" vector and it costs ONE tamper-and-resend — exhaust it before any multi-request race or coupon-stacking attack. On this and the PortSwigger "Excessive trust in client-side controls" lab, the fix is exactly this: intercept the add-to-cart request, drop the price, resend.
+A server that **re-derives** the value server-side is safe; one that **echoes back what you sent** (your posted price/total/quantity reappears in the cart or order) is vulnerable. This is the single most common "pay less / get more / grant yourself access" vector and it costs ONE tamper-and-resend — intercept the request, change the trusted value, resend — so exhaust it before any multi-request race or coupon-stacking attack.
 
 ### Pattern 1: Fast Path Skips State Update
 ```python

