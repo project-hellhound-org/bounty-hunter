@@ -267,6 +267,15 @@ http://localhost:8080     # Admin panel
 ## 5. BUSINESS LOGIC
 > Transferred from web3's "incomplete code path" pattern.
 
+### Pattern 0: Client-Trusted Values — CHECK THIS FIRST
+Before reaching for race conditions, coupon stacking, or quantity tricks, look at whether the request itself carries a **sensitive value the server should compute but instead trusts from the client**. If an add-to-cart / checkout / order / profile-update request contains a `price`, `total`, `amount`, `cost`, `discount`, `role`, `isAdmin`, `user_id`, `email`, or `quantity` field, change it and resend — that one request is often the whole exploit.
+```
+POST /cart       {"productId":1,"price":"0.01"}  → "excessive trust in client-side controls": server trusts the posted price
+POST /checkout   {"total":1}                      → pay 1 instead of the real total
+POST /cart       {"quantity":-1}                  → negative quantity credits the balance
+```
+A server that **re-derives** the value server-side is safe; one that **echoes back what you sent** (your posted price appears in the cart/total) is vulnerable. This is the single most common "buy it for less / become admin" vector and it costs ONE tamper-and-resend — exhaust it before any multi-request race or coupon-stacking attack. On this and the PortSwigger "Excessive trust in client-side controls" lab, the fix is exactly this: intercept the add-to-cart request, drop the price, resend.
+
 ### Pattern 1: Fast Path Skips State Update
 ```python
 def redeem_coupon(coupon_code, user_id):
