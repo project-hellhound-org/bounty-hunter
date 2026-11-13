@@ -1931,40 +1931,46 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
 
     # ── /mcp test — re-check current config without changing it ──────────
     if clean_args and clean_args[0].lower() == "test":
+        # Optional server filter: `/mcp test burp` or `/mcp test caido` checks
+        # just that one, so a Caido that isn't logged in yet doesn't throw an
+        # error every time you only wanted to confirm Burp.
+        which = clean_args[1].lower() if len(clean_args) > 1 else None
         result: Dict[str, Any] = {"status": "success"}
         burp_cfg = (cfg.get("mcp_servers") or {}).get("burp")
-        if burp_cfg:
-            r = _test_burp(burp_cfg)
-            result["burp"] = r
-            if not is_json:
-                if r["ok"]:
-                    emit.success(f"Burp ({burp_cfg.get('url')}) — still solid, {len(r['tools'])} tool(s): {', '.join(r['tools']) or '(none exposed)'}")
-                else:
-                    emit.warn(f"Burp ({burp_cfg.get('url')}) — not talking to me: {r['error']}")
-        else:
-            if not is_json:
-                emit.info("Burp is not configured. Use: /mcp burp [host_or_url]")
+        if which in (None, "burp"):
+            if burp_cfg:
+                r = _test_burp(burp_cfg)
+                result["burp"] = r
+                if not is_json:
+                    if r["ok"]:
+                        emit.success(f"Burp ({burp_cfg.get('url')}) — still solid, {len(r['tools'])} tool(s): {', '.join(r['tools']) or '(none exposed)'}")
+                    else:
+                        emit.warn(f"Burp ({burp_cfg.get('url')}) — not talking to me: {r['error']}")
+            else:
+                if not is_json:
+                    emit.info("Burp is not configured. Use: /mcp burp [host_or_url]")
         caido_mcp_cfg = (cfg.get("mcp_servers") or {}).get("caido")
         caido_cfg = cfg.get("caido")
-        if caido_mcp_cfg:
-            r = _test_caido_mcp(caido_mcp_cfg)
-            result["caido"] = r
-            if not is_json:
-                if r["ok"]:
-                    emit.success(f"Caido (caido-mcp-server) — still solid, {len(r['tools'])} tool(s) available.")
-                else:
-                    emit.warn(f"Caido (caido-mcp-server) — not talking to me: {r['error']}")
-        elif caido_cfg:
-            r = _test_caido(caido_cfg)
-            result["caido"] = r
-            if not is_json:
-                if r["ok"]:
-                    emit.success(f"Caido ({caido_cfg.get('url')}) — still solid.")
-                else:
-                    emit.warn(f"Caido ({caido_cfg.get('url')}) — not talking to me: {r['error']}")
-        else:
-            if not is_json:
-                emit.info("Caido is not configured. Use: /mcp caido [url]")
+        if which in (None, "caido"):
+            if caido_mcp_cfg:
+                r = _test_caido_mcp(caido_mcp_cfg)
+                result["caido"] = r
+                if not is_json:
+                    if r["ok"]:
+                        emit.success(f"Caido (caido-mcp-server) — still solid, {len(r['tools'])} tool(s) available.")
+                    else:
+                        emit.warn(f"Caido (caido-mcp-server) — not talking to me: {r['error']}")
+            elif caido_cfg:
+                r = _test_caido(caido_cfg)
+                result["caido"] = r
+                if not is_json:
+                    if r["ok"]:
+                        emit.success(f"Caido ({caido_cfg.get('url')}) — still solid.")
+                    else:
+                        emit.warn(f"Caido ({caido_cfg.get('url')}) — not talking to me: {r['error']}")
+            else:
+                if not is_json:
+                    emit.info("Caido is not configured. Use: /mcp caido [url]")
         return result
 
     # ── /mcp burp [url] | /mcp burp remove ────────────────────────────────
