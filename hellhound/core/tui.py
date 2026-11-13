@@ -766,6 +766,41 @@ class HellhoundApp(App):
         transcript.mount(widget)
         if pinned:
             transcript.scroll_end(animate=False)
+        self._trim_transcript()
+
+    _TRANSCRIPT_CAP = 100  # max widgets kept LIVE in the transcript. Textual re-renders the
+                           # whole widget tree, so an unbounded transcript is the FPS killer
+                           # on a long session — bounding it is the Claude-Code-style
+                           # lightweight-scrollback trick that keeps every frame cheap.
+
+    def _trim_transcript(self) -> None:
+        """Drop the OLDEST widgets once the transcript passes the cap, so the
+        mounted tree — and therefore every render/layout pass — stays bounded no
+        matter how long the hunt runs. Never removes the live assistant message
+        or a still-running tool card. Dropped cards are far out of view and their
+        content still lives in the agent's history and per-tool /output."""
+        try:
+            transcript = self.query_one("#transcript", VerticalScroll)
+        except Exception:
+            return
+        kids = list(transcript.children)
+        excess = len(kids) - self._TRANSCRIPT_CAP
+        if excess <= 0:
+            return
+        protected = set(self._active_cards)
+        if self._assistant_md is not None:
+            protected.add(self._assistant_md)
+        removed = 0
+        for w in kids:  # oldest first
+            if removed >= excess:
+                break
+            if w in protected:
+                continue
+            try:
+                w.remove()
+                removed += 1
+            except Exception:
+                pass
 
     def add_log_line(self, msg: str) -> None:
         msg = str(msg)
