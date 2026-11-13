@@ -124,7 +124,7 @@ def _format_tool_result(tool_name: str, result: Any, cap: int = 6000) -> str:
     # Generic dict: show the useful fields, skip giant blobs.
     import json as _json
     try:
-        pretty = _json.dumps(result, indent=2, default=str)
+        pretty = _json.dumps(result, indent=2, default=str, ensure_ascii=False)
     except Exception:
         pretty = str(result)
     return pretty[:cap]

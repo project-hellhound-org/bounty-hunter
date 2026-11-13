@@ -4636,7 +4636,13 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
                         if f_name and str(f_name) not in parameters:
                             parameters.append(str(f_name))
 
-        for file_params in (intel.get("js_orphan_params") or {}).values():
+        # js_orphan_params is usually {file: [params]}, but some spider builds
+        # return a flat [params] list — `(x or {}).values()` crashed with
+        # "'list' object has no attribute 'values'" on the list shape (the KWO
+        # spider crash). Handle both, and never crash the whole spider over it.
+        _jop = intel.get("js_orphan_params")
+        _jop_lists = _jop.values() if isinstance(_jop, dict) else ([_jop] if isinstance(_jop, list) else [])
+        for file_params in _jop_lists:
             if isinstance(file_params, list):
                 for p in file_params:
                     if p and str(p) not in parameters:
@@ -11761,6 +11767,11 @@ _RELEASE_PATH_SCOPE_RE = re.compile(
 _PIVOT_HOST_RE = re.compile(
     r'\b(all (in-?scope )?(domains|subdomains|hosts|targets)|every (domain|subdomain|host|target)|'
     r'across (the )?(whole |entire )?program|whole program|entire program|all program targets|'
+    # "<host> AND its (in-scope) subdomains/hosts", "in-scope subdomains", "the
+    # subdomains" — a program-wide hunt intent that isn't phrased with "all"
+    # (the KWO objective "hunt www.kwo.ch and its in-scope subdomains" left the
+    # pivot closed and got every sibling host HOST_FOCUS_VIOLATION'd).
+    r'(its |the |and (its |the )?)(in-?scope )?(sub-?domains|hosts|assets)|in-?scope (sub-?domains|hosts|domains|assets)|'
     r'switch (focus )?to|pivot to|move (on )?to|also (test|check|look at|try)|'
     r'check (out )?(all|every)|work on (all|every|the other))\b',
     re.IGNORECASE,
@@ -13309,6 +13320,22 @@ If there is nothing worth generalizing, return an empty array: []"""
                                  "state-changing tools normally."}
             a = c.get("args") if isinstance(c.get("args"), dict) else {}
             norm.append((t, a))
+        # De-dup identical (tool, same-args) calls — the model sometimes fires the
+        # SAME tool several times in one batch (seen on KWO: 'spider, spider,
+        # spider' with identical args), which just multiplies load on the target
+        # for one result. Keep the first of each.
+        _seen_calls = set()
+        _deduped = []
+        for t, a in norm:
+            try:
+                _k = (t, json.dumps(a, sort_keys=True, default=str))
+            except Exception:
+                _k = (t, repr(a))
+            if _k in _seen_calls:
+                continue
+            _seen_calls.add(_k)
+            _deduped.append((t, a))
+        norm = _deduped
         if not norm:
             return {"error": "No valid {tool, args} entries in 'calls'."}
         if len(norm) > 6:
@@ -14655,6 +14682,8 @@ RULES:
    - SCOPED TARGET & GOAL — SKIP UNNEEDED DISCOVERY: If the researcher already gave a specific, fully-qualified target (a single host/URL) AND a specific goal that doesn't call for discovering additional hosts/subdomains, do NOT run subfinder, dns_bruteforce, or other subdomain/asset-discovery tools before going at the given target — those are for when the attack surface itself is the unknown, not a habitual first step. Go straight at the given URL/endpoint with curl/spider/whatever the goal actually needs. Only reach for discovery tools if the goal explicitly requires finding more hosts, or the direct approach against the given target genuinely dead-ends and broadening scope is the only path left.
    - PROGRAM WITH MANY IN-SCOPE HOSTS — MAP BREADTH-FIRST, DON'T TUNNEL INTO ONE: the rule above is for ONE named host + goal. The OPPOSITE case is an engagement whose scope is a program / wildcard / list of many in-scope hosts with no single target called out. There, do NOT seize the first host and exhaust it — sweep the WHOLE surface first: run `httpx` (and `gowitness`) across every in-scope host to see what's alive and what each one IS (login, API, admin panel, marketing, dev/staging/legacy), note the high-value ones (admin / internal / api / dev / staging / legacy / anything non-marketing), THEN pick the richest to go deep on. A real hunter triages the entire program's surface before committing — one host's homepage is almost never where the bounty is. Breadth first, depth second.
    - DEPTH MEANS THE FORGOTTEN SURFACE, NOT THE HOMEPAGE: once you pick a host to go deep on, the highest-ROI move is NOT re-crawling its linked pages — it's the unlinked/forgotten/leaked surface everyone else skipped: backup and config files (`.bak .old .swp ~`, `config.php.bak`, `backup.zip`, `.env`), exposed VCS (`/.git/`, `/.svn/`), `.DS_Store` (reveals a directory's real contents), API specs (`swagger.json` / `openapi.json` hand you the whole API including unlinked endpoints), and secrets in JS bundles. Run `content_discovery` with the `sensitive`/`backup` wordlist, `curl` the high-signal paths directly, then prioritise endpoints that carry testable params (id → IDOR, url → SSRF, file/path → LFI, q/search → XSS/SQLi). That surface is where bounties live, not the page already linked from the nav.
+   - ALWAYS READ `robots.txt`, `sitemap.xml`, AND `/.well-known/security.txt` EARLY — they are free, zero-impact, and the single highest-signal starting point. `robots.txt` Disallow entries explicitly POINT at the paths the owner wants hidden (a `Disallow: /.env`, `/admin`, `/backup/`, `/cache/` is a direct lead — go fetch exactly those). `sitemap.xml` enumerates real pages; `security.txt` gives the reporting contact. Never crawl past these without having read them and `curl`'d the interesting Disallow paths.
+   - WHEN PASSIVE SOURCES RETURN A PILE OF URLs (wayback/gau/otx with hundreds–thousands of results), DON'T JUST COLLECT THEM — triage and probe. `curl` a batch of the high-value ones (anything with params, `/api/`, `/admin`, `.json`, old/deprecated paths, backup extensions) to see which are STILL LIVE and what they expose — an archived URL that still resolves is exactly the forgotten endpoint nobody re-tested. A 10k-URL wayback dump you never fetch from is worth nothing.
    - IF A BURP / CAIDO PROXY IS CONNECTED (MCP) — PARK THE NOTEWORTHY REQUESTS, NOT THE FLOOD: keep running your bulk recon with `curl` (it's fast and it keeps Burp's Proxy history from drowning in hundreds of your own requests) — do NOT route all traffic through the proxy. BUT the MOMENT you craft or confirm a NOTEWORTHY request — the actual exploit request, an auth-bypass / privilege request, anything the researcher would want to SEE or re-send by hand — ALSO call `create_repeater_tab_http` to drop that one request into Burp Repeater. That is the entire point of the proxy being connected: the researcher watches and manually follows up the handful of requests that matter, without wading through your recon noise. One Repeater tab per genuinely interesting request — not per curl, and never the whole scan. (A plain `send_http1_request` routes through Burp's engine but shows NOWHERE in the UI, so it's no substitute for parking the request in Repeater.)
    - ON A REAL (non-lab) TARGET, RESPECT RATE LIMITS — NEVER GET THE RESEARCHER BLOCKED: if responses start returning 429 (Too Many Requests), a WAF 403, sudden connection resets, CAPTCHAs, or rate-limit headers, STOP hammering immediately — back off, pause heavy fuzzing/scanning/`content_discovery`, switch to slow surgical requests, and tell the researcher what you're seeing. Getting their IP or account banned on a live program ends the engagement and can breach the program's rules of engagement — that's a far worse outcome than being slow. Lab / CTF / explicitly-authorized boxes you can push hard; a real production program you treat with restraint: steady and targeted, never a blind high-rate flood.
    - DO NOT re-run `spider` (a full crawl) more than once per meaningfully-different session state. A fresh unauthenticated crawl, then ONE re-crawl after obtaining an authenticated session, is normal and enough — re-crawling again on a specific sub-path you already have covered (e.g. crawling `/letters/new` right after already crawling the whole site authenticated) adds nothing and burns time. If you already have the endpoints you need from an earlier crawl in ALREADY GATHERED THIS SESSION, use `curl`/`content_discovery` directly against known endpoints instead of re-crawling. If the researcher has told you to stop re-running a tool, that instruction holds for the rest of the session, not just the message it was given in.
