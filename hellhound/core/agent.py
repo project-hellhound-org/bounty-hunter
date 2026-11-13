@@ -7043,6 +7043,78 @@ def _privileged_access_corroborated(target: Target, request_ref: str, claim_text
     return None, summary
 
 
+def _reconstruct_raw_http(entry: Dict[str, Any]):
+    """Rebuild a raw HTTP/1.1 request (for Burp Repeater) from a stored
+    curl_evidence_log entry. Returns (raw, host, port, https); raw is None on
+    failure."""
+    try:
+        url = entry.get("url", "") or ""
+        p = urlparse(url if url.startswith(("http://", "https://")) else "https://" + url)
+        host = p.hostname or ""
+        if not host:
+            return None, "", 0, False
+        port = p.port or (443 if p.scheme == "https" else 80)
+        https = (p.scheme != "http")
+        path = (p.path or "/") + (("?" + p.query) if p.query else "")
+        method = (entry.get("method") or "GET").upper()
+        lines = [f"{method} {path} HTTP/1.1", f"Host: {p.netloc or host}"]
+        for hk, hv in (entry.get("req_headers") or {}).items():
+            if str(hk).lower() == "host":
+                continue
+            lines.append(f"{hk}: {hv}")
+        cookies = entry.get("req_cookies")
+        if cookies:
+            cstr = "; ".join(f"{k}={v}" for k, v in cookies.items()) if isinstance(cookies, dict) else str(cookies)
+            lines.append(f"Cookie: {cstr}")
+        body = ""
+        if entry.get("req_json"):
+            body = json.dumps(entry["req_json"])
+            lines.append("Content-Type: application/json")
+        elif entry.get("req_data"):
+            body = entry["req_data"] if isinstance(entry["req_data"], str) else str(entry["req_data"])
+        if body:
+            lines.append(f"Content-Length: {len(body)}")
+        raw = "\r\n".join(lines) + "\r\n\r\n" + body
+        return raw, host, int(port), bool(https)
+    except Exception:
+        return None, "", 0, False
+
+
+def _mirror_finding_to_repeater(target: Target, request_ref: str, title: str) -> None:
+    """Deterministically park the request behind a recorded finding into Burp
+    Repeater (if a Burp MCP is connected) — the reliable version of 'send
+    noteworthy requests to Repeater', since the prompt nudge alone never got the
+    model to do it (two lab runs: curl 26x, Burp 0x). Best-effort: silent no-op
+    if Burp isn't configured or the request can't be rebuilt; never affects
+    whether the finding records."""
+    try:
+        from hellhound.core.ai_utils import load_config
+        if "burp" not in (load_config().get("mcp_servers") or {}):
+            return
+        if not (hasattr(target, "state") and isinstance(target.state, dict)):
+            return
+        rn = (request_ref or "").strip().lower()
+        if not rn:
+            return
+        entry = None
+        for e in reversed(target.state.get("curl_evidence_log") or []):
+            if isinstance(e, dict) and e.get("url") and (rn in e["url"].lower() or e["url"].lower() in rn):
+                entry = e
+                break
+        if not entry:
+            return
+        raw, host, port, https = _reconstruct_raw_http(entry)
+        if not raw or not host:
+            return
+        from hellhound.core import mcp_bridge
+        mcp_bridge.call_tool_with_reconnect("burp", "create_repeater_tab", {
+            "content": raw, "targetHostname": host, "targetPort": int(port),
+            "usesHttps": bool(https), "tabName": (title or "finding")[:40],
+        })
+    except Exception:
+        pass
+
+
 def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Logs a finding YOU have already confirmed (not a guess or a plan) into
@@ -7374,6 +7446,11 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         save_target(target)
     except Exception as e:
         return {"error": f"Failed to record finding: {e}"}
+
+    # Deterministically park this finding's request in Burp Repeater (if a Burp
+    # MCP is connected) — the reliable form of "noteworthy requests → Repeater",
+    # independent of whether the model remembered to call the tool itself.
+    _mirror_finding_to_repeater(target, request_ref, title)
 
     # Signal-chaining — see _detect_finding_chains above. Best-effort and
     # purely advisory; never blocks or mutates the finding just recorded.
