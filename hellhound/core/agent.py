@@ -1520,41 +1520,50 @@ def _compute_auto_continue(
     return streak < streak_cap
 
 
+def _is_degenerate_text(text: str) -> bool:
+    """True when a model's output has collapsed into pathological repetition —
+    the reasoning-model failure mode where it loops a word/phrase ('function
+    function that function function…') instead of producing coherent prose.
+    Checks three independent signals: a very low unique-word ratio, one token
+    dominating the text, or a long run of the same token back-to-back."""
+    if not text:
+        return False
+    words = re.findall(r'\S+', text.lower())
+    n = len(words)
+    if n < 15:  # too short to judge reliably
+        return False
+    counts: Dict[str, int] = {}
+    for w in words:
+        counts[w] = counts.get(w, 0) + 1
+    uniq_ratio = len(counts) / n
+    top_frac = max(counts.values()) / n
+    run = longest = 1
+    for a, b in zip(words, words[1:]):
+        run = run + 1 if a == b else 1
+        if run > longest:
+            longest = run
+    return uniq_ratio < 0.25 or top_frac > 0.35 or longest >= 6
+
+
 def _clean_synthesizer_output(text: str, tools_executed: Optional[List[str]] = None) -> str:
     """
     Defensive net: if the synthesizer model ignored its plain-prose
     instruction and emitted a raw orchestrator-style JSON tool-call object
     instead of (or wrapped around) real prose, recover something readable
     instead of dumping raw JSON to the user's terminal.
-
-    `tools_executed` (when the caller has it) is the list of tools that
-    actually ran and returned real results EARLIER in this same turn —
-    separate from, and not to be confused with, the specific trailing
-    tool-call-shaped JSON blob this function is here to clean up (which
-    means something ELSE queued after those never fired). See the
-    "nothing ran" branch below for why this distinction matters:
-    CAUGHT IN THE WILD — a researcher watched curl calls actually execute
-    and print real HTTP results, then the turn ended with one more queued
-    tool call left as raw JSON in the final text; this function used to
-    blanket-reply "nothing ran, no results to show," flatly contradicting
-    the real output sitting right above it in the same transcript.
-
-    Seen in practice with small local models on plain advisory questions
-    (e.g. "how do I fix this as a developer") that need no tool at all:
-    the model reaches for a fake "print my answer" tool call instead of
-    just writing the answer as text — most often run_terminal_command with
-    an `echo`, but sometimes an entirely made-up tool name (answer/respond/
-    say/print) with the real text tucked into an args field like
-    "text"/"message"/"answer". Either shape gets unwrapped and returned as
-    the real prose it actually is, rather than the JSON wrapper around it.
-
-    Also tolerates the JSON not being strict JSON: small local models
-    frequently emit Python-dict-style single-quoted pseudo-JSON
-    (`{'tool': 'x', ...}`) rather than double-quoted JSON — json.loads
-    rejects that outright, so a Python-literal fallback parse is tried
-    before giving up. Markdown code fences wrapped around the blob are
-    stripped first for the same reason.
     """
+    # Degeneration net FIRST — a reasoning model that looped into repetition
+    # ('function function that function…') produced no usable narrative. Never
+    # show that garbage; the real work (tool calls, recorded findings) already
+    # happened, so acknowledge the glitch and point to a clean recap instead.
+    if _is_degenerate_text(text):
+        ran = ", ".join(dict.fromkeys(t for t in (tools_executed or []) if t))
+        return (
+            "Done — but my write-up came out garbled (a model generation glitch, not a failure of the work). "
+            + (f"Tools that actually ran this turn: {ran}. " if ran else "")
+            + "The real results and any recorded findings are intact — ask me to \"summarize\" and I'll give a clean recap."
+        )
+
     if not text or "{" not in text or "tool" not in text:
         return text
 
