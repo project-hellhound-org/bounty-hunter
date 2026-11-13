@@ -12,7 +12,7 @@
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
   <a href="#installation--setup">Installation & Setup</a> ·
-  <a href="#two-tier-neural-routing">Two-Tier AI Routing</a> ·
+  <a href="#how-it-works">How It Works</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#the-recon--triage-arsenal">Arsenal</a> ·
   <a href="#what-it-finds">What It Finds</a> ·
@@ -23,6 +23,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/project-hellhound-org/bounty-hunter/stargazers"><img src="https://img.shields.io/github/stars/project-hellhound-org/bounty-hunter?style=flat-square&color=gold" alt="GitHub Stars"/></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
   <a href="https://github.com/project-hellhound-org/bounty-hunter/releases"><img src="https://img.shields.io/badge/Release-v13.21-red?style=flat-square" alt="Release Version"/></a>
   <img src="https://img.shields.io/badge/AI--Powered-Ollama%20%7C%20NVIDIA%20NIM%20%7C%20Claude%20%7C%20Gemini%20%7C%20OpenAI-red?style=flat-square" alt="AI Support"/>
@@ -47,13 +48,18 @@
 
 ## What Is This?
 
-**Bounty Hunter** is the autonomous bug bounty reconnaissance and vulnerability triage framework developed by **Project Hellhound**. Built for security researchers, penetration testers, and CTF practitioners, Bounty Hunter autonomously maps attack surfaces, verifies discovered assets, spiders dynamic Single Page Applications (SPAs) for hidden APIs and secrets, captures visual screenshot evidence via Gowitness, executes security audits through an unconditional scope gate, and writes submission-ready reports for HackerOne, Bugcrowd, and private engagements.
+**Bounty Hunter** (nickname **"Beast"**) is an **autonomous AI agent for bug bounty and penetration testing**, built by **Project Hellhound**. Give it a target and a goal in plain English — it runs the recon, finds *and exploits* the vulnerability, and writes a submission-ready report, all behind a scope gate that can't be bypassed. Built for bug-bounty hunters, pentesters, and CTF players.
 
-It features **persistent target memory and an automated artifact blackboard**—harvested tokens, credentials, session cookies, open ports, crawl trees, visual screenshots, and triage notes are automatically retained in isolated per-target workspaces (`~/.hellhound/targets/<target>/`) so hunts seamlessly resume across sessions without token loss or "lost-in-the-middle" reasoning drops.
+**What makes it different:**
+- **🎯 It exploits, not just scans.** Proves DOM/stored XSS by firing a real `alert()` in a headless browser, forges JWTs, chains IDOR → account takeover — and runs a live `verify_finding` check before recording anything. You get *confirmed* bugs, not a wall of maybes.
+- **🛡️ It refuses to fabricate findings.** A "privileged access" or "solved" claim is **rejected** unless the captured HTTP responses actually back it — no hallucinated criticals, no reports that fall apart at triage.
+- **🧠 It remembers.** A persistent per-target blackboard (tokens, creds, cookies, open ports, crawl trees, screenshots) under `~/.beast/targets/<target>/` lets hunts resume across sessions with zero context loss.
+- **🚧 Unconditional scope gate.** Every network call is scope-checked before a packet leaves — out-of-scope is blocked, always.
+- **💸 Free to run.** Works on free NVIDIA NIM credits — or Claude / Gemini / OpenAI, or fully offline via Ollama.
 
-Works across two flexible interfaces:
-- **Interactive Terminal**: An interactive terminal environment with real-time token streaming, live progress feedback, and inline command autocompletion (`beast`).
-- **Headless CLI Runner**: Direct one-line command execution for quick scripts and CI/CD pipelines (`beast -p "prompt"`).
+**Two ways to drive it:**
+- **Interactive terminal** (`beast`) — a Claude-Code-style TUI with live streaming, collapsible tool cards, a findings browser (`Ctrl+F`), and a command palette (`Ctrl+P`).
+- **Headless** (`beast -p "..."`) — one-line runs for scripts and CI pipelines.
 
 ---
 
