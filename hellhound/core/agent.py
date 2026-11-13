@@ -16013,8 +16013,9 @@ INSTRUCTIONS:
                 # stop. Skip the retries; the caller surfaces the already-
                 # captured tool output/results instead of this write-up.
                 return None, tok
-            if _is_provider_failure(answer):
-                logger.debug(f"Synthesizer call failed ({answer!r}), retrying.")
+            _degenerated = (not _is_provider_failure(answer)) and _is_degenerate_text(answer)
+            if _is_provider_failure(answer) or _degenerated:
+                logger.debug(f"Synthesizer call {'degenerated into repetition' if _degenerated else 'failed'} ({str(answer)[:80]!r}), retrying.")
                 _synth_backoff = 1.5
                 for _synth_attempt in range(_PROVIDER_RETRY_ATTEMPTS):
                     if cancel_check and cancel_check():
@@ -16040,7 +16041,7 @@ INSTRUCTIONS:
                         tools=_synth_tools,
                         tool_choice="none",
                     )
-                    if not _is_provider_failure(answer2):
+                    if not _is_provider_failure(answer2) and not _is_degenerate_text(answer2):
                         answer, tok = answer2, (tok2 if tok2 is not None else tok)
                         break
                 else:
