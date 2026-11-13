@@ -12482,11 +12482,12 @@ class Agent:
         # a second trigger firing while one summarization pass is still in
         # flight skips instead of stacking up concurrent LLM calls.
         self._compaction_lock = threading.Lock()
+        _lab = _is_likely_lab_target(self.target) if self.target else False
         self.guard = AutopilotGuard(
             circuit_threshold=5,
             circuit_cooldown=60.0,
-            recon_rps=10.0,
-            test_rps=1.0,
+            recon_rps=10.0 if _lab else 4.0,  # hammer a lab for speed; go gentle on a real program so we don't trip rate limits / get the researcher's IP banned
+            test_rps=1.0 if _lab else 0.5,
             safe_methods_only=True
         )
         self._turn_path_scope: Optional[str] = None  # e.g. "/app" — set per-turn in handle_message
@@ -12816,11 +12817,12 @@ If there is nothing worth generalizing, return an empty array: []"""
         self._turn_path_scope = None  # Reset path scope to prevent bleeding from previous target
         self._turn_host_pivot_open = False  # Every target switch starts freshly focus-locked onto itself — a "pivot freely" stance from the PREVIOUS program/target must not silently carry over onto this one
         self._auto_continue_streak = 0  # a target switch is a fresh context — don't carry an auto-continue streak over from whatever was happening on the previous target
-        self.guard = AutopilotGuard(  # Reset circuit breaker and rate limiters for the new target
+        _lab = _is_likely_lab_target(self.target) if self.target else False
+        self.guard = AutopilotGuard(  # Reset circuit breaker + rate limiters; fast on labs, gentle on real targets (ban-safety)
             circuit_threshold=5,
             circuit_cooldown=60.0,
-            recon_rps=10.0,
-            test_rps=1.0,
+            recon_rps=10.0 if _lab else 4.0,
+            test_rps=1.0 if _lab else 0.5,
             safe_methods_only=True
         )
         # Sync live into whatever session_context THIS turn is using, the
