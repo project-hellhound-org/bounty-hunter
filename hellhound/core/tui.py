@@ -1366,4 +1366,18 @@ def _looks_like_command(line: str) -> bool:
 
 def start_tui_session(initial_target: Optional[str] = None) -> None:
     """Launch the Textual interactive terminal."""
-    HellhoundApp(initial_target=initial_target).run()
+    try:
+        HellhoundApp(initial_target=initial_target).run()
+    except KeyboardInterrupt:
+        pass
+    # Textual has exited and restored the terminal. A persistent HTTP
+    # ThreadPoolExecutor's non-daemon worker can still be mid-request, and Python
+    # would JOIN it at interpreter shutdown — hanging the quit until a manual
+    # Ctrl+C (the reported 'Ctrl+Q sticks' bug). Cancel pending HTTP work, then
+    # hard-exit, bypassing the thread-join atexit entirely so quit is instant.
+    try:
+        from hellhound.core.tool_shared import shutdown_request_pool
+        shutdown_request_pool()
+    except Exception:
+        pass
+    os._exit(0)

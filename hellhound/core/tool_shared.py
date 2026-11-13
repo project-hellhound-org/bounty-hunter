@@ -30,6 +30,27 @@ _LAST_TOOL_OUTPUT_CAP = 200_000  # chars kept per stream — in-memory only, bou
 _BOUNDED_REQUEST_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="hh-http")
 
 
+def shutdown_request_pool() -> None:
+    """Tear the HTTP pool down on quit so interpreter shutdown can't hang.
+
+    ThreadPoolExecutor's worker threads are non-daemon, and Python's exit
+    handler (concurrent.futures.thread._python_exit) JOINS them — so a single
+    request still in flight when the researcher hits Ctrl+Q blocks exit forever
+    (the 'stuck until Ctrl+C twice' hang). We cancel pending work and then drop
+    this pool's threads from the atexit-join registry, so any in-flight request
+    is simply orphaned and dies with the process instead of pinning shutdown."""
+    try:
+        _BOUNDED_REQUEST_POOL.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+    try:
+        import concurrent.futures.thread as _cft
+        for _t in list(getattr(_BOUNDED_REQUEST_POOL, "_threads", ()) or ()):
+            _cft._threads_queues.pop(_t, None)
+    except Exception:
+        pass
+
+
 def _html_escape(s: Any) -> str:
     import html as _html_mod
     return _html_mod.escape(str(s if s is not None else ""), quote=True)
