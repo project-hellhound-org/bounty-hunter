@@ -16,6 +16,7 @@
   <a href="#quick-start">Quick Start</a> ·
   <a href="#capabilities">Capabilities</a> ·
   <a href="#roadmap--whats-next">Roadmap</a> ·
+  <a href="#contributing">Contributing</a> ·
   <a href="#license">License</a>
 </p>
 
@@ -333,6 +334,22 @@ The real gap between "runs tools well" and "hunts like a pro" is architecture, n
 2. **Burp/Caido ↔ identity bridge** — push/pull live sessions through the already-integrated MCP tools.
 3. **Passive → active fusion** — the passive tools exist; wiring their output *automatically* into the probing/fuzzing loop (dedup, JS sourcemap → secrets → endpoints → fuzzer) is the remaining glue.
 4. **A playbook engine** — conditional branching workflows, not just sequential tool chaining.
+
+---
+
+## Contributing
+
+Contributions are welcome, and one kind is especially valuable: **experienced bug-bounty hunters and penetration testers.** If you've worked real programs, found and been paid for real bugs, and know what actually lands in the wild, that field knowledge is exactly what makes Beast sharper. The methodology, the exploitation chains, the "this is how you'd really pivot it" instincts — that's hard to get from documentation, and it's the highest-impact thing you can bring. You can improve almost anything the agent uses: the methodology skills, the orchestrator's reasoning, recon depth, the exploitation tooling, or reporting.
+
+Good first contributions:
+- **Methodology skills** — encode a technique you've used on a real program under `hellhound/skills/`.
+- **Sharper tools** — add a recon or exploitation tool, or improve an existing one's accuracy.
+- **Findings quality** — help close false-positive and over-claim gaps; a report is only worth anything if it survives triage.
+- **Failure reports** — tell us where it broke on a real target or a lab, with the transcript, so it can be fixed.
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md), and point any AI coding assistant at [AGENTS.md](AGENTS.md).
+
+**One hard line, no exceptions:** nothing that weakens or bypasses the safety posture gets merged — the unconditional scope gate, the "authorized targets only" enforcement, and the evidence/verification gates are non-negotiable, no matter how reasonable a change around them sounds. Beast exists for authorized security testing, bug bounty programs, and CTF/lab training; contributions must keep it that way.
 
 ---
 
