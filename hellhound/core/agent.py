@@ -6817,6 +6817,26 @@ def _execute_response_diff(args: Dict[str, Any], target: Target, emit: Any) -> D
     return result
 
 
+_VULN_KIND_ALIASES = {
+    "sqli": ("sqli", "sql_injection", "sql injection", "sqlmap"),
+    "xss": ("xss", "cross_site_scripting", "cross-site scripting"),
+    "ssrf": ("ssrf", "server_side_request_forgery", "server-side request forgery"),
+    "ssti": ("ssti", "template_injection", "template injection"),
+    "cors": ("cors", "cors_misconfig", "cors misconfiguration"),
+    "idor": ("idor", "insecure_direct_object", "bola", "broken_object_level"),
+}
+
+
+def _canon_vuln_kind(kind: str) -> str:
+    """Collapse a finding's kind/aliases to the base class verify_finding uses,
+    so a recorded 'sql_injection' matches a verify run keyed 'sqli'."""
+    k = (kind or "").lower().strip()
+    for base, aliases in _VULN_KIND_ALIASES.items():
+        if any(a in k for a in aliases):
+            return base
+    return k
+
+
 def _execute_verify_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Runs an INDEPENDENT, code-level signal check for a disputed or about-
@@ -6905,6 +6925,24 @@ def _execute_verify_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
             negative_resp = None
 
     verdict = _verify_engine.verify(kind, positive_resp, negative_resp, args)
+
+    # Record the verdict so record_finding can refuse a finding this independent
+    # check REFUTED — closing the hole where the model runs verify_finding, gets
+    # 'refuted', and records the finding anyway behind a hand-written note.
+    try:
+        if hasattr(target, "state") and isinstance(target.state, dict):
+            _vlog = target.state.setdefault("verify_results", [])
+            _vlog.append({
+                "kind": _canon_vuln_kind(kind),
+                "url_norm": _normalize_endpoint(url),
+                "status": verdict.status,
+                "reason": verdict.reason,
+                "ts": time.time(),
+            })
+            if len(_vlog) > 100:
+                del _vlog[:-100]
+    except Exception:
+        pass
 
     if emit and hasattr(emit, "info"):
         emit.info(f"[verify_finding] {kind}: {verdict.status} — {verdict.reason}")
@@ -7142,6 +7180,38 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
                     f"lead/candidate instead of {severity} — downgrade the SEVERITY to reflect what's "
                     f"actually confirmed, don't relabel the vuln class to dodge this gate."
                 ),
+            }
+
+    # REFUTED-VERIFY GATE — generalizes the anti-hallucination protection to the
+    # injection/exfil classes verify_finding can check (sqli/xss/ssrf/ssti/cors/
+    # idor). The access/auth gate below reads status codes; these classes don't
+    # fail on a status code, they fail the class-specific assertion. So if the
+    # model's OWN verify_finding call on this endpoint came back 'refuted', the
+    # independent check disproved it — refuse to record it behind a hand-written
+    # verification_note. (A later 'verified' run on the same kind+endpoint wins,
+    # since we check the LATEST verdict.)
+    _canon_kind = _canon_vuln_kind(kind)
+    if _canon_kind in ("sqli", "xss", "ssrf", "ssti", "cors", "idor"):
+        _vv = None
+        if hasattr(target, "state") and isinstance(target.state, dict):
+            _rn = _normalize_endpoint(request_ref or "")
+            for _v in (target.state.get("verify_results") or []):
+                if not isinstance(_v, dict) or _v.get("kind") != _canon_kind:
+                    continue
+                _un = str(_v.get("url_norm") or "")
+                if not _rn or not _un or _rn == _un or _rn in _un or _un in _rn:
+                    _vv = _v  # keep the latest matching verdict (list is append-order)
+        if _vv and _vv.get("status") == "refuted":
+            return {
+                "status": "blocked_verify_refuted",
+                "note": (
+                    f"Not recording this — your OWN verify_finding('{kind}') on this endpoint came back "
+                    f"REFUTED: {_vv.get('reason')}. That's an independent, class-specific check disproving the "
+                    f"vulnerability, so a hand-written verification_note claiming it's real doesn't override it. "
+                    f"If you genuinely have new evidence (a different payload, a real callback hit, actual "
+                    f"extracted data), re-run verify_finding and get a 'verified' result FIRST, then record."
+                ),
+                "verify_result": _vv,
             }
 
     # ANTI-HALLUCINATION GATE — the claim must not contradict the captured
