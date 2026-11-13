@@ -10165,6 +10165,8 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                             "evidence_snippet": {"type": "string", "description": "Optional — your own narrative annotation of the evidence, if it adds something the raw data doesn't say on its own. Do NOT use this to reconstruct/retype a request or response from memory — the real, byte-for-byte captured request/response for each finding's request_ref is attached automatically from the curl calls already made this session. Never invent example/placeholder values (e.g. a made-up session cookie or a made-up response body) here or anywhere else in this call — if you don't actually have real evidence for something, leave it out rather than fabricating it."},
                             "screenshot_refs": {"type": "array", "items": {"type": "string"}, "description": "Filenames or paths of screenshots to embed for this finding (from gowitness output already captured for this target)."},
                             "remediation": {"type": "string", "description": "Concrete, actionable fix for THIS specific bug — what the developer should change (e.g. 'Validate the JWT signature server-side and reject alg:none', 'Re-derive the order total server-side from the catalogue price instead of trusting the client-submitted price', 'Enforce an authorization check that the requested resource belongs to the authenticated user'). One or two sentences, specific to the root cause you proved — not generic advice like 'sanitize input'."}
+                        },
+                        "required": ["finding_ref", "severity"]
                     }
                 }
             },
