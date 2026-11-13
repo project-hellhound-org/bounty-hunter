@@ -42,7 +42,9 @@ _PHRASES = [
     "Wrapping up",
 ]
 
-_FRAME_INTERVAL = 0.1     # seconds per spinner frame
+_FRAME_INTERVAL = 0.2     # seconds per spinner frame (5 fps — halved from 10 fps so the
+                          # animation repaint can't eat the UI thread's frame budget and
+                          # starve key/click handling during a long-running tool)
 _PHRASE_EVERY = 4         # seconds each rotating phrase stays up
 
 
