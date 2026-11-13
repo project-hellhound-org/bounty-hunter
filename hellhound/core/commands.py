@@ -1312,12 +1312,19 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
         elif len(switchable) == 1:
             chosen = switchable[0]
         else:
-            # Several hosts and none specified — surface them rather than
-            # guessing (same "which host inside this program" choice /list shows).
-            emit.info(f"Program '{record.get('display_name', prog_name)}' has {len(switchable)} in-scope host(s) — pick one (or /list for the full view):")
-            emit.info(", ".join(switchable[:30]) + (" …" if len(switchable) > 30 else ""))
-            emit.info(f"  /program switch {prog_name} <domain>")
-            return {"status": "ambiguous", "program": record["name"], "domains": switchable}
+            # Several hosts and none specified: ENTER the program anyway, landing
+            # on a sensible default (a host already attached/worked, else the
+            # first in-scope host) — selecting a program should just put you IN
+            # it, not refuse and leave the session with nothing selected. The
+            # other hosts are shown as a hint so you can jump between them.
+            chosen = domains[0] if domains else switchable[0]
+            if not is_json:
+                _others = [d for d in switchable if d != chosen]
+                if _others:
+                    emit.info(f"Entered '{record.get('display_name', prog_name)}' on [bold cyan]{chosen}[/bold cyan]. "
+                              f"Other in-scope hosts: {', '.join(_others[:30])}"
+                              + (" …" if len(_others) > 30 else "")
+                              + f"  —  /program switch {prog_name} <host> to jump, or /list for the full view.")
 
         session_context["target"] = chosen
         target_obj = create_or_load_target(chosen)
@@ -1373,15 +1380,20 @@ def handle_list(args: List[str], session_context: Dict[str, Any], emit: Any) -> 
     prog_name = getattr(target_obj, "program", "") if target_obj else ""
 
     if not prog_name:
-        visible = [p for p in list_programs() if not is_program_private(p)]
+        # Navigation list = YOUR OWN programs, so it must show private ones too
+        # (you can't select a program you can't see) — just mark them with a lock
+        # so you know to be careful on a shared screen. The redaction is for the
+        # public `/program list`, not for navigating your own tool.
+        allp = list_programs()
         if not is_json:
             emit.info("[dim]No program selected — scratch session, nothing is being saved.[/dim]")
-            if visible:
-                emit.info(f"Programs you can enter ({len(visible)}): [bold]{', '.join(visible)}[/bold]")
+            if allp:
+                labeled = ", ".join((f"{p} 🔒" if is_program_private(p) else p) for p in allp)
+                emit.info(f"Programs you can enter ({len(allp)}): [bold]{labeled}[/bold]")
                 emit.info("  Enter one with: [bold red]/program select <name>[/bold red]")
             else:
                 emit.info("No programs yet. Create one with: /program create <name> [domain1,domain2,...]")
-        return {"status": "no_program", "programs": visible}
+        return {"status": "no_program", "programs": allp}
 
     record = load_program(prog_name) or {}
     rules = record.get("scope_rules") or {}
