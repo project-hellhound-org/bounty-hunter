@@ -8469,6 +8469,12 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
             finding_md_parts.append("")
             for r in real_evidence_list:
                 finding_md_parts.append(_evidence_markdown_block(r))
+        # Remediation — programs and triagers value a concrete fix; a report that
+        # ends at "here's the bug" is less actionable than one that says how to
+        # close it. Included when the finding carries one.
+        remediation = item.get("remediation") or item.get("recommended_fix") or ""
+        if remediation:
+            finding_md_parts += ["", "### Remediation", "", str(remediation), ""]
         finding_md_text = "\n".join(finding_md_parts).rstrip() + "\n"
         findings_markdown_parts.append(finding_md_text)
 
@@ -8484,6 +8490,7 @@ def _execute_export_report(args: Dict[str, Any], target: Target, emit: Any) -> D
   {f'<div class="section-label">Steps to Reproduce</div>{steps_html}' if steps_html else ''}
   {evidence_block}
   {f'<div class="section-label">Screenshots</div><div class="evidence-shots">{shots_html}</div>' if shots_html else ''}
+  {f'''<div class="section-label">Remediation</div><p>{_html_escape(str(remediation)).replace(chr(10), "<br>")}</p>''' if remediation else ''}
   <template id="finding-src-{idx}">{_html_escape(finding_md_text)}</template>
 </div>""")
 
@@ -10156,9 +10163,8 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                             "impact_statement": {"type": "string", "description": "Impact-first, proven (not speculative) description of what an attacker can actually do."},
                             "steps_to_reproduce": {"type": "array", "items": {"type": "string"}, "description": "One array entry per step, in order — e.g. ['Request a password reset for a known staff email...', 'Extract the token from the JSON response...', 'POST the token to /api/auth/reset...']. Each entry is rendered as its own numbered list item — do NOT prefix an entry with your own '1.'/'2)' marker, the numbering is added automatically and a manual prefix will show up doubled ('1. 1. ...'). Wrap a raw request/response in ``` fences within an entry to render it as a code block."},
                             "evidence_snippet": {"type": "string", "description": "Optional — your own narrative annotation of the evidence, if it adds something the raw data doesn't say on its own. Do NOT use this to reconstruct/retype a request or response from memory — the real, byte-for-byte captured request/response for each finding's request_ref is attached automatically from the curl calls already made this session. Never invent example/placeholder values (e.g. a made-up session cookie or a made-up response body) here or anywhere else in this call — if you don't actually have real evidence for something, leave it out rather than fabricating it."},
-                            "screenshot_refs": {"type": "array", "items": {"type": "string"}, "description": "Filenames or paths of screenshots to embed for this finding (from gowitness output already captured for this target)."}
-                        },
-                        "required": ["finding_ref", "severity"]
+                            "screenshot_refs": {"type": "array", "items": {"type": "string"}, "description": "Filenames or paths of screenshots to embed for this finding (from gowitness output already captured for this target)."},
+                            "remediation": {"type": "string", "description": "Concrete, actionable fix for THIS specific bug — what the developer should change (e.g. 'Validate the JWT signature server-side and reject alg:none', 'Re-derive the order total server-side from the catalogue price instead of trusting the client-submitted price', 'Enforce an authorization check that the requested resource belongs to the authenticated user'). One or two sentences, specific to the root cause you proved — not generic advice like 'sanitize input'."}
                     }
                 }
             },
