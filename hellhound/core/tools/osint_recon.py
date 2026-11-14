@@ -11,7 +11,6 @@ is unchanged.
 """
 import os
 import re
-import time
 import requests
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
@@ -31,50 +30,156 @@ _PROBE_PRIORITY_EXT = re.compile(
 )
 
 
+_TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
+# RoE flags that mean "stay gentle" — on such programs we drop concurrency and
+# keep the batch small so a liveness sweep never reads as a scanner.
+_GENTLE_FLAGS = frozenset({"no-rate-limit-testing", "no-dos", "no-automated-scanners"})
+
+
+def _probe_one_url(u: str, headers: Dict[str, str], timeout: int = 8) -> Dict[str, Any]:
+    """Single liveness hit that also grabs the cheap, high-signal metadata a
+    hunter triages on — status, title, server/tech, content-type, length — so
+    the batch result tells you WHICH live URL is worth opening, not just that it
+    responded. Never raises."""
+    try:
+        r = requests.get(u, timeout=timeout, allow_redirects=True, stream=True, headers=headers)
+        code = r.status_code
+        ctype = r.headers.get("Content-Type", "")
+        clen = r.headers.get("Content-Length", "")
+        server = r.headers.get("Server", "")
+        title = ""
+        if "html" in ctype.lower():
+            try:
+                chunk = r.raw.read(20000, decode_content=True) or b""
+                m = _TITLE_RE.search(chunk)
+                if m:
+                    title = m.group(1).decode("utf-8", "ignore").strip()[:140]
+            except Exception:
+                pass
+        try:
+            r.close()
+        except Exception:
+            pass
+        return {"url": u, "status": code, "content_type": ctype,
+                "content_length": clen, "server": server, "title": title}
+    except requests.RequestException as e:
+        return {"url": u, "status": None, "error": type(e).__name__}
+
+
 def _probe_live_urls(urls: List[str], target: Target, emit: Any,
-                     cap: int = 25, delay: float = 0.6) -> Dict[str, Any]:
-    """Gently check which archived/passive URLs are STILL live — the step the
-    operator flagged as missing ("a lot of urls in wayback but he never checked
-    they're still accessible"). This TOUCHES the target, so it is deliberately
-    polite: in-scope URLs only (out-of-scope subdomains are skipped via the
-    scope gate), interesting files first, a hard cap, a short timeout, and a
-    fixed pause between requests so it never looks like a scanner on fragile
-    infra. Returns the live hits (status < 400) plus how many were probed."""
+                     cap: int = 25, concurrency: Optional[int] = None) -> Dict[str, Any]:
+    """BATCH liveness check — the recon primitive that separates a fast hunter
+    from one curling URLs one at a time. Given a pile of discovered URLs, it
+    checks which are STILL reachable CONCURRENTLY (bounded pool), in-scope only
+    (out-of-scope subdomains skipped via the scope gate), interesting files
+    first, hard-capped. Each live hit comes back with status + title + server +
+    content-type/length so you can triage WHICH one matters.
+
+    Concurrency adapts to RoE: a program that forbids rate-limit testing / DoS
+    drops to a low fan-out so the sweep stays polite on fragile infra; an open
+    program gets full batch speed. Results are yielded in sensitivity order even
+    though the probes run in parallel. Never raises."""
+    import concurrent.futures
+
     rules = getattr(target, "scope_rules", None)
-    # Interesting (sensitive-extension) URLs first, then the rest; dedupe paths.
+    disallowed = set(getattr(rules, "disallowed", []) or [])
+    gentle = bool(disallowed & _GENTLE_FLAGS)
+    if concurrency is None:
+        concurrency = 4 if gentle else 16
+
+    # Interesting (sensitive-extension) URLs first, then the rest; dedupe. Scope-
+    # filter BEFORE the cap so out-of-scope hosts never eat a probe slot.
     ranked = sorted(set(urls), key=lambda u: (0 if _PROBE_PRIORITY_EXT.search(u) else 1, len(u)))
+    in_scope: List[str] = []
+    skipped_scope = 0
+    for u in ranked:
+        allowed, _reason = is_in_scope(u, rules)
+        if allowed:
+            in_scope.append(u)
+        else:
+            skipped_scope += 1
+        if len(in_scope) >= cap:
+            break
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; recon-liveness/1.0)"}
     live: List[Dict[str, Any]] = []
     probed = 0
-    skipped_scope = 0
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; recon-liveness/1.0)"}
-    for u in ranked:
-        if probed >= cap:
-            break
-        allowed, _reason = is_in_scope(u, rules)
-        if not allowed:
-            skipped_scope += 1
-            continue
-        try:
-            r = requests.get(u, timeout=8, allow_redirects=True, stream=True, headers=headers)
-            code = r.status_code
-            clen = r.headers.get("Content-Type", "")
-            try:
-                r.close()
-            except Exception:
-                pass
-        except requests.RequestException:
-            code, clen = None, ""
-        probed += 1
-        if code is not None and code < 400:
-            live.append({"url": u, "status": code, "content_type": clen})
-        if emit and hasattr(emit, "info") and code is not None:
-            try:
-                emit.info(f"[{code}] {u}")
-            except Exception:
-                pass
-        time.sleep(delay)
+    if in_scope:
+        workers = max(1, min(concurrency, len(in_scope)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            # ex.map preserves input (sensitivity) order while running in parallel.
+            for res in ex.map(lambda u: _probe_one_url(u, headers), in_scope):
+                probed += 1
+                code = res.get("status")
+                if code is not None and code < 400:
+                    live.append(res)
+                if emit and hasattr(emit, "info") and code is not None:
+                    try:
+                        emit.info(f"[{code}] {res['url']}" + (f"  {res['title']}" if res.get("title") else ""))
+                    except Exception:
+                        pass
     return {"live_urls": live, "probed_count": probed, "live_count": len(live),
-            "skipped_out_of_scope": skipped_scope}
+            "skipped_out_of_scope": skipped_scope, "concurrency": (concurrency if in_scope else 0)}
+
+
+def _execute_probe_urls(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """BATCH-probe a pile of URLs for liveness instead of curling them one by
+    one — the move that makes recon fast. Pass an explicit `urls` list, or omit
+    it to sweep everything already discovered this engagement (wayback archive,
+    crawled endpoints, JS-mined routes). Each live hit comes back with status +
+    title + server so you can immediately see which are worth opening. In-scope
+    only, concurrency adapts to the program's RoE, results fold into the surface
+    so later tools see the live set."""
+    urls = args.get("urls")
+    if isinstance(urls, str):
+        urls = [urls]
+    st = target.state if (hasattr(target, "state") and isinstance(target.state, dict)) else {}
+    if not urls:
+        # Nothing passed — pull the whole discovered pool so one call checks
+        # "of everything we've found, what's actually live right now?"
+        pool: List[str] = []
+        for k in ("wayback_urls", "endpoints", "discovered_urls", "js_routes", "urls"):
+            v = st.get(k)
+            if isinstance(v, list):
+                pool.extend(x for x in v if isinstance(x, str))
+        urls = pool
+    urls = [u for u in (urls or []) if isinstance(u, str) and u.startswith(("http://", "https://"))]
+    if not urls:
+        return {
+            "status": "no_urls",
+            "note": "Nothing to probe — pass 'urls', or run wayback_urls/spider/well_known_probe first so there's a discovered set to batch-check.",
+        }
+
+    rules = getattr(target, "scope_rules", None)
+    gentle = bool(set(getattr(rules, "disallowed", []) or []) & _GENTLE_FLAGS)
+    # Hunter wants to sweep MANY; stay bounded on fragile programs.
+    default_cap = 60 if gentle else 150
+    hard_max = 100 if gentle else 300
+    cap = max(1, min(int(args.get("limit", default_cap) or default_cap), hard_max))
+
+    if emit and hasattr(emit, "info"):
+        try:
+            emit.info(f"batch-probing up to {cap} of {len(set(urls))} URL(s) for liveness (in-scope only)…")
+        except Exception:
+            pass
+    probe = _probe_live_urls(urls, target, emit, cap=cap)
+
+    # Fold the live set back into the surface so map_surface / fuzz see it.
+    try:
+        if isinstance(st, dict) and probe["live_urls"]:
+            eps = st.setdefault("endpoints", [])
+            for h in probe["live_urls"]:
+                if h["url"] not in eps:
+                    eps.append(h["url"])
+            save_target(target)
+    except Exception:
+        pass
+
+    note = f"{probe['live_count']} live of {probe['probed_count']} probed"
+    if probe["skipped_out_of_scope"]:
+        note += f" ({probe['skipped_out_of_scope']} out-of-scope skipped)"
+    note += ". These live URLs are the current attack surface — triage by title/status."
+    return {"status": "success", "requested": len(set(urls)), **probe, "note": note}
 
 
 def _execute_wayback_urls(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:

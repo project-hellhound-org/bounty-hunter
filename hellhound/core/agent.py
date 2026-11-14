@@ -138,6 +138,7 @@ from hellhound.core.tools.hackerone_tools import (  # noqa: E402
 from hellhound.core.tools.osint_recon import (  # noqa: E402
     _execute_wayback_urls, _execute_otx_urls, _execute_urlscan_recon,
     _execute_virustotal_lookup, _execute_google_dork, _execute_well_known_probe,
+    _execute_probe_urls,
 )
 
 from hellhound.core.tools.network_recon import _execute_port_scan, _execute_nmap_service_scan  # noqa: E402
@@ -10516,6 +10517,18 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_well_known_probe
     ),
+    "probe_urls": ToolSpec(
+        name="probe_urls",
+        description="BATCH liveness check — give it a list of URLs (or omit 'urls' to sweep everything already discovered this engagement: wayback archive, crawled endpoints, JS routes) and it checks which are STILL reachable CONCURRENTLY instead of you curling them one by one. Each live hit returns status + page title + Server header so you can instantly triage which URL is worth opening. In-scope only; concurrency auto-adapts to the program's RoE (gentle on fragile infra). Run this right after any URL-discovery tool.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs to probe. Omit to sweep all URLs discovered so far (wayback/endpoints/js_routes)."},
+                "limit": {"type": "integer", "description": "Max URLs to probe (hard ceiling 300, or 100 on gentle/strict programs). Sensitive files are probed first."}
+            }
+        },
+        executor=_execute_probe_urls
+    ),
     "urlscan_recon": ToolSpec(
         name="urlscan_recon",
         description="Searches urlscan.io's crawl index for a domain and extracts either discovered subdomains or discovered URLs from pages it has already scanned. Needs an urlscan.io API key configured via /apikey urlscan <key> (free key: https://urlscan.io/user/signup) or the URLSCAN_API_KEY env var.",
@@ -14740,6 +14753,7 @@ RULES:
    - DEPTH MEANS THE FORGOTTEN SURFACE, NOT THE HOMEPAGE: once you pick a host to go deep on, the highest-ROI move is NOT re-crawling its linked pages — it's the unlinked/forgotten/leaked surface everyone else skipped: backup and config files (`.bak .old .swp ~`, `config.php.bak`, `backup.zip`, `.env`), exposed VCS (`/.git/`, `/.svn/`), `.DS_Store` (reveals a directory's real contents), API specs (`swagger.json` / `openapi.json` hand you the whole API including unlinked endpoints), and secrets in JS bundles. Run `content_discovery` with the `sensitive`/`backup` wordlist, `curl` the high-signal paths directly, then prioritise endpoints that carry testable params (id → IDOR, url → SSRF, file/path → LFI, q/search → XSS/SQLi). That surface is where bounties live, not the page already linked from the nav.
    - ALWAYS READ `robots.txt`, `sitemap.xml`, AND `/.well-known/security.txt` EARLY — they are free, zero-impact, and the single highest-signal starting point. Run `well_known_probe` to do this in one shot: it fetches all three and PROBES the `robots.txt` Disallow paths for liveness, so a still-reachable `Disallow: /.env`, `/admin`, `/backup/` comes back already confirmed-live (owner-hidden but reachable = look there first). `sitemap.xml` enumerates real pages; `security.txt` gives the reporting contact. Never crawl past these without having read them.
    - Archived/passive URLs (`wayback_urls`, `otx_urls`) are HISTORICAL — most are dead. `wayback_urls` now probes the interesting ones for liveness automatically (`live_urls` in its result); act on the STILL-LIVE ones, don't reason over the raw archive list as if it were the current surface.
+   - NEVER check URLs for liveness one `curl` at a time — that is slow and leaves assets undiscovered. After ANY URL-discovery step (wayback/otx/gau/spider/JS mining), run `probe_urls` to BATCH-check the whole pile concurrently (or call it with no args to sweep everything discovered so far). It returns each live URL's status + title + Server header so you triage which to open. Breadth of live assets is your edge — surface more than the next hunter by probing everything, not sampling.
    - WHEN PASSIVE SOURCES RETURN A PILE OF URLs (wayback/gau/otx with hundreds–thousands of results), DON'T JUST COLLECT THEM — triage and probe. `curl` a batch of the high-value ones (anything with params, `/api/`, `/admin`, `.json`, old/deprecated paths, backup extensions) to see which are STILL LIVE and what they expose — an archived URL that still resolves is exactly the forgotten endpoint nobody re-tested. A 10k-URL wayback dump you never fetch from is worth nothing.
    - IF A BURP / CAIDO PROXY IS CONNECTED (MCP) — PARK THE NOTEWORTHY REQUESTS, NOT THE FLOOD: keep running your bulk recon with `curl` (it's fast and it keeps Burp's Proxy history from drowning in hundreds of your own requests) — do NOT route all traffic through the proxy. BUT the MOMENT you craft or confirm a NOTEWORTHY request — the actual exploit request, an auth-bypass / privilege request, anything the researcher would want to SEE or re-send by hand — ALSO call `create_repeater_tab_http` to drop that one request into Burp Repeater. That is the entire point of the proxy being connected: the researcher watches and manually follows up the handful of requests that matter, without wading through your recon noise. One Repeater tab per genuinely interesting request — not per curl, and never the whole scan. (A plain `send_http1_request` routes through Burp's engine but shows NOWHERE in the UI, so it's no substitute for parking the request in Repeater.)
    - ON A REAL (non-lab) TARGET, RESPECT RATE LIMITS — NEVER GET THE RESEARCHER BLOCKED: if responses start returning 429 (Too Many Requests), a WAF 403, sudden connection resets, CAPTCHAs, or rate-limit headers, STOP hammering immediately — back off, pause heavy fuzzing/scanning/`content_discovery`, switch to slow surgical requests, and tell the researcher what you're seeing. Getting their IP or account banned on a live program ends the engagement and can breach the program's rules of engagement — that's a far worse outcome than being slow. Lab / CTF / explicitly-authorized boxes you can push hard; a real production program you treat with restraint: steady and targeted, never a blind high-rate flood.
