@@ -2696,9 +2696,16 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         if tool_status["missing_pd"]:
             emit(f"  [dim][*] Manual ProjectDiscovery bulk install:[/dim] `{tool_status['combined_pd_install']}`")
         if tool_status["missing_other"]:
-            emit("  [dim][*] Manual standalone installs (pip tools need the beast env's pip — `~/.beast-env/bin/pip`):[/dim]")
+            # Rewrite bare `pip install X` into the beast env's OWN pip (absolute
+            # path), so a copy-paste installs where Beast will actually find it —
+            # not into the system python (which on Kali errors out as
+            # externally-managed anyway). Go tools are already copy-pasteable.
+            _venv_pip = os.path.join(os.path.dirname(sys.executable), "pip")
+            emit("  [dim][*] Manual standalone installs (copy-paste as-is):[/dim]")
             for t in tool_status["missing_other"]:
-                emit(f"    - {t}: `{tool_status['tools'][t]['install']}`")
+                raw = tool_status["tools"][t]["install"]
+                shown = raw.replace("pip install ", f"{_venv_pip} install ", 1) if raw.startswith("pip install ") else raw
+                emit(f"    - {t}: `{shown}`")
 
         emit("\n  Wordlists & SecLists Dependencies:")
         if wordlist_status["seclists_installed"]:
