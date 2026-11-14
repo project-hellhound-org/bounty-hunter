@@ -30,14 +30,15 @@ from typing import Any, Callable, Dict, Optional
 
 from rich.markup import escape as _rich_escape
 
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
 from textual.containers import Horizontal, VerticalScroll
 from textual.content import Content
+from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Collapsible, Footer, Input, Markdown, OptionList, Static
+from textual.widgets import Collapsible, Footer, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from hellhound.core.emit import PlainEmit
@@ -251,6 +252,90 @@ class SuggestionBox(OptionList):
             return
         cur = self.highlighted if self.highlighted is not None else 0
         self.highlighted = max(0, min(len(self._insert_lines) - 1, cur + delta))
+
+
+class PromptArea(TextArea):
+    """The prompt box — a soft-wrapping, auto-growing editor so a long line
+    FLOWS onto the next row as a paragraph (like Claude Code) instead of
+    scrolling the start off the left edge where you can't see what you typed.
+
+    Enter submits; Shift+Enter / Alt+Enter / Ctrl+J inserts a newline for a
+    deliberate multi-line prompt. ↑/↓ recall shell history only at the very
+    top/bottom of the text (otherwise they move the cursor between lines), and
+    drive the suggestion dropdown when it's open — so the single-line feel is
+    unchanged, you just also get real wrapping + multi-line editing."""
+
+    class Submitted(Message):
+        """Enter pressed — carries the current text. Mirrors Input.Submitted
+        (`.input`, `.value`) so the submit handler barely changes."""
+        def __init__(self, area: "PromptArea", value: str) -> None:
+            self.input = area
+            self.value = value
+            super().__init__()
+
+    def __init__(self, placeholder: str = "", id: Optional[str] = None) -> None:
+        super().__init__(
+            "", id=id, soft_wrap=True, tab_behavior="focus",
+            show_line_numbers=False, placeholder=placeholder, compact=True,
+        )
+
+    # -- Input-compatible shims so the app's handlers keep working unchanged --
+    @property
+    def value(self) -> str:
+        return self.text
+
+    @value.setter
+    def value(self, v: str) -> None:
+        self.text = v or ""
+
+    @property
+    def cursor_position(self) -> int:
+        return len(self.text)
+
+    @cursor_position.setter
+    def cursor_position(self, _pos: int) -> None:
+        # Every call site moves the caret to the end after loading text.
+        try:
+            self.move_cursor(self.document.end)
+        except Exception:
+            pass
+
+    def on_key(self, event: events.Key) -> None:
+        app = self.app
+        box = app._suggest() if hasattr(app, "_suggest") else None
+        key = event.key
+        if key == "enter":
+            event.prevent_default(); event.stop()
+            self.post_message(self.Submitted(self, self.text))
+            return
+        if key in ("shift+enter", "alt+enter", "ctrl+j"):
+            event.prevent_default(); event.stop()
+            self.insert("\n")
+            return
+        if key == "tab":
+            if box is not None and box.display:
+                event.prevent_default(); event.stop()
+                app.action_sugg_accept()
+            return
+        if key in ("up", "down"):
+            if box is not None and box.display:
+                event.prevent_default(); event.stop()
+                (app.action_sugg_next if key == "down" else app.action_sugg_prev)()
+                return
+            # Recall history only when the caret is already at the edge of the
+            # text — otherwise ↑/↓ just move between (wrapped) lines.
+            try:
+                at_start = self.cursor_location == (0, 0)
+                at_end = self.cursor_location == self.document.end
+            except Exception:
+                at_start = at_end = True
+            if key == "up" and at_start:
+                event.prevent_default(); event.stop()
+                app._history_recall(-1)
+            elif key == "down" and at_end:
+                event.prevent_default(); event.stop()
+                app._history_recall(+1)
+            # else: fall through to TextArea's own cursor movement
 
 
 class ToolCard(Collapsible):
@@ -592,19 +677,23 @@ class HellhoundApp(App):
     #working { height: 1; padding: 0 2; color: $text; }
     #suggest { height: auto; max-height: 10; margin: 0 1; border: round #7a2630; background: #141821; display: none; }
     #suggest > .option-list--option-highlighted { background: #5a1f27; color: $text; }
-    #prompt { height: 3; border: round red; margin: 0 1; background: #0b0d12; }
+    #prompt { height: auto; min-height: 3; max-height: 12; border: round red; margin: 0 1; padding: 0 1; background: #0b0d12; }
+    #prompt:focus { border: round red; }
     Footer { height: 1; background: #141821; }
     """
 
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
-        Binding("ctrl+y", "copy_last", "Copy last result", show=False),
+        # priority so it wins over TextArea's built-in ctrl+y (redo) while the
+        # prompt editor holds focus — Ctrl+Y must always copy the last result.
+        Binding("ctrl+y", "copy_last", "Copy last result", show=False, priority=True),
         Binding("ctrl+b", "toggle_sidepanel", "Toggle live panel", show=False),
         Binding("ctrl+f", "show_findings", "Findings", show=True),
         Binding("escape", "cancel_turn", "Cancel turn"),
-        Binding("down", "sugg_next", show=False, priority=True),
-        Binding("up", "sugg_prev", show=False, priority=True),
-        Binding("tab", "sugg_accept", show=False, priority=True),
+        # Up/Down/Tab are handled inside PromptArea.on_key (suggestion-nav when
+        # the dropdown is open, history recall at the text edges, otherwise
+        # normal cursor movement between wrapped lines) — a priority app binding
+        # here would steal them before the editor could move the caret.
         # The input box always holds keyboard focus (so you can type without
         # clicking first), which means plain Up/Down never reach the
         # transcript — they're claimed above for suggestion-nav/history
@@ -651,7 +740,7 @@ class HellhoundApp(App):
         )
         yield WorkingIndicator(id="working")
         yield SuggestionBox()
-        yield Input(placeholder="Ask Hellhound, or type /help … (type / for commands)", id="prompt")
+        yield PromptArea(placeholder="Ask Hellhound, or type /help … (type / for commands)", id="prompt")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -664,7 +753,7 @@ class HellhoundApp(App):
             from hellhound.core.commands import dispatch as _dispatch
             self._dispatch_fn = _dispatch
         self.query_one("#baninfo", Static).update(self._banner_info())
-        self.query_one("#prompt", Input).focus()
+        self.query_one("#prompt", PromptArea).focus()
         self._check_ai_ready()
 
     @work(thread=True, exclusive=False)
@@ -1015,31 +1104,38 @@ class HellhoundApp(App):
         return "\n\n".join(parts) if parts else f"{tool_name}: (no copyable output)"
 
     # -- autocomplete wiring --
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "prompt":
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id == "prompt":
             # Fresh typing resets "did the user navigate the dropdown", so
             # Enter after typing submits instead of accepting a suggestion.
             self._sugg_nav = False
-            self._suggest().update_for(event.value or "")
+            box = self._suggest()  # None until fully mounted (TextArea.Changed
+            if box is not None:    # can fire during compose, before the dropdown)
+                box.update_for(event.text_area.text or "")
 
-    def _suggest(self) -> SuggestionBox:
-        return self.query_one(SuggestionBox)
+    def _suggest(self) -> Optional[SuggestionBox]:
+        try:
+            return self.query_one(SuggestionBox)
+        except Exception:
+            return None
 
     def action_sugg_next(self) -> None:
         # Dropdown showing -> move selection down; otherwise shell-style history
         # recall toward NEWER entries (down arrow).
-        if self._suggest().display:
+        box = self._suggest()
+        if box is not None and box.display:
             self._sugg_nav = True
-            self._suggest().move(1)
+            box.move(1)
         else:
             self._history_recall(+1)
 
     def action_sugg_prev(self) -> None:
         # Dropdown showing -> move selection up; otherwise recall OLDER history
         # (up arrow), exactly like a terminal.
-        if self._suggest().display:
+        box = self._suggest()
+        if box is not None and box.display:
             self._sugg_nav = True
-            self._suggest().move(-1)
+            box.move(-1)
         else:
             self._history_recall(-1)
 
@@ -1051,7 +1147,7 @@ class HellhoundApp(App):
         if not hist:
             return
         try:
-            inp = self.query_one("#prompt", Input)
+            inp = self.query_one("#prompt", PromptArea)
         except Exception:
             return
         if self._hist_pos is None:
@@ -1069,15 +1165,18 @@ class HellhoundApp(App):
 
     def action_sugg_accept(self) -> None:
         """Tab: fill the input with the highlighted suggestion."""
-        line = self._suggest().current_line()
+        box = self._suggest()
+        if box is None:
+            return
+        line = box.current_line()
         if line is not None:
-            inp = self.query_one("#prompt", Input)
+            inp = self.query_one("#prompt", PromptArea)
             inp.value = line
             inp.cursor_position = len(line)
-            self._suggest().update_for(line)  # cascade (e.g. /scope -> its subcommands)
+            box.update_for(line)  # cascade (e.g. /scope -> its subcommands)
 
     # -- input handling --
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_prompt_area_submitted(self, event: "PromptArea.Submitted") -> None:
         # Enter behavior (matches the classic completer):
         #  - still typing the COMMAND NAME (one "/token", not yet an exact
         #    command) -> Enter COMPLETES it (so "/se"+Enter -> "/setup "),
@@ -1086,14 +1185,14 @@ class HellhoundApp(App):
         # Tab always completes; Esc dismisses.
         box = self._suggest()
         raw = event.value or ""
-        chosen = box.current_line() if box.display else None
+        chosen = box.current_line() if (box is not None and box.display) else None
         if chosen is not None:
             toks = raw.split()
             first = toks[0] if toks else ""
             typing_cmd_name = raw.startswith("/") and len(toks) <= 1 and not raw.endswith(" ")
             is_exact = typing_cmd_name and _is_exact_command(first)
             if (typing_cmd_name and not is_exact) or self._sugg_nav:
-                inp = self.query_one("#prompt", Input)
+                inp = self.query_one("#prompt", PromptArea)
                 inp.value = chosen
                 inp.cursor_position = len(chosen)
                 self._sugg_nav = False
@@ -1115,9 +1214,10 @@ class HellhoundApp(App):
             self._input_history.append(line)
         self._hist_pos = None
 
-        inp = self.query_one("#prompt", Input)
+        inp = self.query_one("#prompt", PromptArea)
         inp.value = ""
-        box.update_for("")  # clear/hide dropdown
+        if box is not None:
+            box.update_for("")  # clear/hide dropdown
         inp.disabled = True
         self.add_user_message(line)
         self._cancel_event = threading.Event()
@@ -1142,7 +1242,7 @@ class HellhoundApp(App):
     def action_cancel_turn(self) -> None:
         # Esc first dismisses the dropdown if it's open, otherwise cancels the turn.
         box = self._suggest()
-        if box.display:
+        if box is not None and box.display:
             box.display = False
             return
         self._cancel_event.set()
@@ -1179,7 +1279,7 @@ class HellhoundApp(App):
         """Ctrl+P palette picked a command — drop it into the prompt ready for
         args rather than firing blind (most commands take arguments)."""
         try:
-            inp = self.query_one("#prompt", Input)
+            inp = self.query_one("#prompt", PromptArea)
             inp.value = command_name + " "
             inp.focus()
             inp.cursor_position = len(inp.value)
@@ -1203,7 +1303,7 @@ class HellhoundApp(App):
             self.query_one("#working", WorkingIndicator).stop()
         except Exception:
             pass
-        inp = self.query_one("#prompt", Input)
+        inp = self.query_one("#prompt", PromptArea)
         inp.disabled = False
         inp.focus()
 
