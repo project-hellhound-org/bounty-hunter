@@ -1347,8 +1347,22 @@ def handle_program(args: List[str], session_context: Dict[str, Any], emit: Any) 
                               + f"  —  /program switch {prog_name} <host> to jump, or /list for the full view.")
 
         session_context["target"] = chosen
-        target_obj = create_or_load_target(chosen)
+        # attach_target_to_program APPLIES the program's scope to this target and
+        # saves it — do it on EVERY select path (not just when landing on a
+        # never-worked host), otherwise selecting a program and landing on an
+        # already-listed host left the target with an EMPTY scope gate.
+        target_obj = attach_target_to_program(create_or_load_target(chosen), prog_name)
         session_context["scope_rules"] = target_obj.scope_rules
+        # Persist the active program + target so a fresh process (headless
+        # `beast -p`, or the next launch) resumes this program WITH its scope,
+        # instead of starting at "default" with no scope gate.
+        try:
+            _cfg = load_config()
+            _cfg["active_program"] = record["name"]
+            _cfg["active_target"] = chosen
+            save_config(_cfg)
+        except Exception:
+            pass
         if not is_json:
             _done_word = "Switched to" if _prior_program else "Selected"
             emit.success(f"{_done_word} program '{record.get('display_name', prog_name)}' → active target: [bold cyan]{chosen}[/bold cyan]")

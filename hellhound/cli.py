@@ -100,6 +100,22 @@ def _execute_headless(command_str: str, force_json: bool = False):
         "scope_rules": ScopeRules.from_dict(cfg.get("scope", {})),
         "results": {}
     }
+    # Resume the active program's target (set by `/program select`) so a headless
+    # hunt/command runs against the right host WITH its scope gate — a fresh
+    # `beast -p` process is otherwise cold and would start at "default" with no
+    # scope. The target's saved scope (inherited from the program) wins over the
+    # bare global scope above.
+    _active_target = cfg.get("active_target")
+    if _active_target:
+        session_context["target"] = _active_target
+        try:
+            from hellhound.core.tasks import create_or_load_target
+            _t = create_or_load_target(_active_target)
+            _sr = getattr(_t, "scope_rules", None)
+            if _sr and (_sr.in_scope or _sr.out_scope or _sr.disallowed):
+                session_context["scope_rules"] = _sr
+        except Exception:
+            pass
 
     emit = PlainEmit()
     if force_json or "--json" in command_str:
