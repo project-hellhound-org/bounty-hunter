@@ -10722,7 +10722,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "gf_patterns": ToolSpec(
         name="gf_patterns",
-        description="Triage a big pile of collected URLs into VULN CANDIDATES by class (redirect/ssrf/lfi/sqli/ssti/idor) — like tomnomnom's gf. Uses the real gf binary + your ~/.gf patterns when installed, else a built-in param-name matcher (works with no setup). Local-only — sends NO traffic to the target. Pass urls, or omit to use everything discovered this engagement. Run it after wayback/waymore/gau to focus on the URLs worth testing.",
+        description="Triage a big pile of collected URLs into VULN CANDIDATES by class (redirect/ssrf/lfi/sqli/ssti/idor/rce/…) — like tomnomnom's gf. Loads your gf pattern .json files directly from wherever they live (checks $GF_PATH, beast config 'gf_patterns_dir', ~/.gf, then common clone dirs), so your whole collection is used; falls back to a built-in param-name matcher if none are found. Local-only — sends NO traffic to the target. Pass urls, or omit to use everything discovered. Run it after wayback/waymore/gau to focus on the URLs worth testing.",
         parameters={
             "type": "object",
             "properties": {

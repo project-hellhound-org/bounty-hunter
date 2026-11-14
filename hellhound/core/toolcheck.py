@@ -41,8 +41,12 @@ OTHER_TOOLS: Dict[str, str] = {
     # XSS / parameter-injection scanner used by dalfox_scan.
     "dalfox": "go install github.com/hahwul/dalfox/v2@latest",
     # Pattern-grep for pulling vuln-candidate URLs (ssrf/redirect/lfi/sqli/…)
-    # out of a big collected URL list. gf_patterns also has a built-in matcher,
-    # so the ~/.gf pattern files are an optional upgrade, not required.
+    # out of a big collected URL list. gf_patterns reads the pattern .json files
+    # directly, so after installing gf, clone a pattern set and point Beast at it:
+    #   git clone https://github.com/1ndianl33t/Gf-Patterns ~/.gf
+    #   (or set GF_PATH=/path/to/patterns, or `gf_patterns_dir` in beast config)
+    # The ~/.gf pattern files are an optional upgrade — gf_patterns has a
+    # built-in matcher that works with no patterns at all.
     "gf": "go install github.com/tomnomnom/gf@latest",
     # Deep wayback/commoncrawl/otx/urlscan URL harvester (more sources than gau).
     "waymore": "pip install waymore",

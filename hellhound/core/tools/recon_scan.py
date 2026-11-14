@@ -1074,13 +1074,70 @@ _GF_BUILTIN = {
 }
 
 
+def _gf_patterns_dir() -> Optional[str]:
+    """Locate a gf-patterns directory (the JSON files like ssrf.json/lfi.json).
+    gf itself only reads ~/.gf and $GF_PATH, so a collection cloned ANYWHERE
+    else is invisible to it. Beast is more forgiving: it checks, in order, the
+    $GF_PATH env var, a `gf_patterns_dir` set in beast config, the standard
+    ~/.gf, and a few common clone spots — so pointing Beast at your patterns is
+    one env var or config line, no matter where you cloned them."""
+    cands = []
+    if os.environ.get("GF_PATH"):
+        cands.append(os.environ["GF_PATH"])
+    try:
+        cfgdir = load_config().get("gf_patterns_dir")
+        if cfgdir:
+            cands.append(str(cfgdir))
+    except Exception:
+        pass
+    home = Path.home()
+    cands += [
+        str(home / ".gf"),
+        str(home / "Gf-Patterns"),
+        str(home / "tools" / "Gf-Patterns"),
+        str(home / ".config" / "gf"),
+    ]
+    for c in cands:
+        try:
+            p = Path(c).expanduser()
+            if p.is_dir() and any(p.glob("*.json")):
+                return str(p)
+        except Exception:
+            continue
+    return None
+
+
+def _load_gf_regexes(pattern_name: str, patterns_dir: str):
+    """Load a gf JSON pattern file (e.g. ssrf.json) and compile its regex(es).
+    Format: {"flags": "-iE", "patterns": [...]} or {"flags": ..., "pattern": "..."}."""
+    f = Path(patterns_dir) / f"{pattern_name}.json"
+    if not f.is_file():
+        return None
+    try:
+        data = json.loads(f.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+    pats = data.get("patterns") or ([data["pattern"]] if data.get("pattern") else [])
+    if not pats:
+        return None
+    reflags = re.IGNORECASE if "i" in str(data.get("flags", "")) else 0
+    compiled = []
+    for p in pats:
+        try:
+            compiled.append(re.compile(p, reflags))
+        except Exception:
+            continue
+    return compiled or None
+
+
 def _execute_gf_patterns(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Triage a big pile of collected URLs into VULN CANDIDATES by class
-    (redirect / ssrf / lfi / sqli / ssti / idor) — like tomnomnom's gf. Prefers
-    the real gf binary + your ~/.gf patterns when installed; otherwise falls
-    back to a built-in param-name matcher so it works with no setup. Local
-    processing of already-collected URLs — sends NO traffic to the target.
-    Pass urls, or omit to use everything discovered this engagement."""
+    (redirect / ssrf / lfi / sqli / ssti / idor / rce / …) — like tomnomnom's gf.
+    Loads your gf pattern .json files directly from wherever they live ($GF_PATH,
+    beast config `gf_patterns_dir`, ~/.gf, or a common clone dir) so your full
+    collection is used; falls back to a built-in param-name matcher if no
+    patterns are found. Local processing of already-collected URLs — sends NO
+    traffic to the target. Pass urls, or omit to use everything discovered."""
     pattern = str(args.get("pattern") or "all").lower()
     urls = args.get("urls")
     if isinstance(urls, str):
@@ -1098,37 +1155,50 @@ def _execute_gf_patterns(args: Dict[str, Any], target: Target, emit: Any) -> Dic
         return {"status": "no_urls",
                 "note": "No param-bearing URLs to triage — run wayback_urls/waymore/probe_urls first."}
 
-    patterns = [pattern] if pattern != "all" else list(_GF_BUILTIN.keys())
-    gf_bin = get_binary_path("gf")
+    patterns_dir = _gf_patterns_dir()
+    # For "all": use every pattern file in the dir (your full collection), else
+    # the built-in class list.
+    if pattern != "all":
+        patterns = [pattern]
+    elif patterns_dir:
+        patterns = sorted({p.stem for p in Path(patterns_dir).glob("*.json")})
+    else:
+        patterns = list(_GF_BUILTIN.keys())
+
     results = {}
+    used_dir_for = 0
     for pat in patterns:
         matched = []
-        if gf_bin:
-            try:
-                proc = subprocess.run([gf_bin, pat], input="\n".join(urls),
-                                      capture_output=True, text=True, timeout=30)
-                matched = [u.strip() for u in (proc.stdout or "").splitlines() if u.strip()]
-            except Exception:
-                matched = []
-        if not matched:  # built-in fallback (gf missing, or that pattern not installed)
-            names = _GF_BUILTIN.get(pat, set())
+        compiled = _load_gf_regexes(pat, patterns_dir) if patterns_dir else None
+        if compiled:
+            used_dir_for += 1
             for u in urls:
-                q = urlparse(u).query
-                pkeys = {kv.split("=", 1)[0].lower() for kv in q.split("&") if kv}
-                if pkeys & names:
+                if any(rx.search(u) for rx in compiled):
                     matched.append(u)
+        else:  # built-in param-name fallback (pattern file absent)
+            names = _GF_BUILTIN.get(pat, set())
+            if names:
+                for u in urls:
+                    q = urlparse(u).query
+                    pkeys = {kv.split("=", 1)[0].lower() for kv in q.split("&") if kv}
+                    if pkeys & names:
+                        matched.append(u)
         if matched:
             results[pat] = sorted(set(matched))[:200]
     total = sum(len(v) for v in results.values())
+    source = (f"gf-patterns ({patterns_dir})" if used_dir_for else "built-in")
     return {
         "status": "success",
-        "source": "gf" if gf_bin else "built-in",
+        "source": source,
+        "patterns_dir": patterns_dir,
         "patterns": list(results.keys()),
         "candidates": results,
         "candidate_count": total,
-        "note": (f"{total} vuln-candidate URL(s) across {len(results)} class(es) — test each by its class "
-                 "(redirect->open-redirect, ssrf->SSRF, lfi->path-traversal, sqli->injection, idor->access-control)."
-                 if total else "No URLs matched any vuln-candidate pattern."),
+        "note": (f"{total} vuln-candidate URL(s) across {len(results)} class(es) via {source} — test each by its "
+                 "class (redirect->open-redirect, ssrf->SSRF, lfi->path-traversal, sqli->injection, idor->access-control)."
+                 if total else
+                 ("No URLs matched any pattern." if patterns_dir else
+                  "No gf patterns found — clone them to ~/.gf or set GF_PATH, or Beast used only its built-in matcher.")),
     }
 
 
