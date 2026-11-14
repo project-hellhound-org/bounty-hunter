@@ -138,7 +138,8 @@ from hellhound.core.tools.hackerone_tools import (  # noqa: E402
 from hellhound.core.tools.osint_recon import (  # noqa: E402
     _execute_wayback_urls, _execute_otx_urls, _execute_urlscan_recon,
     _execute_virustotal_lookup, _execute_google_dork, _execute_well_known_probe,
-    _execute_probe_urls, _execute_crtsh_subdomains,
+    _execute_probe_urls, _execute_crtsh_subdomains, _execute_favicon_hash,
+    _execute_asn_expand,
 )
 
 from hellhound.core.tools.network_recon import _execute_port_scan, _execute_nmap_service_scan  # noqa: E402
@@ -158,6 +159,7 @@ from hellhound.core.tools.recon_scan import (  # noqa: E402
     _resolve_resolvers_path, _execute_subfinder, _execute_permute_subdomains,
     _execute_resolve_candidates, _execute_subdomain_sweep, _execute_httpx,
     _execute_tls_cert_scan, _execute_takeover_scanner, _execute_subzy,
+    _execute_param_discover,
 )
 
 from hellhound.core.tools.crawl_scan import (  # noqa: E402
@@ -10661,6 +10663,21 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_recon_pipeline
     ),
+    "param_discover": ToolSpec(
+        name="param_discover",
+        description="Find HIDDEN / unlinked request parameters on an endpoint (arjun-style) — the IDOR id, SSRF url, file-read path, debug or admin toggle the server accepts but never links, so a crawler never sees it. Sends a canary across batches of common param names and flags the ones that change the response (reflected / status change / length delta), isolating the exact param. Gentle (scope-gated, batched, capped). Run it on a live endpoint to expand the testable surface before fuzzing.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The specific endpoint URL to test for hidden params."},
+                "method": {"type": "string", "enum": ["GET", "POST"], "description": "Where to inject candidate params.", "default": "GET"},
+                "params": {"type": "array", "items": {"type": "string"}, "description": "Extra candidate param names to test on top of the built-in common list."},
+                "limit": {"type": "integer", "description": "Max candidate params to test (hard ceiling 400).", "default": 160}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_param_discover
+    ),
     "crtsh_subdomains": ToolSpec(
         name="crtsh_subdomains",
         description="Enumerate subdomains from certificate-transparency logs via crt.sh's free JSON API — no binary, no API key, pure OSINT (queries crt.sh, never the target, so it's safe on strict/fragile programs). Every TLS cert a host requested is logged, so this routinely surfaces dev/staging/internal hosts that other sources miss. Use it alongside subfinder (not instead of), and it works even when subfinder isn't installed. Follow with probe_urls to see which discovered hosts are live.",
@@ -10671,6 +10688,28 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             }
         },
         executor=_execute_crtsh_subdomains
+    ),
+    "favicon_hash": ToolSpec(
+        name="favicon_hash",
+        description="Fetch a site's favicon and compute its Shodan-compatible mmh3 hash (app/stack fingerprint). Pivot it in Shodan (`http.favicon.hash:<n>`) to find every OTHER host serving the same favicon — the org's other properties, staging mirrors, forgotten infra on the same build that other hunters never connect. One gentle GET, scope-gated.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Site or full favicon URL (defaults to the active target's /favicon.ico)."}
+            }
+        },
+        executor=_execute_favicon_hash
+    ),
+    "asn_expand": ToolSpec(
+        name="asn_expand",
+        description="Expand a host to its ASN and the owning org's FULL set of announced IP prefixes (CIDRs) via RIPEstat — free, no key, pure OSINT (queries RIPEstat, never the target, safe on strict programs). The org's other hosts live in those netblocks; enumerating in-scope IPs there finds assets a hunter who only touched the given hostname never sees.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Hostname, domain, or IP to look up (defaults to the active target)."}
+            }
+        },
+        executor=_execute_asn_expand
     ),
     "urlscan_recon": ToolSpec(
         name="urlscan_recon",
@@ -14898,6 +14937,8 @@ RULES:
    - Archived/passive URLs (`wayback_urls`, `otx_urls`) are HISTORICAL — most are dead. `wayback_urls` now probes the interesting ones for liveness automatically (`live_urls` in its result); act on the STILL-LIVE ones, don't reason over the raw archive list as if it were the current surface.
    - NEVER check URLs for liveness one `curl` at a time — that is slow and leaves assets undiscovered. After ANY URL-discovery step (wayback/otx/gau/spider/JS mining), run `probe_urls` to BATCH-check the whole pile concurrently (or call it with no args to sweep everything discovered so far). It returns each live URL's status + title + Server header so you triage which to open. Breadth of live assets is your edge — surface more than the next hunter by probing everything, not sampling.
    - Cast a WIDE asset net before going deep: pull subdomains from `crtsh_subdomains` (certificate-transparency, free, no key, works with no binary and finds dev/staging/internal hosts others miss) AND `subfinder` when available, then `probe_urls` the lot to see which resolve live. The host a lazy hunter never found is where the uncontested bug lives.
+   - For a fresh target, `recon` runs the whole opening enumeration in one deterministic pass (discover -> resolve -> live hosts -> robots/sitemap -> wayback) and hands back a ranked inventory — prefer it over firing the sub-tools by hand, so nothing gets skipped.
+   - Expand surface and pivot to assets others miss: on a live endpoint run `param_discover` to surface hidden IDOR/SSRF/LFI/redirect params a crawler can't see; `favicon_hash` then a Shodan pivot finds the org's other properties on the same build; `asn_expand` maps the org's whole IP space (probe only in-scope ranges).
    - WHEN PASSIVE SOURCES RETURN A PILE OF URLs (wayback/gau/otx with hundreds–thousands of results), DON'T JUST COLLECT THEM — triage and probe. `curl` a batch of the high-value ones (anything with params, `/api/`, `/admin`, `.json`, old/deprecated paths, backup extensions) to see which are STILL LIVE and what they expose — an archived URL that still resolves is exactly the forgotten endpoint nobody re-tested. A 10k-URL wayback dump you never fetch from is worth nothing.
    - IF A BURP / CAIDO PROXY IS CONNECTED (MCP) — PARK THE NOTEWORTHY REQUESTS, NOT THE FLOOD: keep running your bulk recon with `curl` (it's fast and it keeps Burp's Proxy history from drowning in hundreds of your own requests) — do NOT route all traffic through the proxy. BUT the MOMENT you craft or confirm a NOTEWORTHY request — the actual exploit request, an auth-bypass / privilege request, anything the researcher would want to SEE or re-send by hand — ALSO call `create_repeater_tab_http` to drop that one request into Burp Repeater. That is the entire point of the proxy being connected: the researcher watches and manually follows up the handful of requests that matter, without wading through your recon noise. One Repeater tab per genuinely interesting request — not per curl, and never the whole scan. (A plain `send_http1_request` routes through Burp's engine but shows NOWHERE in the UI, so it's no substitute for parking the request in Repeater.)
    - ON A REAL (non-lab) TARGET, RESPECT RATE LIMITS — NEVER GET THE RESEARCHER BLOCKED: if responses start returning 429 (Too Many Requests), a WAF 403, sudden connection resets, CAPTCHAs, or rate-limit headers, STOP hammering immediately — back off, pause heavy fuzzing/scanning/`content_discovery`, switch to slow surgical requests, and tell the researcher what you're seeing. Getting their IP or account banned on a live program ends the engagement and can breach the program's rules of engagement — that's a far worse outcome than being slow. Lab / CTF / explicitly-authorized boxes you can push hard; a real production program you treat with restraint: steady and targeted, never a blind high-rate flood.

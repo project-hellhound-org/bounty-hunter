@@ -11,6 +11,8 @@ is unchanged.
 """
 import os
 import re
+import base64
+import socket
 import requests
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
@@ -19,6 +21,43 @@ from hellhound.core.ai_utils import load_config
 from hellhound.core.tasks import Target, save_target
 from hellhound.core.scope import is_in_scope
 from hellhound.memory import update_from_subfinder
+
+
+def _mmh3_x86_32(key: bytes, seed: int = 0) -> int:
+    """MurmurHash3 x86_32 (signed) — pure-Python so we don't need the mmh3 C
+    package. Matches Shodan's http.favicon.hash so the result can be pivoted
+    directly in Shodan to find every host serving the same favicon."""
+    c1, c2 = 0xcc9e2d51, 0x1b873593
+    length = len(key)
+    h1 = seed & 0xffffffff
+    rounded_end = length & 0xfffffffc
+    for i in range(0, rounded_end, 4):
+        k1 = (key[i] & 0xff) | ((key[i + 1] & 0xff) << 8) | ((key[i + 2] & 0xff) << 16) | ((key[i + 3] & 0xff) << 24)
+        k1 = (k1 * c1) & 0xffffffff
+        k1 = ((k1 << 15) | (k1 >> 17)) & 0xffffffff
+        k1 = (k1 * c2) & 0xffffffff
+        h1 ^= k1
+        h1 = ((h1 << 13) | (h1 >> 19)) & 0xffffffff
+        h1 = (h1 * 5 + 0xe6546b64) & 0xffffffff
+    k1 = 0
+    tail = length & 0x03
+    if tail == 3:
+        k1 = (key[rounded_end + 2] & 0xff) << 16
+    if tail >= 2:
+        k1 |= (key[rounded_end + 1] & 0xff) << 8
+    if tail >= 1:
+        k1 |= (key[rounded_end] & 0xff)
+        k1 = (k1 * c1) & 0xffffffff
+        k1 = ((k1 << 15) | (k1 >> 17)) & 0xffffffff
+        k1 = (k1 * c2) & 0xffffffff
+        h1 ^= k1
+    h1 ^= length
+    h1 ^= (h1 >> 16)
+    h1 = (h1 * 0x85ebca6b) & 0xffffffff
+    h1 ^= (h1 >> 13)
+    h1 = (h1 * 0xc2b2ae35) & 0xffffffff
+    h1 ^= (h1 >> 16)
+    return h1 - 0x100000000 if h1 & 0x80000000 else h1
 
 
 # Extensions that make an archived URL worth probing first — config/secret/
@@ -349,6 +388,110 @@ def _execute_crtsh_subdomains(args: Dict[str, Any], target: Target, emit: Any) -
         "note": (f"{len(sub_list)} subdomain(s) from CT logs. Resolve/probe_urls these to find which are live — "
                  "CT often reveals dev/staging/admin hosts others never see."
                  if sub_list else "No CT-log subdomains found (domain may not use public CAs, or isn't indexed)."),
+    }
+
+
+def _execute_favicon_hash(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Fetch a site's favicon and compute its Shodan-compatible mmh3 hash — a
+    fingerprint of the app/stack. Pivot the hash in Shodan
+    (`http.favicon.hash:<n>`) to find EVERY other host on the internet serving
+    the same favicon: an org's other properties, staging mirrors, and
+    forgotten infra sharing the same build. One of the highest-leverage ways to
+    find assets other hunters never connect. One gentle GET, scope-gated."""
+    raw = str(args.get("url") or args.get("domain") or target.name).strip()
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    # Favicon lives at the site root unless a full icon URL was passed.
+    fav_url = raw if re.search(r"\.(ico|png|svg)(\?|$)", parsed.path, re.I) else f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+
+    rules = getattr(target, "scope_rules", None)
+    allowed, reason = is_in_scope(fav_url, rules)
+    if not allowed:
+        return {"status": "out_of_scope", "note": f"{fav_url} out of scope ({reason})."}
+    try:
+        r = requests.get(fav_url, timeout=10, verify=False, allow_redirects=True,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; recon-favicon/1.0)"})
+    except requests.RequestException as e:
+        return {"error": f"favicon fetch failed: {e}", "favicon_url": fav_url}
+    if r.status_code != 200 or not r.content:
+        return {"status": "no_favicon", "favicon_url": fav_url,
+                "note": f"No favicon at {fav_url} (HTTP {r.status_code})."}
+
+    b64 = base64.encodebytes(r.content)  # Shodan hashes the base64 (with newlines)
+    fav_hash = _mmh3_x86_32(b64)
+    import hashlib
+    return {
+        "status": "success",
+        "favicon_url": fav_url,
+        "favicon_hash": fav_hash,
+        "md5": hashlib.md5(r.content).hexdigest(),
+        "bytes": len(r.content),
+        "shodan_query": f"http.favicon.hash:{fav_hash}",
+        "note": (f"Shodan-pivot this: search `http.favicon.hash:{fav_hash}` to find every host serving the "
+                 "same favicon — related/forgotten org assets sharing this build."),
+    }
+
+
+def _execute_asn_expand(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Expand a host to its ASN and the owning org's full set of announced IP
+    prefixes (CIDRs) via RIPEstat — free, no key, PURE OSINT (queries RIPEstat,
+    never the target, so safe on strict/fragile programs). The org's other
+    hosts live in those netblocks; enumerating them finds assets a hunter who
+    only touched the one given hostname never sees. Only act on ranges whose
+    hosts are actually in scope."""
+    raw = str(args.get("host") or args.get("domain") or args.get("ip") or target.name).strip()
+    if raw.startswith(("http://", "https://")):
+        raw = urlparse(raw).netloc
+    host = raw.split(":")[0]
+    # Resolve to an IP (ASN lookups key on the address).
+    try:
+        ip = host if re.match(r"^\d+\.\d+\.\d+\.\d+$", host) else socket.gethostbyname(host)
+    except Exception as e:
+        return {"error": f"could not resolve {host}: {e}"}
+
+    def _ripe(path: str) -> Dict[str, Any]:
+        try:
+            r = requests.get(f"https://stat.ripe.net/data/{path}", timeout=20,
+                            headers={"User-Agent": "recon-asn/1.0"})
+            if r.status_code == 200:
+                return r.json().get("data", {}) or {}
+        except Exception:
+            return {}
+        return {}
+
+    net = _ripe(f"network-info/data.json?resource={ip}")
+    asns = net.get("asns", []) or []
+    prefix = net.get("prefix", "")
+    holder = ""
+    prefixes: List[str] = []
+    for asn in asns[:2]:
+        meta = _ripe(f"as-overview/data.json?resource=AS{asn}")
+        if meta.get("holder"):
+            holder = meta["holder"]
+        ann = _ripe(f"announced-prefixes/data.json?resource=AS{asn}")
+        for p in (ann.get("prefixes", []) or []):
+            pfx = p.get("prefix")
+            if pfx and pfx not in prefixes:
+                prefixes.append(pfx)
+
+    if emit and hasattr(emit, "info"):
+        try:
+            emit.info(f"ASN: {ip} -> AS{asns[0] if asns else '?'} ({holder or 'unknown'}), {len(prefixes)} prefix(es)")
+        except Exception:
+            pass
+    return {
+        "status": "success",
+        "host": host,
+        "ip": ip,
+        "asns": asns,
+        "holder": holder,
+        "containing_prefix": prefix,
+        "announced_prefixes": prefixes[:200],
+        "prefix_count": len(prefixes),
+        "note": (f"AS{asns[0]} ({holder}) announces {len(prefixes)} prefix(es). Other org hosts live in these "
+                 "ranges — but only enumerate/probe IPs that are actually IN SCOPE." if asns else
+                 "No ASN data from RIPEstat (host may be behind a CDN/cloud whose ASN isn't the org's)."),
     }
 
 

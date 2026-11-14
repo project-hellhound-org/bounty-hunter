@@ -546,6 +546,143 @@ def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
     }
 
 
+# A compact, high-value common-parameter list (arjun-style). Hidden/unlinked
+# params are attack surface a crawler never sees — IDOR ids, SSRF urls, file
+# reads, debug/admin toggles, redirects.
+_COMMON_PARAMS = [
+    "id", "user", "user_id", "userid", "uid", "account", "account_id", "customer",
+    "profile", "member", "page", "p", "pid", "cat", "category", "item", "item_id",
+    "product", "product_id", "order", "order_id", "invoice", "doc", "document",
+    "file", "filename", "path", "dir", "folder", "download", "attachment", "url",
+    "uri", "link", "redirect", "redirect_url", "return", "return_url", "returnurl",
+    "next", "continue", "dest", "destination", "callback", "jsonp", "domain", "host",
+    "site", "server", "ip", "port", "proxy", "fetch", "load", "src", "source",
+    "image", "img", "img_url", "avatar", "q", "query", "search", "s", "keyword",
+    "term", "filter", "sort", "order_by", "limit", "offset", "start", "count",
+    "token", "access_token", "api_key", "apikey", "key", "secret", "auth", "session",
+    "sid", "ref", "referrer", "email", "mail", "name", "username", "role", "admin",
+    "is_admin", "debug", "test", "dev", "preview", "edit", "action", "cmd", "command",
+    "exec", "func", "function", "method", "type", "mode", "format", "view", "template",
+    "lang", "locale", "country", "region", "currency", "amount", "price", "qty",
+    "status", "state", "flag", "enable", "disable", "show", "hide", "data", "json",
+    "xml", "code", "hash", "sig", "signature", "nonce", "timestamp", "date", "year",
+]
+
+
+def _req_simple(url: str, params: Dict[str, str], method: str, headers: Dict[str, str], timeout: int = 8):
+    try:
+        if method == "POST":
+            return requests.post(url, data=params, timeout=timeout, verify=False,
+                                 allow_redirects=False, headers=headers)
+        return requests.get(url, params=params, timeout=timeout, verify=False,
+                           allow_redirects=False, headers=headers)
+    except Exception:
+        return None
+
+
+def _execute_param_discover(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Find HIDDEN / unlinked request parameters on an endpoint (arjun-style) —
+    the IDOR id, SSRF url, file-read path, or debug toggle the server accepts
+    but never links, which a crawler can't see. Sends a unique canary across
+    BATCHES of candidate params and flags the ones that change the response:
+    reflected value, status change, or significant length delta; triggering
+    batches are isolated param-by-param to name the exact one.
+
+    Gentle by design: scope-gated, batched (few requests), capped. Great on a
+    live endpoint found by recon to expand the testable surface."""
+    url = str(args.get("url") or args.get("target") or "").strip()
+    if not url:
+        return {"error": "param_discover needs a 'url' (a specific endpoint to test)."}
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    rules = getattr(target, "scope_rules", None)
+    allowed, reason = is_in_scope(url, rules)
+    if not allowed:
+        return {"status": "out_of_scope", "note": f"{url} is out of scope — not probing ({reason})."}
+
+    method = str(args.get("method") or "GET").upper()
+    headers = merge_global_context({})
+    import secrets as _secrets
+    canary = "hhpx" + _secrets.token_hex(4)
+
+    # wordlist = common + anything already discovered + caller extras, deduped.
+    extra = args.get("params") or args.get("wordlist") or []
+    if isinstance(extra, str):
+        extra = re.split(r"[,\s]+", extra)
+    state_params = []
+    if hasattr(target, "state") and isinstance(target.state, dict):
+        sp = target.state.get("parameters") or target.state.get("params") or []
+        if isinstance(sp, list):
+            state_params = [str(x) for x in sp]
+    words = list(dict.fromkeys([w for w in (_COMMON_PARAMS + state_params + list(extra)) if w and str(w).strip()]))
+    cap = max(1, min(int(args.get("limit", 160) or 160), 400))
+    words = words[:cap]
+
+    base = _req_simple(url, {}, method, headers)
+    if base is None:
+        return {"error": f"baseline request to {url} failed — endpoint unreachable."}
+    base_len = len(base.text or "")
+    base_status = base.status_code
+    # noise-tolerant length threshold (dynamic tokens/timestamps shift a little)
+    len_thresh = max(60, int(base_len * 0.02))
+
+    def _evidence(r):
+        if r is None:
+            return []
+        ev = []
+        if canary in (r.text or ""):
+            ev.append("reflected")
+        if r.status_code != base_status:
+            ev.append(f"status {base_status}->{r.status_code}")
+        if abs(len(r.text or "") - base_len) > len_thresh:
+            ev.append(f"length {base_len}->{len(r.text or '')}")
+        return ev
+
+    found = []
+    chunk = 25
+    isolations = 0
+    for i in range(0, len(words), chunk):
+        batch = words[i:i + chunk]
+        r = _req_simple(url, {w: canary for w in batch}, method, headers)
+        if not _evidence(r) or isolations > 8:
+            continue
+        isolations += 1
+        # isolate which param(s) in this batch actually did it
+        for w in batch:
+            rr = _req_simple(url, {w: canary}, method, headers)
+            ev = _evidence(rr)
+            if ev:
+                found.append({"param": w, "evidence": ev, "status": rr.status_code})
+        if emit and hasattr(emit, "info"):
+            try:
+                emit.info(f"param_discover: {len(found)} candidate param(s) so far")
+            except Exception:
+                pass
+
+    # persist for later fuzzing/map_surface
+    try:
+        if found and hasattr(target, "state") and isinstance(target.state, dict):
+            known = target.state.setdefault("parameters", [])
+            for f in found:
+                if f["param"] not in known:
+                    known.append(f["param"])
+            save_target(target)
+    except Exception:
+        pass
+
+    return {
+        "status": "success",
+        "url": url,
+        "method": method,
+        "tested": len(words),
+        "found": found,
+        "found_count": len(found),
+        "note": (f"{len(found)} hidden param(s) the endpoint reacts to — test these for IDOR/SSRF/LFI/redirect/"
+                 "mass-assignment per their names." if found else
+                 "No hidden params reacted — the endpoint ignores unknown params, or try method=POST / a bigger limit."),
+    }
+
+
 def _execute_tls_cert_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Scan and parse TLS/SSL certificate SANs and CNs using tlsx to discover related infrastructure."""
     raw_target = args.get("hosts") or args.get("target") or args.get("domains") or target.name
