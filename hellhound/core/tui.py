@@ -1222,7 +1222,14 @@ class HellhoundApp(App):
         self.add_user_message(line)
         self._cancel_event = threading.Event()
         try:
-            self.query_one("#working", WorkingIndicator).start()
+            # A slash command runs locally (dispatch, no model) — pin a plain
+            # "Running /cmd" label instead of the AI "picking up the scent…"
+            # phrase rotation, which only makes sense while the model is thinking.
+            if _looks_like_command(line):
+                cmd = line.strip().lstrip("/").split()[0] if line.strip().lstrip("/") else "command"
+                self.query_one("#working", WorkingIndicator).start(label=f"Running /{cmd}")
+            else:
+                self.query_one("#working", WorkingIndicator).start()
         except Exception:
             pass
         self.run_turn(line)
@@ -1483,6 +1490,11 @@ def _looks_like_command(line: str) -> bool:
 
 def start_tui_session(initial_target: Optional[str] = None) -> None:
     """Launch the Textual interactive terminal."""
+    # Tell every command that blocking stdin prompts (input()/getpass) are
+    # unavailable: this full-screen app owns the terminal, so a stdin read would
+    # hang the worker thread forever (the `/setup` freeze). Interactive prompts
+    # degrade to non-interactive defaults; the UI surfaces a command to run.
+    os.environ["BEAST_TUI"] = "1"
     try:
         HellhoundApp(initial_target=initial_target).run()
     except KeyboardInterrupt:

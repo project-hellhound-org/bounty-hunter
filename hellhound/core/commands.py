@@ -60,7 +60,25 @@ RECON_API_KEY_INFO: Dict[str, Dict[str, str]] = {
 }
 
 
+def _stdin_interactive() -> bool:
+    """True only when a blocking `input()` prompt will actually work.
+
+    False inside the full-screen Textual TUI: it owns the terminal in raw mode,
+    so a stdin read blocks the worker thread FOREVER (the keystrokes go to
+    Textual, never to input()) — which froze the whole UI mid-`/setup`. The TUI
+    exports BEAST_TUI=1 so every command's interactive prompt degrades to a
+    non-interactive default instead of hanging. Also false for non-tty/headless."""
+    if os.environ.get("BEAST_TUI") or os.environ.get("HELLHOUND_TUI"):
+        return False
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except Exception:
+        return False
+
+
 def _interactive_prompt(prompt_text: str) -> str:
+    if not _stdin_interactive():
+        return ""  # TUI / headless — never block on stdin
     print(f"\033[93m[?]\033[0m {prompt_text}")
     try:
         val = input("> ").strip()
@@ -70,6 +88,8 @@ def _interactive_prompt(prompt_text: str) -> str:
 
 
 def _interactive_prompt_multiline(prompt_text: str) -> str:
+    if not _stdin_interactive():
+        return ""  # TUI / headless — never block on stdin
     print(f"\033[93m[?]\033[0m {prompt_text}")
     lines = []
     try:
@@ -847,7 +867,7 @@ def handle_scope(args: List[str], session_context: Dict[str, Any], emit: Any) ->
     target_name = sanitize_target_name(target_name)
     session_context["target"] = target_name
 
-    if target_name == "default" and not is_json and sys.stdin.isatty():
+    if target_name == "default" and not is_json and _stdin_interactive():
         target_name = _interactive_prompt("No target is currently active. Which target is this scope for? (type a domain)")
         if not target_name:
             msg = "No target specified. Usage: /scope [show | clear | <rules_text>]"
@@ -1471,7 +1491,7 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
 
     # ── Subcommand: /model set-key <provider> <api_key> ──────────────
     if clean_args and clean_args[0] == "set-key":
-        if len(clean_args) < 3 and not is_json and sys.stdin.isatty():
+        if len(clean_args) < 3 and not is_json and _stdin_interactive():
             provider = ""
             if len(clean_args) >= 2:
                 provider = clean_args[1].lower()
@@ -1555,7 +1575,7 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         clean_args = clean_args[1:]
 
     if not clean_args:
-        if not is_json and sys.stdin.isatty():
+        if not is_json and _stdin_interactive():
             model_spec = _interactive_prompt(f"Enter model for {target_role or 'both tiers'} (e.g., 'gemini gemini-2.5-flash' or 'ollama qwen2.5:3b'):")
             if model_spec:
                 clean_args = model_spec.split()
@@ -1584,7 +1604,7 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
                 prov_hint = "gemini"
 
         if prov_hint is None:
-            if not is_json and sys.stdin.isatty():
+            if not is_json and _stdin_interactive():
                 ans = _interactive_prompt(f"Provider for '{new_model}' could not be determined. Enter provider (ollama, nvidia, openai, gemini, anthropic):")
                 if ans.strip().lower() in KNOWN_PROVIDERS:
                     prov_hint = ans.strip().lower()
@@ -1612,7 +1632,7 @@ def handle_model(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         if not has_key and os.environ.get(env_map.get(prov_hint, ""), ""):
             has_key = True
         if not has_key:
-            if not is_json and sys.stdin.isatty():
+            if not is_json and _stdin_interactive():
                 ans = _interactive_prompt(f"No API key configured for '{prov_hint}'. Enter API key now (blank to skip):")
                 if ans.strip():
                     cfg.setdefault("api_keys", {})[prov_hint] = ans.strip()
@@ -1694,7 +1714,7 @@ def handle_headers(args: List[str], session_context: Dict[str, Any], emit: Any) 
                 emit.info("No custom global headers set.")
         
         # Interactive prompt for setting a header if in interactive terminal
-        if not is_json and sys.stdin.isatty():
+        if not is_json and _stdin_interactive():
             new_header = _interactive_prompt("Enter a header to add in Header-Name: Value format (blank to skip):")
             if new_header:
                 clean_args = [new_header]
@@ -1715,7 +1735,7 @@ def handle_headers(args: List[str], session_context: Dict[str, Any], emit: Any) 
         return {"status": "success", "headers": headers}
     else:
         # Check if interactive and prompt for value
-        if not is_json and sys.stdin.isatty():
+        if not is_json and _stdin_interactive():
             header_name = raw.strip()
             header_val = _interactive_prompt(f"Enter the value for header '{header_name}':")
             if header_val:
@@ -2001,7 +2021,7 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
 
         url = sub[0] if sub else ""
         if not url:
-            if not is_json and sys.stdin.isatty():
+            if not is_json and _stdin_interactive():
                 url = _interactive_prompt(
                     "Burp's MCP tab -> \"Server host\" / \"Server port\" (default http://127.0.0.1:9876):"
                 ) or "http://127.0.0.1:9876"
@@ -2136,7 +2156,7 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
         if sub and sub[0].lower() == "token":
             token = sub[1] if len(sub) >= 2 else ""
             if not token:
-                if not is_json and sys.stdin.isatty():
+                if not is_json and _stdin_interactive():
                     try:
                         import getpass
                         token = getpass.getpass(
@@ -2155,13 +2175,13 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
             url = sub[0] if sub else (existing.get("url") or "")
             token = sub[1] if len(sub) >= 2 else ""
             if not url:
-                if not is_json and sys.stdin.isatty():
+                if not is_json and _stdin_interactive():
                     url = _interactive_prompt("Caido GraphQL URL (default http://localhost:8080/graphql):") or "http://localhost:8080/graphql"
                 else:
                     url = "http://localhost:8080/graphql"
             if not token:
                 token = existing.get("token", "")
-                if not token and not is_json and sys.stdin.isatty():
+                if not token and not is_json and _stdin_interactive():
                     try:
                         import getpass
                         token = getpass.getpass(
@@ -2504,7 +2524,7 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         if first in ("auto-install", "autoinstall") or (first == "tools" and len(clean_args) > 1 and clean_args[1].lower() in ("auto-install", "autoinstall")):
             action = clean_args[-1].lower()
             known_actions = {"on", "true", "1", "enable", "enabled", "off", "false", "0", "disable", "disabled"}
-            if action not in known_actions and not is_json and sys.stdin.isatty():
+            if action not in known_actions and not is_json and _stdin_interactive():
                 ans = _interactive_prompt("Enable tool auto-installation? (y/n)")
                 action = "on" if ans.lower() in ("y", "yes") else "off"
 
@@ -2570,7 +2590,7 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
             provider = clean_args[1].lower() if len(clean_args) >= 2 else ""
             key = clean_args[2] if len(clean_args) >= 3 else ""
 
-            if not provider and not is_json and sys.stdin.isatty():
+            if not provider and not is_json and _stdin_interactive():
                 names = ", ".join(RECON_API_KEY_INFO.keys())
                 provider = _interactive_prompt(f"Which tool's key? ({names}):").lower()
             if provider not in RECON_API_KEY_INFO:
@@ -2579,7 +2599,7 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
                     emit.info("Usage: /setup set-key <tool> <api_key>")
                 return {"status": "error", "error": "unknown_provider", "provider": provider}
 
-            if not key and not is_json and sys.stdin.isatty():
+            if not key and not is_json and _stdin_interactive():
                 info = RECON_API_KEY_INFO[provider]
                 emit.info(f"Don't have one? Get it at: {info['signup_url']}  ({info['where']})")
                 key = _interactive_prompt(f"Enter API key for {info['label']}:")
@@ -2665,10 +2685,18 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
             else:
                 emit(f"    [bold red][✗][/bold red] {tool_name:<14} ({info['type']}) -> Missing! Install: {info['install']}")
 
+        if tool_status["missing_pd"] or tool_status["missing_other"]:
+            # The RIGHT way to install: `/setup tools install-all` runs each
+            # install through the beast environment itself (pip tools land in
+            # ~/.beast-env, Go tools in your GOPATH bin) and Beast picks them up
+            # automatically. Running the raw `pip install` below in a plain
+            # shell installs into the WRONG python and Beast won't see it.
+            emit("\n  [bold green][*] Install all missing tools INTO the beast env:[/bold green] `/setup tools install-all`")
+            emit("      (or turn on `/setup tools auto-install on` to grab them on demand)")
         if tool_status["missing_pd"]:
-            emit(f"\n  [bold yellow][*] Bulk ProjectDiscovery Install:[/bold yellow] `{tool_status['combined_pd_install']}`")
+            emit(f"  [dim][*] Manual ProjectDiscovery bulk install:[/dim] `{tool_status['combined_pd_install']}`")
         if tool_status["missing_other"]:
-            emit("  [bold yellow][*] Standalone Installs:[/bold yellow]")
+            emit("  [dim][*] Manual standalone installs (pip tools need the beast env's pip — `~/.beast-env/bin/pip`):[/dim]")
             for t in tool_status["missing_other"]:
                 emit(f"    - {t}: `{tool_status['tools'][t]['install']}`")
 
@@ -2738,24 +2766,29 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         emit("    /setup max-iterations <n>               — cap tool-call iterations per turn")
         emit("  Run /help for the full command catalog, or /help skills for the methodology library.")
 
-        if (tool_status["missing_pd"] or tool_status["missing_other"]) and not is_json and sys.stdin.isatty():
-            ans = _interactive_prompt("Some binary tools are missing. Would you like to install them now? (y/n)")
-            if ans.lower() in ("y", "yes"):
-                emit.banner("INSTALLING MISSING TOOLS")
-                still_missing = []
-                for t in tool_status["missing_pd"] + tool_status["missing_other"]:
-                    ok = try_install(t, emit=emit)
-                    if ok:
-                        emit.success(f"[✓] {t} installed.")
-                    else:
-                        still_missing.append(t)
-                        emit.warn(f"[✗] {t} still missing — see the error above (or install it manually).")
-                tool_status = check_all_tools()
-                status["tools"] = tool_status
-                if still_missing:
-                    emit.warn(f"\n{len(still_missing)} tool(s) could not be auto-installed: {', '.join(still_missing)}. Run `/setup` again to recheck after installing manually.")
+        if (tool_status["missing_pd"] or tool_status["missing_other"]) and not is_json:
+            if _stdin_interactive():
+                ans = _interactive_prompt("Some binary tools are missing. Would you like to install them now? (y/n)")
+                if ans.lower() in ("y", "yes"):
+                    emit.banner("INSTALLING MISSING TOOLS")
+                    still_missing = []
+                    for t in tool_status["missing_pd"] + tool_status["missing_other"]:
+                        ok = try_install(t, emit=emit)
+                        if ok:
+                            emit.success(f"[✓] {t} installed.")
+                        else:
+                            still_missing.append(t)
+                            emit.warn(f"[✗] {t} still missing — see the error above (or install it manually).")
+                    tool_status = check_all_tools()
+                    status["tools"] = tool_status
+                    if still_missing:
+                        emit.warn(f"\n{len(still_missing)} tool(s) could not be auto-installed: {', '.join(still_missing)}. Run `/setup` again to recheck after installing manually.")
+            else:
+                # TUI / headless — can't do a blocking y/n here (it would freeze
+                # the UI). Point at the non-interactive installer instead.
+                emit.info("Run `/setup tools install-all` to install the missing tools into the beast env now.")
 
-        if missing_recon_keys and not is_json and sys.stdin.isatty():
+        if missing_recon_keys and not is_json and _stdin_interactive():
             ans = _interactive_prompt(f"Set up recon tool API key(s) now? ({', '.join(missing_recon_keys)}) (y/n)")
             if ans.lower() in ("y", "yes"):
                 for key_name in missing_recon_keys:
