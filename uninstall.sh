@@ -53,9 +53,15 @@ LOCAL_BIN_LINK="$HOME/.local/bin/beast"
 LEGACY_LOCAL_BIN_LINK="$HOME/.local/bin/hellhound"
 GLOBAL_BIN_LINK="/usr/local/bin/beast"
 LEGACY_GLOBAL_BIN_LINK="/usr/local/bin/hellhound"
-DESKTOP_FILE="$HOME/.local/share/applications/hellhound.desktop"
-DATA_ICON_DIR="$HOME/.local/share/hellhound"
-ICON_FILE="$HOME/.local/share/icons/hellhound.png"
+DESKTOP_FILE="$HOME/.local/share/applications/beast.desktop"
+DATA_ICON_DIR="$HOME/.local/share/beast"
+ICON_FILE="$HOME/.local/share/icons/beast.png"
+LAUNCH_WRAPPER="$HOME/.local/bin/beast-launch.sh"
+# Pre-rename "hellhound" assets, removed if an older install left them behind.
+LEGACY_DESKTOP_FILE="$HOME/.local/share/applications/hellhound.desktop"
+LEGACY_DATA_ICON_DIR="$HOME/.local/share/hellhound"
+LEGACY_ICON_FILE="$HOME/.local/share/icons/hellhound.png"
+LEGACY_LAUNCH_WRAPPER="$HOME/.local/bin/hellhound-launch.sh"
 GOWITNESS_LOCAL="$HOME/.local/bin/gowitness"
 
 if [ "$(basename "${SHELL:-bash}")" = "zsh" ]; then
@@ -123,10 +129,18 @@ for _glink in "$GLOBAL_BIN_LINK" "$LEGACY_GLOBAL_BIN_LINK"; do
     fi
 done
 
-# ── Remove desktop integration ──────────────────────────
+# ── Remove desktop integration (current + legacy "hellhound" assets) ────
 [ -f "$DESKTOP_FILE" ] && rm -f "$DESKTOP_FILE" && success "Removed desktop entry: $DESKTOP_FILE"
 [ -d "$DATA_ICON_DIR" ] && rm -rf "$DATA_ICON_DIR" && success "Removed icon assets: $DATA_ICON_DIR"
 [ -f "$ICON_FILE" ] && rm -f "$ICON_FILE" && success "Removed icon: $ICON_FILE"
+[ -f "$LAUNCH_WRAPPER" ] && rm -f "$LAUNCH_WRAPPER" && success "Removed launcher: $LAUNCH_WRAPPER"
+rm -f "$HOME/.local/share/pixmaps/beast.png" 2>/dev/null || true
+for _legacy in "$LEGACY_DESKTOP_FILE" "$LEGACY_ICON_FILE" "$LEGACY_LAUNCH_WRAPPER" \
+               "$HOME/.local/share/pixmaps/hellhound.png"; do
+    [ -f "$_legacy" ] && rm -f "$_legacy" && success "Removed legacy asset: $_legacy"
+done
+[ -d "$LEGACY_DATA_ICON_DIR" ] && rm -rf "$LEGACY_DATA_ICON_DIR" && success "Removed legacy icon assets: $LEGACY_DATA_ICON_DIR"
+rm -f /usr/local/bin/beast-launch.sh /usr/local/bin/hellhound-launch.sh 2>/dev/null || true
 if command -v update-desktop-database &>/dev/null; then
     update-desktop-database "$HOME/.local/share/applications/" &>/dev/null || true
 fi

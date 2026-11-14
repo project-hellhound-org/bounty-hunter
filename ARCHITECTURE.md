@@ -158,7 +158,7 @@ Hellhound is CLI-first, with two ways to drive it:
 * **Interactive Terminal UI (`hellhound/core/chat_ui.py`)**: Full-featured CLI environment with real-time token streaming, rich Markdown formatting, command autocomplete, and live progress drawers.
 * **Headless CLI Runner (`hellhound -p "..."`)**: Direct one-line command execution for scripts and CI/CD pipelines, routed through the same central dispatcher (`hellhound/core/commands.py`) as the interactive console.
 
-A desktop launcher entry (`packaging/hellhound.desktop`) is still installed for discoverability in application menus — it has no separate windowed app behind it; `Terminal=true` simply opens the user's default terminal running the same `hellhound` CLI, the same way tools like `xfreerdp` get a menu entry without being a GUI app themselves.
+A desktop launcher entry (`packaging/beast.desktop`, shown as **Beast** in the app menu) is still installed for discoverability in application menus — it has no separate windowed app behind it; its `Exec=beast-launch.sh` wrapper opens the user's preferred terminal running the same `beast` CLI, the same way tools like `xfreerdp` get a menu entry without being a GUI app themselves.
 
 ---
 

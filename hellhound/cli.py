@@ -156,7 +156,7 @@ def upgrade():
 
 
 # -------------------------------------------------
-# Terminal preference (used by packaging/hellhound-launch.sh, the desktop
+# Terminal preference (used by packaging/beast-launch.sh, the desktop
 # launcher's entry point) — NOT read by the console itself. Stored as a
 # plain one-line file, not config.json, so the bash wrapper can read it
 # with `cat` before Python (and the venv) is even on the critical path.

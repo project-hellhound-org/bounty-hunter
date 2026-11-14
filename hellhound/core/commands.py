@@ -3217,12 +3217,12 @@ def handle_uninstall(args: List[str], session_context: Dict[str, Any], emit: Any
 
     home = Path.home()
     plan = {
-        "venv": home / ".hellhound-env",
-        "local_bin_symlink": home / ".local" / "bin" / "hellhound",
-        "global_bin_symlink": Path("/usr/local/bin/hellhound"),
-        "desktop_entry": home / ".local" / "share" / "applications" / "hellhound.desktop",
-        "icon_assets": home / ".local" / "share" / "hellhound",
-        "icon_file": home / ".local" / "share" / "icons" / "hellhound.png",
+        "venv": home / ".beast-env",
+        "local_bin_symlink": home / ".local" / "bin" / "beast",
+        "global_bin_symlink": Path("/usr/local/bin/beast"),
+        "desktop_entry": home / ".local" / "share" / "applications" / "beast.desktop",
+        "icon_assets": home / ".local" / "share" / "beast",
+        "icon_file": home / ".local" / "share" / "icons" / "beast.png",
         "config_and_data": home / ".beast",
     }
     existing = {k: str(v) for k, v in plan.items() if v.exists() or v.is_symlink()}

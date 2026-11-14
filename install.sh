@@ -389,8 +389,16 @@ fi
 
 # ── 7. Desktop Launcher (opens the CLI in a terminal) ──
 echo ""
-info "Registering HELLHOUND as a desktop application..."
-mkdir -p "$HOME/.local/share/applications" "$HOME/.local/share/hellhound" "$HOME/.local/share/icons/hicolor/512x512/apps" "$HOME/.local/share/pixmaps"
+info "Registering Beast as a desktop application..."
+mkdir -p "$HOME/.local/share/applications" "$HOME/.local/share/beast" "$HOME/.local/share/icons/hicolor/512x512/apps" "$HOME/.local/share/pixmaps"
+
+# Migrate away from the old "hellhound" branding so an upgrading user doesn't
+# end up with TWO menu entries (the stale HELLHOUND one + the new Beast one).
+rm -f "$HOME/.local/share/applications/hellhound.desktop" \
+      "$HOME/.local/bin/hellhound-launch.sh" \
+      "$HOME/.local/share/icons/hellhound.png" \
+      "$HOME/.local/share/pixmaps/hellhound.png" 2>/dev/null || true
+rm -f /usr/local/bin/hellhound-launch.sh 2>/dev/null || true
 
 # Ensure stable icon location (copied, not symlinked)
 if [ -f "$PROJECT_ROOT/Images/logo.png" ]; then
@@ -398,9 +406,9 @@ if [ -f "$PROJECT_ROOT/Images/logo.png" ]; then
 else
     ICON_SRC="$PROJECT_ROOT/Images/hellhound.png"
 fi
-cp "$ICON_SRC" "$HOME/.local/share/hellhound/logo.png" 2>/dev/null || true
-cp "$ICON_SRC" "$HOME/.local/share/icons/hellhound.png" 2>/dev/null || true
-cp "$ICON_SRC" "$HOME/.local/share/pixmaps/hellhound.png" 2>/dev/null || true
+cp "$ICON_SRC" "$HOME/.local/share/beast/logo.png" 2>/dev/null || true
+cp "$ICON_SRC" "$HOME/.local/share/icons/beast.png" 2>/dev/null || true
+cp "$ICON_SRC" "$HOME/.local/share/pixmaps/beast.png" 2>/dev/null || true
 
 # Generate hicolor icon hierarchy for Linux application launchers (best-effort
 # — only runs if Pillow happens to be available; a missing Pillow just means
@@ -419,31 +427,31 @@ if os.path.exists(src):
         for s in [16, 24, 32, 48, 64, 128, 256, 512]:
             d = os.path.join(base, f'{s}x{s}', 'apps')
             os.makedirs(d, exist_ok=True)
-            img.resize((s, s), Image.Resampling.LANCZOS).save(os.path.join(d, 'hellhound.png'))
+            img.resize((s, s), Image.Resampling.LANCZOS).save(os.path.join(d, 'beast.png'))
         os.makedirs(os.path.join(base, 'scalable', 'apps'), exist_ok=True)
-        img.save(os.path.join(base, 'scalable', 'apps', 'hellhound.png'))
+        img.save(os.path.join(base, 'scalable', 'apps', 'beast.png'))
     except Exception: pass
 " 2>/dev/null || true
 
-# Install the terminal-aware launcher wrapper alongside the `hellhound`
+# Install the terminal-aware launcher wrapper alongside the `beast`
 # symlink so it's resolvable by bare name from Exec=. This wrapper picks an
-# explicit terminal emulator (user preference, via `hellhound terminal set`,
+# explicit terminal emulator (user preference, via `beast terminal set`,
 # or auto-detected) instead of relying on Terminal=true's DE-default
 # handoff, which had no way to honor a user's own terminal choice (e.g.
 # ghostty) and no consistent starting window size.
-cp "$PROJECT_ROOT/packaging/hellhound-launch.sh" "$HOME/.local/bin/hellhound-launch.sh"
-chmod +x "$HOME/.local/bin/hellhound-launch.sh"
+cp "$PROJECT_ROOT/packaging/beast-launch.sh" "$HOME/.local/bin/beast-launch.sh"
+chmod +x "$HOME/.local/bin/beast-launch.sh"
 if [ -w "/usr/local/bin" ] 2>/dev/null; then
-    ln -sf "$HOME/.local/bin/hellhound-launch.sh" "/usr/local/bin/hellhound-launch.sh" 2>/dev/null || true
+    ln -sf "$HOME/.local/bin/beast-launch.sh" "/usr/local/bin/beast-launch.sh" 2>/dev/null || true
 elif command -v sudo &>/dev/null; then
-    sudo ln -sf "$HOME/.local/bin/hellhound-launch.sh" "/usr/local/bin/hellhound-launch.sh" 2>/dev/null || true
+    sudo ln -sf "$HOME/.local/bin/beast-launch.sh" "/usr/local/bin/beast-launch.sh" 2>/dev/null || true
 fi
 
 # Install .desktop file. Exec points at the wrapper above (Terminal=false —
 # the wrapper opens its own terminal window itself, so the desktop
 # environment doesn't need to supply one).
-cp "$PROJECT_ROOT/packaging/hellhound.desktop" "$HOME/.local/share/applications/hellhound.desktop"
-chmod +x "$HOME/.local/share/applications/hellhound.desktop"
+cp "$PROJECT_ROOT/packaging/beast.desktop" "$HOME/.local/share/applications/beast.desktop"
+chmod +x "$HOME/.local/share/applications/beast.desktop"
 
 # Update system desktop database & GTK icon cache for app menu visibility
 if command -v gtk-update-icon-cache &>/dev/null; then
@@ -452,9 +460,9 @@ fi
 if command -v update-desktop-database &>/dev/null; then
     update-desktop-database "$HOME/.local/share/applications/" &>/dev/null || true
 fi
-touch "$HOME/.local/share/applications/hellhound.desktop"
+touch "$HOME/.local/share/applications/beast.desktop"
 
-success "HELLHOUND registered — search for it in your application menu (opens the CLI in a terminal)."
+success "Beast registered — search for it in your application menu (opens the CLI in a terminal)."
 
 # ── 8. Done ──────────────────────────────────────────
 echo ""

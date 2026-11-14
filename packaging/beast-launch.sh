@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hellhound-launch.sh
+# beast-launch.sh
 #
 # Invoked by the .desktop entry instead of relying on Terminal=true.
 # Terminal=true just hands off to whatever the desktop environment resolves
@@ -7,12 +7,13 @@
 # and users on GNOME/KDE/i3/etc. all land on different apps. This script
 # picks the terminal explicitly:
 #
-#   1. $HELLHOUND_TERMINAL env var, if set (one-off override)
+#   1. $BEAST_TERMINAL env var, if set (one-off override; the older
+#      $HELLHOUND_TERMINAL name is still honored for back-compat)
 #   2. ~/.beast/terminal_preference, if set (persistent, via
-#      `hellhound terminal set <name>`)
+#      `beast terminal set <name>`)
 #   3. First terminal found from a priority list of common emulators
 #   4. x-terminal-emulator (Debian/Ubuntu alternatives system)
-#   5. Terminal=true-style fallback: just exec hellhound in whatever
+#   5. Terminal=true-style fallback: just exec beast in whatever
 #      controlling terminal this script already has (covers the case where
 #      it's launched from inside a terminal, not the app menu)
 #
@@ -72,12 +73,13 @@ launch_with() {
     esac
 }
 
-# 1. Explicit one-off override
-if [ -n "$HELLHOUND_TERMINAL" ] && command -v "$HELLHOUND_TERMINAL" &>/dev/null; then
-    launch_with "$HELLHOUND_TERMINAL"
+# 1. Explicit one-off override (BEAST_TERMINAL; fall back to the legacy name)
+OVERRIDE_TERMINAL="${BEAST_TERMINAL:-$HELLHOUND_TERMINAL}"
+if [ -n "$OVERRIDE_TERMINAL" ] && command -v "$OVERRIDE_TERMINAL" &>/dev/null; then
+    launch_with "$OVERRIDE_TERMINAL"
 fi
 
-# 2. Persistent user preference (set via `hellhound terminal set <name>`)
+# 2. Persistent user preference (set via `beast terminal set <name>`)
 if [ -f "$PREF_FILE" ]; then
     PREFERRED="$(tr -d '[:space:]' < "$PREF_FILE")"
     if [ -n "$PREFERRED" ] && command -v "$PREFERRED" &>/dev/null; then

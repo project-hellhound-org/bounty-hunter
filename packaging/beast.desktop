@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=HELLHOUND
+Name=Beast
 GenericName=Bug Bounty Reconnaissance & Triage Framework
 Comment=Autonomous AI bug bounty recon & triage assistant — opens the interactive terminal console
-Exec=beast
-Icon=hellhound
+Exec=beast-launch.sh
+Icon=beast
 Terminal=false
 Categories=Security;Network;System;Utility;
 Keywords=bugbounty;recon;pentest;security;hacking;osint;
