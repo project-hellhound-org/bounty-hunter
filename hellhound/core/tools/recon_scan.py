@@ -363,6 +363,77 @@ def _execute_subdomain_sweep(args: Dict[str, Any], target: Target, emit: Any) ->
     }
 
 
+_GENTLE_FLAGS = frozenset({"no-rate-limit-testing", "no-dos", "no-automated-scanners"})
+_HTTPX_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+
+def _probe_host_live(host: str, headers: Dict[str, str], timeout: int = 6) -> Optional[Dict[str, Any]]:
+    """Probe ONE host for a live web service — https first, then http — and
+    capture status/title/server. Returns None if neither scheme answers. Never
+    raises. A host that already carries a scheme is probed as-is."""
+    if host.startswith(("http://", "https://")):
+        schemes = [host]
+    else:
+        schemes = [f"https://{host}", f"http://{host}"]
+    for u in schemes:
+        try:
+            r = requests.get(u, timeout=timeout, verify=False, allow_redirects=True, headers=headers)
+            m = _HTTPX_TITLE_RE.search(r.text or "")
+            server = r.headers.get("Server", "")
+            return {
+                "url": u,
+                "status_code": r.status_code,
+                "title": (m.group(1).strip()[:140] if m else ""),
+                "tech": [server] if server else [],
+                "webserver": server,
+                "content_length": len(r.content) if r.content is not None else 0,
+                "location": r.headers.get("Location", ""),
+            }
+        except Exception:
+            continue
+    return None
+
+
+def _concurrent_http_probe(hosts: List[str], target: Target, emit: Any,
+                           cap: Optional[int] = None) -> List[Dict[str, Any]]:
+    """BATCH, concurrent HTTP liveness for a host list — the no-binary fallback
+    for httpx. Replaces the old sequential, 20-host-capped loop so a full
+    subdomain list actually gets probed. In-scope only (so a batch spanning
+    subdomains never touches an out-of-scope host), concurrency adapts to RoE
+    (low fan-out on fragile/strict programs), hard-capped."""
+    import concurrent.futures
+    rules = getattr(target, "scope_rules", None)
+    gentle = bool(set(getattr(rules, "disallowed", []) or []) & _GENTLE_FLAGS)
+    if cap is None:
+        cap = 60 if gentle else 150
+    workers = 6 if gentle else 20
+
+    in_scope: List[str] = []
+    for h in hosts:
+        probe_host = h if h.startswith(("http://", "https://")) else f"https://{h}"
+        allowed, _reason = is_in_scope(probe_host, rules)
+        if allowed:
+            in_scope.append(h)
+        if len(in_scope) >= cap:
+            break
+    if not in_scope:
+        return []
+    headers = merge_global_context({})
+    out: List[Dict[str, Any]] = []
+    workers = max(1, min(workers, len(in_scope)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for res in ex.map(lambda h: _probe_host_live(h, headers), in_scope):
+            if res:
+                out.append(res)
+                if emit and hasattr(emit, "info"):
+                    try:
+                        emit.info(f"[{res['status_code']}] {res['url']}"
+                                  + (f"  {res['title']}" if res.get("title") else ""))
+                    except Exception:
+                        pass
+    return out
+
+
 def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     raw_target = args.get("target") or target.name
     # CAUGHT IN THE WILD: this tool's own schema describes 'target' as
@@ -386,6 +457,28 @@ def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
     else:
         targets_to_probe = re.split(r"[,\s]+", str(raw_target).strip())
     targets_to_probe = [t for t in targets_to_probe if t]
+
+    # Scope-gate the host list BEFORE probing (binary OR fallback) — httpx often
+    # gets handed a whole subdomain list, which on a strict program (KWO) can
+    # include out-of-scope subdomains. Filtering here keeps BOTH paths in-scope.
+    _rules = getattr(target, "scope_rules", None)
+    if _rules is not None:
+        _kept, _dropped = [], 0
+        for _t in targets_to_probe:
+            _probe_host = _t if _t.startswith(("http://", "https://")) else f"https://{_t}"
+            _ok, _r = is_in_scope(_probe_host, _rules)
+            if _ok:
+                _kept.append(_t)
+            else:
+                _dropped += 1
+        if _dropped and emit and hasattr(emit, "info"):
+            try:
+                emit.info(f"httpx: skipped {_dropped} out-of-scope host(s)")
+            except Exception:
+                pass
+        targets_to_probe = _kept
+    if not targets_to_probe:
+        return {"count": 0, "live_hosts": [], "note": "No in-scope hosts to probe."}
 
     auto_install = bool(load_config().get("auto_install_missing_tools", False))
     check = ensure_tool("httpx", emit=emit, auto_install=auto_install)
@@ -421,29 +514,13 @@ def _execute_httpx(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
         except Exception as e:
             logger.warning(f"httpx binary failed: {e}")
 
-    # 2. Fallback to lightweight HTTP probe (runs if binary unavailable or returned no hosts)
+    # 2. Fallback to a CONCURRENT HTTP probe (runs if binary unavailable or
+    #    returned no hosts). The old fallback was sequential and capped at 20,
+    #    so a large subdomain list barely got sampled; this batch-probes the
+    #    whole in-scope list in parallel (https+http, title/server), bounded by
+    #    RoE so it stays polite on fragile infra.
     if not live_hosts:
-        for t in targets_to_probe[:20]:
-            host = t.strip()
-            if not host.startswith(("http://", "https://")):
-                urls = [f"https://{host}", f"http://{host}"]
-            else:
-                urls = [host]
-            for u in urls:
-                try:
-                    r = requests.get(u, timeout=5, verify=False, allow_redirects=True, headers=merge_global_context({}))
-                    live_hosts.append({
-                        "url": u,
-                        "status_code": r.status_code,
-                        "title": re.search(r'<title>(.*?)</title>', r.text, re.I).group(1).strip() if re.search(r'<title>(.*?)</title>', r.text, re.I) else "",
-                        "tech": [r.headers.get("Server")] if r.headers.get("Server") else [],
-                        "webserver": r.headers.get("Server", ""),
-                        "content_length": len(r.content) if r.content is not None else 0,
-                        "location": r.headers.get("Location", "")
-                    })
-                    break
-                except Exception:
-                    continue
+        live_hosts = _concurrent_http_probe(targets_to_probe, target, emit)
 
     # Update target state and investigation memory
     try:

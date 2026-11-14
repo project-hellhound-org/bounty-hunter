@@ -9369,6 +9369,126 @@ def _execute_map_surface(args: Dict[str, Any], target: Target, emit: Any) -> Dic
     return {"status": "success", **smap}
 
 
+def _execute_recon_pipeline(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Deterministic recon/enumeration pipeline — the backbone that chains the
+    individual recon tools in the RIGHT ORDER so enumeration is COMPLETE every
+    time, instead of depending on the model to remember all seven steps (the
+    proven failure mode: it would run one tool and call recon 'done').
+
+    Chains: subdomain discovery (crt.sh + subfinder) -> DNS resolve -> live web
+    host probe (httpx) -> robots/sitemap/security.txt -> wayback archive +
+    liveness -> consolidated, ranked asset inventory. Every sub-step is already
+    scope-gated and RoE-adaptive (gentle on fragile/strict programs), and each
+    is best-effort so one failure never kills the sweep. `passive_only=True`
+    skips everything that touches the target (discovery + resolve only)."""
+    from urllib.parse import urlparse as _urlparse
+    passive_only = bool(args.get("passive_only", False))
+
+    def _say(msg: str) -> None:
+        if emit and hasattr(emit, "section"):
+            try:
+                emit.section(msg)
+                return
+            except Exception:
+                pass
+        if emit and hasattr(emit, "info"):
+            try:
+                emit.info(msg)
+            except Exception:
+                pass
+
+    apex = str(args.get("domain") or target.name).strip()
+    if apex.startswith(("http://", "https://")):
+        apex = _urlparse(apex).netloc.split(":")[0]
+
+    inv: Dict[str, Any] = {
+        "apex": apex, "steps": [], "subdomains": [], "live_hosts": [],
+        "sensitive_live_paths": [], "contacts": [], "wayback_live": [],
+    }
+
+    # 1. Subdomain discovery — crt.sh (always works) + subfinder (if installed).
+    _say("recon 1/6 — subdomain discovery (crt.sh + subfinder)")
+    subs = set()
+    try:
+        crt = _execute_crtsh_subdomains({"domain": apex}, target, emit)
+        subs.update(crt.get("subdomains", []) or [])
+        inv["steps"].append({"crtsh": crt.get("count", 0)})
+    except Exception as e:
+        inv["steps"].append({"crtsh_error": f"{type(e).__name__}: {e}"})
+    try:
+        sf = _execute_subfinder({"domain": apex}, target, emit)
+        if isinstance(sf, dict) and not sf.get("error"):
+            subs.update(sf.get("subdomains", []) or [])
+            inv["steps"].append({"subfinder": sf.get("count", 0)})
+    except Exception:
+        pass
+    subs.add(apex)
+    inv["subdomains"] = sorted(subs)
+
+    # 2. Resolve — which candidate names actually exist (stdlib fallback).
+    _say(f"recon 2/6 — resolving {len(subs)} candidate host(s)")
+    resolved_hosts: List[str] = []
+    try:
+        rc = _execute_resolve_candidates({"candidates": inv["subdomains"]}, target, emit)
+        for r in rc.get("resolved", []) or []:
+            h = r.get("host") if isinstance(r, dict) else None
+            if h:
+                resolved_hosts.append(h)
+    except Exception:
+        pass
+    if not resolved_hosts:
+        resolved_hosts = list(inv["subdomains"])
+    inv["resolved_count"] = len(resolved_hosts)
+
+    # 3. Live web hosts — turn resolving names into an inventory of live
+    #    services with status/title/tech (skipped entirely when passive_only).
+    if not passive_only:
+        _say(f"recon 3/6 — probing {len(resolved_hosts)} host(s) for live web services")
+        try:
+            hp = _execute_httpx({"target": resolved_hosts}, target, emit)
+            inv["live_hosts"] = hp.get("live_hosts", []) or []
+        except Exception:
+            pass
+    else:
+        inv["steps"].append({"passive_only": True})
+
+    # 4. The free, highest-signal starting points.
+    _say("recon 4/6 — robots.txt / sitemap.xml / security.txt")
+    try:
+        wk = _execute_well_known_probe({"domain": apex, "probe_live": not passive_only}, target, emit)
+        inv["contacts"] = wk.get("security_contacts", []) or []
+        for h in wk.get("disallow_live", []) or []:
+            inv["sensitive_live_paths"].append({"url": h["url"], "status": h.get("status"), "source": "robots.txt"})
+    except Exception:
+        pass
+
+    # 5. Historical URLs + which are still live.
+    _say("recon 5/6 — wayback archive + liveness")
+    try:
+        wb = _execute_wayback_urls({"domain": apex, "probe_live": not passive_only}, target, emit)
+        for h in wb.get("live_urls", []) or []:
+            inv["wayback_live"].append({"url": h["url"], "status": h.get("status"), "title": h.get("title", "")})
+    except Exception:
+        pass
+
+    # 6. Consolidate into a ranked inventory.
+    _say("recon 6/6 — consolidating attack surface")
+    summary = (f"{len(inv['subdomains'])} subdomain(s), {inv['resolved_count']} resolved, "
+               f"{len(inv['live_hosts'])} live web host(s), "
+               f"{len(inv['sensitive_live_paths'])} owner-hidden live path(s), "
+               f"{len(inv['wayback_live'])} live archived URL(s).")
+    inv["summary"] = summary
+    inv["note"] = (summary + " Triage: owner-hidden live paths first, then live hosts by title/status. "
+                   "Run probe_urls / map_surface / js_miner next to go deeper on the live surface.")
+    inv["status"] = "success"
+    if emit and hasattr(emit, "success"):
+        try:
+            emit.success(f"[✓] recon complete — {summary}")
+        except Exception:
+            pass
+    return inv
+
+
 def _execute_profile(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Read or annotate the persistent TARGET PROFILE — the accumulated record
@@ -10528,6 +10648,18 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             }
         },
         executor=_execute_probe_urls
+    ),
+    "recon": ToolSpec(
+        name="recon",
+        description="DETERMINISTIC recon/enumeration pipeline — runs the whole opening recon in the right order in ONE call so nothing is skipped: subdomain discovery (crt.sh + subfinder) -> DNS resolve -> live web-host probe (status/title/tech) -> robots.txt/sitemap/security.txt -> wayback archive + liveness -> a consolidated, ranked asset inventory. Every step is scope-gated and gentle on fragile/strict programs. This is the FIRST thing to run on a fresh target. Pass passive_only=true for a zero-touch first pass (discovery + resolve only, nothing hits the target).",
+        parameters={
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Apex domain to enumerate (defaults to the active target)."},
+                "passive_only": {"type": "boolean", "description": "Skip everything that touches the target (live-host probe, well-known, wayback liveness) — discovery + resolve only.", "default": False}
+            }
+        },
+        executor=_execute_recon_pipeline
     ),
     "crtsh_subdomains": ToolSpec(
         name="crtsh_subdomains",
