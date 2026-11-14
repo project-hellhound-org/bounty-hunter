@@ -34,6 +34,18 @@ OTHER_TOOLS: Dict[str, str] = {
     "nuclei": "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
     "jsluice": "go install github.com/BishopFox/jsluice/cmd/jsluice@latest",
     "uro": "pip install uro",
+    # Hidden-parameter discovery — param_discover prefers this real tool and
+    # falls back to its built-in reflection probe when it's absent.
+    "arjun": "pipx install arjun (or: pip install arjun)",
+    # XSS / parameter-injection scanner used by dalfox_scan.
+    "dalfox": "go install github.com/hahwul/dalfox/v2@latest",
+    # Pattern-grep for pulling vuln-candidate URLs (ssrf/redirect/lfi/sqli/…)
+    # out of a big collected URL list.
+    "gf": "go install github.com/tomnomnom/gf@latest  (then add the gf-patterns to ~/.gf)",
+    # Deep wayback/commoncrawl/otx/urlscan URL harvester (more sources than gau).
+    "waymore": "pipx install waymore (or: pip install waymore)",
+    # Secret/credential scanner for crawled JS and responses.
+    "trufflehog": "go install github.com/trufflesecurity/trufflehog/v3@latest  (or: brew install trufflehog)",
     # The deeper crawler, maintained as its own pip package (console script
     # `spider`). bounty-hunter invokes it as an external binary; when it's
     # missing, spider falls back to katana. This hint lets /setup install it.

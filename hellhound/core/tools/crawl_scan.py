@@ -750,3 +750,146 @@ def _execute_gowitness(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
 # only accept a curl-log match that actually contains a payload marker for
 # that class -- returning nothing is correct here, since it's what makes
 # record_finding fall through to _lookup_terminal_evidence next.
+
+
+def _execute_nuclei_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Run nuclei's community templates against a URL (or all live hosts
+    discovered so far) to catch known CVEs, misconfigurations, exposures,
+    default creds, and takeovers — the single highest-ROI "is anything already
+    broken here" check. ACTIVE scanner: gated by engagement rules like the other
+    scanners (blocked where the program forbids automated scanning). Needs
+    nuclei on PATH; install via /setup."""
+    raw = args.get("url") or args.get("target")
+    targets = raw if isinstance(raw, list) else ([raw] if raw else [])
+    if not targets:
+        st = target.state if isinstance(getattr(target, "state", None), dict) else {}
+        live = st.get("live_hosts") or []
+        urls = [h.get("url") for h in live if isinstance(h, dict) and h.get("url")]
+        targets = urls or [target.name]
+
+    rules = getattr(target, "scope_rules", None)
+    gated = []
+    for t in targets:
+        u = str(t).strip()
+        if not u:
+            continue
+        if not u.startswith(("http://", "https://")):
+            u = f"https://{u}"
+        ok, _r = is_in_scope(u, rules)
+        if ok and u not in gated:
+            gated.append(u)
+    if not gated:
+        return {"status": "no_in_scope_targets", "note": "No in-scope URL to scan with nuclei."}
+
+    nuclei_bin = get_binary_path("nuclei")
+    if not nuclei_bin:
+        return {"error": "nuclei not installed", "hint": install_hint("nuclei")}
+
+    severity = str(args.get("severity") or "low,medium,high,critical")
+    in_fd, in_path = tempfile.mkstemp(suffix=".txt", prefix="hh_nuclei_")
+    with os.fdopen(in_fd, "w") as f:
+        f.write("\n".join(gated) + "\n")
+    cmd = [nuclei_bin, "-l", in_path, "-jsonl", "-silent", "-severity", severity,
+           "-timeout", "10", "-rate-limit", str(int(args.get("rate_limit", 50) or 50))]
+    tags = args.get("tags")
+    if tags:
+        cmd += ["-tags", tags if isinstance(tags, str) else ",".join(tags)]
+
+    findings = []
+    try:
+        proc = _run_cmd_with_heartbeat(cmd, timeout=int(args.get("max_runtime", 300) or 300),
+                                       emit=emit, label="nuclei (template scan)")
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                it = json.loads(line)
+                info = it.get("info", {}) if isinstance(it.get("info"), dict) else {}
+                findings.append({
+                    "template": it.get("template-id") or it.get("templateID"),
+                    "name": info.get("name"),
+                    "severity": (info.get("severity") or "unknown"),
+                    "matched_at": it.get("matched-at") or it.get("matched_at") or it.get("host"),
+                    "type": it.get("type"),
+                })
+            except Exception:
+                pass
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        try:
+            os.unlink(in_path)
+        except Exception:
+            pass
+
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
+    findings.sort(key=lambda f: order.get(str(f.get("severity")).lower(), 9))
+    return {
+        "status": "success",
+        "targets_scanned": len(gated),
+        "findings": findings,
+        "finding_count": len(findings),
+        "note": (f"nuclei flagged {len(findings)} issue(s) — VERIFY each (templates can false-positive) before recording."
+                 if findings else "nuclei found nothing on the scanned targets."),
+    }
+
+
+def _execute_dalfox_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Run dalfox for XSS / parameter-injection on a URL. ACTIVE scanner, gated
+    by engagement rules (and on programs where XSS is out of scope the gate
+    blocks it). Needs dalfox on PATH; install via /setup."""
+    url = str(args.get("url") or args.get("target") or target.name).strip()
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    rules = getattr(target, "scope_rules", None)
+    ok, reason = is_in_scope(url, rules)
+    if not ok:
+        return {"status": "out_of_scope", "note": f"{url} out of scope ({reason})."}
+
+    dalfox_bin = get_binary_path("dalfox")
+    if not dalfox_bin:
+        return {"error": "dalfox not installed", "hint": install_hint("dalfox")}
+
+    cmd = [dalfox_bin, "url", url, "--format", "json", "--silence", "--no-spinner"]
+    if args.get("data"):
+        cmd += ["--data", str(args["data"])]
+    if args.get("cookie"):
+        cmd += ["--cookie", str(args["cookie"])]
+
+    findings = []
+    try:
+        proc = _run_cmd_with_heartbeat(cmd, timeout=int(args.get("max_runtime", 300) or 300),
+                                       emit=emit, label="dalfox (XSS scan)")
+        out = (proc.stdout or "").strip()
+        try:
+            data = json.loads(out)
+            findings = data if isinstance(data, list) else [data]
+        except Exception:
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    findings.append(json.loads(line))
+                except Exception:
+                    pass
+    except subprocess.TimeoutExpired:
+        pass
+
+    pocs = []
+    for f in findings:
+        if isinstance(f, dict):
+            pocs.append({
+                "type": f.get("type"), "severity": f.get("severity"),
+                "param": f.get("param"), "poc": f.get("data") or f.get("poc"),
+                "cwe": f.get("cwe"), "evidence": f.get("evidence"),
+            })
+    return {
+        "status": "success",
+        "url": url,
+        "findings": pocs or findings,
+        "finding_count": len(findings),
+        "note": (f"dalfox reported {len(findings)} XSS candidate(s) — VERIFY the PoC fires in a real browser before recording."
+                 if findings else "dalfox found no XSS on this endpoint."),
+    }

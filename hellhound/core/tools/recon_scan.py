@@ -580,8 +580,55 @@ def _req_simple(url: str, params: Dict[str, str], method: str, headers: Dict[str
         return None
 
 
+def _run_arjun(url: str, method: str, emit: Any, timeout: int = 180) -> Optional[List[str]]:
+    """Drive the real `arjun` binary if it's installed. Returns the discovered
+    param names, or None to signal 'arjun unavailable/failed — use the built-in
+    fallback'. arjun is the purpose-built tool for this; we only reimplement it
+    in pure Python for boxes that don't have it (or strict programs that want
+    the gentler built-in)."""
+    arjun_bin = get_binary_path("arjun")
+    if not arjun_bin:
+        return None
+    import tempfile
+    out_fd, out_path = tempfile.mkstemp(suffix=".json", prefix="hh_arjun_")
+    os.close(out_fd)
+    cmd = [arjun_bin, "-u", url, "-m", method, "-oJ", out_path, "-q"]
+    try:
+        _run_cmd_with_heartbeat(cmd, timeout=timeout, emit=emit, label="arjun (hidden-param discovery)")
+    except Exception:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
+        return None
+    params: List[str] = []
+
+    def _collect(obj):
+        if isinstance(obj, dict):
+            if isinstance(obj.get("params"), list):
+                params.extend(str(p) for p in obj["params"])
+            else:
+                for v in obj.values():
+                    _collect(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _collect(v)
+
+    try:
+        with open(out_path, "r", encoding="utf-8") as f:
+            _collect(json.load(f))
+    except Exception:
+        return None
+    finally:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
+    return sorted(set(p for p in params if p))
+
+
 def _execute_param_discover(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
-    """Find HIDDEN / unlinked request parameters on an endpoint (arjun-style) —
+    """Find HIDDEN / unlinked request parameters on an endpoint. Prefers the real
     the IDOR id, SSRF url, file-read path, or debug toggle the server accepts
     but never links, which a crawler can't see. Sends a unique canary across
     BATCHES of candidate params and flags the ones that change the response:
@@ -601,6 +648,33 @@ def _execute_param_discover(args: Dict[str, Any], target: Target, emit: Any) -> 
         return {"status": "out_of_scope", "note": f"{url} is out of scope — not probing ({reason})."}
 
     method = str(args.get("method") or "GET").upper()
+
+    # Prefer the real arjun binary — but NOT on a program that forbids
+    # automated/rate-limit testing (arjun fires a lot of requests); there we
+    # use the gentler, capped built-in. force_builtin=true also skips arjun.
+    gentle = bool(set(getattr(rules, "disallowed", []) or []) & _GENTLE_FLAGS)
+    if not gentle and not bool(args.get("force_builtin")):
+        arjun_params = _run_arjun(url, method, emit)
+        if arjun_params is not None:
+            try:
+                if arjun_params and hasattr(target, "state") and isinstance(target.state, dict):
+                    known = target.state.setdefault("parameters", [])
+                    for p in arjun_params:
+                        if p not in known:
+                            known.append(p)
+                    save_target(target)
+            except Exception:
+                pass
+            return {
+                "status": "success", "url": url, "method": method, "tool": "arjun",
+                "found": [{"param": p, "evidence": ["arjun"]} for p in arjun_params],
+                "found_count": len(arjun_params),
+                "note": (f"arjun found {len(arjun_params)} param(s): {', '.join(arjun_params[:20])}. "
+                         "Test these for IDOR/SSRF/LFI/redirect/mass-assignment." if arjun_params else
+                         "arjun found no hidden params on this endpoint."),
+            }
+        # arjun not installed -> fall through to the built-in reflection probe.
+
     headers = merge_global_context({})
     import secrets as _secrets
     canary = "hhpx" + _secrets.token_hex(4)

@@ -164,6 +164,7 @@ from hellhound.core.tools.recon_scan import (  # noqa: E402
 
 from hellhound.core.tools.crawl_scan import (  # noqa: E402
     _execute_katana, _execute_gau_nuclei_sweep, _execute_wpscan_scan, _execute_gowitness,
+    _execute_nuclei_scan, _execute_dalfox_scan,
 )
 
 from hellhound.core.tools.content_fuzz import (  # noqa: E402
@@ -10665,18 +10666,47 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "param_discover": ToolSpec(
         name="param_discover",
-        description="Find HIDDEN / unlinked request parameters on an endpoint (arjun-style) — the IDOR id, SSRF url, file-read path, debug or admin toggle the server accepts but never links, so a crawler never sees it. Sends a canary across batches of common param names and flags the ones that change the response (reflected / status change / length delta), isolating the exact param. Gentle (scope-gated, batched, capped). Run it on a live endpoint to expand the testable surface before fuzzing.",
+        description="Find HIDDEN / unlinked request parameters on an endpoint — the IDOR id, SSRF url, file-read path, debug or admin toggle the server accepts but never links, so a crawler never sees it. Prefers the real `arjun` binary when installed (install via /setup); otherwise falls back to a built-in reflection probe (canary across batched common param names, isolating the exact one). Gentle/scope-gated; on programs that forbid automated testing it uses the gentle built-in. Run it on a live endpoint to expand the testable surface before fuzzing.",
         parameters={
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "The specific endpoint URL to test for hidden params."},
                 "method": {"type": "string", "enum": ["GET", "POST"], "description": "Where to inject candidate params.", "default": "GET"},
-                "params": {"type": "array", "items": {"type": "string"}, "description": "Extra candidate param names to test on top of the built-in common list."},
-                "limit": {"type": "integer", "description": "Max candidate params to test (hard ceiling 400).", "default": 160}
+                "params": {"type": "array", "items": {"type": "string"}, "description": "Extra candidate param names to test on top of the built-in common list (built-in probe only)."},
+                "limit": {"type": "integer", "description": "Max candidate params for the built-in probe (hard ceiling 400).", "default": 160},
+                "force_builtin": {"type": "boolean", "description": "Skip arjun and use the built-in reflection probe even if arjun is installed.", "default": False}
             },
             "required": ["url"]
         },
         executor=_execute_param_discover
+    ),
+    "nuclei_scan": ToolSpec(
+        name="nuclei_scan",
+        description="Run nuclei's community templates against a URL (or all live hosts found so far) to catch known CVEs, misconfigurations, exposures, default creds, and takeovers — the highest-ROI 'is anything already broken here' check. ACTIVE scanner: blocked by the scope gate on programs that forbid automated scanning. Needs nuclei installed (via /setup). VERIFY every hit — templates can false-positive.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target URL (or list). Omit to scan all live hosts discovered so far."},
+                "severity": {"type": "string", "description": "Comma-separated severities to include.", "default": "low,medium,high,critical"},
+                "tags": {"type": "string", "description": "Restrict to nuclei template tags (e.g. 'cve,exposure,takeover')."},
+                "rate_limit": {"type": "integer", "description": "Max requests/sec.", "default": 50}
+            }
+        },
+        executor=_execute_nuclei_scan
+    ),
+    "dalfox_scan": ToolSpec(
+        name="dalfox_scan",
+        description="Run dalfox for XSS / parameter-injection on a URL (great right after param_discover surfaces reflected params). ACTIVE scanner: blocked by the scope gate on programs where automated scanning or XSS is out of scope. Needs dalfox installed (via /setup). VERIFY the PoC fires in a real browser before recording.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Target URL to test for XSS (include the params to test)."},
+                "data": {"type": "string", "description": "POST body to test instead of the query string."},
+                "cookie": {"type": "string", "description": "Cookie header for authenticated testing."}
+            },
+            "required": ["url"]
+        },
+        executor=_execute_dalfox_scan
     ),
     "crtsh_subdomains": ToolSpec(
         name="crtsh_subdomains",
@@ -14938,7 +14968,8 @@ RULES:
    - NEVER check URLs for liveness one `curl` at a time — that is slow and leaves assets undiscovered. After ANY URL-discovery step (wayback/otx/gau/spider/JS mining), run `probe_urls` to BATCH-check the whole pile concurrently (or call it with no args to sweep everything discovered so far). It returns each live URL's status + title + Server header so you triage which to open. Breadth of live assets is your edge — surface more than the next hunter by probing everything, not sampling.
    - Cast a WIDE asset net before going deep: pull subdomains from `crtsh_subdomains` (certificate-transparency, free, no key, works with no binary and finds dev/staging/internal hosts others miss) AND `subfinder` when available, then `probe_urls` the lot to see which resolve live. The host a lazy hunter never found is where the uncontested bug lives.
    - For a fresh target, `recon` runs the whole opening enumeration in one deterministic pass (discover -> resolve -> live hosts -> robots/sitemap -> wayback) and hands back a ranked inventory — prefer it over firing the sub-tools by hand, so nothing gets skipped.
-   - Expand surface and pivot to assets others miss: on a live endpoint run `param_discover` to surface hidden IDOR/SSRF/LFI/redirect params a crawler can't see; `favicon_hash` then a Shodan pivot finds the org's other properties on the same build; `asn_expand` maps the org's whole IP space (probe only in-scope ranges).
+   - Expand surface and pivot to assets others miss: on a live endpoint run `param_discover` to surface hidden IDOR/SSRF/LFI/redirect params a crawler can't see (it drives real `arjun` when installed, a built-in probe otherwise); `favicon_hash` then a Shodan pivot finds the org's other properties on the same build; `asn_expand` maps the org's whole IP space (probe only in-scope ranges).
+   - These wrap REAL external tools and degrade gracefully when they aren't installed (they return an install hint — tell the researcher to run /setup): `nuclei_scan` (templated CVE/misconfig/exposure/takeover detection on the live hosts — highest-ROI "already broken?" check) and `dalfox_scan` (XSS/param-injection). Both are active scanners, so the scope gate BLOCKS them on programs that forbid automated scanning — don't fight the block, fall back to manual/gentle tools there. Always VERIFY a scanner hit before recording it; templates false-positive.
    - WHEN PASSIVE SOURCES RETURN A PILE OF URLs (wayback/gau/otx with hundreds–thousands of results), DON'T JUST COLLECT THEM — triage and probe. `curl` a batch of the high-value ones (anything with params, `/api/`, `/admin`, `.json`, old/deprecated paths, backup extensions) to see which are STILL LIVE and what they expose — an archived URL that still resolves is exactly the forgotten endpoint nobody re-tested. A 10k-URL wayback dump you never fetch from is worth nothing.
    - IF A BURP / CAIDO PROXY IS CONNECTED (MCP) — PARK THE NOTEWORTHY REQUESTS, NOT THE FLOOD: keep running your bulk recon with `curl` (it's fast and it keeps Burp's Proxy history from drowning in hundreds of your own requests) — do NOT route all traffic through the proxy. BUT the MOMENT you craft or confirm a NOTEWORTHY request — the actual exploit request, an auth-bypass / privilege request, anything the researcher would want to SEE or re-send by hand — ALSO call `create_repeater_tab_http` to drop that one request into Burp Repeater. That is the entire point of the proxy being connected: the researcher watches and manually follows up the handful of requests that matter, without wading through your recon noise. One Repeater tab per genuinely interesting request — not per curl, and never the whole scan. (A plain `send_http1_request` routes through Burp's engine but shows NOWHERE in the UI, so it's no substitute for parking the request in Repeater.)
    - ON A REAL (non-lab) TARGET, RESPECT RATE LIMITS — NEVER GET THE RESEARCHER BLOCKED: if responses start returning 429 (Too Many Requests), a WAF 403, sudden connection resets, CAPTCHAs, or rate-limit headers, STOP hammering immediately — back off, pause heavy fuzzing/scanning/`content_discovery`, switch to slow surgical requests, and tell the researcher what you're seeing. Getting their IP or account banned on a live program ends the engagement and can breach the program's rules of engagement — that's a far worse outcome than being slow. Lab / CTF / explicitly-authorized boxes you can push hard; a real production program you treat with restraint: steady and targeted, never a blind high-rate flood.

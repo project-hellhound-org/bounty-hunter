@@ -53,6 +53,12 @@ MODULE_RISK_MAP = {
     "takeoverscanner": ["no-automated-scanners"],
     "wpscanscan": ["no-automated-scanners"],
     "sqlmapscan": ["no-automated-scanners"],
+    # nuclei templates / dalfox send real payloads at the target — same active
+    # scanner class as gaunucleisweep. Blocked where automated scanning/fuzzing
+    # is disallowed. (param_discover is deliberately NOT tagged: on a strict
+    # program it self-downgrades to a gentle, capped built-in probe.)
+    "nucleiscan": ["no-fuzzing", "no-dos", "no-automated-scanners"],
+    "dalfoxscan": ["no-fuzzing", "no-automated-scanners"],
 }
 
 
