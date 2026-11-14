@@ -137,7 +137,7 @@ from hellhound.core.tools.hackerone_tools import (  # noqa: E402
 
 from hellhound.core.tools.osint_recon import (  # noqa: E402
     _execute_wayback_urls, _execute_otx_urls, _execute_urlscan_recon,
-    _execute_virustotal_lookup, _execute_google_dork,
+    _execute_virustotal_lookup, _execute_google_dork, _execute_well_known_probe,
 )
 
 from hellhound.core.tools.network_recon import _execute_port_scan, _execute_nmap_service_scan  # noqa: E402
@@ -4601,6 +4601,26 @@ def _execute_spider(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str
                 kat["spider_install_hint"] = "pip install hellhound-spider"
             return kat
         intel = res.get("intel", {}) if isinstance(res, dict) else {}
+
+        # Spider RAN but DIED mid-crawl (launch error, crash, or non-zero exit)
+        # and brought back nothing usable — do NOT report an empty surface as if
+        # the site were bare. The operator hit exactly this on KWO ("he doesn't
+        # know spider is dead"): a crashed crawl returned 0 endpoints and the
+        # beast reasoned as if the host had none. Fall back to katana so recon
+        # coverage is REAL, and label the crawler + the spider error plainly.
+        _spider_eps = intel.get("endpoints", []) if isinstance(intel, dict) else []
+        _spider_err = res.get("error") if isinstance(res, dict) else None
+        _spider_crashed = bool(isinstance(res, dict) and res.get("crashed"))
+        if (_spider_crashed or _spider_err) and not _spider_eps:
+            _err = _spider_err or "spider crashed with no output"
+            if emit and hasattr(emit, "warn"):
+                emit.warn(f"spider died mid-crawl ({_err}) — falling back to katana so recon coverage is real, not assumed.")
+            kat = _execute_katana(args, target, emit)
+            if isinstance(kat, dict):
+                kat["crawler_used"] = "katana (fallback — spider crashed)"
+                kat["spider_error"] = _err
+            return kat
+
         if intel and hasattr(target, "state"):
             target.state["spider_intel"] = intel
         endpoints = [ep.get("url") for ep in intel.get("endpoints", []) if isinstance(ep, dict) and ep.get("url")]
@@ -10454,7 +10474,7 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
     ),
     "wayback_urls": ToolSpec(
         name="wayback_urls",
-        description="Pulls archived URLs for a domain from the Wayback Machine's CDX API (web.archive.org) — free, no API key. Often surfaces old endpoints, params, and backup/config files that live crawlers (gau/katana) never see. Supports subdomain inclusion and filtering by sensitive file extensions or HTTP status codes.",
+        description="Pulls archived URLs for a domain from the Wayback Machine's CDX API (web.archive.org) — free, no API key. Often surfaces old endpoints, params, and backup/config files that live crawlers (gau/katana) never see. By default it then GENTLY probes the most interesting archived URLs to see which are STILL LIVE (in-scope only, capped, polite) — because an archived URL is only actionable once you know it still resolves. Supports subdomain inclusion and filtering by sensitive file extensions or HTTP status codes.",
         parameters={
             "type": "object",
             "properties": {
@@ -10462,7 +10482,9 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
                 "include_subdomains": {"type": "boolean", "description": "Include *.domain archived URLs, not just the apex.", "default": True},
                 "extensions_only": {"type": "boolean", "description": "Only return URLs ending in a sensitive extension (sql, env, bak, config, pem, key, etc.).", "default": False},
                 "status_codes": {"type": "string", "description": "Comma-separated HTTP status codes to include only (e.g. '200,301')."},
-                "exclude_status_codes": {"type": "string", "description": "Comma-separated HTTP status codes to exclude (e.g. '404,500')."}
+                "exclude_status_codes": {"type": "string", "description": "Comma-separated HTTP status codes to exclude (e.g. '404,500')."},
+                "probe_live": {"type": "boolean", "description": "Gently probe the most interesting archived URLs for liveness (in-scope only, capped). Returns live_urls with status codes. Set False for the raw archive list without touching the target.", "default": True},
+                "probe_limit": {"type": "integer", "description": "Max archived URLs to probe for liveness (hard ceiling 50). Sensitive-extension URLs are probed first.", "default": 25}
             },
             "required": ["domain"]
         },
@@ -10480,6 +10502,19 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": ["domain"]
         },
         executor=_execute_otx_urls
+    ),
+    "well_known_probe": ToolSpec(
+        name="well_known_probe",
+        description="Fetches and parses the free, zero-impact starting points EVERY engagement should read first — robots.txt, sitemap.xml, and /.well-known/security.txt — then gently probes the robots.txt Disallow paths for liveness (in-scope only, capped). Disallow entries literally point at what the owner wants hidden (/admin, /backup/, /.env …), so this is the single highest-signal opening recon move. Run it EARLY, before crawling.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Host/URL to read robots.txt, sitemap.xml and security.txt from (defaults to the active target)."},
+                "probe_live": {"type": "boolean", "description": "Probe the robots Disallow paths for liveness (in-scope only, capped). Returns disallow_live with status codes.", "default": True},
+                "probe_limit": {"type": "integer", "description": "Max Disallow paths to probe for liveness (hard ceiling 50).", "default": 25}
+            }
+        },
+        executor=_execute_well_known_probe
     ),
     "urlscan_recon": ToolSpec(
         name="urlscan_recon",
@@ -14703,7 +14738,8 @@ RULES:
    - SCOPED TARGET & GOAL — SKIP UNNEEDED DISCOVERY: If the researcher already gave a specific, fully-qualified target (a single host/URL) AND a specific goal that doesn't call for discovering additional hosts/subdomains, do NOT run subfinder, dns_bruteforce, or other subdomain/asset-discovery tools before going at the given target — those are for when the attack surface itself is the unknown, not a habitual first step. Go straight at the given URL/endpoint with curl/spider/whatever the goal actually needs. Only reach for discovery tools if the goal explicitly requires finding more hosts, or the direct approach against the given target genuinely dead-ends and broadening scope is the only path left.
    - PROGRAM WITH MANY IN-SCOPE HOSTS — MAP BREADTH-FIRST, DON'T TUNNEL INTO ONE: the rule above is for ONE named host + goal. The OPPOSITE case is an engagement whose scope is a program / wildcard / list of many in-scope hosts with no single target called out. There, do NOT seize the first host and exhaust it — sweep the WHOLE surface first: run `httpx` (and `gowitness`) across every in-scope host to see what's alive and what each one IS (login, API, admin panel, marketing, dev/staging/legacy), note the high-value ones (admin / internal / api / dev / staging / legacy / anything non-marketing), THEN pick the richest to go deep on. A real hunter triages the entire program's surface before committing — one host's homepage is almost never where the bounty is. Breadth first, depth second.
    - DEPTH MEANS THE FORGOTTEN SURFACE, NOT THE HOMEPAGE: once you pick a host to go deep on, the highest-ROI move is NOT re-crawling its linked pages — it's the unlinked/forgotten/leaked surface everyone else skipped: backup and config files (`.bak .old .swp ~`, `config.php.bak`, `backup.zip`, `.env`), exposed VCS (`/.git/`, `/.svn/`), `.DS_Store` (reveals a directory's real contents), API specs (`swagger.json` / `openapi.json` hand you the whole API including unlinked endpoints), and secrets in JS bundles. Run `content_discovery` with the `sensitive`/`backup` wordlist, `curl` the high-signal paths directly, then prioritise endpoints that carry testable params (id → IDOR, url → SSRF, file/path → LFI, q/search → XSS/SQLi). That surface is where bounties live, not the page already linked from the nav.
-   - ALWAYS READ `robots.txt`, `sitemap.xml`, AND `/.well-known/security.txt` EARLY — they are free, zero-impact, and the single highest-signal starting point. `robots.txt` Disallow entries explicitly POINT at the paths the owner wants hidden (a `Disallow: /.env`, `/admin`, `/backup/`, `/cache/` is a direct lead — go fetch exactly those). `sitemap.xml` enumerates real pages; `security.txt` gives the reporting contact. Never crawl past these without having read them and `curl`'d the interesting Disallow paths.
+   - ALWAYS READ `robots.txt`, `sitemap.xml`, AND `/.well-known/security.txt` EARLY — they are free, zero-impact, and the single highest-signal starting point. Run `well_known_probe` to do this in one shot: it fetches all three and PROBES the `robots.txt` Disallow paths for liveness, so a still-reachable `Disallow: /.env`, `/admin`, `/backup/` comes back already confirmed-live (owner-hidden but reachable = look there first). `sitemap.xml` enumerates real pages; `security.txt` gives the reporting contact. Never crawl past these without having read them.
+   - Archived/passive URLs (`wayback_urls`, `otx_urls`) are HISTORICAL — most are dead. `wayback_urls` now probes the interesting ones for liveness automatically (`live_urls` in its result); act on the STILL-LIVE ones, don't reason over the raw archive list as if it were the current surface.
    - WHEN PASSIVE SOURCES RETURN A PILE OF URLs (wayback/gau/otx with hundreds–thousands of results), DON'T JUST COLLECT THEM — triage and probe. `curl` a batch of the high-value ones (anything with params, `/api/`, `/admin`, `.json`, old/deprecated paths, backup extensions) to see which are STILL LIVE and what they expose — an archived URL that still resolves is exactly the forgotten endpoint nobody re-tested. A 10k-URL wayback dump you never fetch from is worth nothing.
    - IF A BURP / CAIDO PROXY IS CONNECTED (MCP) — PARK THE NOTEWORTHY REQUESTS, NOT THE FLOOD: keep running your bulk recon with `curl` (it's fast and it keeps Burp's Proxy history from drowning in hundreds of your own requests) — do NOT route all traffic through the proxy. BUT the MOMENT you craft or confirm a NOTEWORTHY request — the actual exploit request, an auth-bypass / privilege request, anything the researcher would want to SEE or re-send by hand — ALSO call `create_repeater_tab_http` to drop that one request into Burp Repeater. That is the entire point of the proxy being connected: the researcher watches and manually follows up the handful of requests that matter, without wading through your recon noise. One Repeater tab per genuinely interesting request — not per curl, and never the whole scan. (A plain `send_http1_request` routes through Burp's engine but shows NOWHERE in the UI, so it's no substitute for parking the request in Repeater.)
    - ON A REAL (non-lab) TARGET, RESPECT RATE LIMITS — NEVER GET THE RESEARCHER BLOCKED: if responses start returning 429 (Too Many Requests), a WAF 403, sudden connection resets, CAPTCHAs, or rate-limit headers, STOP hammering immediately — back off, pause heavy fuzzing/scanning/`content_discovery`, switch to slow surgical requests, and tell the researcher what you're seeing. Getting their IP or account banned on a live program ends the engagement and can breach the program's rules of engagement — that's a far worse outcome than being slow. Lab / CTF / explicitly-authorized boxes you can push hard; a real production program you treat with restraint: steady and targeted, never a blind high-rate flood.

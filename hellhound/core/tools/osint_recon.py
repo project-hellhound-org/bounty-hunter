@@ -11,13 +11,70 @@ is unchanged.
 """
 import os
 import re
+import time
 import requests
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 from hellhound.core.ai_utils import load_config
 from hellhound.core.tasks import Target, save_target
+from hellhound.core.scope import is_in_scope
 from hellhound.memory import update_from_subfinder
+
+
+# Extensions that make an archived URL worth probing first — config/secret/
+# backup/source-ish files are the ones where "still live" actually matters.
+_PROBE_PRIORITY_EXT = re.compile(
+    r"\.(?:env|git|sql|bak|backup|config|conf|ini|yml|yaml|json|xml|log|"
+    r"key|pem|crt|zip|tar|tar\.gz|tgz|gz|7z|rar|db|csv|txt|old|swp|~)(?:$|\?)",
+    re.I,
+)
+
+
+def _probe_live_urls(urls: List[str], target: Target, emit: Any,
+                     cap: int = 25, delay: float = 0.6) -> Dict[str, Any]:
+    """Gently check which archived/passive URLs are STILL live — the step the
+    operator flagged as missing ("a lot of urls in wayback but he never checked
+    they're still accessible"). This TOUCHES the target, so it is deliberately
+    polite: in-scope URLs only (out-of-scope subdomains are skipped via the
+    scope gate), interesting files first, a hard cap, a short timeout, and a
+    fixed pause between requests so it never looks like a scanner on fragile
+    infra. Returns the live hits (status < 400) plus how many were probed."""
+    rules = getattr(target, "scope_rules", None)
+    # Interesting (sensitive-extension) URLs first, then the rest; dedupe paths.
+    ranked = sorted(set(urls), key=lambda u: (0 if _PROBE_PRIORITY_EXT.search(u) else 1, len(u)))
+    live: List[Dict[str, Any]] = []
+    probed = 0
+    skipped_scope = 0
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; recon-liveness/1.0)"}
+    for u in ranked:
+        if probed >= cap:
+            break
+        allowed, _reason = is_in_scope(u, rules)
+        if not allowed:
+            skipped_scope += 1
+            continue
+        try:
+            r = requests.get(u, timeout=8, allow_redirects=True, stream=True, headers=headers)
+            code = r.status_code
+            clen = r.headers.get("Content-Type", "")
+            try:
+                r.close()
+            except Exception:
+                pass
+        except requests.RequestException:
+            code, clen = None, ""
+        probed += 1
+        if code is not None and code < 400:
+            live.append({"url": u, "status": code, "content_type": clen})
+        if emit and hasattr(emit, "info") and code is not None:
+            try:
+                emit.info(f"[{code}] {u}")
+            except Exception:
+                pass
+        time.sleep(delay)
+    return {"live_urls": live, "probed_count": probed, "live_count": len(live),
+            "skipped_out_of_scope": skipped_scope}
 
 
 def _execute_wayback_urls(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -95,7 +152,7 @@ def _execute_wayback_urls(args: Dict[str, Any], target: Target, emit: Any) -> Di
         except Exception:
             pass
 
-    return {
+    result = {
         "domain": domain,
         "url_count": len(urls),
         "urls": urls[:500],
@@ -105,6 +162,159 @@ def _execute_wayback_urls(args: Dict[str, Any], target: Target, emit: Any) -> Di
             "No archived URLs found for this domain/filter combination — the CDX index may simply not have this host crawled."
         ),
     }
+
+    # Archived URLs are historical — most are long dead. The find is only
+    # actionable once you know which are STILL reachable, so probe the most
+    # interesting ones (gently, in-scope only, capped). Default on; set
+    # probe_live=False to get the raw list without touching the target.
+    if urls and bool(args.get("probe_live", True)):
+        cap = int(args.get("probe_limit", 25) or 25)
+        cap = max(1, min(cap, 50))  # hard ceiling — stay polite on fragile infra
+        if emit and hasattr(emit, "info"):
+            try:
+                emit.info(f"probing up to {cap} archived URL(s) for liveness (in-scope only)…")
+            except Exception:
+                pass
+        probe = _probe_live_urls(urls, target, emit, cap=cap)
+        result.update(probe)
+        if probe["live_count"]:
+            result["note"] += (f" {probe['live_count']} of {probe['probed_count']} probed are STILL LIVE "
+                               f"(status < 400) — these are the ones worth looking at.")
+        elif probe["probed_count"]:
+            result["note"] += f" Probed {probe['probed_count']}; none still reachable (all archived/dead)."
+
+    return result
+
+
+def _execute_well_known_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Deterministically fetch and parse the free, zero-impact starting points
+    every engagement should read FIRST — robots.txt, sitemap.xml, and
+    /.well-known/security.txt — then gently probe the robots Disallow paths for
+    liveness.
+
+    This exists because a prompt nudge alone wasn't reliable: on a real run the
+    operator saw a sensitive endpoint sitting in robots.txt that Beast never
+    mentioned. robots Disallow entries literally point at what the owner wants
+    hidden (/admin, /backup/, /.env …), so surfacing + liveness-checking them
+    deterministically is high-signal recon. In-scope only, capped, polite."""
+    raw = str(args.get("domain") or args.get("url") or target.name).strip()
+    if not raw:
+        return {"status": "no_domain_given", "note": "well_known_probe needs a domain/url."}
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    rules = getattr(target, "scope_rules", None)
+    allowed, reason = is_in_scope(base, rules)
+    if not allowed:
+        return {"status": "out_of_scope", "note": f"{base} is out of scope — not fetching ({reason})."}
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; recon-wellknown/1.0)"}
+
+    def _fetch(path: str) -> Optional[str]:
+        try:
+            r = requests.get(base + path, timeout=10, allow_redirects=True, headers=headers)
+            if r.status_code == 200 and r.text:
+                return r.text
+        except requests.RequestException:
+            return None
+        return None
+
+    robots_txt = _fetch("/robots.txt")
+    sitemap_xml = _fetch("/sitemap.xml")
+    security_txt = _fetch("/.well-known/security.txt")
+
+    disallow_paths: List[str] = []
+    allow_paths: List[str] = []
+    sitemap_refs: List[str] = []
+    if robots_txt:
+        for line in robots_txt.splitlines():
+            line = line.strip()
+            m = re.match(r"(?i)^(dis)?allow\s*:\s*(\S+)", line)
+            if m:
+                p = m.group(2)
+                (disallow_paths if m.group(1) else allow_paths).append(p)
+                continue
+            sm = re.match(r"(?i)^sitemap\s*:\s*(\S+)", line)
+            if sm:
+                sitemap_refs.append(sm.group(1))
+
+    sitemap_urls: List[str] = []
+    if sitemap_xml:
+        sitemap_urls = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", sitemap_xml, re.I)
+
+    security_contacts: List[str] = []
+    if security_txt:
+        for line in security_txt.splitlines():
+            cm = re.match(r"(?i)^contact\s*:\s*(\S+)", line.strip())
+            if cm:
+                security_contacts.append(cm.group(1))
+
+    # Build full URLs for the robots Disallow paths (globs like /x/* -> /x/)
+    # and probe them — these are the owner-flagged "hidden" paths.
+    probe_targets: List[str] = []
+    seen = set()
+    for p in disallow_paths:
+        clean = p.split("*", 1)[0]
+        if not clean or clean == "/":
+            continue
+        full = base + ("" if clean.startswith("/") else "/") + clean
+        if full not in seen:
+            seen.add(full)
+            probe_targets.append(full)
+
+    note_bits = []
+    if robots_txt:
+        note_bits.append(f"robots.txt: {len(disallow_paths)} Disallow")
+    if sitemap_urls:
+        note_bits.append(f"sitemap.xml: {len(sitemap_urls)} URLs")
+    if security_contacts:
+        note_bits.append(f"security.txt contact: {security_contacts[0]}")
+    if not note_bits:
+        note_bits.append("no robots.txt / sitemap.xml / security.txt found")
+
+    result = {
+        "status": "success",
+        "base": base,
+        "robots_found": bool(robots_txt),
+        "robots_disallow": disallow_paths[:100],
+        "robots_allow": allow_paths[:50],
+        "sitemap_urls": sitemap_urls[:200],
+        "sitemap_refs": sitemap_refs,
+        "security_contacts": security_contacts,
+        "note": "; ".join(note_bits),
+    }
+
+    if probe_targets and bool(args.get("probe_live", True)):
+        cap = max(1, min(int(args.get("probe_limit", 25) or 25), 50))
+        if emit and hasattr(emit, "info"):
+            try:
+                emit.info(f"probing {min(cap, len(probe_targets))} robots.txt Disallow path(s) for liveness…")
+            except Exception:
+                pass
+        probe = _probe_live_urls(probe_targets, target, emit, cap=cap)
+        result.update({
+            "disallow_probed": probe["probed_count"],
+            "disallow_live": probe["live_urls"],
+            "disallow_live_count": probe["live_count"],
+        })
+        if probe["live_count"]:
+            result["note"] += (f" — {probe['live_count']} Disallow path(s) are STILL LIVE "
+                               f"(owner-hidden but reachable — look here first).")
+
+    # Persist what we learned so later turns/tools can pick it up.
+    try:
+        if hasattr(target, "state") and isinstance(target.state, dict):
+            existing = target.state.setdefault("endpoints", [])
+            for h in result.get("disallow_live", []):
+                if h["url"] not in existing:
+                    existing.append(h["url"])
+            save_target(target)
+    except Exception:
+        pass
+
+    return result
 
 
 def _execute_otx_urls(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
