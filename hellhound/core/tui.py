@@ -154,6 +154,15 @@ class AssistantMessage(Static):
 
 _STATUS_RE = re.compile(r'^\s*\[(\d{3})\]\s*(.*)$')
 
+# Lines carrying our OWN emit markup vocabulary (PlainEmit.warn/success/error/
+# finding/section/banner/row). When such a line folds into a running tool card,
+# it must render as the intended color, not show the raw [bold ...] tags. Raw
+# tool output never contains these tokens, so gating pass-through on this keeps
+# arbitrary brackets (URLs, JSON) safely escaped.
+_EMIT_MARKUP_RE = re.compile(
+    r'\[/?(?:bold|dim|italic)\b|'
+    r'\[/?(?:green|red|yellow|cyan|magenta|white|orange1)\]')
+
 # Only these genuinely long-running sweeps earn a slot in the right-side 'Live
 # work' panel — an instant curl/read/record would just flash in and vanish,
 # duplicating the transcript card for a split second. Fast tools still get their
@@ -183,6 +192,14 @@ def _colorize_log(raw: str) -> str:
     s = str(raw)
     m = _STATUS_RE.match(s)
     if not m:
+        # Our own semantic emits (warn/success/error/finding/section) arrive as
+        # Rich markup — e.g. '[bold orange1][!][/bold orange1] msg'. Escaping
+        # them would print the tags literally inside the card ("colors not
+        # used"), so pass a line carrying our known markup vocab straight to the
+        # markup parser. Raw tool output (URLs, JSON) has no such tags and stays
+        # safely escaped.
+        if _EMIT_MARKUP_RE.search(s):
+            return s
         return f"[#9aa0ac]{_rich_escape(s)}[/]"
     code, rest = m.group(1), m.group(2)
     c = int(code)

@@ -13375,12 +13375,33 @@ If there is nothing worth generalizing, return an empty array: []"""
             def __getattr__(self, name):
                 return getattr(self._real, name)
 
+        # Give each concurrent sub-tool its OWN labeled card (tool name shown in
+        # the title) instead of dumping every stream into one opaque 'parallel'
+        # blob — the researcher asked to SEE which tools are running side by side.
+        # tool_start/tool_result marshal onto the UI thread, so concurrent calls
+        # from the worker threads are safe; a UI without cards just logs them.
+        _per_tool_cards = (emit is not None
+                           and hasattr(emit, "tool_start") and hasattr(emit, "tool_result"))
+
         def _run(i: int, tool: str, a: Dict[str, Any]):
+            sub_emit = _TaggedEmit(emit, tool) if emit is not None else emit
+            carded = _per_tool_cards
+            if carded:
+                try:
+                    emit.tool_start(tool, a)
+                except Exception:
+                    carded = False
             try:
-                sub_emit = _TaggedEmit(emit, tool) if emit is not None else emit
-                results[i] = {"tool": tool, "result": self.execute_tool_call(tool, a, sub_emit)}
+                r = self.execute_tool_call(tool, a, sub_emit)
+                results[i] = {"tool": tool, "result": r}
             except Exception as e:
-                results[i] = {"tool": tool, "error": f"{type(e).__name__}: {e}"}
+                r = {"error": f"{type(e).__name__}: {e}"}
+                results[i] = {"tool": tool, "error": r["error"]}
+            if carded:
+                try:
+                    emit.tool_result(tool, r)
+                except Exception:
+                    pass
 
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(norm)), thread_name_prefix="hh-par")
         _par_cancelled = False
