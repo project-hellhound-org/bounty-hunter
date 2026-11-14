@@ -291,6 +291,67 @@ def _execute_wayback_urls(args: Dict[str, Any], target: Target, emit: Any) -> Di
     return result
 
 
+def _execute_crtsh_subdomains(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Enumerate subdomains straight from certificate-transparency logs via
+    crt.sh's free JSON API — no binary, no API key. This is pure OSINT (it
+    queries crt.sh, never the target), so it's safe on strict/fragile programs,
+    and because every TLS cert a host ever requested shows up in CT logs it
+    routinely surfaces dev/staging/internal names that subfinder's other
+    sources — or a hunter who only ran one tool — miss. More assets = more
+    surface others left on the table."""
+    domain = str(args.get("domain") or target.name).strip().lower()
+    if domain.startswith(("http://", "https://")):
+        domain = urlparse(domain).netloc.split(":")[0]
+    if not domain:
+        return {"status": "no_domain_given", "note": "crtsh_subdomains needs a domain."}
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; recon-crtsh/1.0)"}
+    found = set()
+    try:
+        r = requests.get(f"https://crt.sh/?q=%25.{domain}&output=json",
+                         timeout=30, headers=headers)
+        if r.status_code == 200 and r.text:
+            try:
+                rows = r.json()
+            except ValueError:
+                rows = []
+            for row in rows if isinstance(rows, list) else []:
+                nv = str(row.get("name_value", "")) + "\n" + str(row.get("common_name", ""))
+                for name in nv.splitlines():
+                    name = name.strip().lower().lstrip("*.")
+                    # keep only real sub-hosts of the target domain
+                    if name and name.endswith("." + domain) and "@" not in name and " " not in name:
+                        found.add(name)
+    except requests.RequestException as e:
+        return {"error": f"crt.sh request failed: {e}", "domain": domain}
+
+    sub_list = sorted(found)
+    if sub_list:
+        try:
+            update_from_subfinder(target, sub_list)
+            save_target(target)
+        except Exception:
+            existing = target.state.setdefault("subdomains", []) if hasattr(target, "state") else []
+            for s in sub_list:
+                if s not in existing:
+                    existing.append(s)
+    if emit and hasattr(emit, "info"):
+        try:
+            emit.info(f"crt.sh: {len(sub_list)} subdomain(s) from certificate transparency for {domain}")
+        except Exception:
+            pass
+    return {
+        "domain": domain,
+        "count": len(sub_list),
+        "subdomains": sub_list[:200],
+        "total_discovered": len(sub_list),
+        "source": "crt.sh certificate transparency",
+        "note": (f"{len(sub_list)} subdomain(s) from CT logs. Resolve/probe_urls these to find which are live — "
+                 "CT often reveals dev/staging/admin hosts others never see."
+                 if sub_list else "No CT-log subdomains found (domain may not use public CAs, or isn't indexed)."),
+    }
+
+
 def _execute_well_known_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """Deterministically fetch and parse the free, zero-impact starting points
     every engagement should read FIRST — robots.txt, sitemap.xml, and

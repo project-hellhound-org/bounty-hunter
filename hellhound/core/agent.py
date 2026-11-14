@@ -138,7 +138,7 @@ from hellhound.core.tools.hackerone_tools import (  # noqa: E402
 from hellhound.core.tools.osint_recon import (  # noqa: E402
     _execute_wayback_urls, _execute_otx_urls, _execute_urlscan_recon,
     _execute_virustotal_lookup, _execute_google_dork, _execute_well_known_probe,
-    _execute_probe_urls,
+    _execute_probe_urls, _execute_crtsh_subdomains,
 )
 
 from hellhound.core.tools.network_recon import _execute_port_scan, _execute_nmap_service_scan  # noqa: E402
@@ -10529,6 +10529,17 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_probe_urls
     ),
+    "crtsh_subdomains": ToolSpec(
+        name="crtsh_subdomains",
+        description="Enumerate subdomains from certificate-transparency logs via crt.sh's free JSON API — no binary, no API key, pure OSINT (queries crt.sh, never the target, so it's safe on strict/fragile programs). Every TLS cert a host requested is logged, so this routinely surfaces dev/staging/internal hosts that other sources miss. Use it alongside subfinder (not instead of), and it works even when subfinder isn't installed. Follow with probe_urls to see which discovered hosts are live.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Apex domain to pull CT-log subdomains for (defaults to the active target)."}
+            }
+        },
+        executor=_execute_crtsh_subdomains
+    ),
     "urlscan_recon": ToolSpec(
         name="urlscan_recon",
         description="Searches urlscan.io's crawl index for a domain and extracts either discovered subdomains or discovered URLs from pages it has already scanned. Needs an urlscan.io API key configured via /apikey urlscan <key> (free key: https://urlscan.io/user/signup) or the URLSCAN_API_KEY env var.",
@@ -14754,6 +14765,7 @@ RULES:
    - ALWAYS READ `robots.txt`, `sitemap.xml`, AND `/.well-known/security.txt` EARLY — they are free, zero-impact, and the single highest-signal starting point. Run `well_known_probe` to do this in one shot: it fetches all three and PROBES the `robots.txt` Disallow paths for liveness, so a still-reachable `Disallow: /.env`, `/admin`, `/backup/` comes back already confirmed-live (owner-hidden but reachable = look there first). `sitemap.xml` enumerates real pages; `security.txt` gives the reporting contact. Never crawl past these without having read them.
    - Archived/passive URLs (`wayback_urls`, `otx_urls`) are HISTORICAL — most are dead. `wayback_urls` now probes the interesting ones for liveness automatically (`live_urls` in its result); act on the STILL-LIVE ones, don't reason over the raw archive list as if it were the current surface.
    - NEVER check URLs for liveness one `curl` at a time — that is slow and leaves assets undiscovered. After ANY URL-discovery step (wayback/otx/gau/spider/JS mining), run `probe_urls` to BATCH-check the whole pile concurrently (or call it with no args to sweep everything discovered so far). It returns each live URL's status + title + Server header so you triage which to open. Breadth of live assets is your edge — surface more than the next hunter by probing everything, not sampling.
+   - Cast a WIDE asset net before going deep: pull subdomains from `crtsh_subdomains` (certificate-transparency, free, no key, works with no binary and finds dev/staging/internal hosts others miss) AND `subfinder` when available, then `probe_urls` the lot to see which resolve live. The host a lazy hunter never found is where the uncontested bug lives.
    - WHEN PASSIVE SOURCES RETURN A PILE OF URLs (wayback/gau/otx with hundreds–thousands of results), DON'T JUST COLLECT THEM — triage and probe. `curl` a batch of the high-value ones (anything with params, `/api/`, `/admin`, `.json`, old/deprecated paths, backup extensions) to see which are STILL LIVE and what they expose — an archived URL that still resolves is exactly the forgotten endpoint nobody re-tested. A 10k-URL wayback dump you never fetch from is worth nothing.
    - IF A BURP / CAIDO PROXY IS CONNECTED (MCP) — PARK THE NOTEWORTHY REQUESTS, NOT THE FLOOD: keep running your bulk recon with `curl` (it's fast and it keeps Burp's Proxy history from drowning in hundreds of your own requests) — do NOT route all traffic through the proxy. BUT the MOMENT you craft or confirm a NOTEWORTHY request — the actual exploit request, an auth-bypass / privilege request, anything the researcher would want to SEE or re-send by hand — ALSO call `create_repeater_tab_http` to drop that one request into Burp Repeater. That is the entire point of the proxy being connected: the researcher watches and manually follows up the handful of requests that matter, without wading through your recon noise. One Repeater tab per genuinely interesting request — not per curl, and never the whole scan. (A plain `send_http1_request` routes through Burp's engine but shows NOWHERE in the UI, so it's no substitute for parking the request in Repeater.)
    - ON A REAL (non-lab) TARGET, RESPECT RATE LIMITS — NEVER GET THE RESEARCHER BLOCKED: if responses start returning 429 (Too Many Requests), a WAF 403, sudden connection resets, CAPTCHAs, or rate-limit headers, STOP hammering immediately — back off, pause heavy fuzzing/scanning/`content_discovery`, switch to slow surgical requests, and tell the researcher what you're seeing. Getting their IP or account banned on a live program ends the engagement and can breach the program's rules of engagement — that's a far worse outcome than being slow. Lab / CTF / explicitly-authorized boxes you can push hard; a real production program you treat with restraint: steady and targeted, never a blind high-rate flood.
