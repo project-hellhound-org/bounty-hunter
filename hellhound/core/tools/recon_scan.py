@@ -992,3 +992,218 @@ def _execute_subzy(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str,
         save_target(target)
 
     return result
+
+
+def _execute_waymore(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Deep PASSIVE URL harvest via waymore — pulls from Wayback + Common Crawl
+    + OTX + URLScan + VirusTotal in one shot (far more sources than gau or
+    wayback_urls alone). Pure OSINT (third-party archives, never the target), so
+    safe on strict programs. Needs waymore installed (pipx install waymore).
+    Follow with probe_urls to see which of the harvested URLs are still live."""
+    domain = str(args.get("domain") or target.name).strip().lower()
+    if domain.startswith(("http://", "https://")):
+        domain = urlparse(domain).netloc.split(":")[0]
+    if not domain:
+        return {"status": "no_domain_given", "note": "waymore needs a domain."}
+
+    waymore_bin = get_binary_path("waymore") or pick_available(["waymore"])
+    if not waymore_bin:
+        return {"error": "waymore not installed", "hint": install_hint("waymore")}
+
+    out_fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="hh_waymore_")
+    os.close(out_fd)
+    cmd = [waymore_bin, "-i", domain, "-mode", "U", "-oU", out_path]
+    try:
+        _run_cmd_with_heartbeat(cmd, timeout=int(args.get("max_runtime", 240) or 240),
+                                emit=emit, label="waymore (deep URL harvest)")
+    except Exception as e:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
+        return {"error": f"waymore failed: {e}"}
+
+    urls = []
+    try:
+        with open(out_path, "r", encoding="utf-8", errors="ignore") as f:
+            urls = [ln.strip() for ln in f if ln.strip()]
+    except Exception:
+        pass
+    finally:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
+
+    if urls and hasattr(target, "state") and isinstance(target.state, dict):
+        existing = target.state.setdefault("wayback_urls", [])
+        for u in urls:
+            if u not in existing:
+                existing.append(u)
+        try:
+            save_target(target)
+        except Exception:
+            pass
+    return {
+        "status": "success", "domain": domain, "url_count": len(urls),
+        "urls": urls[:500], "truncated": len(urls) > 500,
+        "note": (f"{len(urls)} URL(s) from waymore (wayback+commoncrawl+otx+urlscan+vt). "
+                 "Run probe_urls to find which are live, then gf_patterns to triage by bug class."
+                 if urls else "waymore returned no URLs for this domain."),
+    }
+
+
+# Built-in param-name sets per vuln class — the gf-pattern fallback when the real
+# gf binary / ~/.gf patterns aren't installed.
+_GF_BUILTIN = {
+    "redirect": {"url", "redirect", "redirect_url", "redir", "return", "return_url", "returnurl",
+                 "next", "continue", "dest", "destination", "r", "u", "out", "goto", "to", "target", "link"},
+    "ssrf": {"url", "uri", "path", "dest", "host", "site", "target", "feed", "to", "out", "dir",
+             "show", "file", "filename", "image_url", "img", "proxy", "callback", "domain", "port",
+             "ip", "server", "fetch", "load", "src"},
+    "lfi": {"file", "document", "folder", "root", "path", "pg", "style", "pdf", "template",
+            "php_path", "doc", "include", "page", "inc", "locate", "show", "type", "view",
+            "content", "download", "filename"},
+    "sqli": {"id", "select", "report", "role", "update", "query", "user", "name", "sort", "where",
+             "search", "params", "process", "row", "view", "table", "from", "sel", "results",
+             "fetch", "order", "keyword", "column", "field", "delete", "number", "filter", "cat",
+             "category", "pid", "item", "item_id"},
+    "ssti": {"template", "preview", "id", "view", "activity", "name", "content", "redirect", "q"},
+    "idor": {"id", "user_id", "uid", "account", "account_id", "order", "order_id", "invoice",
+             "doc", "file", "number", "no", "key", "profile", "customer", "item_id"},
+}
+
+
+def _execute_gf_patterns(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Triage a big pile of collected URLs into VULN CANDIDATES by class
+    (redirect / ssrf / lfi / sqli / ssti / idor) — like tomnomnom's gf. Prefers
+    the real gf binary + your ~/.gf patterns when installed; otherwise falls
+    back to a built-in param-name matcher so it works with no setup. Local
+    processing of already-collected URLs — sends NO traffic to the target.
+    Pass urls, or omit to use everything discovered this engagement."""
+    pattern = str(args.get("pattern") or "all").lower()
+    urls = args.get("urls")
+    if isinstance(urls, str):
+        urls = [urls]
+    if not urls:
+        st = target.state if isinstance(getattr(target, "state", None), dict) else {}
+        pool = []
+        for k in ("wayback_urls", "endpoints", "discovered_urls", "urls"):
+            v = st.get(k)
+            if isinstance(v, list):
+                pool.extend(x for x in v if isinstance(x, str))
+        urls = pool
+    urls = [u for u in (urls or []) if isinstance(u, str) and "?" in u and "=" in u]
+    if not urls:
+        return {"status": "no_urls",
+                "note": "No param-bearing URLs to triage — run wayback_urls/waymore/probe_urls first."}
+
+    patterns = [pattern] if pattern != "all" else list(_GF_BUILTIN.keys())
+    gf_bin = get_binary_path("gf")
+    results = {}
+    for pat in patterns:
+        matched = []
+        if gf_bin:
+            try:
+                proc = subprocess.run([gf_bin, pat], input="\n".join(urls),
+                                      capture_output=True, text=True, timeout=30)
+                matched = [u.strip() for u in (proc.stdout or "").splitlines() if u.strip()]
+            except Exception:
+                matched = []
+        if not matched:  # built-in fallback (gf missing, or that pattern not installed)
+            names = _GF_BUILTIN.get(pat, set())
+            for u in urls:
+                q = urlparse(u).query
+                pkeys = {kv.split("=", 1)[0].lower() for kv in q.split("&") if kv}
+                if pkeys & names:
+                    matched.append(u)
+        if matched:
+            results[pat] = sorted(set(matched))[:200]
+    total = sum(len(v) for v in results.values())
+    return {
+        "status": "success",
+        "source": "gf" if gf_bin else "built-in",
+        "patterns": list(results.keys()),
+        "candidates": results,
+        "candidate_count": total,
+        "note": (f"{total} vuln-candidate URL(s) across {len(results)} class(es) — test each by its class "
+                 "(redirect->open-redirect, ssrf->SSRF, lfi->path-traversal, sqli->injection, idor->access-control)."
+                 if total else "No URLs matched any vuln-candidate pattern."),
+    }
+
+
+def _execute_trufflehog_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Scan already-discovered JS files / URLs for LIVE secrets with trufflehog
+    (far more detectors + verification than the built-in js_miner). Fetches the
+    in-scope content gently (capped, scope-gated) and runs trufflehog over it.
+    Needs trufflehog installed."""
+    urls = args.get("urls")
+    if isinstance(urls, str):
+        urls = [urls]
+    if not urls:
+        st = target.state if isinstance(getattr(target, "state", None), dict) else {}
+        urls = [u for u in (st.get("js_routes") or st.get("js_files") or []) if isinstance(u, str)]
+        if not urls:
+            urls = [u for u in (st.get("endpoints") or []) if isinstance(u, str) and u.endswith(".js")]
+    urls = [u for u in (urls or []) if isinstance(u, str) and u.startswith(("http://", "https://"))]
+    if not urls:
+        return {"status": "no_urls", "note": "No JS/URLs to scan — pass 'urls' or run spider/js_miner first."}
+
+    th_bin = get_binary_path("trufflehog")
+    if not th_bin:
+        return {"error": "trufflehog not installed", "hint": install_hint("trufflehog")}
+
+    import shutil
+    rules = getattr(target, "scope_rules", None)
+    headers = merge_global_context({})
+    tmpdir = tempfile.mkdtemp(prefix="hh_th_")
+    cap = max(1, min(int(args.get("limit", 30) or 30), 100))
+    fetched = 0
+    try:
+        for i, u in enumerate(urls[:cap]):
+            ok, _r = is_in_scope(u, rules)
+            if not ok:
+                continue
+            try:
+                r = requests.get(u, timeout=8, verify=False, headers=headers)
+                if r.status_code == 200 and r.content:
+                    with open(os.path.join(tmpdir, f"f{i}.js"), "wb") as f:
+                        f.write(r.content[:2_000_000])
+                    fetched += 1
+            except Exception:
+                continue
+
+        findings = []
+        if fetched:
+            try:
+                proc = _run_cmd_with_heartbeat([th_bin, "filesystem", tmpdir, "--json", "--no-update"],
+                                               timeout=150, emit=emit, label="trufflehog (secret scan)")
+                for line in (proc.stdout or "").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        it = json.loads(line)
+                        findings.append({
+                            "detector": it.get("DetectorName"),
+                            "verified": bool(it.get("Verified")),
+                            "raw": (it.get("Raw") or "")[:80],
+                        })
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+    verified = [f for f in findings if f.get("verified")]
+    return {
+        "status": "success", "scanned_files": fetched,
+        "findings": findings, "finding_count": len(findings), "verified_count": len(verified),
+        "note": (f"trufflehog: {len(verified)} VERIFIED + {len(findings) - len(verified)} unverified secret(s) "
+                 f"across {fetched} file(s) — verified ones are live, triage first."
+                 if findings else f"trufflehog found no secrets in {fetched} fetched file(s)."),
+    }

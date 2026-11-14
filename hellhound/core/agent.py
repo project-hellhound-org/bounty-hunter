@@ -159,7 +159,8 @@ from hellhound.core.tools.recon_scan import (  # noqa: E402
     _resolve_resolvers_path, _execute_subfinder, _execute_permute_subdomains,
     _execute_resolve_candidates, _execute_subdomain_sweep, _execute_httpx,
     _execute_tls_cert_scan, _execute_takeover_scanner, _execute_subzy,
-    _execute_param_discover,
+    _execute_param_discover, _execute_waymore, _execute_gf_patterns,
+    _execute_trufflehog_scan,
 )
 
 from hellhound.core.tools.crawl_scan import (  # noqa: E402
@@ -10708,6 +10709,41 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         },
         executor=_execute_dalfox_scan
     ),
+    "waymore": ToolSpec(
+        name="waymore",
+        description="Deep PASSIVE URL harvest via waymore — pulls archived URLs from Wayback + Common Crawl + OTX + URLScan + VirusTotal in one shot (far more sources than gau/wayback_urls). Pure OSINT (third-party archives, never the target), safe on strict programs. Needs waymore installed (via /setup). Follow with probe_urls (liveness) then gf_patterns (triage).",
+        parameters={
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Domain to harvest URLs for (defaults to the active target)."}
+            }
+        },
+        executor=_execute_waymore
+    ),
+    "gf_patterns": ToolSpec(
+        name="gf_patterns",
+        description="Triage a big pile of collected URLs into VULN CANDIDATES by class (redirect/ssrf/lfi/sqli/ssti/idor) — like tomnomnom's gf. Uses the real gf binary + your ~/.gf patterns when installed, else a built-in param-name matcher (works with no setup). Local-only — sends NO traffic to the target. Pass urls, or omit to use everything discovered this engagement. Run it after wayback/waymore/gau to focus on the URLs worth testing.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Vuln class: redirect|ssrf|lfi|sqli|ssti|idor, or 'all'.", "default": "all"},
+                "urls": {"type": "array", "items": {"type": "string"}, "description": "URLs to triage. Omit to use all discovered URLs."}
+            }
+        },
+        executor=_execute_gf_patterns
+    ),
+    "trufflehog_scan": ToolSpec(
+        name="trufflehog_scan",
+        description="Scan already-discovered JS files / URLs for LIVE secrets with trufflehog (more detectors + verification than the built-in js_miner) — API keys, tokens, cloud creds left in frontend code. Fetches the in-scope content gently (capped, scope-gated) and scans it. Needs trufflehog installed (via /setup). Verified hits are live credentials — triage first.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "urls": {"type": "array", "items": {"type": "string"}, "description": "JS/URLs to scan. Omit to use discovered JS files/endpoints."},
+                "limit": {"type": "integer", "description": "Max files to fetch+scan (hard ceiling 100).", "default": 30}
+            }
+        },
+        executor=_execute_trufflehog_scan
+    ),
     "crtsh_subdomains": ToolSpec(
         name="crtsh_subdomains",
         description="Enumerate subdomains from certificate-transparency logs via crt.sh's free JSON API — no binary, no API key, pure OSINT (queries crt.sh, never the target, so it's safe on strict/fragile programs). Every TLS cert a host requested is logged, so this routinely surfaces dev/staging/internal hosts that other sources miss. Use it alongside subfinder (not instead of), and it works even when subfinder isn't installed. Follow with probe_urls to see which discovered hosts are live.",
@@ -14970,6 +15006,7 @@ RULES:
    - For a fresh target, `recon` runs the whole opening enumeration in one deterministic pass (discover -> resolve -> live hosts -> robots/sitemap -> wayback) and hands back a ranked inventory — prefer it over firing the sub-tools by hand, so nothing gets skipped.
    - Expand surface and pivot to assets others miss: on a live endpoint run `param_discover` to surface hidden IDOR/SSRF/LFI/redirect params a crawler can't see (it drives real `arjun` when installed, a built-in probe otherwise); `favicon_hash` then a Shodan pivot finds the org's other properties on the same build; `asn_expand` maps the org's whole IP space (probe only in-scope ranges).
    - These wrap REAL external tools and degrade gracefully when they aren't installed (they return an install hint — tell the researcher to run /setup): `nuclei_scan` (templated CVE/misconfig/exposure/takeover detection on the live hosts — highest-ROI "already broken?" check) and `dalfox_scan` (XSS/param-injection). Both are active scanners, so the scope gate BLOCKS them on programs that forbid automated scanning — don't fight the block, fall back to manual/gentle tools there. Always VERIFY a scanner hit before recording it; templates false-positive.
+   - More URL/triage/secret tools (install via /setup; all safe on strict programs — passive or local): `waymore` (deeper archived-URL harvest than wayback/gau), `gf_patterns` (triage the URL pile into redirect/ssrf/lfi/sqli/idor candidates — works built-in with no binary), `trufflehog_scan` (live secrets in discovered JS, better than js_miner). Good chain: `waymore` → `probe_urls` → `gf_patterns` → test each candidate by its class.
    - WHEN PASSIVE SOURCES RETURN A PILE OF URLs (wayback/gau/otx with hundreds–thousands of results), DON'T JUST COLLECT THEM — triage and probe. `curl` a batch of the high-value ones (anything with params, `/api/`, `/admin`, `.json`, old/deprecated paths, backup extensions) to see which are STILL LIVE and what they expose — an archived URL that still resolves is exactly the forgotten endpoint nobody re-tested. A 10k-URL wayback dump you never fetch from is worth nothing.
    - IF A BURP / CAIDO PROXY IS CONNECTED (MCP) — PARK THE NOTEWORTHY REQUESTS, NOT THE FLOOD: keep running your bulk recon with `curl` (it's fast and it keeps Burp's Proxy history from drowning in hundreds of your own requests) — do NOT route all traffic through the proxy. BUT the MOMENT you craft or confirm a NOTEWORTHY request — the actual exploit request, an auth-bypass / privilege request, anything the researcher would want to SEE or re-send by hand — ALSO call `create_repeater_tab_http` to drop that one request into Burp Repeater. That is the entire point of the proxy being connected: the researcher watches and manually follows up the handful of requests that matter, without wading through your recon noise. One Repeater tab per genuinely interesting request — not per curl, and never the whole scan. (A plain `send_http1_request` routes through Burp's engine but shows NOWHERE in the UI, so it's no substitute for parking the request in Repeater.)
    - ON A REAL (non-lab) TARGET, RESPECT RATE LIMITS — NEVER GET THE RESEARCHER BLOCKED: if responses start returning 429 (Too Many Requests), a WAF 403, sudden connection resets, CAPTCHAs, or rate-limit headers, STOP hammering immediately — back off, pause heavy fuzzing/scanning/`content_discovery`, switch to slow surgical requests, and tell the researcher what you're seeing. Getting their IP or account banned on a live program ends the engagement and can breach the program's rules of engagement — that's a far worse outcome than being slow. Lab / CTF / explicitly-authorized boxes you can push hard; a real production program you treat with restraint: steady and targeted, never a blind high-rate flood.
