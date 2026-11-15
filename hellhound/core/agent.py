@@ -14461,6 +14461,37 @@ If there is nothing worth generalizing, return an empty array: []"""
                                 )
                     elif tool_name in streaks and streaks[tool_name]:
                         streaks[tool_name] = 0
+
+                    # SAME-REQUEST-SAME-RESPONSE loop — the low-signal streak
+                    # above only catches EMPTY results, so a request that keeps
+                    # returning the SAME non-empty response (e.g. curling an SPA
+                    # root 16x hunting a hidden API, each time the identical 200)
+                    # looks like "signal" and never trips it. Catch it by exact
+                    # URL + response fingerprint (status + body size): keyed on
+                    # the URL, so IDOR/param testing — which varies the URL —
+                    # never false-trips, but a header-only variation loop on one
+                    # URL does. Advisory note nudges a pivot instead of letting
+                    # the (now-uncapped) budget burn on one dead avenue.
+                    if ("_pivot_note" not in result and isinstance(result, dict)
+                            and result.get("url") and ("status_code" in result or "body_preview" in result)):
+                        _rurl = str(result.get("url"))
+                        _fp = [result.get("status_code"), len(str(result.get("body_preview") or ""))]
+                        _reps = self.target.state.setdefault("_same_resp_streaks", {})
+                        _key = f"{tool_name}|{_rurl}"
+                        if isinstance(_reps.get(_key), dict) and _reps[_key].get("fp") == _fp:
+                            _reps[_key]["n"] = _reps[_key].get("n", 1) + 1
+                        else:
+                            _reps[_key] = {"fp": _fp, "n": 1}
+                        _n = _reps[_key]["n"]
+                        if _n >= 3:
+                            result["_pivot_note"] = (
+                                f"SAME RESPONSE {_n}x — you've requested {_rurl} {_n} times this turn and gotten the "
+                                f"identical response ({_fp[0]}, ~{_fp[1]} bytes) every time. This request is exhausted; "
+                                f"repeating it (even with different headers) will not change the result. PIVOT NOW: "
+                                f"try a genuinely different technique on this host (content_discovery, nuclei with "
+                                f"API/exposure tags, subdomain enum for a separate api.* host), or move to another "
+                                f"lead. Do NOT request this same URL again."
+                            )
                     save_target(self.target)
                 except Exception:
                     pass
