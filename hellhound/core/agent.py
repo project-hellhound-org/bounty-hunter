@@ -16173,22 +16173,21 @@ INSTRUCTIONS:
                             # (40 min wall clock) set above, which this can
                             # never push past.
                             #
-                            # CAUGHT IN THE WILD (bbmc deep hunt): a prior
-                            # `tools_executed.count(t_name) <= 12` guard here
-                            # STARVED real hunts — `curl` is the primary hunting
-                            # tool and a genuine engagement fires dozens of them,
-                            # so after the 12th curl the rolling budget stopped
-                            # extending and the turn got force-summarized at ~8
-                            # min, ~80% of the budget unused, the model wrongly
-                            # reporting "time budget ran out". The dedup check
-                            # (`_dup_skip_count == 0`) already prevents an
-                            # identical-call stall from extending; a DISTINCT
-                            # productive call is progress regardless of how many
-                            # times that tool has been used, and is bounded by
-                            # the hard ceiling. So gate the extension on dedup
-                            # alone, matching this block's stated design.
-                            if _dup_skip_count == 0:
-                                _loop_deadline = min(max(_loop_deadline, time.time() + 240), _hard_ceiling)
+                            # CAUGHT IN THE WILD (bbmc deep hunt): every long run
+                            # got force-summarized at ~8 min with ~80% of the
+                            # budget unused, the model wrongly reporting "time
+                            # budget ran out". Cause: this extension was gated on
+                            # `_dup_skip_count == 0`, but _dup_skip_count is a
+                            # CUMULATIVE turn total (incremented, never reset), so
+                            # the FIRST duplicate call anywhere in the turn pinned
+                            # it >0 and the rolling clock then NEVER extended again,
+                            # dying 240s later even while real distinct work kept
+                            # happening. We only reach this block for a tool that
+                            # ACTUALLY DISPATCHED (dups `continue` out above) and
+                            # produced a non-NO_OP result — that IS progress, full
+                            # stop. Extend unconditionally; the _hard_ceiling is
+                            # the only bound.
+                            _loop_deadline = min(max(_loop_deadline, time.time() + 240), _hard_ceiling)
 
                         if emit and hasattr(emit, "tool_result"):
                             emit.tool_result(t_name, tool_result)
