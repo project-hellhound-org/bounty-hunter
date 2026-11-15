@@ -754,6 +754,16 @@ class HellhoundApp(App):
             self._dispatch_fn = _dispatch
         self.query_one("#baninfo", Static).update(self._banner_info())
         self.query_one("#prompt", PromptArea).focus()
+        # Soft, opt-in resume hint — we start FRESH, but if you were mid-
+        # engagement last time, offer the one command to pick it back up.
+        if not self._initial_target:
+            _lp = _last_program()
+            if _lp:
+                _prog, _tgt = _lp
+                self.add_log_line(
+                    f"[dim]Last session: program [bold]{_rich_escape(_prog)}[/bold] on "
+                    f"[bold]{_rich_escape(_tgt)}[/bold]. Run [bold]/program select {_rich_escape(_prog)}[/bold] "
+                    f"to resume it, or just start typing for a fresh session.[/dim]")
         self._check_ai_ready()
 
     @work(thread=True, exclusive=False)
@@ -1486,6 +1496,23 @@ def _looks_like_command(line: str) -> bool:
     except Exception:
         pass
     return False
+
+
+def _last_program() -> Optional[tuple]:
+    """The program/target you last selected (if any), from config. Used ONLY to
+    show a soft 'resume?' hint at launch — the TUI deliberately starts FRESH
+    (default target, nothing scoped), like opening a new chat, so just asking a
+    question never drops you into yesterday's engagement. Resuming is opt-in:
+    the hint tells you the /program select command to run if you want it."""
+    try:
+        from hellhound.core.ai_utils import load_config
+        cfg = load_config()
+        prog, tgt = cfg.get("active_program"), cfg.get("active_target")
+        if prog and tgt:
+            return (prog, tgt)
+    except Exception:
+        pass
+    return None
 
 
 def start_tui_session(initial_target: Optional[str] = None) -> None:
