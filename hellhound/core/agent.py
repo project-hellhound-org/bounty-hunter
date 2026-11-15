@@ -14759,13 +14759,17 @@ If there is nothing worth generalizing, return an empty array: []"""
                  "and do NOT claim to remember something from a prior session you have no record of here."
         )
 
-        # Iteration ceiling: explicit arg wins, else the configured value
-        # (default 60 — see ai_utils.load_config), never below 1.
+        # Iteration ceiling: explicit arg wins, else the configured value. A
+        # real hunt is multi-step — map, verify, then chase several leads to
+        # confirmation — so the default is a realistic 100 (it's a SAFETY cap,
+        # not a target: a turn stops the moment it's actually done, and
+        # dead-end/degeneration detection ends a stuck one early). Raise it with
+        # /setup max-iterations for a deep autonomous sweep. Never below 1.
         if max_iterations is None:
             try:
-                max_iterations = max(1, int(cfg.get("max_agent_iterations", 60)))
+                max_iterations = max(1, int(cfg.get("max_agent_iterations", 100)))
             except (TypeError, ValueError):
-                max_iterations = 60
+                max_iterations = 100
 
         forced_skill = getattr(self, "_forced_skill", None)
         was_forced_skill = bool(forced_skill)
@@ -15003,6 +15007,7 @@ RULES:
        (4) THINK — call `generate_hypotheses` to rank what THIS specific surface is actually likely to be vulnerable to, instead of running every tool and hoping. Work the lead board top-down.
        (5) TEST TARGETED — go at the specific leads. Never bulk-scan everything.
    - TARGETED SCANS, NOT BULK — point a scanner at a SPECIFIC lead recon surfaced; never "scan the whole program with every template and hope". Worked examples: `takeover_scanner`/`subzy` flags a dangling CNAME → run `nuclei_scan` with `tags=takeover` (or the specific provider's takeover template) on THAT host to confirm it; a `swagger.json`/`openapi.json` spec turns up → enumerate ITS endpoints and test the interesting ones, don't blind-fuzz; WordPress detected → `wpscan_scan`; a version string hints at a known CVE → the nuclei template/tag for that CVE; GraphQL endpoint → `graphql_probe` introspection. Bulk template sweeps are noisy, slow, get you rate-limited/banned, bury the real signal, and are blocked outright on strict programs — `nuclei_scan` takes `url` and `tags` precisely so you can AIM it. Verify every scanner hit before recording; templates false-positive.
+   - EXECUTE YOUR HYPOTHESES THIS TURN — DO NOT DEFER THEM TO A "NEXT STEPS" LIST. The moment you form a concrete, actionable test — a specific request to send, a session or credential to reuse somewhere, a parameter to tamper, an endpoint to hit, a scanner to aim — RUN IT NOW and read the result. Mapping a surface and writing down what you "would" test next is NOT hunting; actually sending the request and confirming the behavior is. A lead you named but never executed is worth zero. Only wrap up / summarize once each concrete lead has been driven to a yes/no — either you CONFIRMED the finding (with evidence) or you genuinely TRIED the test and hit a real wall (an observed failure, not a guess that it probably won't work). When several actionable leads are open, work them down one at a time to a result; never end a turn with a concrete, in-scope test still sitting untried on a to-do list. Deferring the exploit is the single most common way a mapped attack surface produces no bounty.
    - SCOPED TARGET & GOAL — SKIP UNNEEDED DISCOVERY: If the researcher already gave a specific, fully-qualified target (a single host/URL) AND a specific goal that doesn't call for discovering additional hosts/subdomains, do NOT run subfinder, dns_bruteforce, or other subdomain/asset-discovery tools before going at the given target — those are for when the attack surface itself is the unknown, not a habitual first step. Go straight at the given URL/endpoint with curl/spider/whatever the goal actually needs. Only reach for discovery tools if the goal explicitly requires finding more hosts, or the direct approach against the given target genuinely dead-ends and broadening scope is the only path left.
    - PROGRAM WITH MANY IN-SCOPE HOSTS — MAP BREADTH-FIRST, DON'T TUNNEL INTO ONE: the rule above is for ONE named host + goal. The OPPOSITE case is an engagement whose scope is a program / wildcard / list of many in-scope hosts with no single target called out. There, do NOT seize the first host and exhaust it — sweep the WHOLE surface first: run `httpx` (and `gowitness`) across every in-scope host to see what's alive and what each one IS (login, API, admin panel, marketing, dev/staging/legacy), note the high-value ones (admin / internal / api / dev / staging / legacy / anything non-marketing), THEN pick the richest to go deep on. A real hunter triages the entire program's surface before committing — one host's homepage is almost never where the bounty is. Breadth first, depth second.
    - DEPTH MEANS THE FORGOTTEN SURFACE, NOT THE HOMEPAGE: once you pick a host to go deep on, the highest-ROI move is NOT re-crawling its linked pages — it's the unlinked/forgotten/leaked surface everyone else skipped: backup and config files (`.bak .old .swp ~`, `config.php.bak`, `backup.zip`, `.env`), exposed VCS (`/.git/`, `/.svn/`), `.DS_Store` (reveals a directory's real contents), API specs (`swagger.json` / `openapi.json` hand you the whole API including unlinked endpoints), and secrets in JS bundles. Run `content_discovery` with the `sensitive`/`backup` wordlist, `curl` the high-signal paths directly, then prioritise endpoints that carry testable params (id → IDOR, url → SSRF, file/path → LFI, q/search → XSS/SQLi). That surface is where bounties live, not the page already linked from the nav.
