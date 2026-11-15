@@ -16170,9 +16170,24 @@ INSTRUCTIONS:
                             # has no per-extension cap of its own — a turn that
                             # keeps making real (if slow) progress forever is
                             # bounded instead by the absolute _hard_ceiling
-                            # (20 min wall clock) set above, which this can
+                            # (40 min wall clock) set above, which this can
                             # never push past.
-                            if _dup_skip_count == 0 and tools_executed.count(t_name) <= 12:
+                            #
+                            # CAUGHT IN THE WILD (bbmc deep hunt): a prior
+                            # `tools_executed.count(t_name) <= 12` guard here
+                            # STARVED real hunts — `curl` is the primary hunting
+                            # tool and a genuine engagement fires dozens of them,
+                            # so after the 12th curl the rolling budget stopped
+                            # extending and the turn got force-summarized at ~8
+                            # min, ~80% of the budget unused, the model wrongly
+                            # reporting "time budget ran out". The dedup check
+                            # (`_dup_skip_count == 0`) already prevents an
+                            # identical-call stall from extending; a DISTINCT
+                            # productive call is progress regardless of how many
+                            # times that tool has been used, and is bounded by
+                            # the hard ceiling. So gate the extension on dedup
+                            # alone, matching this block's stated design.
+                            if _dup_skip_count == 0:
                                 _loop_deadline = min(max(_loop_deadline, time.time() + 240), _hard_ceiling)
 
                         if emit and hasattr(emit, "tool_result"):
