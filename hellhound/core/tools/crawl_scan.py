@@ -328,11 +328,18 @@ def _execute_wpscan_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dic
     if token:
         cmd += ["--api-token", token]
 
+    # A full vp,vt,u enum (esp. with an API token pulling vuln data per plugin)
+    # routinely runs 3-6 min — the old 180s cap killed it mid-enum and returned
+    # nothing (seen on the bbmc WordPress host). Default to a realistic ceiling,
+    # overridable via max_runtime, and pass wpscan its own request timeouts so a
+    # couple of slow responses don't eat the whole budget.
+    _runtime = max(120, min(int(args.get("max_runtime", 420) or 420), 900))
+    cmd += ["--request-timeout", "15", "--connect-timeout", "10"]
     try:
-        proc = _run_cmd_with_heartbeat(cmd, timeout=180, emit=emit, label=f"wpscan ({url})")
+        proc = _run_cmd_with_heartbeat(cmd, timeout=_runtime, emit=emit, label=f"wpscan ({url})")
         output = (proc.stdout or "") + "\n" + (proc.stderr or "")
     except subprocess.TimeoutExpired:
-        return {"url": url, "error": "wpscan timed out after 180 seconds."}
+        return {"url": url, "error": f"wpscan timed out after {_runtime}s (raise with max_runtime, or narrow --enumerate)."}
     except Exception as e:
         return {"url": url, "error": f"wpscan execution failed: {e}"}
 
