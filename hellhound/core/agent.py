@@ -9465,7 +9465,7 @@ def _execute_recon_pipeline(args: Dict[str, Any], target: Target, emit: Any) -> 
     }
 
     # 1. Subdomain discovery — crt.sh (always works) + subfinder (if installed).
-    _say("recon 1/6 — subdomain discovery (crt.sh + subfinder)")
+    _say("recon 1/8 — subdomain discovery (crt.sh + subfinder)")
     subs = set()
     try:
         crt = _execute_crtsh_subdomains({"domain": apex}, target, emit)
@@ -9484,7 +9484,7 @@ def _execute_recon_pipeline(args: Dict[str, Any], target: Target, emit: Any) -> 
     inv["subdomains"] = sorted(subs)
 
     # 2. Resolve — which candidate names actually exist (stdlib fallback).
-    _say(f"recon 2/6 — resolving {len(subs)} candidate host(s)")
+    _say(f"recon 2/8 — resolving {len(subs)} candidate host(s)")
     resolved_hosts: List[str] = []
     try:
         rc = _execute_resolve_candidates({"candidates": inv["subdomains"]}, target, emit)
