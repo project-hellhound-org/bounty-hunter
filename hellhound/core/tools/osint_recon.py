@@ -161,6 +161,454 @@ def _probe_live_urls(urls: List[str], target: Target, emit: Any,
             "skipped_out_of_scope": skipped_scope, "concurrency": (concurrency if in_scope else 0)}
 
 
+# Curated high-value ports — services that routinely run on a NON-80/443 port and
+# get missed when recon only probes the web host. Each entry: service name + whether
+# it speaks HTTP (so we know to issue a GET vs a raw-socket fingerprint). This is the
+# gap that leaves an unauthenticated ClickHouse / Prometheus / Jenkins / actuator
+# sitting one port over from a boring landing page, invisible to a 443-only sweep.
+_ALT_PORTS: Dict[int, Dict[str, Any]] = {
+    80:    {"svc": "http",        "http": True},
+    443:   {"svc": "https",       "http": True, "tls": True},
+    8080:  {"svc": "http-alt",    "http": True},
+    8443:  {"svc": "https-alt",   "http": True, "tls": True},
+    8000:  {"svc": "http-dev",    "http": True},
+    8008:  {"svc": "http-alt",    "http": True},
+    8081:  {"svc": "http-alt",    "http": True},
+    8888:  {"svc": "http-alt",    "http": True},
+    3000:  {"svc": "node/grafana","http": True},
+    5000:  {"svc": "flask/upnp",  "http": True},
+    9000:  {"svc": "clickhouse/php-fpm/minio", "http": True},
+    9090:  {"svc": "prometheus/openshift",     "http": True},
+    9200:  {"svc": "elasticsearch",            "http": True},
+    5601:  {"svc": "kibana",      "http": True},
+    8123:  {"svc": "clickhouse-http",          "http": True},
+    2375:  {"svc": "docker-api",  "http": True},
+    2379:  {"svc": "etcd",        "http": True},
+    7001:  {"svc": "weblogic",    "http": True},
+    8161:  {"svc": "activemq",    "http": True},
+    15672: {"svc": "rabbitmq-mgmt", "http": True},
+    4000:  {"svc": "http-dev",    "http": True},
+    3001:  {"svc": "http-dev",    "http": True},
+    5001:  {"svc": "http-dev",    "http": True},
+    1337:  {"svc": "http-alt",    "http": True},
+    8009:  {"svc": "ajp/tomcat",  "http": False},
+    6379:  {"svc": "redis",       "http": False},
+    27017: {"svc": "mongodb",     "http": False},
+    3306:  {"svc": "mysql",       "http": False},
+    5432:  {"svc": "postgres",    "http": False},
+    9092:  {"svc": "kafka",       "http": False},
+    11211: {"svc": "memcached",   "http": False},
+    25:    {"svc": "smtp",        "http": False},
+}
+
+# Response fingerprints that name the service behind an alt-port HTTP endpoint, so
+# the surface entry says "ClickHouse DB (unauth?)" not just "[200] :9000".
+_SVC_FINGERPRINTS: List[tuple] = [
+    (re.compile(rb"ClickHouse", re.I),                 "ClickHouse DB"),
+    (re.compile(rb"\"cluster_name\"\s*:\s*\"elasticsearch", re.I), "Elasticsearch"),
+    (re.compile(rb"Prometheus Time Series", re.I),     "Prometheus"),
+    (re.compile(rb"<title>Grafana", re.I),             "Grafana"),
+    (re.compile(rb"<title>Kibana", re.I),              "Kibana"),
+    (re.compile(rb"Dashboard \[Jenkins\]|X-Jenkins", re.I), "Jenkins"),
+    (re.compile(rb"RabbitMQ Management", re.I),         "RabbitMQ mgmt"),
+    (re.compile(rb"MinIO", re.I),                       "MinIO"),
+    (re.compile(rb"\"_links\".*actuator", re.I | re.S), "Spring Boot Actuator"),
+    (re.compile(rb"Apache Tomcat", re.I),              "Tomcat"),
+    (re.compile(rb"WebLogic", re.I),                   "WebLogic"),
+    (re.compile(rb"Docker.*ApiVersion|\"ApiVersion\"", re.I), "Docker Engine API"),
+]
+
+
+def _tcp_open(ip: str, port: int, timeout: float = 2.5) -> bool:
+    """Is this TCP port accepting connections? Fast, never raises."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _fingerprint_http_port(host: str, port: int, tls: bool, timeout: int = 6) -> Dict[str, Any]:
+    """GET an alt-port HTTP endpoint and name the service behind it (ClickHouse,
+    Prometheus, Jenkins, actuator, …). Tries both schemes if the first fails so a
+    TLS-only alt port is not reported dead. Never raises."""
+    schemes = ["https", "http"] if tls else ["http", "https"]
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; recon-portscan/1.0)"}
+    for scheme in schemes:
+        url = f"{scheme}://{host}:{port}/"
+        try:
+            r = requests.get(url, timeout=timeout, verify=False, headers=headers, stream=True)
+            body = b""
+            try:
+                body = r.raw.read(20000, decode_content=True) or b""
+            except Exception:
+                try:
+                    body = r.content[:20000]
+                except Exception:
+                    body = b""
+            server = r.headers.get("Server", "")
+            svc = ""
+            for rx, name in _SVC_FINGERPRINTS:
+                if rx.search(body) or rx.search(server.encode("utf-8", "ignore")):
+                    svc = name
+                    break
+            m = _TITLE_RE.search(body)
+            title = m.group(1).decode("utf-8", "ignore").strip()[:120] if m else ""
+            try:
+                r.close()
+            except Exception:
+                pass
+            return {"url": url, "scheme": scheme, "status": r.status_code,
+                    "server": server, "service": svc, "title": title}
+        except requests.RequestException:
+            continue
+    return {}
+
+
+def _execute_alt_port_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Scan resolved hosts for SERVICES ON NON-WEB PORTS — the recon step that
+    turns a boring 443 landing page into the unauthenticated ClickHouse /
+    Prometheus / Jenkins / Redis sitting one port over. A 80/443-only sweep is
+    blind to it; this is where real hunters pull findings other people walk past.
+
+    Given host(s) (or every resolved/live host this engagement), it connects to a
+    curated set of high-value alt ports CONCURRENTLY, and for each open HTTP port
+    fingerprints the service behind it (ClickHouse, Elasticsearch, Grafana,
+    Jenkins, Spring actuator, Docker API, …). Non-HTTP services (redis, mongo,
+    mysql, …) are reported as open-port leads to pivot on. Discovered HTTP
+    services are folded onto the surface so the model probes them next.
+
+    Scope-gated per host, RoE-adaptive concurrency (gentle on fragile programs),
+    hard-capped. Never raises."""
+    import concurrent.futures
+
+    rules = getattr(target, "scope_rules", None)
+    disallowed = set(getattr(rules, "disallowed", []) or [])
+    gentle = bool(disallowed & _GENTLE_FLAGS)
+
+    # Resolve the host list: explicit arg, else everything we've found live/resolved.
+    raw_hosts = args.get("hosts") or args.get("host") or args.get("target")
+    hosts: List[str] = []
+    if isinstance(raw_hosts, str):
+        hosts = [h.strip() for h in re.split(r"[,\s]+", raw_hosts) if h.strip()]
+    elif isinstance(raw_hosts, list):
+        hosts = [str(h).strip() for h in raw_hosts if str(h).strip()]
+    if not hosts:
+        state = getattr(target, "state", {}) or {}
+        seen = []
+        for key in ("live_hosts", "discovered_subdomains"):
+            for h in (state.get(key) or []):
+                seen.append(h)
+        # live_hosts are full URLs; reduce to hostnames
+        for h in seen:
+            hn = urlparse(h).netloc.split(":")[0] if h.startswith(("http://", "https://")) else h.split(":")[0]
+            if hn and hn not in hosts:
+                hosts.append(hn)
+    if not hosts:
+        hosts = [str(getattr(target, "name", "")).split(":")[0]]
+    hosts = [h for h in hosts if h][: int(args.get("max_hosts", 12))]
+
+    # Which ports — default to the curated set; let a caller narrow it.
+    want_ports = args.get("ports")
+    if isinstance(want_ports, str):
+        want_ports = [int(p) for p in re.split(r"[,\s]+", want_ports) if p.strip().isdigit()]
+    ports = [p for p in (want_ports or list(_ALT_PORTS.keys()))]
+    # Skip the plain web ports by default (httpx already covers them) unless asked.
+    if not args.get("include_web", False):
+        ports = [p for p in ports if p not in (80, 443)]
+
+    concurrency = 8 if gentle else 40
+    results: List[Dict[str, Any]] = []
+    surface_urls: List[str] = []
+    skipped_scope = 0
+
+    # Build (host, ip, port) work items, scope-gating each host once.
+    work: List[tuple] = []
+    for host in hosts:
+        allowed, _r = is_in_scope(f"https://{host}", rules)
+        if not allowed:
+            skipped_scope += 1
+            continue
+        try:
+            ip = socket.gethostbyname(host)
+        except Exception:
+            continue
+        for port in ports:
+            work.append((host, ip, port))
+
+    if not work:
+        return {"status": "success", "open_services": [], "host_count": len(hosts),
+                "skipped_out_of_scope": skipped_scope,
+                "note": "No in-scope resolvable hosts to port-scan."}
+
+    if emit and hasattr(emit, "info"):
+        try:
+            emit.info(f"port_scan — {len(hosts)} host(s) × {len(ports)} port(s), concurrency {concurrency}")
+        except Exception:
+            pass
+
+    def _scan(item: tuple) -> Optional[Dict[str, Any]]:
+        host, ip, port = item
+        if not _tcp_open(ip, port):
+            return None
+        meta = _ALT_PORTS.get(port, {"svc": f"port-{port}", "http": True})
+        entry = {"host": host, "port": port, "svc_hint": meta.get("svc", ""), "open": True}
+        if meta.get("http"):
+            fp = _fingerprint_http_port(host, port, bool(meta.get("tls")))
+            if fp:
+                entry.update({"http": True, "status": fp.get("status"),
+                              "server": fp.get("server", ""), "service": fp.get("service", ""),
+                              "title": fp.get("title", ""), "url": fp.get("url", "")})
+            else:
+                entry["http"] = False
+        else:
+            entry["http"] = False
+        return entry
+
+    workers = max(1, min(concurrency, len(work)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for res in ex.map(_scan, work):
+            if not res:
+                continue
+            results.append(res)
+            label = res.get("service") or res.get("title") or res.get("svc_hint") or ""
+            if res.get("url"):
+                surface_urls.append(res["url"])
+            if emit and hasattr(emit, "info"):
+                try:
+                    tag = f" [{res.get('status')}]" if res.get("status") else ""
+                    emit.info(f"  OPEN {res['host']}:{res['port']}{tag} {label}")
+                except Exception:
+                    pass
+
+    # Fold discovered HTTP services onto the surface so the model probes them next —
+    # same "endpoints" list well_known_probe/wayback feed, plus a labeled alt-port
+    # list so the service names (ClickHouse, actuator, …) survive into later turns.
+    if surface_urls:
+        try:
+            state = getattr(target, "state", None)
+            if isinstance(state, dict):
+                endpoints = state.setdefault("endpoints", [])
+                for u in surface_urls:
+                    if u not in endpoints:
+                        endpoints.append(u)
+                alt = state.setdefault("alt_port_services", [])
+                for e in results:
+                    if e.get("url"):
+                        label = {"url": e["url"], "service": e.get("service", ""),
+                                 "port": e["port"], "status": e.get("status")}
+                        if label not in alt:
+                            alt.append(label)
+        except Exception:
+            pass
+
+    # Rank: fingerprinted services first, then other open HTTP, then raw TCP.
+    def _rank(e: Dict[str, Any]) -> tuple:
+        return (0 if e.get("service") else (1 if e.get("http") else 2), e.get("port", 0))
+    results.sort(key=_rank)
+
+    named = [f"{e['host']}:{e['port']} {e.get('service') or e.get('svc_hint','')}".strip()
+             for e in results if e.get("service") or not e.get("http")]
+    nonweb = [e for e in results if not e.get("http")]
+    try:
+        save_target(target)
+    except Exception:
+        pass
+    summary = (f"{len(results)} open service(s) across {len(hosts)} host(s); "
+               f"{sum(1 for e in results if e.get('service'))} fingerprinted, "
+               f"{len(nonweb)} non-HTTP (redis/mongo/db-style) lead(s).")
+    return {
+        "status": "success",
+        "open_services": results,
+        "surface_added": surface_urls,
+        "host_count": len(hosts),
+        "skipped_out_of_scope": skipped_scope,
+        "summary": summary,
+        "note": (summary + " Alt-port HTTP services added to the surface — probe them like any host "
+                 "(an unauth ClickHouse/ES/actuator here is often critical). For non-HTTP leads "
+                 "(redis/mongo/mysql) try an unauthenticated client connect."),
+    }
+
+
+# High-value framework / debug / management endpoints that routinely sit exposed and
+# are each a finding on their own (actuator heapdump → secrets, swagger → full API map,
+# .git → source, wp-json/users → user enum, graphql introspection → schema). A generic
+# content sweep misses these because they are framework-specific, not in a wordlist.
+_SERVICE_ENDPOINTS: List[tuple] = [
+    # (path, label, why-it-matters)
+    ("/actuator",                 "spring-actuator", "Spring Boot management — pivot to env/heapdump"),
+    ("/actuator/env",             "spring-actuator", "env/config incl. masked-but-leaky props"),
+    ("/actuator/heapdump",        "spring-actuator", "FULL HEAP DUMP — secrets/creds in memory"),
+    ("/actuator/health",          "spring-actuator", "confirms actuator is live"),
+    ("/actuator/mappings",        "spring-actuator", "every route the app exposes"),
+    ("/env",                      "spring-actuator", "actuator env on a non-default path"),
+    ("/swagger.json",             "api-spec",        "full API contract — hidden endpoints"),
+    ("/openapi.json",             "api-spec",        "full API contract — hidden endpoints"),
+    ("/swagger-ui.html",          "api-spec",        "Swagger UI — interactive API map"),
+    ("/v3/api-docs",              "api-spec",        "SpringDoc OpenAPI spec"),
+    ("/v2/api-docs",              "api-spec",        "Springfox OpenAPI spec"),
+    ("/api-docs",                 "api-spec",        "OpenAPI spec"),
+    ("/api/swagger.json",         "api-spec",        "OpenAPI spec under /api"),
+    ("/graphql",                  "graphql",         "GraphQL — try introspection"),
+    ("/graphiql",                 "graphql",         "GraphQL IDE exposed"),
+    ("/.git/config",              "source-leak",     ".git exposed — dump source"),
+    ("/.git/HEAD",                "source-leak",     ".git exposed — dump source"),
+    ("/.env",                     "config-leak",     "dotenv — creds/keys"),
+    ("/wp-json/wp/v2/users",      "wordpress",       "WP user enumeration via REST"),
+    ("/metrics",                  "metrics",         "Prometheus metrics — internal intel"),
+    ("/debug/pprof/",             "go-debug",        "Go pprof — memory/goroutine dumps"),
+    ("/server-status",            "apache",          "Apache mod_status — live requests"),
+    ("/.well-known/security.txt", "contact",         "security contact"),
+    ("/h2-console",               "db-console",      "H2 DB web console"),
+    ("/console",                  "db-console",      "embedded DB/management console"),
+    ("/manage/health",            "spring-actuator", "actuator on /manage base-path"),
+]
+
+# Endpoints whose mere 200 is high-signal (don't need body inspection to be worth flagging).
+_SERVICE_CRITICAL = {"/actuator/heapdump", "/.git/config", "/.git/HEAD", "/.env",
+                     "/actuator/env", "/v3/api-docs", "/v2/api-docs"}
+
+
+def _execute_service_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Hit a live host's FRAMEWORK / DEBUG / MANAGEMENT endpoints — the exposed
+    actuator heapdump, swagger spec, .git, wp-json user list, graphql, metrics —
+    each of which is a finding on its own and routinely left open. A generic path
+    wordlist misses these because they are framework-specific; this knows exactly
+    where each stack hides its secrets.
+
+    Runs the curated set CONCURRENTLY against the given host(s) (or every live
+    host this engagement), scope-gated per host, RoE-adaptive, and folds anything
+    live onto the surface. Flags the critical ones (heapdump/.git/.env/api-docs)
+    loudly. Never raises."""
+    import concurrent.futures
+
+    rules = getattr(target, "scope_rules", None)
+    disallowed = set(getattr(rules, "disallowed", []) or [])
+    gentle = bool(disallowed & _GENTLE_FLAGS)
+
+    raw = args.get("hosts") or args.get("host") or args.get("target") or args.get("url")
+    hosts: List[str] = []
+    if isinstance(raw, str):
+        hosts = [h.strip() for h in re.split(r"[,\s]+", raw) if h.strip()]
+    elif isinstance(raw, list):
+        hosts = [str(h).strip() for h in raw if str(h).strip()]
+    if not hosts:
+        state = getattr(target, "state", {}) or {}
+        for h in (state.get("live_hosts") or []):
+            if h not in hosts:
+                hosts.append(h)
+    if not hosts:
+        nm = str(getattr(target, "name", "")).strip()
+        hosts = [nm if nm.startswith(("http://", "https://")) else f"https://{nm}"]
+    # Normalise to base origins.
+    bases: List[str] = []
+    for h in hosts:
+        if not h.startswith(("http://", "https://")):
+            h = "https://" + h
+        p = urlparse(h)
+        base = f"{p.scheme}://{p.netloc}"
+        if base not in bases:
+            bases.append(base)
+    bases = bases[: int(args.get("max_hosts", 10))]
+
+    work: List[tuple] = []
+    skipped_scope = 0
+    for base in bases:
+        allowed, _r = is_in_scope(base, rules)
+        if not allowed:
+            skipped_scope += 1
+            continue
+        for path, label, why in _SERVICE_ENDPOINTS:
+            work.append((base, path, label, why))
+
+    if not work:
+        return {"status": "success", "exposed": [], "host_count": len(bases),
+                "skipped_out_of_scope": skipped_scope,
+                "note": "No in-scope live hosts to probe."}
+
+    concurrency = 6 if gentle else 24
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; recon-service/1.0)"}
+
+    def _probe(item: tuple) -> Optional[Dict[str, Any]]:
+        base, path, label, why = item
+        url = base + path
+        try:
+            r = requests.get(url, timeout=8, verify=False, headers=headers,
+                             allow_redirects=False, stream=True)
+            code = r.status_code
+            ctype = r.headers.get("Content-Type", "")
+            clen = r.headers.get("Content-Length", "")
+            snippet = ""
+            try:
+                body = r.raw.read(400, decode_content=True) or b""
+                snippet = body.decode("utf-8", "ignore").replace("\n", " ")[:160]
+            except Exception:
+                pass
+            try:
+                r.close()
+            except Exception:
+                pass
+            # Interesting = 200/401/403 on a framework path (401/403 still CONFIRMS the
+            # endpoint exists, which is itself the recon win); skip plain 404/redirect.
+            if code in (200, 401, 403, 500):
+                return {"url": url, "status": code, "label": label, "why": why,
+                        "content_type": ctype, "content_length": clen, "snippet": snippet,
+                        "critical": (path in _SERVICE_CRITICAL and code == 200)}
+            return None
+        except requests.RequestException:
+            return None
+
+    exposed: List[Dict[str, Any]] = []
+    workers = max(1, min(concurrency, len(work)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for res in ex.map(_probe, work):
+            if not res:
+                continue
+            exposed.append(res)
+            if emit and hasattr(emit, "info"):
+                try:
+                    mark = " ***CRITICAL***" if res.get("critical") else ""
+                    emit.info(f"  [{res['status']}] {res['url']} ({res['label']}){mark}")
+                except Exception:
+                    pass
+
+    # Fold onto the surface.
+    if exposed:
+        try:
+            state = getattr(target, "state", None)
+            if isinstance(state, dict):
+                endpoints = state.setdefault("endpoints", [])
+                for e in exposed:
+                    if e["status"] == 200 and e["url"] not in endpoints:
+                        endpoints.append(e["url"])
+                save_target(target)
+        except Exception:
+            pass
+
+    exposed.sort(key=lambda e: (0 if e.get("critical") else (1 if e["status"] == 200 else 2)))
+    crit = [e for e in exposed if e.get("critical")]
+    summary = (f"{len(exposed)} framework/debug endpoint(s) responding across {len(bases)} host(s); "
+               f"{len(crit)} CRITICAL (heapdump/.git/.env/api-docs reachable).")
+    return {
+        "status": "success",
+        "exposed": exposed,
+        "critical_count": len(crit),
+        "host_count": len(bases),
+        "skipped_out_of_scope": skipped_scope,
+        "summary": summary,
+        "note": (summary + " A reachable actuator heapdump / .git / .env / api-docs is a finding on its "
+                 "own — verify + record it. 401/403 still CONFIRMS the endpoint exists (try an auth bypass: "
+                 "arbitrary Bearer token, X-Forwarded-For 127.0.0.1, path tricks)."),
+    }
+
+
 def _execute_probe_urls(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """BATCH-probe a pile of URLs for liveness instead of curling them one by
     one — the move that makes recon fast. Pass an explicit `urls` list, or omit

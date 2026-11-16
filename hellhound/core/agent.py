@@ -139,7 +139,7 @@ from hellhound.core.tools.osint_recon import (  # noqa: E402
     _execute_wayback_urls, _execute_otx_urls, _execute_urlscan_recon,
     _execute_virustotal_lookup, _execute_google_dork, _execute_well_known_probe,
     _execute_probe_urls, _execute_crtsh_subdomains, _execute_favicon_hash,
-    _execute_asn_expand,
+    _execute_asn_expand, _execute_alt_port_scan, _execute_service_probe,
 )
 
 from hellhound.core.tools.network_recon import _execute_port_scan, _execute_nmap_service_scan  # noqa: E402
@@ -9501,7 +9501,7 @@ def _execute_recon_pipeline(args: Dict[str, Any], target: Target, emit: Any) -> 
     # 3. Live web hosts — turn resolving names into an inventory of live
     #    services with status/title/tech (skipped entirely when passive_only).
     if not passive_only:
-        _say(f"recon 3/6 — probing {len(resolved_hosts)} host(s) for live web services")
+        _say(f"recon 3/8 — probing {len(resolved_hosts)} host(s) for live web services")
         try:
             hp = _execute_httpx({"target": resolved_hosts}, target, emit)
             inv["live_hosts"] = hp.get("live_hosts", []) or []
@@ -9510,8 +9510,45 @@ def _execute_recon_pipeline(args: Dict[str, Any], target: Target, emit: Any) -> 
     else:
         inv["steps"].append({"passive_only": True})
 
+    # 3b. ALT-PORT SERVICES — the step a 443-only sweep skips. Find the unauth
+    #     ClickHouse / Prometheus / Jenkins / actuator sitting one port over.
+    inv["alt_port_services"] = []
+    if not passive_only:
+        _say(f"recon 4/8 — alt-port service scan ({len(resolved_hosts)} host(s))")
+        try:
+            ps = _execute_alt_port_scan({"hosts": resolved_hosts}, target, emit)
+            for s in ps.get("open_services", []) or []:
+                if s.get("http") or s.get("service"):
+                    inv["alt_port_services"].append({
+                        "host": s.get("host"), "port": s.get("port"),
+                        "service": s.get("service") or s.get("svc_hint", ""),
+                        "url": s.get("url", ""), "status": s.get("status"),
+                    })
+            inv["steps"].append({"alt_port_services": len(inv["alt_port_services"])})
+        except Exception as e:
+            inv["steps"].append({"alt_port_scan_error": f"{type(e).__name__}: {e}"})
+
+    # 3c. FRAMEWORK / DEBUG ENDPOINTS — actuator heapdump, swagger, .git, wp-json,
+    #     graphql, metrics on each live host. Each is a finding on its own.
+    inv["exposed_services"] = []
+    if not passive_only and inv.get("live_hosts"):
+        _say(f"recon 5/8 — framework/debug endpoint probe")
+        try:
+            live_urls = [h.get("url") or h.get("host") for h in inv["live_hosts"]
+                         if isinstance(h, dict)] or resolved_hosts
+            sp = _execute_service_probe({"hosts": live_urls}, target, emit)
+            for e in sp.get("exposed", []) or []:
+                inv["exposed_services"].append({
+                    "url": e.get("url"), "status": e.get("status"),
+                    "label": e.get("label"), "critical": e.get("critical", False),
+                })
+            inv["steps"].append({"exposed_services": len(inv["exposed_services"]),
+                                 "critical": sp.get("critical_count", 0)})
+        except Exception as e:
+            inv["steps"].append({"service_probe_error": f"{type(e).__name__}: {e}"})
+
     # 4. The free, highest-signal starting points.
-    _say("recon 4/6 — robots.txt / sitemap.xml / security.txt")
+    _say("recon 6/8 — robots.txt / sitemap.xml / security.txt")
     try:
         wk = _execute_well_known_probe({"domain": apex, "probe_live": not passive_only}, target, emit)
         inv["contacts"] = wk.get("security_contacts", []) or []
@@ -9521,7 +9558,7 @@ def _execute_recon_pipeline(args: Dict[str, Any], target: Target, emit: Any) -> 
         pass
 
     # 5. Historical URLs + which are still live.
-    _say("recon 5/6 — wayback archive + liveness")
+    _say("recon 7/8 — wayback archive + liveness")
     try:
         wb = _execute_wayback_urls({"domain": apex, "probe_live": not passive_only}, target, emit)
         for h in wb.get("live_urls", []) or []:
@@ -9530,14 +9567,23 @@ def _execute_recon_pipeline(args: Dict[str, Any], target: Target, emit: Any) -> 
         pass
 
     # 6. Consolidate into a ranked inventory.
-    _say("recon 6/6 — consolidating attack surface")
+    _say("recon 8/8 — consolidating attack surface")
+    crit_exposed = sum(1 for e in inv.get("exposed_services", []) if e.get("critical"))
     summary = (f"{len(inv['subdomains'])} subdomain(s), {inv['resolved_count']} resolved, "
                f"{len(inv['live_hosts'])} live web host(s), "
+               f"{len(inv.get('alt_port_services', []))} alt-port service(s), "
+               f"{len(inv.get('exposed_services', []))} framework/debug endpoint(s) ({crit_exposed} critical), "
                f"{len(inv['sensitive_live_paths'])} owner-hidden live path(s), "
                f"{len(inv['wayback_live'])} live archived URL(s).")
     inv["summary"] = summary
-    inv["note"] = (summary + " Triage: owner-hidden live paths first, then live hosts by title/status. "
-                   "Run probe_urls / map_surface / js_miner next to go deeper on the live surface.")
+    _triage = "Triage: "
+    if crit_exposed:
+        _triage += "CRITICAL framework/debug endpoints (heapdump/.git/.env/api-docs) FIRST, then "
+    if inv.get("alt_port_services"):
+        _triage += "alt-port services (unauth DB/dashboard = often critical), then "
+    _triage += ("owner-hidden live paths, then live hosts by title/status. "
+                "Run probe_urls / map_surface / js_miner next to go deeper.")
+    inv["note"] = summary + " " + _triage
     inv["status"] = "success"
     if emit and hasattr(emit, "success"):
         try:
@@ -10851,6 +10897,62 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             }
         },
         executor=_execute_asn_expand
+    ),
+    "alt_port_scan": ToolSpec(
+        name="alt_port_scan",
+        description=(
+            "Scan hosts for SERVICES ON NON-WEB PORTS and fingerprint what's behind each one — the recon "
+            "step that finds the unauthenticated ClickHouse / Elasticsearch / Prometheus / Jenkins / Spring "
+            "actuator / Redis sitting one port over from a boring 443 landing page. A 80/443-only sweep (httpx) "
+            "is BLIND to this; it's where real findings get walked past. Pure-Python (no naabu needed, always "
+            "available), connects to a curated set of high-value alt ports concurrently, GETs each open HTTP "
+            "port and names the service (ClickHouse, Grafana, actuator, Docker API, …), and folds discovered "
+            "HTTP services onto the surface so you probe them next. Non-HTTP leads (redis/mongo/mysql) come back "
+            "as open-port pivots. Scope-gated per host, RoE-adaptive concurrency. Omit `hosts` to scan every "
+            "resolved/live host found this engagement. Use the naabu-based `port_scan` instead only when you "
+            "need a full/top-1000 TCP sweep rather than this targeted high-value set."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "hosts": {
+                    "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
+                    "description": "Host(s) to scan (hostname or URL; list or comma-separated string). Omit to scan all live/resolved hosts.",
+                },
+                "ports": {
+                    "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "integer"}}],
+                    "description": "Narrow to specific ports (default: curated high-value alt-port set).",
+                },
+                "max_hosts": {"type": "integer", "description": "Cap number of hosts scanned. Default 12.", "default": 12},
+                "include_web": {"type": "boolean", "description": "Also scan 80/443 (httpx already covers these). Default false.", "default": False},
+            },
+            "required": []
+        },
+        executor=_execute_alt_port_scan
+    ),
+    "service_probe": ToolSpec(
+        name="service_probe",
+        description=(
+            "Probe a live host's FRAMEWORK / DEBUG / MANAGEMENT endpoints — the exposed Spring actuator "
+            "heapdump (→ secrets in memory), swagger/openapi spec (→ full hidden API map), .git/.env (→ source "
+            "& creds), wp-json user list (→ user enum), graphql (→ introspection), metrics, pprof, mod_status. "
+            "Each is a finding on its own and routinely left open; a generic path wordlist misses them because "
+            "they're framework-specific. Runs the curated set concurrently, flags the critical ones "
+            "(heapdump/.git/.env/api-docs) loudly, and folds live endpoints onto the surface. A 401/403 still "
+            "CONFIRMS the endpoint exists — then try an auth bypass. Omit `hosts` to probe every live host."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "hosts": {
+                    "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
+                    "description": "Host(s)/URL(s) to probe. Omit to probe all live hosts found this engagement.",
+                },
+                "max_hosts": {"type": "integer", "description": "Cap number of hosts probed. Default 10.", "default": 10},
+            },
+            "required": []
+        },
+        executor=_execute_service_probe
     ),
     "urlscan_recon": ToolSpec(
         name="urlscan_recon",
@@ -15108,8 +15210,8 @@ RULES:
    - ONLY emit a tool call when active reconnaissance, probing, scanning, or exploitation against a valid, in-scope target endpoint is required right now.
    - RECON BEFORE HUNTING — MAP THE SURFACE, THINK, THEN TEST WHAT YOU FOUND. Do not jump straight to a vuln probe on the homepage. A paid hunter (and a strong autonomous one — XBOW/Horizon-style) works in ORDER, and the edge is a MORE COMPLETE surface + SHARPER targeting found BEFORE anyone else:
        (1) MAP the full attack surface — subdomains (`crtsh_subdomains` + `subfinder`), URLs from every passive source (`wayback_urls`, `otx_urls`, `urlscan_recon`, `waymore`, gau), crawl (`spider`/`katana`), JS mining. `recon` does the opening pass in one call.
-       (2) VERIFY LIVE — `probe_urls` the WHOLE pile so you know what actually resolves right now. An archived or unlinked URL that is STILL LIVE is the forgotten, un-retested endpoint where bounties hide (an old `/api/v1/`, a `backup.zip`, a `.env`, a staging host) — exactly the info-disclosure surface nobody re-checked.
-       (3) TRIAGE the live surface — `well_known_probe` (robots/sitemap/security.txt + exposed Disallow paths), `gf_patterns` (bucket URLs into redirect/ssrf/lfi/sqli/idor candidates), `param_discover` (hidden params), and note WHAT each live host is (login / API / admin / dev / staging / legacy) and its tech/auth.
+       (2) VERIFY LIVE + LOOK BEYOND 80/443 — `probe_urls` the WHOLE pile so you know what actually resolves right now, AND `alt_port_scan` the live hosts to find services on NON-WEB PORTS. An archived or unlinked URL that is STILL LIVE is the forgotten, un-retested endpoint where bounties hide (an old `/api/v1/`, a `backup.zip`, a `.env`, a staging host); a service one port over from the boring 443 page (an unauth ClickHouse on :9000, Prometheus on :9090, Jenkins, Docker API) is the finding every 443-only hunter walked straight past — exactly the surface nobody re-checked.
+       (3) TRIAGE the live surface — `well_known_probe` (robots/sitemap/security.txt + exposed Disallow paths), `service_probe` (actuator/swagger/.git/.env/wp-json/graphql/metrics on each live host — each a finding on its own), `gf_patterns` (bucket URLs into redirect/ssrf/lfi/sqli/idor candidates), `param_discover` (hidden params), and note WHAT each live host is (login / API / admin / dev / staging / legacy) and its tech/auth.
        (4) THINK — call `generate_hypotheses` to rank what THIS specific surface is actually likely to be vulnerable to, instead of running every tool and hoping. Work the lead board top-down.
        (5) TEST TARGETED — go at the specific leads. Never bulk-scan everything.
    - TARGETED SCANS, NOT BULK — point a scanner at a SPECIFIC lead recon surfaced; never "scan the whole program with every template and hope". Worked examples: `takeover_scanner`/`subzy` flags a dangling CNAME → run `nuclei_scan` with `tags=takeover` (or the specific provider's takeover template) on THAT host to confirm it; a `swagger.json`/`openapi.json` spec turns up → enumerate ITS endpoints and test the interesting ones, don't blind-fuzz; WordPress detected → `wpscan_scan`; a version string hints at a known CVE → the nuclei template/tag for that CVE; GraphQL endpoint → `graphql_probe` introspection. Bulk template sweeps are noisy, slow, get you rate-limited/banned, bury the real signal, and are blocked outright on strict programs — `nuclei_scan` takes `url` and `tags` precisely so you can AIM it. Verify every scanner hit before recording; templates false-positive.
@@ -15120,6 +15222,11 @@ RULES:
    - PROGRAM WITH MANY IN-SCOPE HOSTS — MAP BREADTH-FIRST, DON'T TUNNEL INTO ONE: the rule above is for ONE named host + goal. The OPPOSITE case is an engagement whose scope is a program / wildcard / list of many in-scope hosts with no single target called out. There, do NOT seize the first host and exhaust it — sweep the WHOLE surface first: run `httpx` (and `gowitness`) across every in-scope host to see what's alive and what each one IS (login, API, admin panel, marketing, dev/staging/legacy), note the high-value ones (admin / internal / api / dev / staging / legacy / anything non-marketing), THEN pick the richest to go deep on. A real hunter triages the entire program's surface before committing — one host's homepage is almost never where the bounty is. Breadth first, depth second.
    - DEPTH MEANS THE FORGOTTEN SURFACE, NOT THE HOMEPAGE: once you pick a host to go deep on, the highest-ROI move is NOT re-crawling its linked pages — it's the unlinked/forgotten/leaked surface everyone else skipped: backup and config files (`.bak .old .swp ~`, `config.php.bak`, `backup.zip`, `.env`), exposed VCS (`/.git/`, `/.svn/`), `.DS_Store` (reveals a directory's real contents), API specs (`swagger.json` / `openapi.json` hand you the whole API including unlinked endpoints), and secrets in JS bundles. Run `content_discovery` with the `sensitive`/`backup` wordlist, `curl` the high-signal paths directly, then prioritise endpoints that carry testable params (id → IDOR, url → SSRF, file/path → LFI, q/search → XSS/SQLi). That surface is where bounties live, not the page already linked from the nav.
    - A 404 ON A HOST'S ROOT DOES NOT MEAN THE HOST IS DEAD — it usually means it's an API, not a website. `api.*` / `*-service` hosts routinely 404 `/` while serving live endpoints underneath. Never write off a 404 host: probe for the API and its docs — `/api`, `/api/v1`, `/api/v2`, `/v1`, `/v2`, `/graphql`, `/health`, AND the spec paths `/swagger.json`, `/openapi.json`, `/api-docs`, `/v2/api-docs`, `/swagger-ui`, `/swagger`, `/redoc`, `/.well-known/`. A Swagger/OpenAPI spec hands you the ENTIRE API (every route + param) for free. Run `nuclei_scan` with `tags=exposure,swagger,api` on these hosts to surface exposed specs/endpoints fast — this is exactly how an API host that "looks 404" gives up its whole attack surface. If the root 404s but a sub-path returns 200/401/403, the API is live — keep enumerating.
+   - A HOST IS NOT JUST ITS WEB PORT — SCAN THE ALT PORTS. The single most common surface a 80/443-only sweep misses is a juicy service listening on a NON-STANDARD port of a host you already found. Run `alt_port_scan` on your live/resolved hosts (it's pure-Python, always available, no naabu needed): it connects to a curated high-value port set and fingerprints what answers — an unauthenticated ClickHouse/Elasticsearch on :9000/:8123/:9200, a Prometheus on :9090, a Grafana on :3000, a Jenkins on :8080, a Spring actuator, a Docker Engine API on :2375, a Redis/Mongo/MySQL with no auth. Any of those is frequently critical ON ITS OWN (full DB read, secrets, RCE). Treat each discovered alt-port HTTP service as a first-class host and probe it like one; for a non-HTTP lead (redis/mongo/mysql) try an unauthenticated client connect. `recon` now runs this automatically — but if you only ran `httpx`, you have NOT looked at the alt ports yet.
+   - PROBE EACH LIVE HOST'S FRAMEWORK/DEBUG ENDPOINTS with `service_probe` — the exposed Spring actuator heapdump (dumps secrets/creds straight out of memory → `/actuator/heapdump`), the swagger/openapi spec (hands you every hidden API route), `/.git/` and `/.env` (source + creds), `/wp-json/wp/v2/users` (WordPress user enum), `/graphql` (introspection), `/metrics`, `/debug/pprof/`, `/server-status`. Each is a finding by itself and is routinely left open; a generic content wordlist misses them because they're framework-specific. A `401`/`403` on one of these still CONFIRMS it exists — then try an auth bypass (next bullet). `recon` runs this automatically on the live hosts; run it by hand on any host you add later.
+   - WHEN AN ENDPOINT 401/403s, TRY THE CHEAP AUTH BYPASSES BEFORE MOVING ON — a "requires auth" wall is often paper-thin. Standard deltas, one at a time: an ARBITRARY Bearer token (`Authorization: Bearer anything` — broken API auth that "accepts any token" is a real, common bug; a Swagger that literally says "enter any token" is a tell), `X-Forwarded-For: 127.0.0.1` / `X-Real-IP` / `X-Forwarded-Host: localhost` (trusts-the-proxy header bypass), a path trick (`/admin/..;/`, `//admin`, `/admin.`, case/encoding), a query/cookie flag the client-side code sets (read the page's own JS — e.g. it appends `?role=` or sets an "activated" cookie the backend trusts), or a signed-but-forgeable session (JWT `alg:none`/key confusion). Try the dummy-Bearer and the forwarded-IP header first; they cost one request each and routinely turn a 401 into full data.
+   - ENUMERATE EVERY ACTION ON AN API/APP, NOT JUST THE FIRST ONE THAT WORKED. Finding ONE broken endpoint (one IDOR, one game action) and stopping leaves the rest of the bounty on the table. When a host exposes a set of parallel operations — a casino's poker AND blackjack AND slots AND roulette, an airline's getMembership AND getPaymentMethods AND getBookings, a bank's accounts AND transfers AND statements — test them ALL the same way: each game's deal/state endpoint can leak hidden state (a dealer hole-card in the response's `_internal`/debug field), each `get*` can be a separate IDOR/BOLA, each action can have its own missing-authz. Pull the full action list from the swagger spec / the page's JS / the obvious REST verbs, and walk the whole set to yes/no. One confirmed bug on a host is a cue to find its siblings, not to leave.
+   - STORED/BLIND XSS IS A SUBMIT-THEN-VERIFY LOOP, NOT A ONE-SHOT. When you find an input that gets stored and later rendered (an issue tracker, support ticket, profile field, comment), SUBMIT a uniquely-tagged payload via the real submit endpoint (`<script>`/`"><img src=x onerror=...>` with a marker you can grep), THEN fetch the page where it's displayed (often an admin/staff view at a different path) and confirm the payload landed UNSANITIZED in the HTML. The confirmation is seeing your raw `<script>`/`onerror` reflected into the markup of the rendering page — not just that the submit returned 200. For true blind XSS (you can't see the admin view), point the payload at an OOB collector (`alt_port_scan` may have even revealed an Interactsh/`oast.*` host in-scope) and confirm the callback. Record it only once you've verified the sink renders it.
    - ALWAYS READ `robots.txt`, `sitemap.xml`, AND `/.well-known/security.txt` EARLY — they are free, zero-impact, and the single highest-signal starting point. Run `well_known_probe` to do this in one shot: it fetches all three and PROBES the `robots.txt` Disallow paths for liveness, so a still-reachable `Disallow: /.env`, `/admin`, `/backup/` comes back already confirmed-live (owner-hidden but reachable = look there first). `sitemap.xml` enumerates real pages; `security.txt` gives the reporting contact. Never crawl past these without having read them.
    - Archived/passive URLs (`wayback_urls`, `otx_urls`) are HISTORICAL — most are dead. `wayback_urls` now probes the interesting ones for liveness automatically (`live_urls` in its result); act on the STILL-LIVE ones, don't reason over the raw archive list as if it were the current surface.
    - NEVER check URLs for liveness one `curl` at a time — that is slow and leaves assets undiscovered. After ANY URL-discovery step (wayback/otx/gau/spider/JS mining), run `probe_urls` to BATCH-check the whole pile concurrently (or call it with no args to sweep everything discovered so far). It returns each live URL's status + title + Server header so you triage which to open. Breadth of live assets is your edge — surface more than the next hunter by probing everything, not sampling.
