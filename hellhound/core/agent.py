@@ -12232,7 +12232,15 @@ def register_mcp_servers(emit: Any = None) -> int:
             continue  # already connected this process
         discovered = connect_mcp_server(server_name, server_cfg, emit=emit)
         for tool in discovered:
-            registry_name = f"mcp_{server_name}_{tool.name}"
+            # Avoid a doubled prefix when the server already namespaces its own
+            # tools with its name (HexBrain exposes `hexbrain_search_reports`, so
+            # `mcp_hexbrain_hexbrain_search_reports` would be ugly and wouldn't match
+            # the `mcp_hexbrain_*` the prompt tells the model to use). Strip the
+            # redundant leading `<server>_` before prefixing.
+            _tname = tool.name
+            if _tname.startswith(f"{server_name}_"):
+                _tname = _tname[len(server_name) + 1:]
+            registry_name = f"mcp_{server_name}_{_tname}"
             if registry_name in TOOL_REGISTRY:
                 if emit and hasattr(emit, "warn"):
                     emit.warn(f"[!] MCP tool '{registry_name}' collides with an existing tool name — skipped.")

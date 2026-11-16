@@ -225,7 +225,13 @@ class MCPBridge:
             else:
                 raise ValueError(f"Unknown transport '{transport}' (use 'sse', 'streamable_http', or 'stdio')")
 
-            async with cm as (read, write):
+            # SSE and stdio clients yield (read, write); the Streamable-HTTP client
+            # yields a THIRD value (a get-session-id callback). Unpack positionally so
+            # the HTTP transport doesn't blow up with "too many values to unpack" — the
+            # exact bug that made a valid HexBrain key "time out" (the connection
+            # actually succeeded, then the 2-tuple unpack failed and start() hung).
+            async with cm as streams:
+                read, write = streams[0], streams[1]
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     self._session = session
