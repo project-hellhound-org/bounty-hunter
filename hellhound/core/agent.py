@@ -16034,16 +16034,22 @@ INSTRUCTIONS:
         # report-register prompt instead of a normal conversational reply.
         _NO_OP_TOOL_STATUSES = {"skipped", "already_recorded", "blocked_previously_dismissed", "no_title_given", "no_reason_given", "nothing_to_dismiss"}
         _productive_tools_executed = []
-        # Hard cap on record_finding per turn — enforced here, not just
-        # requested in the prompt. Prompt instructions are advisory; the
-        # model has repeatedly ignored "don't re-record" wording and kept
-        # calling record_finding 5-10+ times in a single turn (recap
-        # follow-ups, praise, even a meta-question about its own behavior).
-        # Once this cap is hit, further record_finding calls in THIS turn
-        # are refused before the executor even runs — deterministic, not
-        # dependent on the model choosing to listen.
-        _RECORD_FINDING_CAP_PER_TURN = 3
-        _record_finding_calls_this_turn = 0
+        # Per-turn record_finding budget — enforced here, not just requested in
+        # the prompt. The hazard this guards against is the model spamming
+        # record_finding 5-10+ times with the SAME finding (recap follow-ups,
+        # praise, a meta-question about its own behavior). But the old cap of 3
+        # counted EVERY call — so on a genuinely rich host with 4+ DISTINCT real
+        # bugs (caught on bbmc: a casino with blackjack-leak + poker-IDOR +
+        # roulette-logic-flaw, an API with an auth bypass, all in one turn) it
+        # dropped the legitimate extras and told the model to "stop logging".
+        # record_finding's own dedup gate already rejects true duplicates
+        # (status "already_recorded"), so we now count only GENUINELY-NEW records
+        # toward the cap, and set it high enough for a productive host. A separate
+        # total-call ceiling still bounds pure duplicate-spam loops.
+        _RECORD_FINDING_CAP_PER_TURN = 12       # distinct NEW findings per turn
+        _RECORD_FINDING_CALL_CEILING = 30       # absolute call ceiling (spam guard)
+        _record_finding_calls_this_turn = 0     # total calls (incl. dupes)
+        _new_findings_this_turn = 0             # calls that actually recorded a new finding
         ai_resp = None  # stays None if has_real_target is False and the
                          # loop below never runs — without this, referencing
                          # it in the final-answer fallback chain crashes with
@@ -16507,18 +16513,26 @@ INSTRUCTIONS:
                             continue
                         _executed_signatures[_sig] = _current_fp
 
-                        # Hard cap: record_finding specifically, enforced before
-                        # execution — see _RECORD_FINDING_CAP_PER_TURN comment above.
+                        # record_finding budget: block a call only once we've already
+                        # banked the cap of DISTINCT NEW findings this turn, or on a
+                        # runaway total-call count (pure duplicate spam). Genuinely-new
+                        # findings are counted AFTER execution (status == "recorded");
+                        # duplicates the dedup gate rejects don't burn the budget. See
+                        # the _RECORD_FINDING_CAP_PER_TURN comment above.
                         if t_name == "record_finding":
                             _record_finding_calls_this_turn += 1
-                            if _record_finding_calls_this_turn > _RECORD_FINDING_CAP_PER_TURN:
+                            _cap_hit = _new_findings_this_turn >= _RECORD_FINDING_CAP_PER_TURN
+                            _ceiling_hit = _record_finding_calls_this_turn > _RECORD_FINDING_CALL_CEILING
+                            if _cap_hit or _ceiling_hit:
                                 blocked_result = {
                                     "status": "blocked",
                                     "note": (
-                                        f"Hard cap hit — that's {_record_finding_calls_this_turn} record_finding "
-                                        f"calls this turn, capped at {_RECORD_FINDING_CAP_PER_TURN}. Whatever you're "
-                                        f"trying to log, it's a variation of something already recorded — stop "
-                                        f"logging and move on to the next real step, or finish up."
+                                        (f"That's {_new_findings_this_turn} distinct findings recorded this turn "
+                                         f"(cap {_RECORD_FINDING_CAP_PER_TURN}) — an unusually rich haul; bank the rest "
+                                         f"next turn so each gets full attention."
+                                         if _cap_hit else
+                                         f"Too many record_finding calls this turn ({_record_finding_calls_this_turn}) — "
+                                         f"most are variations of findings already logged. Stop re-logging and move on.")
                                     )
                                 }
                                 if emit and hasattr(emit, "tool_result"):
@@ -16541,6 +16555,15 @@ INSTRUCTIONS:
                             emit.info(f"[*] Executing tool: {t_name} with args: {t_args}")
 
                         tool_result = self.execute_tool_call(t_name, t_args, emit)
+
+                        # Count only GENUINELY-NEW findings toward the per-turn cap —
+                        # record_finding returns status "recorded" for a new finding and
+                        # "already_recorded"/"blocked_*" for a dup/rejected one, so a
+                        # rich host's distinct bugs all land while duplicate spam doesn't
+                        # consume the budget.
+                        if (t_name == "record_finding" and isinstance(tool_result, dict)
+                                and tool_result.get("status") == "recorded"):
+                            _new_findings_this_turn += 1
 
                         if not (isinstance(tool_result, dict) and tool_result.get("status") in _NO_OP_TOOL_STATUSES):
                             _productive_tools_executed.append(t_name)
