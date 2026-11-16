@@ -1861,6 +1861,15 @@ def handle_apikey(args: List[str], session_context: Dict[str, Any], emit: Any) -
                     emit(f"  [unset] {name}" + (f" — {hint}" if hint else ""))
             if not all_names:
                 emit.info("Nothing configured yet. e.g. /apikey wpscan <token>")
+            # HexBrain's key is an MCP-server credential (stored under mcp_servers,
+            # not tool_api_keys), so it isn't in the list above — but people look
+            # here for it. Point them at the right command.
+            _hb = (cfg.get("mcp_servers") or {}).get("hexbrain")
+            emit("")
+            if _hb:
+                emit(f"  [set]   hexbrain (MCP): {_mask_secret(_hb.get('api_key',''))}  (disclosed-report corpus — manage with /mcp hexbrain)")
+            else:
+                emit("  [unset] hexbrain (MCP) — 15k+ disclosed HackerOne reports/playbooks for the model; set with:  /mcp hexbrain <api_key>  (free key at https://hexbrainai.com/account)")
         return {
             "status": "success",
             "tool_api_keys": {n: r for n, r in resolved.items() if r["set"]},
@@ -2019,6 +2028,28 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
             else:
                 if not is_json:
                     emit.info("Caido is not configured. Use: /mcp caido [url]")
+        hexbrain_cfg = (cfg.get("mcp_servers") or {}).get("hexbrain")
+        if which in (None, "hexbrain"):
+            if hexbrain_cfg:
+                try:
+                    from hellhound.core.mcp_bridge import MCPBridge
+                    _b = MCPBridge("hexbrain", hexbrain_cfg)
+                    _ok = _b.start(timeout=12.0)
+                    _tools = [t.name for t in _b.tools] if _ok else []
+                    _err = _b.error
+                    _b.stop()
+                    r = {"ok": _ok, "error": _err, "tools": _tools}
+                except ImportError:
+                    r = {"ok": False, "error": "The 'mcp' Python package is not installed (pip install mcp).", "tools": []}
+                result["hexbrain"] = r
+                if not is_json:
+                    if r["ok"]:
+                        emit.success(f"HexBrain — connected, {len(r['tools'])} tool(s): {', '.join(r['tools']) or '(none listed)'}")
+                    else:
+                        emit.warn(f"HexBrain — not talking to me: {r['error']} (check your key at https://hexbrainai.com/account)")
+            else:
+                if not is_json:
+                    emit.info("HexBrain is not configured. Use: /mcp hexbrain <api_key>")
         return result
 
     # ── /mcp burp [url] | /mcp burp remove ────────────────────────────────
@@ -2286,28 +2317,35 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
     burp_cfg = (cfg.get("mcp_servers") or {}).get("burp")
     caido_mcp_cfg = (cfg.get("mcp_servers") or {}).get("caido")
     caido_cfg = cfg.get("caido")
+    hexbrain_cfg = (cfg.get("mcp_servers") or {}).get("hexbrain")
     if not is_json:
         emit.banner("MCP / INTEGRATIONS")
         if burp_cfg:
-            emit.info(f"Burp:  configured — {burp_cfg.get('url')}")
+            emit.info(f"Burp:     configured — {burp_cfg.get('url')}")
         else:
-            emit.info("Burp:  not configured")
+            emit.info("Burp:     not configured")
         if caido_mcp_cfg:
-            emit.info(f"Caido: configured — caido-mcp-server (stdio, {caido_mcp_cfg.get('env', {}).get('CAIDO_URL', '?')})")
+            emit.info(f"Caido:    configured — caido-mcp-server (stdio, {caido_mcp_cfg.get('env', {}).get('CAIDO_URL', '?')})")
         elif caido_cfg:
-            emit.info(f"Caido: configured — GraphQL direct, {caido_cfg.get('url')} (token {_mask_secret(caido_cfg.get('token', ''))})")
+            emit.info(f"Caido:    configured — GraphQL direct, {caido_cfg.get('url')} (token {_mask_secret(caido_cfg.get('token', ''))})")
         else:
-            emit.info("Caido: not configured")
+            emit.info("Caido:    not configured")
+        if hexbrain_cfg:
+            emit.info(f"HexBrain: configured — {hexbrain_cfg.get('url')} (key {_mask_secret(hexbrain_cfg.get('api_key', ''))})")
+        else:
+            emit.info("HexBrain: not configured — 15k+ disclosed HackerOne reports, playbooks & payloads for the model")
         emit("")
-        emit.info("Configure:  /mcp burp [host_or_url]    (auto-detects transport; default http://127.0.0.1:9876)")
+        emit.info("Configure:  /mcp hexbrain <api_key>    (free key at https://hexbrainai.com/account — 200 calls/day)")
+        emit.info("            /mcp burp [host_or_url]    (auto-detects transport; default http://127.0.0.1:9876)")
         emit.info("            /mcp caido [url]           (uses caido-mcp-server if installed, else GraphQL; default http://localhost:8080)")
         emit.info("Force the old GraphQL path:  /mcp caido graphql [url] [token]")
         emit.info("Refresh Caido's GraphQL token:  /mcp caido token <token>")
         emit.info("Test current config:    /mcp test")
-        emit.info("Remove:                 /mcp burp remove  |  /mcp caido remove")
+        emit.info("Remove:                 /mcp hexbrain remove  |  /mcp burp remove  |  /mcp caido remove")
     return {
         "status": "success",
         "burp": burp_cfg,
+        "hexbrain": ({"url": hexbrain_cfg.get("url"), "api_key": _mask_secret(hexbrain_cfg.get("api_key", ""))} if hexbrain_cfg else None),
         "caido": (
             caido_mcp_cfg
             if caido_mcp_cfg
@@ -2845,6 +2883,10 @@ def handle_setup(args: List[str], session_context: Dict[str, Any], emit: Any) ->
         emit("  Behavior tuning:")
         emit("    /setup recaps on|off                    — toggle multi-tool recap footers")
         emit("    /setup max-iterations <n>               — cap tool-call iterations per turn")
+        emit("  Integrations (MCP):")
+        emit("    /mcp hexbrain <api_key>                 — connect HexBrain: 15k+ disclosed HackerOne reports, playbooks & payloads the model mines mid-hunt (free key at hexbrainai.com/account)")
+        emit("    /mcp burp [host_or_url] | /mcp caido [url]  — connect Burp / Caido proxies")
+        emit("    /mcp                                    — show integration status & test connections")
         emit("  Run /help for the full command catalog, or /help skills for the methodology library.")
 
         if (tool_status["missing_pd"] or tool_status["missing_other"]) and not is_json:
