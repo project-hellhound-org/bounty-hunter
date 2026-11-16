@@ -54,7 +54,17 @@ def _execute_port_scan(args: Dict[str, Any], target: Target, emit: Any) -> Dict[
     ports = str(args.get("ports", "top-100")).strip().lower()
     exclude_ports = args.get("exclude_ports")
 
-    cmd = [binary, "-j", "-silent"]
+    # RoE-aware rate limiting — a port sweep is active traffic ON the target, so
+    # keep it polite by default and crawl on a fragile/strict program. `rate` is
+    # naabu's packets/sec; caller can override, else we pick from the RoE flags.
+    rules = getattr(target, "scope_rules", None)
+    disallowed = set(getattr(rules, "disallowed", []) or [])
+    _gentle = bool(disallowed & {"no-rate-limit-testing", "no-dos", "no-automated-scanners"})
+    rate = args.get("rate")
+    if rate is None:
+        rate = 150 if _gentle else 1000
+
+    cmd = [binary, "-j", "-silent", "-rate", str(int(rate))]
     if ports in ("top-100", "top100", "100"):
         cmd.extend(["-tp", "100"])
     elif ports in ("top-1000", "top1000", "1000"):

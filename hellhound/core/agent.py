@@ -140,7 +140,7 @@ from hellhound.core.tools.osint_recon import (  # noqa: E402
     _execute_virustotal_lookup, _execute_google_dork, _execute_well_known_probe,
     _execute_probe_urls, _execute_crtsh_subdomains, _execute_favicon_hash,
     _execute_asn_expand, _execute_alt_port_scan, _execute_service_probe,
-    _execute_default_creds, _execute_company_intel,
+    _execute_default_creds, _execute_company_intel, _fingerprint_http_port,
 )
 
 from hellhound.core.tools.network_recon import _execute_port_scan, _execute_nmap_service_scan  # noqa: E402
@@ -9566,6 +9566,57 @@ def _execute_recon_pipeline(args: Dict[str, Any], target: Target, emit: Any) -> 
             inv["steps"].append({"alt_port_services": len(inv["alt_port_services"])})
         except Exception as e:
             inv["steps"].append({"alt_port_scan_error": f"{type(e).__name__}: {e}"})
+
+        # 3b-deep. BROADER PORT SWEEP (naabu) — the curated alt-port set catches the
+        # usual suspects, but an UNINTENDED exposed port (a stray admin daemon, a
+        # debug listener, a dev service bound to 0.0.0.0) lives outside any curated
+        # list. naabu top-ports finds those. Gated: only on a program whose RoE
+        # allows automated scanning (gentle/strict programs skip it — the curated,
+        # low-volume alt_port_scan already covered them), and only when naabu is
+        # installed. Rate-limited per RoE. Any port naabu finds that alt_port_scan
+        # didn't is fingerprinted and folded in, so "unintended exposure" is caught
+        # by default recon instead of waiting for the model to think of it.
+        _dis = set(getattr(getattr(target, "scope_rules", None), "disallowed", []) or [])
+        _scan_blocked = bool(_dis & {"no-automated-scanners", "no-dos", "no-port-scanning"})
+        if not _scan_blocked:
+            try:
+                from hellhound.core.toolcheck import get_binary_path as _gbp
+                if _gbp("naabu"):
+                    _say(f"recon 4b/8 — broader port sweep (naabu top-ports, rate-limited)")
+                    _known = {(s.get("host"), s.get("port")) for s in inv["alt_port_services"]}
+                    nb = _execute_port_scan({"hosts": resolved_hosts, "ports": "top-1000"}, target, emit)
+                    _extra = 0
+                    for op in (nb.get("open_ports", []) or []):
+                        host, port = op.get("host"), op.get("port")
+                        if not host or not port or (host, port) in _known:
+                            continue
+                        # Fingerprint the unexpected open port if it speaks HTTP.
+                        fp = {}
+                        try:
+                            fp = _fingerprint_http_port(host, int(port), bool(op.get("tls")))
+                        except Exception:
+                            pass
+                        entry = {"host": host, "port": port,
+                                 "service": (fp.get("service") or fp.get("title") or "")[:80],
+                                 "url": fp.get("url", ""), "status": fp.get("status"),
+                                 "unexpected": True}
+                        inv["alt_port_services"].append(entry)
+                        if entry.get("url"):
+                            try:
+                                eps = target.state.setdefault("endpoints", [])
+                                if entry["url"] not in eps:
+                                    eps.append(entry["url"])
+                            except Exception:
+                                pass
+                        _extra += 1
+                    inv["steps"].append({"naabu_extra_ports": _extra})
+                    if _extra and emit and hasattr(emit, "info"):
+                        try:
+                            emit.info(f"[!] naabu found {_extra} open port(s) OUTSIDE the curated set — unintended exposure, triage these")
+                        except Exception:
+                            pass
+            except Exception as e:
+                inv["steps"].append({"naabu_sweep_error": f"{type(e).__name__}: {e}"})
 
     # 3c. FRAMEWORK / DEBUG ENDPOINTS — actuator heapdump, swagger, .git, wp-json,
     #     graphql, metrics on each live host. Each is a finding on its own.
