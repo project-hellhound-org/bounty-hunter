@@ -88,6 +88,32 @@ except ImportError:
     STREAMABLE_HTTP_AVAILABLE = False
 
 
+def _flatten_exc(e: BaseException) -> str:
+    """Pull a human-useful message out of a (possibly nested) anyio/asyncio
+    ExceptionGroup. The MCP client runs its transport in a TaskGroup, so a plain
+    str() of a connection failure is the useless 'unhandled errors in a
+    TaskGroup (1 sub-exception)'; this walks down to the real leaf cause(s) —
+    e.g. 'Server returned an error response' (bad/expired API key) or a concrete
+    ConnectError/TimeoutError — so the saved .error actually helps diagnose it."""
+    leaves: List[str] = []
+
+    def _walk(exc: BaseException) -> None:
+        subs = getattr(exc, "exceptions", None)
+        if subs:
+            for s in subs:
+                _walk(s)
+        else:
+            msg = str(exc).strip() or type(exc).__name__
+            if msg not in leaves:
+                leaves.append(msg)
+
+    try:
+        _walk(e)
+    except Exception:
+        return str(e)
+    return "; ".join(leaves) if leaves else str(e)
+
+
 @dataclass
 class DiscoveredMCPTool:
     name: str
@@ -153,19 +179,39 @@ class MCPBridge:
 
     async def _connect_and_serve(self):
         transport = (self.config.get("transport") or "sse").lower()
+        # Optional auth headers for an HTTP-based remote MCP server — e.g. a hosted
+        # service that gates access with 'Authorization: Bearer <api_key>'. Accept
+        # either an explicit `headers` dict, or an `api_key`/`bearer_token` shortcut
+        # that we fold into an Authorization header so a researcher can just paste
+        # their key. Never logged.
+        headers = dict(self.config.get("headers") or {})
+        _key = self.config.get("api_key") or self.config.get("bearer_token")
+        if _key and not any(k.lower() == "authorization" for k in headers):
+            headers["Authorization"] = f"Bearer {_key}"
+        headers = headers or None
         try:
             if transport == "sse":
                 url = self.config.get("url")
                 if not url:
                     raise ValueError("'url' is required for transport='sse'")
-                cm = sse_client(url)
+                cm = sse_client(url, headers=headers) if headers else sse_client(url)
             elif transport in ("streamable_http", "streamable-http", "http"):
                 if not STREAMABLE_HTTP_AVAILABLE:
                     raise ValueError("Streamable HTTP transport needs a newer 'mcp' package (pip install -U mcp).")
                 url = self.config.get("url")
                 if not url:
                     raise ValueError("'url' is required for transport='streamable_http'")
-                cm = streamable_http_client(url)
+                if headers:
+                    # streamable_http_client takes no `headers=`; inject them via a
+                    # pre-built httpx client (the MCP SDK's own factory keeps its
+                    # timeouts/retries behavior).
+                    try:
+                        from mcp.shared._httpx_utils import create_mcp_http_client
+                        cm = streamable_http_client(url, http_client=create_mcp_http_client(headers=headers))
+                    except Exception:
+                        cm = streamable_http_client(url)
+                else:
+                    cm = streamable_http_client(url)
             elif transport == "stdio":
                 command = self.config.get("command")
                 if not command:
@@ -203,9 +249,12 @@ class MCPBridge:
             # call_tool_sync() to stop trying this now-broken loop.
             if self._session is not None:
                 self._dead = True
-                self.error = f"Connection to '{self.name}' was lost: {e}"
+                self.error = f"Connection to '{self.name}' was lost: {_flatten_exc(e)}"
             else:
-                self.error = str(e)
+                # Unwrap anyio/asyncio ExceptionGroups so a real cause (e.g. an HTTP
+                # 401/403 "Server returned an error response" on a bad API key)
+                # surfaces instead of the useless "unhandled errors in a TaskGroup".
+                self.error = _flatten_exc(e)
             self._ready.set()
 
     def call_tool_sync(self, tool_name: str, args: Dict[str, Any], timeout: float = 120.0) -> Dict[str, Any]:

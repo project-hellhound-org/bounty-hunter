@@ -1898,6 +1898,8 @@ def handle_apikey(args: List[str], session_context: Dict[str, Any], emit: Any) -
 def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> Dict[str, Any]:
     """
     /mcp                            — show Burp/Caido configuration + live status
+    /mcp hexbrain <api_key>          — connect HexBrain (hexbrainai.com): 15k+ disclosed HackerOne reports, playbooks, payloads, program payouts (free key at /account)
+    /mcp hexbrain remove            — remove the HexBrain entry from config
     /mcp burp [host_or_url]          — configure Burp's MCP server (auto-detects transport; default http://127.0.0.1:9876)
     /mcp burp remove                — remove the Burp entry from config
     /mcp caido [url]                — configure Caido via caido-mcp-server (stdio MCP, 66 tools) if it's on PATH,
@@ -2020,6 +2022,64 @@ def handle_mcp(args: List[str], session_context: Dict[str, Any], emit: Any) -> D
         return result
 
     # ── /mcp burp [url] | /mcp burp remove ────────────────────────────────
+    # ── /mcp hexbrain <api_key> — connect the HexBrain disclosed-report corpus ──
+    # HexBrain (hexbrainai.com) is a hosted MCP over 15k+ disclosed HackerOne
+    # reports: search_reports, get_report, get_testing_playbook, find_payloads,
+    # find_bypasses, get_program_history, get_attack_surface, find_cves, plan_tests,
+    # list_classes, get_cve. Streamable HTTP + Bearer key. Gives Beast real
+    # "how was this bug found" reference material mid-engagement.
+    if clean_args and clean_args[0].lower() == "hexbrain":
+        sub = clean_args[1:]
+        if sub and sub[0].lower() == "remove":
+            if "mcp_servers" in cfg and "hexbrain" in cfg["mcp_servers"]:
+                del cfg["mcp_servers"]["hexbrain"]
+                save_config(cfg)
+                if not is_json:
+                    emit.success("HexBrain removed from config.")
+                return {"status": "success", "removed": "hexbrain"}
+            if not is_json:
+                emit.info("HexBrain wasn't configured.")
+            return {"status": "success", "removed": None}
+
+        api_key = sub[0].strip() if sub else ""
+        if not api_key and not is_json and _stdin_interactive():
+            api_key = (_interactive_prompt(
+                "Paste your HexBrain API key (sk_... — create one free at https://hexbrainai.com/account):"
+            ) or "").strip()
+        if not api_key:
+            if not is_json:
+                emit.warn("Need your HexBrain API key: /mcp hexbrain sk_your_key  "
+                          "(create one free at https://hexbrainai.com/account)")
+            return {"status": "error", "error": "no api_key given"}
+
+        server_cfg = {
+            "transport": "streamable_http",
+            "url": "https://hexbrainai.com/api/mcp",
+            "api_key": api_key,
+        }
+        cfg.setdefault("mcp_servers", {})["hexbrain"] = server_cfg
+        save_config(cfg)
+        # Live-test: connect and list the tools it exposes.
+        try:
+            from hellhound.core.mcp_bridge import MCPBridge
+            bridge = MCPBridge("hexbrain", server_cfg)
+            ok = bridge.start(timeout=12.0)
+            tool_names = [t.name for t in bridge.tools] if ok else []
+            err = bridge.error
+            bridge.stop()
+        except ImportError:
+            ok, tool_names, err = False, [], "The 'mcp' Python package is not installed (pip install mcp)."
+        if not is_json:
+            if ok:
+                emit.success(f"HexBrain connected — {len(tool_names)} tool(s): {', '.join(tool_names) or '(none listed)'}")
+                emit.info("Beast will consult it as mcp_hexbrain_* (search_reports, get_testing_playbook, find_payloads, …) when a target's stack/vuln-class matches disclosed reports.")
+            else:
+                emit.warn(f"Saved, but the test connection failed: {err or 'unknown error'}. "
+                          f"Check the key at https://hexbrainai.com/account; Beast will retry on next launch.")
+        return {"status": "success" if ok else "saved_untested",
+                "hexbrain": {"url": server_cfg["url"], "transport": server_cfg["transport"]},
+                "test": {"ok": ok, "error": err, "tools": tool_names}}
+
     if clean_args and clean_args[0].lower() == "burp":
         sub = clean_args[1:]
         if sub and sub[0].lower() == "remove":
