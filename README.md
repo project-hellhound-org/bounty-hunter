@@ -2,7 +2,7 @@
   <img src="Images/hellhound.gif" alt="Hellhound Bounty Hunter Animation" width="100%"/>
 </p>
 <p align="center">
-  <img src="Image/logo.png" alt="BEAST logo" width="80">
+  <img src="Images/logo.png" alt="BEAST logo" width="80">
 </p>
   <b>Autonomous AI Bug Bounty & Penetration Testing Framework — runs as <code>beast</code>, built by Project Hellhound</b>
   <br>
