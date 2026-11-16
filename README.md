@@ -1,8 +1,17 @@
 <p align="center">
   <img src="Images/hellhound.gif" alt="Hellhound Bounty Hunter Animation" width="100%"/>
 </p>
+
 <p align="center">
   <img src="Images/logo.png" alt="BEAST logo" width="120">
+</p>
+
+<h1 align="center">BOUNTY HUNTER</h1>
+
+<p align="center">
+  <b>Autonomous AI Bug Bounty & Penetration Testing Framework — runs as <code>beast</code>, built by Project Hellhound</b>
+  <br>
+  <i>Target enumeration, two-tier neural reasoning, 30 methodology skills, persistent artifact blackboard, live SPA crawling, visual evidence capture, and zero-bypass scope guardrails — from recon to submission-ready report.</i>
 </p>
 
 <p align="center">
@@ -24,13 +33,6 @@
   <a href="#roadmap--whats-next">Roadmap</a> ·
   <a href="#contributing">Contributing</a> ·
   <a href="#license">License</a>
-</p>
-<h1 align="center">BOUNTY HUNTER</h1>
-<p align="center">
-  
-  <b>Autonomous AI Bug Bounty & Penetration Testing Framework — runs as <code>beast</code>, built by Project Hellhound</b>
-  <br>
-  <i>Target enumeration, two-tier neural reasoning, 30 methodology skills, persistent artifact blackboard, live SPA crawling, visual evidence capture, and zero-bypass scope guardrails — from recon to submission-ready report.</i>
 </p>
 
 ---
