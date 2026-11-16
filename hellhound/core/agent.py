@@ -12159,6 +12159,12 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
 # on every single turn.
 _MCP_SERVERS_REGISTERED = False
 
+# MCP servers that are PASSIVE knowledge sources (read-only reference corpora),
+# not interactive proxies — these auto-register on any real hunting turn so the
+# model can consult them, instead of waiting for an explicit mcp/burp/caido
+# mention like the noisy proxy integrations do. HexBrain = 15k+ disclosed reports.
+_KNOWLEDGE_MCP_SERVERS = frozenset({"hexbrain"})
+
 
 def _make_mcp_executor(call_fn: Callable[..., Dict[str, Any]]) -> Callable[[Dict[str, Any], Target, Any], Dict[str, Any]]:
     """
@@ -12184,7 +12190,7 @@ def _make_mcp_executor(call_fn: Callable[..., Dict[str, Any]]) -> Callable[[Dict
     return _executor
 
 
-def register_mcp_servers(emit: Any = None) -> int:
+def register_mcp_servers(emit: Any = None, only: Optional[set] = None) -> int:
     """
     Reads mcp_servers from config (~/.beast/config.json's "mcp_servers"
     key — see ai_utils.load_config), connects to each configured server,
@@ -12228,6 +12234,8 @@ def register_mcp_servers(emit: Any = None) -> int:
     for server_name, server_cfg in servers.items():
         if not isinstance(server_cfg, dict):
             continue
+        if only is not None and server_name not in only:
+            continue  # selective registration — e.g. knowledge servers only
         if server_name in _bridges:
             continue  # already connected this process
         discovered = connect_mcp_server(server_name, server_cfg, emit=emit)
@@ -14929,6 +14937,24 @@ If there is nothing worth generalizing, return an empty array: []"""
         # false-positive firing on unrelated target-scoped messages.
         global _MCP_SERVERS_REGISTERED, _CAIDO_TOOLS_REGISTERED
         _mcp_relevant_turn = bool(_MCP_RELEVANT_RE.search(user_text or ""))
+        # KNOWLEDGE MCPs (HexBrain's disclosed-report corpus) are PASSIVE reference
+        # tools the model should have during ANY real hunt — not interactive proxies
+        # the researcher invokes by name. The _MCP_RELEVANT_RE gate exists to spare
+        # unrelated chat the noisy Burp/Caido connect banner; it should NOT also hide
+        # a quiet knowledge source that's useless unless it's actually in the tool
+        # list while hunting. So on a hunting turn (a real, non-default target),
+        # register just the knowledge servers even without an mcp/burp/caido mention.
+        # Proxy servers (burp/caido) keep the strict text-relevance gate.
+        _hunting_turn = bool(self.target and str(getattr(self.target, "name", "default")) not in ("default", ""))
+        _knowledge_configured = {
+            n for n in (load_config().get("mcp_servers") or {})
+            if n in _KNOWLEDGE_MCP_SERVERS
+        }
+        if _knowledge_configured and _hunting_turn and not _mcp_relevant_turn:
+            try:
+                register_mcp_servers(emit=emit, only=_knowledge_configured)
+            except Exception:
+                pass
         if _mcp_relevant_turn:
             if not _MCP_SERVERS_REGISTERED:
                 _MCP_SERVERS_REGISTERED = True
