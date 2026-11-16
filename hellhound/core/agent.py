@@ -16304,8 +16304,15 @@ INSTRUCTIONS:
                 # fall through to synthesis rather than burning iterations. Skip this
                 # when we just recognized a real tool call above: a repeated tool call
                 # should be EXECUTED (the pivot / same-URL loop detectors handle true
-                # repetition downstream), never surfaced as the final answer.
-                if tool_call is None and isinstance(ai_resp, str) and ai_resp.strip() == (_prev_ai_resp or "").strip():
+                # repetition downstream), never surfaced as the final answer. ALSO
+                # skip when the response is a tool-call ATTEMPT that didn't parse
+                # (`"tool"` present but extraction failed — malformed/truncated JSON,
+                # a classic Nemotron degeneration on deeply-nested `parallel` calls):
+                # that must reach the malformed-JSON retry path below, which asks for
+                # valid JSON, NOT get treated as finished planning and dumped raw.
+                if (tool_call is None and isinstance(ai_resp, str)
+                        and '"tool"' not in ai_resp
+                        and ai_resp.strip() == (_prev_ai_resp or "").strip()):
                     break
                 if isinstance(ai_resp, str):
                     _prev_ai_resp = ai_resp
@@ -16575,18 +16582,24 @@ INSTRUCTIONS:
                     # final answer, with the intended tool call never run.
                     # Force a clean retry instead of silently giving up.
                     _narration_retry_count += 1
+                    # If the malformed attempt was a `parallel` wrapper (the model
+                    # botches its deep nesting — missing a closing brace per inner
+                    # call — far more often than a flat call), steer it to a SINGLE
+                    # simple call instead of asking it to re-nest the same structure.
+                    _looked_parallel = '"parallel"' in ai_resp or '"calls"' in ai_resp
+                    _retry_msg = (
+                        "SYSTEM: That was not valid JSON — it looked like a tool call but failed to parse "
+                        "(unbalanced braces/quotes). "
+                        + ("You tried a nested `parallel` call; its deep nesting is what broke. Do NOT retry "
+                           "`parallel` — instead emit ONE simple tool call this turn (e.g. a single `curl`), "
+                           "as a single valid JSON object, nothing before or after it. You can make the next "
+                           "call after you see this one's result."
+                           if _looked_parallel else
+                           "Resend the SAME tool call as a single valid JSON object, nothing else before or after it.")
+                    )
                     self.history.append({"role": "assistant", "content": ai_resp})
-                    self.history.append({
-                        "role": "user",
-                        "content": (
-                            "SYSTEM: That was not valid JSON — it looked like a tool call "
-                            "but failed to parse (check for mismatched braces/quotes, "
-                            "especially inside string args like payload content). "
-                            "Resend the SAME tool call as a single valid JSON object, "
-                            "nothing else before or after it."
-                        )
-                    })
-                    user_text = "Resend the tool call as valid JSON only."
+                    self.history.append({"role": "user", "content": _retry_msg})
+                    user_text = "Resend as ONE valid-JSON tool call." + (" Avoid parallel." if _looked_parallel else "")
                     continue
 
                 # Non-tool response — could be a genuine "DONE"/conversational
