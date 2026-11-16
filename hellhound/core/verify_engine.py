@@ -182,13 +182,44 @@ def verify_xss(positive: Dict[str, Any], negative: Optional[Dict[str, Any]], arg
             "(and execution_evidence=<its evidence string>) here instead.")
     body = _body_of(positive)
     if payload in body:
+        # Classify the reflection CONTEXT so stored/blind XSS isn't held hostage to a
+        # browser-execution check that is impossible when the payload fires in the
+        # VICTIM's browser, not ours. A raw executing-context tag (<script>, <svg
+        # onload=>, <img onerror=>, <iframe onload=>, <body onload=>) reflected
+        # verbatim in HTML body/element context — i.e. NOT sitting inside an attribute
+        # value you'd still need to break out of — is a bona-fide XSS sink and is
+        # recordable on reflection alone. The attribute-context case still needs a
+        # breakout, so it keeps the cautious guidance.
+        exec_ctx = bool(re.search(
+            r"<\s*(?:script|svg|img|iframe|body|details|video|audio|marquee)\b[^>]*"
+            r"(?:>|\son(?:error|load|toggle|animationstart|mouseover)\s*=)",
+            payload, re.I))
+        # Is the reflection inside an HTML attribute value? Look at the text just
+        # before the reflected payload: an unclosed ="/=' quoted attribute means
+        # we're in attribute context and a breakout prefix is still required.
+        idx = body.find(payload)
+        preceding = body[max(0, idx - 80):idx]
+        in_attr = bool(re.search(r"=\s*[\"'][^\"'<>]*$", preceding))
+
+        if exec_ctx and not in_attr:
+            return VerifyResult(True, "verified",
+                "the exact payload reflects verbatim (unescaped) in the response body IN AN EXECUTING HTML "
+                "CONTEXT — a raw <script>/<svg onload>/<img onerror>-style tag in element/body context, not "
+                "inside an attribute value. That is a genuine XSS sink and is RECORDABLE NOW on the reflection "
+                "alone. For STORED/BLIND XSS this is the correct standard of proof: the script fires in the "
+                "VICTIM's browser (e.g. an admin viewing the stored content), so you cannot — and need not — "
+                "confirm execution in your own headless browser. A browser confirm_script_execution only helps "
+                "for a REFLECTED XSS you can load yourself; do not block a stored/blind finding waiting for it. "
+                "Record it, citing the submit request + the render URL where the raw tag appears unescaped.",
+                positive_evidence=payload)
+
         return VerifyResult(True, "verified",
             "the exact payload reflects verbatim (unescaped) in the response body. This confirms the HTML "
-            "sink is unescaped — it does NOT by itself confirm a script actually ran (escaped-but-present "
-            "text, a dead context, or CSP could still block real execution). For a stronger result: goto the "
-            "same URL via browser_control, call action='confirm_script_execution' with a unique marker the "
-            "payload executes (e.g. alert('<marker>') or window.__hh_xss_proof='<marker>'), then re-call "
-            "this with execution_confirmed=true.",
+            "sink is unescaped — but the reflection appears to sit INSIDE AN HTML ATTRIBUTE VALUE, so as-sent "
+            "it may not execute without a breakout (close the attribute/tag first, e.g. prefix '\"> or '>). "
+            "Craft a breakout payload and re-verify. If this is a REFLECTED XSS you can load yourself, you can "
+            "also goto the same URL via browser_control + confirm_script_execution for execution proof; for a "
+            "STORED/BLIND sink that fires in the victim's browser, a successful breakout reflection is enough.",
             positive_evidence=payload)
     escaped_variants = [
         payload.replace("<", "&lt;").replace(">", "&gt;"),
