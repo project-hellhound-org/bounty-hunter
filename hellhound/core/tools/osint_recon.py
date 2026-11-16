@@ -729,6 +729,220 @@ def _execute_service_probe(args: Dict[str, Any], target: Target, emit: Any) -> D
     }
 
 
+# Vendor/default creds — the ones that are a real finding when they still work, NOT a
+# brute-force list. Keyed by how to try them. "basic" entries are tried against any
+# endpoint that answers 401 WWW-Authenticate: Basic. Service entries target a known
+# management console on its own path. Short lists on purpose: this is "did they leave
+# the default password" — a handful of tries per host, not credential stuffing.
+_DEFAULT_BASIC_CREDS: List[tuple] = [
+    ("admin", "admin"), ("admin", "password"), ("admin", ""), ("admin", "changeme"),
+    ("admin", "admin123"), ("administrator", "administrator"), ("root", "root"),
+    ("root", "toor"), ("guest", "guest"), ("user", "user"), ("test", "test"),
+    ("tomcat", "tomcat"), ("tomcat", "s3cret"),
+]
+
+# (service-name-from-fingerprint) -> list of (path, method, auth_style, creds, success_check)
+# auth_style: "basic" | "json" | "form". success_check runs on (status, body) → bool.
+def _ok_not_401(code: int, body: bytes) -> bool:
+    return code not in (401, 403)
+
+_SERVICE_LOGINS: Dict[str, List[Dict[str, Any]]] = {
+    "Tomcat": [{"path": "/manager/html", "auth": "basic",
+                "creds": [("tomcat", "tomcat"), ("admin", "admin"), ("tomcat", "s3cret"),
+                          ("admin", ""), ("role1", "role1")],
+                "ok": lambda c, b: c == 200 and (b"Tomcat Web Application Manager" in b or b"/manager/" in b)}],
+    "Grafana": [{"path": "/login", "auth": "json", "field_user": "user", "field_pass": "password",
+                 "creds": [("admin", "admin")],
+                 "ok": lambda c, b: c == 200 and b"message" in b and b"Invalid" not in b}],
+    "RabbitMQ mgmt": [{"path": "/api/whoami", "auth": "basic",
+                       "creds": [("guest", "guest")],
+                       "ok": lambda c, b: c == 200 and b"name" in b}],
+    "Jenkins": [{"path": "/api/json", "auth": "basic",
+                 "creds": [("admin", "admin"), ("admin", "password")],
+                 "ok": lambda c, b: c == 200}],
+    "Kibana": [{"path": "/api/status", "auth": "basic",
+                "creds": [("elastic", "changeme"), ("kibana", "changeme")],
+                "ok": lambda c, b: c == 200}],
+    "MinIO": [{"path": "/minio/admin/v3/info", "auth": "basic",
+               "creds": [("minioadmin", "minioadmin")],
+               "ok": lambda c, b: c == 200}],
+}
+
+
+def _execute_default_creds(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
+    """Check whether a discovered service still has its DEFAULT/weak password —
+    the bread-and-butter finding behind a management console (Tomcat manager,
+    Grafana admin:admin, RabbitMQ guest:guest, Jenkins, a basic-auth wall). This
+    is NOT a brute-forcer: it tries the small set of vendor defaults for the
+    service type, so it stays fast, quiet, and safe on strict programs.
+
+    Two modes, combined: (a) for any URL that answers 401 WWW-Authenticate: Basic,
+    try the default basic-auth creds; (b) for a host fingerprinted as a known
+    service (via alt_port_scan / passed in), hit that service's login with its
+    known defaults. A working default login is recorded-worthy on its own.
+
+    Pulls targets from `urls`/`hosts`, else from the alt-port services + live
+    hosts found this engagement. Scope-gated per host. Never raises."""
+    import concurrent.futures
+
+    rules = getattr(target, "scope_rules", None)
+    disallowed = set(getattr(rules, "disallowed", []) or [])
+    gentle = bool(disallowed & _GENTLE_FLAGS)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; recon-defaultcreds/1.0)"}
+    _TIMEOUT = (5, 10)
+
+    # Collect (url, service) candidates.
+    cand: List[tuple] = []  # (base_url, service_name_or_"")
+    raw = args.get("urls") or args.get("hosts") or args.get("host") or args.get("url") or args.get("target")
+    if isinstance(raw, str):
+        for u in re.split(r"[,\s]+", raw):
+            if u.strip():
+                cand.append((u.strip(), ""))
+    elif isinstance(raw, list):
+        for u in raw:
+            if str(u).strip():
+                cand.append((str(u).strip(), ""))
+    state = getattr(target, "state", {}) or {}
+    if not cand:
+        # Prefer fingerprinted alt-port services (they carry a service name).
+        for s in (state.get("alt_port_services") or []):
+            if isinstance(s, dict) and s.get("url"):
+                cand.append((s["url"], s.get("service", "")))
+        for h in (state.get("live_hosts") or []):
+            u = h.get("url") if isinstance(h, dict) else h
+            if u:
+                cand.append((u, ""))
+    else:
+        # Enrich caller-supplied URLs with any known service name for that origin.
+        svc_by_origin = {}
+        for s in (state.get("alt_port_services") or []):
+            if isinstance(s, dict) and s.get("url"):
+                svc_by_origin[s["url"].rstrip("/")] = s.get("service", "")
+        cand = [(u, svc_by_origin.get(u.rstrip("/"), sv)) for (u, sv) in cand]
+
+    # Normalise to origins + dedupe, scope-gate.
+    seen_origins = set()
+    work: List[tuple] = []
+    skipped_scope = 0
+    for url, svc in cand:
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        p = urlparse(url)
+        origin = f"{p.scheme}://{p.netloc}"
+        key = (origin, svc)
+        if key in seen_origins:
+            continue
+        seen_origins.add(key)
+        allowed, _r = is_in_scope(origin, rules)
+        if not allowed:
+            skipped_scope += 1
+            continue
+        work.append((origin, svc))
+    work = work[: int(args.get("max_hosts", 12))]
+
+    if not work:
+        return {"status": "success", "weak_logins": [], "tested": 0,
+                "skipped_out_of_scope": skipped_scope,
+                "note": "No in-scope service to check for default creds."}
+
+    hits: List[Dict[str, Any]] = []
+    tested = 0
+
+    def _try_basic(origin: str, path: str, creds: List[tuple], ok=None) -> Optional[Dict[str, Any]]:
+        nonlocal tested
+        url = origin + path
+        try:
+            probe = requests.get(url, timeout=_TIMEOUT, verify=False, headers=headers, allow_redirects=False)
+        except requests.RequestException:
+            return None
+        www = probe.headers.get("WWW-Authenticate", "")
+        # Only attempt basic-auth creds where the server actually asks for Basic,
+        # unless a service entry named this path explicitly.
+        if ok is None and not (probe.status_code == 401 and "basic" in www.lower()):
+            return None
+        for user, pw in creds:
+            tested += 1
+            try:
+                r = requests.get(url, timeout=_TIMEOUT, verify=False, headers=headers,
+                                 allow_redirects=False, auth=(user, pw))
+                body = r.content[:3000] if r.content else b""
+            except requests.RequestException:
+                continue
+            good = ok(r.status_code, body) if ok else _ok_not_401(r.status_code, body)
+            if good:
+                return {"url": url, "auth": "basic", "username": user, "password": pw,
+                        "status": r.status_code}
+        return None
+
+    def _try_json(origin: str, spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        nonlocal tested
+        url = origin + spec["path"]
+        for user, pw in spec["creds"]:
+            tested += 1
+            payload = {spec.get("field_user", "user"): user, spec.get("field_pass", "password"): pw}
+            try:
+                r = requests.post(url, json=payload, timeout=_TIMEOUT, verify=False,
+                                  headers=headers, allow_redirects=False)
+                body = r.content[:3000] if r.content else b""
+            except requests.RequestException:
+                continue
+            if spec["ok"](r.status_code, body):
+                return {"url": url, "auth": "json", "username": user, "password": pw,
+                        "status": r.status_code}
+        return None
+
+    def _check(item: tuple) -> List[Dict[str, Any]]:
+        origin, svc = item
+        found = []
+        # Service-specific logins first (highest signal).
+        for spec in _SERVICE_LOGINS.get(svc, []):
+            if spec["auth"] == "basic":
+                hit = _try_basic(origin, spec["path"], spec["creds"], ok=spec.get("ok"))
+            elif spec["auth"] == "json":
+                hit = _try_json(origin, spec)
+            else:
+                hit = None
+            if hit:
+                hit["service"] = svc
+                found.append(hit)
+        # Generic basic-auth wall on the root (and /admin) — only fires if the
+        # server actually answers 401 Basic, so it's a no-op on everything else.
+        for path in ("/", "/admin"):
+            hit = _try_basic(origin, path, _DEFAULT_BASIC_CREDS)
+            if hit:
+                hit["service"] = svc or "http-basic"
+                found.append(hit)
+                break
+        return found
+
+    concurrency = 4 if gentle else 8
+    workers = max(1, min(concurrency, len(work)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for found in ex.map(_check, work):
+            for hit in found:
+                hits.append(hit)
+                if emit and hasattr(emit, "info"):
+                    try:
+                        emit.info(f"  WEAK LOGIN {hit['url']} — {hit['username']}:{hit['password'] or '(blank)'} "
+                                  f"[{hit.get('service','')}]")
+                    except Exception:
+                        pass
+
+    summary = (f"{len(hits)} default/weak login(s) found across {len(work)} service(s) "
+               f"({tested} credential attempt(s)).")
+    return {
+        "status": "success",
+        "weak_logins": hits,
+        "tested": tested,
+        "service_count": len(work),
+        "skipped_out_of_scope": skipped_scope,
+        "summary": summary,
+        "note": (summary + (" Each working default login is a finding on its own — verify by "
+                 "re-authenticating and record it with the credential pair as POC." if hits
+                 else " No default creds worked; the services require real auth (or none).")),
+    }
+
+
 def _execute_probe_urls(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """BATCH-probe a pile of URLs for liveness instead of curling them one by
     one — the move that makes recon fast. Pass an explicit `urls` list, or omit

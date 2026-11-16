@@ -140,6 +140,7 @@ from hellhound.core.tools.osint_recon import (  # noqa: E402
     _execute_virustotal_lookup, _execute_google_dork, _execute_well_known_probe,
     _execute_probe_urls, _execute_crtsh_subdomains, _execute_favicon_hash,
     _execute_asn_expand, _execute_alt_port_scan, _execute_service_probe,
+    _execute_default_creds,
 )
 
 from hellhound.core.tools.network_recon import _execute_port_scan, _execute_nmap_service_scan  # noqa: E402
@@ -7146,6 +7147,35 @@ def _mirror_finding_to_repeater(target: Target, request_ref: str, title: str) ->
         pass
 
 
+def _reconcile_findings_from_disk(target: Target) -> None:
+    """Union the in-memory findings list with what's saved on disk so a run that
+    started from a stale/partial Target can never overwrite previously-saved
+    findings. Keyed by (title, endpoint); disk entries missing from memory are
+    re-added (appended after the in-memory ones so this turn's working set keeps
+    its order). Best-effort and silent — a read failure just leaves memory as-is."""
+    try:
+        from hellhound.core.tasks import get_target_path, sanitize_target_name
+        path = get_target_path(sanitize_target_name(target.name))
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            disk = json.load(f)
+        disk_findings = disk.get("findings")
+        if not isinstance(disk_findings, list) or not disk_findings:
+            return
+        mem = target.findings if isinstance(target.findings, list) else []
+        def _key(fn: Dict[str, Any]) -> tuple:
+            return (str(fn.get("type", "")).strip().lower(),
+                    str(fn.get("target", "")).strip().lower())
+        seen = {_key(f) for f in mem if isinstance(f, dict)}
+        recovered = [f for f in disk_findings
+                     if isinstance(f, dict) and _key(f) not in seen]
+        if recovered:
+            target.findings = mem + recovered
+    except Exception:
+        pass
+
+
 def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Logs a finding YOU have already confirmed (not a guess or a plan) into
@@ -7360,6 +7390,15 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     # the same flag get logged 5+ times under different titles ("Flag
     # captured: X", "Flag confirmed: X", "Mission complete: X"...) in one
     # session, AND let the same endpoint get logged as two "different"
+    # SAFETY NET — never lose previously-saved findings to a stale in-memory
+    # target. Before we dedup/append, reconcile the in-memory findings list with
+    # whatever is on disk (union by title+endpoint). A headless run constructed
+    # with a fresh/partial Target, a mid-session state overwrite, or any path that
+    # left target.findings shorter than the saved file would otherwise overwrite
+    # the on-disk findings with an incomplete set the moment we save. This makes
+    # record_finding strictly ADDITIVE across runs.
+    _reconcile_findings_from_disk(target)
+
     # IDOR findings just because the researcher asked "is this really a
     # vuln?" and the model re-verified + re-recorded it under slightly
     # different wording. Three ways an incoming finding can turn out to be
@@ -10953,6 +10992,31 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
             "required": []
         },
         executor=_execute_service_probe
+    ),
+    "default_creds": ToolSpec(
+        name="default_creds",
+        description=(
+            "Check whether a discovered service still has its DEFAULT/weak password — the bread-and-butter "
+            "finding behind a management console (Tomcat manager tomcat:tomcat, Grafana admin:admin, RabbitMQ "
+            "guest:guest, Jenkins, MinIO minioadmin, or any HTTP Basic-auth wall). NOT a brute-forcer: it tries "
+            "the small set of vendor defaults for the service type, so it's fast, quiet, and safe on strict "
+            "programs. For a 401 WWW-Authenticate: Basic endpoint it tries default basic creds; for a host "
+            "fingerprinted by alt_port_scan it hits that service's known login. A working default login is a "
+            "finding on its own. Omit args to check every alt-port service + live host found this engagement. "
+            "Pair with alt_port_scan (which fingerprints the service and tells this tool what defaults to try)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "urls": {
+                    "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
+                    "description": "Service URL(s)/host(s) to check. Omit to check all alt-port services + live hosts.",
+                },
+                "max_hosts": {"type": "integer", "description": "Cap services checked. Default 12.", "default": 12},
+            },
+            "required": []
+        },
+        executor=_execute_default_creds
     ),
     "urlscan_recon": ToolSpec(
         name="urlscan_recon",
@@ -15225,6 +15289,7 @@ RULES:
    - A HOST IS NOT JUST ITS WEB PORT — SCAN THE ALT PORTS. The single most common surface a 80/443-only sweep misses is a juicy service listening on a NON-STANDARD port of a host you already found. Run `alt_port_scan` on your live/resolved hosts (it's pure-Python, always available, no naabu needed): it connects to a curated high-value port set and fingerprints what answers — an unauthenticated ClickHouse/Elasticsearch on :9000/:8123/:9200, a Prometheus on :9090, a Grafana on :3000, a Jenkins on :8080, a Spring actuator, a Docker Engine API on :2375, a Redis/Mongo/MySQL with no auth. Any of those is frequently critical ON ITS OWN (full DB read, secrets, RCE). Treat each discovered alt-port HTTP service as a first-class host and probe it like one; for a non-HTTP lead (redis/mongo/mysql) try an unauthenticated client connect. `recon` now runs this automatically — but if you only ran `httpx`, you have NOT looked at the alt ports yet.
    - PROBE EACH LIVE HOST'S FRAMEWORK/DEBUG ENDPOINTS with `service_probe` — the exposed Spring actuator heapdump (dumps secrets/creds straight out of memory → `/actuator/heapdump`), the swagger/openapi spec (hands you every hidden API route), `/.git/` and `/.env` (source + creds), `/wp-json/wp/v2/users` (WordPress user enum), `/graphql` (introspection), `/metrics`, `/debug/pprof/`, `/server-status`. Each is a finding by itself and is routinely left open; a generic content wordlist misses them because they're framework-specific. A `401`/`403` on one of these still CONFIRMS it exists — then try an auth bypass (next bullet). `recon` runs this automatically on the live hosts; run it by hand on any host you add later.
    - WHEN AN ENDPOINT 401/403s, TRY THE CHEAP AUTH BYPASSES BEFORE MOVING ON — a "requires auth" wall is often paper-thin. Standard deltas, one at a time: an ARBITRARY Bearer token (`Authorization: Bearer anything` — broken API auth that "accepts any token" is a real, common bug; a Swagger that literally says "enter any token" is a tell), `X-Forwarded-For: 127.0.0.1` / `X-Real-IP` / `X-Forwarded-Host: localhost` (trusts-the-proxy header bypass), a path trick (`/admin/..;/`, `//admin`, `/admin.`, case/encoding), a query/cookie flag the client-side code sets (read the page's own JS — e.g. it appends `?role=` or sets an "activated" cookie the backend trusts), or a signed-but-forgeable session (JWT `alg:none`/key confusion). Try the dummy-Bearer and the forwarded-IP header first; they cost one request each and routinely turn a 401 into full data.
+   - CHECK DEFAULT / WEAK CREDENTIALS ON ANY MANAGEMENT CONSOLE OR LOGIN WALL — it is one of the most common real findings and costs almost nothing. The MOMENT recon fingerprints a service with a known default (Tomcat → tomcat:tomcat, Grafana → admin:admin, RabbitMQ → guest:guest, Jenkins, MinIO → minioadmin:minioadmin, Kibana/Elastic → elastic:changeme) or you hit an HTTP Basic-auth wall (`401 WWW-Authenticate: Basic`), run `default_creds` on it — it tries just that service's vendor defaults (not a brute-force, so it's safe even on strict programs). A working default login is a finding on its own; confirm it by re-authenticating and record the credential pair as the POC. This pairs directly with `alt_port_scan`, which fingerprints the service and tells `default_creds` which defaults to try.
    - ENUMERATE EVERY ACTION ON AN API/APP, NOT JUST THE FIRST ONE THAT WORKED. Finding ONE broken endpoint (one IDOR, one game action) and stopping leaves the rest of the bounty on the table. When a host exposes a set of parallel operations — a casino's poker AND blackjack AND slots AND roulette, an airline's getMembership AND getPaymentMethods AND getBookings, a bank's accounts AND transfers AND statements — test them ALL the same way: each game's deal/state endpoint can leak hidden state (a dealer hole-card in the response's `_internal`/debug field), each `get*` can be a separate IDOR/BOLA, each action can have its own missing-authz. Pull the full action list from the swagger spec / the page's JS / the obvious REST verbs, and walk the whole set to yes/no. One confirmed bug on a host is a cue to find its siblings, not to leave.
    - STORED/BLIND XSS IS A SUBMIT-THEN-VERIFY LOOP, NOT A ONE-SHOT. When you find an input that gets stored and later rendered (an issue tracker, support ticket, profile field, comment), SUBMIT a uniquely-tagged payload via the real submit endpoint (`<script>`/`"><img src=x onerror=...>` with a marker you can grep), THEN fetch the page where it's displayed (often an admin/staff view at a different path) and confirm the payload landed UNSANITIZED in the HTML. The confirmation is seeing your raw `<script>`/`onerror` reflected into the markup of the rendering page — not just that the submit returned 200. For true blind XSS (you can't see the admin view), point the payload at an OOB collector (`alt_port_scan` may have even revealed an Interactsh/`oast.*` host in-scope) and confirm the callback. Record it only once you've verified the sink renders it.
    - ALWAYS READ `robots.txt`, `sitemap.xml`, AND `/.well-known/security.txt` EARLY — they are free, zero-impact, and the single highest-signal starting point. Run `well_known_probe` to do this in one shot: it fetches all three and PROBES the `robots.txt` Disallow paths for liveness, so a still-reachable `Disallow: /.env`, `/admin`, `/backup/` comes back already confirmed-live (owner-hidden but reachable = look there first). `sitemap.xml` enumerates real pages; `security.txt` gives the reporting contact. Never crawl past these without having read them.
