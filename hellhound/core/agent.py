@@ -14937,32 +14937,44 @@ If there is nothing worth generalizing, return an empty array: []"""
         # false-positive firing on unrelated target-scoped messages.
         global _MCP_SERVERS_REGISTERED, _CAIDO_TOOLS_REGISTERED
         _mcp_relevant_turn = bool(_MCP_RELEVANT_RE.search(user_text or ""))
-        # KNOWLEDGE MCPs (HexBrain's disclosed-report corpus) are PASSIVE reference
-        # tools the model should have during ANY real hunt — not interactive proxies
-        # the researcher invokes by name. The _MCP_RELEVANT_RE gate exists to spare
-        # unrelated chat the noisy Burp/Caido connect banner; it should NOT also hide
-        # a quiet knowledge source that's useless unless it's actually in the tool
-        # list while hunting. So on a hunting turn (a real, non-default target),
-        # register just the knowledge servers even without an mcp/burp/caido mention.
-        # Proxy servers (burp/caido) keep the strict text-relevance gate.
+        _burp_turn = bool(_BURP_MENTION_RE.search(user_text or ""))
+        _caido_turn = bool(_CAIDO_MENTION_RE.search(user_text or ""))
         _hunting_turn = bool(self.target and str(getattr(self.target, "name", "default")) not in ("default", ""))
-        _knowledge_configured = {
-            n for n in (load_config().get("mcp_servers") or {})
-            if n in _KNOWLEDGE_MCP_SERVERS
-        }
-        if _knowledge_configured and _hunting_turn and not _mcp_relevant_turn:
+        _cfg_servers = load_config().get("mcp_servers") or {}
+        _knowledge_configured = {n for n in _cfg_servers if n in _KNOWLEDGE_MCP_SERVERS}
+
+        # KNOWLEDGE MCPs (HexBrain's disclosed-report corpus) are PASSIVE reference
+        # tools the model should have during ANY real hunt — register them on a
+        # hunting turn or any mcp-relevant turn. They connect quietly (no proxy
+        # banner) and are useless unless actually in the tool list while hunting.
+        if _knowledge_configured and (_hunting_turn or _mcp_relevant_turn):
             try:
                 register_mcp_servers(emit=emit, only=_knowledge_configured)
             except Exception:
                 pass
-        if _mcp_relevant_turn:
-            if not _MCP_SERVERS_REGISTERED:
-                _MCP_SERVERS_REGISTERED = True
+
+        # INTERACTIVE PROXY MCPs (Burp / Caido) connect ONLY when that specific
+        # vendor is NAMED this turn — never on a generic "mcp"/"proxy" mention or a
+        # HexBrain/knowledge turn. Dialing a proxy that isn't running dumps a
+        # spurious connect error into an unrelated reply (the exact Caido noise the
+        # researcher hit while setting up HexBrain). But when the researcher DOES
+        # name the vendor, any connect error IS surfaced to the model — it needs to
+        # know the tool's real state (running? reachable?) to adapt, the same way it
+        # reads a spider/katana failure and switches approach. Beast is the brain;
+        # hiding a tool's failure from it is worse than the noise.
+        if _burp_turn and "burp" in _cfg_servers:
+            try:
+                register_mcp_servers(emit=emit, only={"burp"})
+            except Exception as _e:
+                if emit and hasattr(emit, "warn"):
+                    emit.warn(f"[!] Burp registration failed: {_e}")
+        if _caido_turn:
+            if "caido" in _cfg_servers:
                 try:
-                    register_mcp_servers(emit=emit)
-                except Exception as _mcp_reg_err:
+                    register_mcp_servers(emit=emit, only={"caido"})
+                except Exception as _e:
                     if emit and hasattr(emit, "warn"):
-                        emit.warn(f"[!] MCP server registration failed: {_mcp_reg_err}")
+                        emit.warn(f"[!] Caido registration failed: {_e}")
             if not _CAIDO_TOOLS_REGISTERED:
                 _CAIDO_TOOLS_REGISTERED = True
                 try:
