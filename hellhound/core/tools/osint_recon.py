@@ -218,6 +218,23 @@ _SVC_FINGERPRINTS: List[tuple] = [
     (re.compile(rb"Docker.*ApiVersion|\"ApiVersion\"", re.I), "Docker Engine API"),
 ]
 
+# How to actually QUERY a fingerprinted service — the difference between "curled the
+# root, got an HTML play page, gave up" and "dumped the database". Keyed by the service
+# name _SVC_FINGERPRINTS emits. Each hint is an unauthenticated read that proves access.
+_SVC_QUERY_HINT: Dict[str, str] = {
+    "ClickHouse DB":        "GET /?query=SHOW DATABASES  (then  SELECT name FROM system.tables) — the HTTP interface is :8123; proves unauth DB read.",
+    "Elasticsearch":        "GET /_cat/indices?v  then  /<index>/_search?size=5 — unauth index/doc read.",
+    "Prometheus":           "GET /api/v1/status/config  and  /api/v1/targets — leaks internal hosts/scrape config.",
+    "Grafana":              "GET /api/health ; try /api/datasources (anon-org) and default admin:admin login.",
+    "Jenkins":              "GET /api/json  and  /script (Groovy console = RCE if reachable).",
+    "RabbitMQ mgmt":        "GET /api/overview with guest:guest — default creds often live.",
+    "MinIO":                "GET /minio/health/live ; try anonymous bucket list.",
+    "Spring Boot Actuator": "GET /actuator  then /actuator/env , /actuator/heapdump (secrets in memory).",
+    "Tomcat":               "GET /manager/html (tomcat:tomcat / default creds) ; /host-manager.",
+    "WebLogic":             "Check /console and known CVE paths (CVE-2017-10271 /wls-wsat, CVE-2020-14882).",
+    "Docker Engine API":    "GET /version and /containers/json — unauth Docker API = host RCE.",
+}
+
 
 def _tcp_open(ip: str, port: int, timeout: float = 2.5) -> bool:
     """Is this TCP port accepting connections? Fast, never raises."""
@@ -235,7 +252,7 @@ def _tcp_open(ip: str, port: int, timeout: float = 2.5) -> bool:
             pass
 
 
-def _fingerprint_http_port(host: str, port: int, tls: bool, timeout: int = 6) -> Dict[str, Any]:
+def _fingerprint_http_port(host: str, port: int, tls: bool, timeout: Any = (5, 10)) -> Dict[str, Any]:
     """GET an alt-port HTTP endpoint and name the service behind it (ClickHouse,
     Prometheus, Jenkins, actuator, …). Tries both schemes if the first fails so a
     TLS-only alt port is not reported dead. Never raises."""
@@ -324,7 +341,10 @@ def _execute_alt_port_scan(args: Dict[str, Any], target: Target, emit: Any) -> D
     if not args.get("include_web", False):
         ports = [p for p in ports if p not in (80, 443)]
 
-    concurrency = 8 if gentle else 40
+    # Modest fan-out: a TCP connect is cheap, but each open HTTP port also gets a
+    # GET for fingerprinting, and 40 simultaneous against one rate-limiting host
+    # self-throttles into timeouts. 20 stays fast without faking "port closed".
+    concurrency = 8 if gentle else 20
     results: List[Dict[str, Any]] = []
     surface_urls: List[str] = []
     skipped_scope = 0
@@ -363,9 +383,13 @@ def _execute_alt_port_scan(args: Dict[str, Any], target: Target, emit: Any) -> D
         if meta.get("http"):
             fp = _fingerprint_http_port(host, port, bool(meta.get("tls")))
             if fp:
+                svc = fp.get("service", "")
                 entry.update({"http": True, "status": fp.get("status"),
-                              "server": fp.get("server", ""), "service": fp.get("service", ""),
+                              "server": fp.get("server", ""), "service": svc,
                               "title": fp.get("title", ""), "url": fp.get("url", "")})
+                hint = _SVC_QUERY_HINT.get(svc)
+                if hint:
+                    entry["query_hint"] = hint
             else:
                 entry["http"] = False
         else:
@@ -424,16 +448,26 @@ def _execute_alt_port_scan(args: Dict[str, Any], target: Target, emit: Any) -> D
     summary = (f"{len(results)} open service(s) across {len(hosts)} host(s); "
                f"{sum(1 for e in results if e.get('service'))} fingerprinted, "
                f"{len(nonweb)} non-HTTP (redis/mongo/db-style) lead(s).")
+    # Surface the "how to query this" hints so a fingerprinted ClickHouse/ES/actuator
+    # becomes "dumped the DB", not "curled the root page and moved on".
+    hints = []
+    for e in results:
+        if e.get("query_hint") and e.get("url"):
+            hints.append(f"{e['url']} ({e.get('service')}): {e['query_hint']}")
+    note = (summary + " Alt-port HTTP services added to the surface — probe them like any host "
+            "(an unauth ClickHouse/ES/actuator here is often critical). For non-HTTP leads "
+            "(redis/mongo/mysql) try an unauthenticated client connect.")
+    if hints:
+        note += " HOW TO QUERY (don't stop at the root page): " + "  |  ".join(hints[:8])
     return {
         "status": "success",
         "open_services": results,
         "surface_added": surface_urls,
+        "query_hints": hints,
         "host_count": len(hosts),
         "skipped_out_of_scope": skipped_scope,
         "summary": summary,
-        "note": (summary + " Alt-port HTTP services added to the surface — probe them like any host "
-                 "(an unauth ClickHouse/ES/actuator here is often critical). For non-HTTP leads "
-                 "(redis/mongo/mysql) try an unauthenticated client connect."),
+        "note": note,
     }
 
 
@@ -474,6 +508,38 @@ _SERVICE_ENDPOINTS: List[tuple] = [
 # Endpoints whose mere 200 is high-signal (don't need body inspection to be worth flagging).
 _SERVICE_CRITICAL = {"/actuator/heapdump", "/.git/config", "/.git/HEAD", "/.env",
                      "/actuator/env", "/v3/api-docs", "/v2/api-docs"}
+
+# Body signatures that CONFIRM a 200 is really the service, not a catch-all 200 / SPA
+# index / soft-404. Keyed by path. A path with a validator must match its signature in
+# the body to count; this is what stops an Interactsh/oast host (200 + empty body on
+# every path) from reading as "26 exposed endpoints, 7 critical". Paths with no entry
+# fall back to the catch-all baseline check only.
+_SERVICE_VALIDATORS: Dict[str, re.Pattern] = {
+    "/actuator":            re.compile(rb"\"_links\"|\"status\"\s*:", re.I),
+    "/actuator/env":        re.compile(rb"propertySources|activeProfiles|\"profiles\"", re.I),
+    "/actuator/heapdump":   re.compile(rb"JAVA PROFILE|\x00\x00\x00", re.I),
+    "/actuator/health":     re.compile(rb"\"status\"\s*:\s*\"(UP|DOWN|OUT_OF_SERVICE)", re.I),
+    "/actuator/mappings":   re.compile(rb"dispatcherServlet|\"mappings\"|handler", re.I),
+    "/env":                 re.compile(rb"propertySources|activeProfiles", re.I),
+    "/swagger.json":        re.compile(rb"\"swagger\"|\"openapi\"|\"paths\"", re.I),
+    "/openapi.json":        re.compile(rb"\"openapi\"|\"paths\"", re.I),
+    "/swagger-ui.html":     re.compile(rb"swagger-ui|SwaggerUIBundle", re.I),
+    "/v3/api-docs":         re.compile(rb"\"openapi\"|\"paths\"", re.I),
+    "/v2/api-docs":         re.compile(rb"\"swagger\"|\"paths\"", re.I),
+    "/api-docs":            re.compile(rb"\"openapi\"|\"swagger\"|\"paths\"", re.I),
+    "/api/swagger.json":    re.compile(rb"\"swagger\"|\"openapi\"|\"paths\"", re.I),
+    "/graphql":             re.compile(rb"\"data\"|\"errors\"|Must provide query|GraphQL|__schema", re.I),
+    "/graphiql":            re.compile(rb"graphiql|GraphiQL", re.I),
+    "/.git/config":         re.compile(rb"\[core\]|repositoryformatversion", re.I),
+    "/.git/HEAD":           re.compile(rb"ref:\s*refs/", re.I),
+    "/.env":                re.compile(rb"(?m)^[A-Z][A-Z0-9_]{2,}\s*="),
+    "/wp-json/wp/v2/users": re.compile(rb"\"slug\"|\"id\"\s*:\s*\d", re.I),
+    "/metrics":             re.compile(rb"#\s*HELP|#\s*TYPE", re.I),
+    "/debug/pprof/":        re.compile(rb"pprof|goroutine|/debug/pprof/", re.I),
+    "/server-status":       re.compile(rb"Apache Server Status|Server uptime", re.I),
+    "/h2-console":          re.compile(rb"H2 Console|login\.jsp", re.I),
+    "/manage/health":       re.compile(rb"\"status\"\s*:\s*\"(UP|DOWN)", re.I),
+}
 
 
 def _execute_service_probe(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
@@ -533,35 +599,89 @@ def _execute_service_probe(args: Dict[str, Any], target: Target, emit: Any) -> D
                 "skipped_out_of_scope": skipped_scope,
                 "note": "No in-scope live hosts to probe."}
 
-    concurrency = 6 if gentle else 24
+    # Concurrency kept modest even on open programs: hammering one host with 24+
+    # simultaneous requests self-throttles a rate-limiting target and turns real
+    # endpoints into timeouts (false negatives). 12 is fast enough and reliable.
+    concurrency = 6 if gentle else 12
     headers = {"User-Agent": "Mozilla/5.0 (compatible; recon-service/1.0)"}
+    _TIMEOUT = (5, 12)  # (connect, read) — read is generous for a slow/large endpoint
 
-    def _probe(item: tuple) -> Optional[Dict[str, Any]]:
-        base, path, label, why = item
-        url = base + path
+    # CATCH-ALL BASELINE — a host that answers 200 to a random junk path (Interactsh/
+    # oast, some SPAs, soft-404 servers) would otherwise read as "everything exposed".
+    # Record, per base, whether it is catch-all and the junk-response body length so a
+    # real path returning the SAME length/status can be rejected as noise.
+    import uuid as _uuid
+
+    def _baseline(base: str) -> Dict[str, Any]:
+        junk = f"/zz-{_uuid.uuid4().hex[:12]}-nope"
         try:
-            r = requests.get(url, timeout=8, verify=False, headers=headers,
+            r = requests.get(base + junk, timeout=_TIMEOUT, verify=False, headers=headers,
                              allow_redirects=False, stream=True)
-            code = r.status_code
-            ctype = r.headers.get("Content-Type", "")
-            clen = r.headers.get("Content-Length", "")
-            snippet = ""
+            blen = 0
             try:
-                body = r.raw.read(400, decode_content=True) or b""
-                snippet = body.decode("utf-8", "ignore").replace("\n", " ")[:160]
+                blen = len(r.raw.read(2000, decode_content=True) or b"")
             except Exception:
                 pass
             try:
                 r.close()
             except Exception:
                 pass
-            # Interesting = 200/401/403 on a framework path (401/403 still CONFIRMS the
-            # endpoint exists, which is itself the recon win); skip plain 404/redirect.
-            if code in (200, 401, 403, 500):
-                return {"url": url, "status": code, "label": label, "why": why,
-                        "content_type": ctype, "content_length": clen, "snippet": snippet,
-                        "critical": (path in _SERVICE_CRITICAL and code == 200)}
-            return None
+            return {"catch_all": r.status_code in (200, 401, 403), "status": r.status_code, "len": blen}
+        except requests.RequestException:
+            return {"catch_all": False, "status": None, "len": -1}
+
+    baselines: Dict[str, Dict[str, Any]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(concurrency, len(bases)))) as ex:
+        for base, bl in zip(bases, ex.map(_baseline, bases)):
+            baselines[base] = bl
+
+    def _probe(item: tuple) -> Optional[Dict[str, Any]]:
+        base, path, label, why = item
+        url = base + path
+        try:
+            r = requests.get(url, timeout=_TIMEOUT, verify=False, headers=headers,
+                             allow_redirects=False, stream=True)
+            code = r.status_code
+            ctype = r.headers.get("Content-Type", "")
+            clen = r.headers.get("Content-Length", "")
+            body = b""
+            try:
+                body = r.raw.read(4000, decode_content=True) or b""
+            except Exception:
+                pass
+            snippet = body.decode("utf-8", "ignore").replace("\n", " ")[:160]
+            try:
+                r.close()
+            except Exception:
+                pass
+            if code not in (200, 401, 403, 500):
+                return None
+
+            bl = baselines.get(base, {})
+            validator = _SERVICE_VALIDATORS.get(path)
+            body_ok = bool(validator and validator.search(body))
+
+            # On a 200, reject the response as catch-all noise UNLESS the body positively
+            # matches the service signature. For a path with a validator that's the whole
+            # test; for a path without one, only reject when the host is catch-all and this
+            # response looks identical to the junk baseline.
+            if code == 200:
+                if validator:
+                    if not body_ok:
+                        return None
+                elif bl.get("catch_all"):
+                    # No validator + catch-all host + junk-sized body ⇒ noise.
+                    if abs(len(body) - int(bl.get("len", -1))) <= 16:
+                        return None
+            # 401/403 is a real "endpoint exists" signal only if the host isn't blanket-
+            # gating every path the same way.
+            elif code in (401, 403) and bl.get("status") == code and bl.get("catch_all"):
+                return None
+
+            critical = (path in _SERVICE_CRITICAL and code == 200 and (body_ok or validator is None))
+            return {"url": url, "status": code, "label": label, "why": why,
+                    "content_type": ctype, "content_length": clen, "snippet": snippet,
+                    "verified": body_ok, "critical": critical}
         except requests.RequestException:
             return None
 
