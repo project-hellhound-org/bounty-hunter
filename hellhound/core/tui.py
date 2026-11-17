@@ -689,6 +689,10 @@ class HellhoundApp(App):
         Binding("ctrl+y", "copy_last", "Copy last result", show=False, priority=True),
         Binding("ctrl+b", "toggle_sidepanel", "Toggle live panel", show=False),
         Binding("ctrl+f", "show_findings", "Findings", show=True),
+        # Classic clear-screen. priority so it wins over the TextArea even while the
+        # prompt editor holds focus (it always does). `clear` / `/clear` typed at
+        # the prompt do the same thing (see on_prompt_area_submitted).
+        Binding("ctrl+l", "clear_transcript", "Clear screen", show=True, priority=True),
         Binding("escape", "cancel_turn", "Cancel turn"),
         # Up/Down/Tab are handled inside PromptArea.on_key (suggestion-nav when
         # the dropdown is open, history recall at the text edges, otherwise
@@ -1218,6 +1222,18 @@ class HellhoundApp(App):
             self.exit()
             return
 
+        # clear-screen — matches the classic terminal `clear`/Ctrl+L. Wipes the
+        # visible scrollback only (history/findings/output untouched); never runs a
+        # turn, so it works instantly even while a hunt is in progress.
+        if line.lower() in ("clear", "cls", "/clear", "/cls"):
+            inp = self.query_one("#prompt", PromptArea)
+            inp.value = ""
+            _box = self._suggest()
+            if _box is not None:
+                _box.update_for("")
+            self.action_clear_transcript()
+            return
+
         # Record for shell-style ↑/↓ recall (skip consecutive dupes), and reset
         # the history cursor so the next ↑ starts from the newest entry.
         if not self._input_history or self._input_history[-1] != line:
@@ -1255,6 +1271,26 @@ class HellhoundApp(App):
             self.query_one("#transcript", VerticalScroll).scroll_page_down()
         except Exception:
             pass
+
+    def action_clear_transcript(self) -> None:
+        """Clear the on-screen transcript — the classic `clear` / Ctrl+L. Only wipes
+        the VISIBLE scrollback: the agent's conversation history, recorded findings,
+        and every tool's /output are untouched, so a running turn and all context
+        survive. A card that's still running (or the live assistant reply) is kept so
+        clearing mid-turn doesn't orphan an in-flight tool."""
+        try:
+            transcript = self.query_one("#transcript", VerticalScroll)
+        except Exception:
+            return
+        protected = set(self._active_cards)
+        if self._assistant_md is not None:
+            protected.add(self._assistant_md)
+        for w in list(transcript.children):
+            if w not in protected:
+                try:
+                    w.remove()
+                except Exception:
+                    pass
 
     def action_cancel_turn(self) -> None:
         # Esc first dismisses the dropdown if it's open, otherwise cancels the turn.
