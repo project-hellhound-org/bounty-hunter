@@ -39,13 +39,13 @@
 
 > [!WARNING]
 > ### Project Status — Where It Actually Stands
-> **Bounty Hunter — "Beast" — is under active development.** Here's an honest read of how it performs across the environments it's run against, so you know what to expect before you point it at anything:
+> **Bounty Hunter — "Beast" — is under active development.** An honest read of how it performs across the environments it's run against, so you know what to expect before you point it at anything:
 >
-> - **PortSwigger Web Security Academy labs** — solves them **autonomously, end to end**, across multiple vulnerability classes: password-reset poisoning via host-header injection, deleting a user through an exposed API-documentation endpoint, reflected / stored / DOM-based XSS (confirmed by firing a real `alert()` in a headless browser), CORS, and SSRF. Not just recon — the full exploit.
-> - **Hardened & intentionally-vulnerable ranges** (HackTheBox, CTFHub, local hardened labs) — recon, foothold, and exploitation hold up well.
-> - **Real, authorized bug-bounty programs** — strong at recon, scoping, and triage; it surfaces and verifies genuine issues. But it is **not yet "fire and forget"** on production targets — **review every finding before you rely on it or submit it.**
+> - **Training labs & intentionally-vulnerable ranges** (PortSwigger Web Security Academy, HackTheBox, CTFHub, local hardened labs) — solves them **autonomously, end to end** across a wide range of vulnerability classes: reflected / stored / DOM XSS (confirmed by firing a real `alert()` in a headless browser), SSRF, IDOR and broken access control, authentication/authorization bypass, SSTI, CORS, injection, and exposed-service / secret-leak classes. Not just recon — the full exploit, each one driven to a yes/no and verified before it's recorded.
+> - **Multi-host program surfaces** — maps a whole program at once (subdomains, services on non-standard ports, framework/debug endpoints), surfaces the forgotten host or the unauthenticated service sitting one port over from a boring landing page, and works every lead to a result. It can also learn *mid-hunt* from 15k+ **disclosed real-world reports** to copy a proven methodology onto the target in front of it (see the HexBrain integration).
+> - **Real, authorized bug-bounty programs** — strong at recon, scoping, triage, and surfacing/verifying genuine issues under the program's rules of engagement. But it is **not yet "fire and forget"** on production targets — **review every finding before you rely on it or submit it.**
 >
-> What it reports is meant to be a *confirmed* bug, not a guess: XSS has to actually execute in a browser to be recorded, `verify_finding` runs class-specific live checks, and a dismissed false positive can't silently reappear. Use responsibly and strictly on authorized targets.
+> What it reports is meant to be a *confirmed* bug, not a guess: an XSS has to actually execute (or demonstrably render unsanitized in an executing sink) to be recorded, `verify_finding` runs class-specific live checks, each distinct confirmed bug is recorded the moment it's proven, and a dismissed false positive can't silently reappear. Use responsibly and strictly on authorized targets.
 
 ---
 
@@ -214,23 +214,34 @@ beast
 
 ---
 
-### 4. Burp Suite & Caido Integration (MCP)
+### 4. Integrations (MCP) — Burp, Caido & HexBrain
 
-Bounty Hunter can drive Burp Suite and/or Caido directly as additional
-tools, alongside its own built-in recon arsenal. Both are configured
-inside the console with one command each — no manual config editing:
+Bounty Hunter can connect external MCP servers as additional tools, alongside
+its own built-in arsenal. Two kinds:
+
+- **Interactive proxies** — drive **Burp Suite** and/or **Caido** directly (send
+  to Repeater, search captured traffic, push findings). These connect only when
+  you actually name them, so an offline proxy never clutters an unrelated turn.
+- **Knowledge source** — **HexBrain**, a free hosted corpus of 15k+ *disclosed*
+  HackerOne reports mapped to how each bug was found (plus playbooks, payloads,
+  bypasses and program payout history). It auto-loads during a hunt so the model
+  can learn from what has actually worked on similar stacks.
+
+Each is one command — no manual config editing:
 
 ```bash
 beast
-> /mcp burp http://127.0.0.1:9876   # auto-detects Burp's MCP transport
-> /mcp caido http://localhost:8080  # uses caido-mcp-server if installed, else falls back to built-in GraphQL
-> /mcp                              # shows current config + live status for both
-> /mcp test                         # re-checks without changing anything
+> /mcp hexbrain sk_your_key          # free key at hexbrainai.com/account (200 calls/day)
+> /mcp burp http://127.0.0.1:9876    # auto-detects Burp's MCP transport
+> /mcp caido http://localhost:8080   # uses caido-mcp-server if installed, else built-in GraphQL
+> /mcp                               # shows current config + live status for all
+> /mcp test                          # re-checks without changing anything
 ```
 
-Full step-by-step guides (where to find Burp's MCP tab, getting Caido's
-token or setting up `caido-mcp-server`'s OAuth login, and a troubleshooting
-table for each): [Burp Suite MCP Setup](docs/mcp-burp-setup.md) ·
+Full step-by-step guides (getting each key/token, where to find Burp's MCP tab,
+`caido-mcp-server`'s OAuth login, and a troubleshooting table for each):
+[HexBrain Setup](docs/mcp-hexbrain-setup.md) ·
+[Burp Suite MCP Setup](docs/mcp-burp-setup.md) ·
 [Caido Setup](docs/mcp-caido-setup.md).
 
 ---
@@ -299,13 +310,15 @@ For the full command reference, run `/help` inside the console (or `beast --help
 
 ## Capabilities
 
-Bounty Hunter coordinates **86 scope-gated tools** and **30 methodology skills**, both loaded on demand by the orchestrator — you rarely call anything by name.
+Bounty Hunter coordinates **100+ scope-gated tools** and **30 methodology skills**, both loaded on demand by the orchestrator — you rarely call anything by name.
 
-- **Recon** — subdomain and DNS enumeration, port and TLS scanning, passive URL harvesting (Wayback, OTX, urlscan, VirusTotal), cloud-asset discovery, WAF fingerprinting.
+- **Recon** — subdomain and DNS enumeration, **alt-port service discovery** (fingerprints the unauthenticated ClickHouse / Elasticsearch / Prometheus / Jenkins / actuator sitting one port over) backed by a **RoE-aware broad port sweep** for the ports a curated list misses, TLS scanning, passive URL harvesting (Wayback, OTX, urlscan, VirusTotal), cloud-asset discovery, WAF fingerprinting.
+- **Enumeration** — framework/debug endpoint probing (actuator heapdump, swagger/OpenAPI, `.git`/`.env`, graphql, metrics), default/weak-credential checks on discovered consoles, and **business-context OSINT** that profiles the target org to aim hypotheses (a fintech's money-movement, a healthcare app's PII, a SaaS's tenant isolation).
 - **Crawling** — SPA spider, katana, content and vhost fuzzing, JavaScript endpoint and secret mining.
 - **Browser** — a persistent headless Playwright browser that runs real JS (how DOM and stored XSS are *proven*, not guessed), auth-flow capture/replay, and screenshots.
-- **Exploitation** — SQLi, XSS, SSRF, SSTI, CORS, IDOR, JWT forgery, GraphQL introspection, mass-assignment, host-header injection, 403-bypass, and race conditions — each confirmed by a live `verify_finding` check.
+- **Exploitation** — SQLi, XSS (reflected / stored / blind), SSRF, SSTI, CORS, IDOR / broken access control, auth bypass, JWT forgery, GraphQL introspection, mass-assignment, host-header injection, 403-bypass, and race conditions — each confirmed by a live `verify_finding` check and recorded the moment it's proven.
 - **Takeover & exposure** — dangling-CNAME subdomain takeovers, leaked API keys and bearer tokens, PII and internal-endpoint disclosure in client-side code and API responses.
+- **Learn from the real world** — optional [HexBrain](docs/mcp-hexbrain-setup.md) integration lets the agent consult 15k+ *disclosed* HackerOne reports mid-hunt (playbooks, payloads, bypasses, program payout history) and copy a proven methodology onto the target. External content is treated as untrusted reference data, never as instructions.
 - **Reporting** — evidence-backed finding records with pre-submission re-verification and self-contained HTML/Markdown export.
 
 Everything runs behind the unconditional scope gate and rate limiter and writes to a per-target artifact ledger. For the exact live tool and skill list, run `/help` or just ask the agent (*"what tools do you have for X?"*).
@@ -316,12 +329,12 @@ Everything runs behind the unconditional scope gate and rate limiter and writes 
 
 Highlights of recent work (full history in [CHANGELOG.md](CHANGELOG.md)):
 
-- **Solves PortSwigger labs end-to-end** — reset-poisoning via host-header injection, exposed-API-doc user deletion, reflected / stored / DOM XSS (real browser `alert()`), CORS.
-- **Exploitation validation hardened** — XSS gated on real browser execution (a browser-disproved payload is refused, not recorded), `verify_finding` live class-checks, dismissed false positives can't silently re-appear, per-finding report splitting.
-- **Tool-calling made robust** — native-function-calling-first across every provider; the reasoning-model preamble that used to truncate calls mid-JSON is disabled; a provably regex-free path on Claude.
-- **Identity & session model** — `capture_identity`/`swap_session` and `save_auth_flow`/`replay_auth_flow`, bridged into the headless browser and the fuzzers.
-- **Textual TUI** — full-screen console with clickable, collapsible request/response cards (classic REPL still available via `HELLHOUND_CLASSIC_UI=1`).
-- **Codebase refactor** — the 20k-line `agent.py` is being split into focused `tools/` modules (one file per tool domain), each change gated by an AST import scan + smoke test.
+- **Port scanning is now default recon** — a pure-Python alt-port scan fingerprints high-value non-web services (ClickHouse, Elasticsearch, Prometheus, Jenkins, Spring actuator, Docker API, …) and attaches "how to query this" hints, backed by a RoE-aware naabu sweep that catches the *unintended* exposed port a curated list would miss. Plus a framework/debug endpoint probe (actuator heapdump, swagger, `.git`/`.env`, graphql, metrics) with a catch-all-200 false-positive guard.
+- **OSINT & interactive learning** — business-context OSINT that profiles the target org to aim hypotheses, default/weak-credential checks on discovered consoles, and the [HexBrain](docs/mcp-hexbrain-setup.md) MCP integration (15k+ disclosed reports the model mines mid-hunt). All external content runs behind a hard prompt-injection guardrail — it's data to analyze, never instructions to obey.
+- **Findings discipline** — each distinct confirmed bug is recorded the moment it's proven (no batching confirmed bugs into a summary and losing them), findings persist additively across runs instead of being overwritten, and a flag/marker that appears site-wide by default is never treated as proof on its own.
+- **Exploitation validation hardened** — XSS gated on real execution (a browser-disproved payload is refused), with stored/blind XSS recordable on an unsanitized executing-context reflection; `verify_finding` live class-checks; dismissed false positives can't silently re-appear.
+- **Tool-calling made robust** — native-function-calling-first across every provider, with recovery when a reasoning model scrambles a tool call into malformed text instead of leaking the raw JSON and stalling the turn.
+- **Identity, TUI & integrations** — `capture_identity`/`swap_session` and `save_auth_flow`/`replay_auth_flow` bridged into the headless browser and fuzzers; a full-screen Textual TUI with collapsible request/response cards; and MCP integrations (HexBrain knowledge source + Burp/Caido proxies) that connect only when relevant.
 
 ---
 
@@ -330,14 +343,16 @@ Highlights of recent work (full history in [CHANGELOG.md](CHANGELOG.md)):
 The real gap between "runs tools well" and "hunts like a pro" is architecture, not more tools. Fuller reasoning in [CHANGELOG.md](CHANGELOG.md).
 
 **Already landed** (was on this list, now shipped):
-- Passive recon surface — Wayback, OTX, urlscan, `gau` → `nuclei`, and CT-log subdomain sweeps are live tools.
-- Scriptable browser with record/replay of auth flows (`save_auth_flow` / `replay_auth_flow`) and live request observation.
-- Native-function-calling tool execution across every provider.
+- Passive recon surface — Wayback, OTX, urlscan, `gau` → `nuclei`, and CT-log subdomain sweeps.
+- Alt-port service discovery + RoE-aware broad port scanning as part of default recon.
+- Business-context OSINT and a disclosed-report knowledge source (HexBrain) the agent learns from mid-hunt.
+- Scriptable browser with record/replay of auth flows and live request observation.
+- Native-function-calling tool execution (with malformed-call recovery) across every provider.
 
 **Open, in rough priority:**
-1. **Browser request *interception*** — the browser already observes traffic; modifying or blocking requests mid-flight is what's left.
-2. **Burp/Caido ↔ identity bridge** — push/pull live sessions through the already-integrated MCP tools.
-3. **Passive → active fusion** — the passive tools exist; wiring their output *automatically* into the probing/fuzzing loop (dedup, JS sourcemap → secrets → endpoints → fuzzer) is the remaining glue.
+1. **Passive → active fusion** — the passive, recon, and disclosed-report signals exist; wiring their output *automatically* into the probing/fuzzing loop (dedup, JS sourcemap → secrets → endpoints → fuzzer, playbook → targeted tests) is the remaining glue.
+2. **Browser request *interception*** — the browser already observes traffic; modifying or blocking requests mid-flight is what's left.
+3. **Burp/Caido ↔ identity bridge** — push/pull live sessions through the integrated proxy MCP tools.
 4. **A playbook engine** — conditional branching workflows, not just sequential tool chaining.
 
 ---
