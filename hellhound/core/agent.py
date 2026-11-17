@@ -7684,6 +7684,16 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         ):
             matched_existing = f
             break
+        # 1b. Same DESCRIPTIVE title, verbatim — a dup even when the recorded
+        # target URL differs (the same leak re-reported against a slightly
+        # different JS bundle / endpoint string on each pass). Beast's titles are
+        # long and specific, so a byte-identical one (len-guarded to avoid merging
+        # two short generic labels) is the same finding, not a new one. This is the
+        # case that was letting one K8s-JWT leak get recorded 5 times.
+        _t = title.strip().lower()
+        if len(_t) >= 25 and f.get("type", "").strip().lower() == _t:
+            matched_existing = f
+            break
         # 2. Same endpoint path (ignoring query string/value) + same vuln
         # category — almost certainly a re-confirmation of the SAME finding
         # under reworded title (e.g. re-verifying after the researcher asked
