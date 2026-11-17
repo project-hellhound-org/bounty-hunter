@@ -3590,6 +3590,108 @@ def _execute_recall_patterns(args: Dict[str, Any], target: Target, emit: Any) ->
     }
 
 
+def _hexbrain_hypotheses(target: Target, tech_stack: List[str], now: str, emit: Any) -> List[Dict[str, Any]]:
+    """Fold DISCLOSED-REPORT intel (HexBrain) into the hypothesis board automatically,
+    so the model hunts like it has read every public report on this program/stack
+    WITHOUT having to remember to call HexBrain. Two signals:
+      - get_program_history: what THIS program has actually been paid for, by class
+        and count — the single best 'where do bugs live here' prior.
+      - search_reports: disclosed reports matching the tech stack, by vuln_class.
+    Best-effort, never raises. Rate-limit-aware: queries at most ONCE per target
+    (cached on target.state), since HexBrain is 200 calls/day. Returns [] when the
+    HexBrain MCP isn't connected."""
+    if "mcp_hexbrain_get_program_history" not in TOOL_REGISTRY:
+        return []  # HexBrain not connected this session
+    state = target.state if isinstance(getattr(target, "state", None), dict) else {}
+    cached = state.get("_hexbrain_hyps")
+    if isinstance(cached, list):
+        return cached  # already queried this engagement — don't burn quota
+
+    import re as _re
+    hyps: List[Dict[str, Any]] = []
+
+    def _call(tool: str, a: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            spec = TOOL_REGISTRY.get(tool)
+            return spec.executor(a, target, emit) if spec else {}
+        except Exception:
+            return {}
+
+    # Candidate program names: the explicit program bucket, then the registrable
+    # label of the apex (shopify.com -> "shopify"). HexBrain matches real H1
+    # program names; a private/lab target just returns nothing and we move on.
+    cands: List[str] = []
+    prog = str(getattr(target, "program", "") or "").strip()
+    if prog and prog.lower() not in ("default", ""):
+        cands.append(prog)
+    host = str(getattr(target, "name", "") or "")
+    parts = [p for p in host.split(".") if p]
+    if len(parts) >= 2:
+        cands.append(parts[-2])
+    seen_c = set()
+    cands = [c for c in cands if c and (c.lower() not in seen_c and not seen_c.add(c.lower()))]
+
+    # 1. Program history — ranked classes this program has paid for.
+    for prog_name in cands[:2]:
+        r = _call("mcp_hexbrain_get_program_history", {"program": prog_name})
+        content = " ".join(r.get("content", [])) if isinstance(r.get("content"), list) else str(r.get("content") or "")
+        m = _re.search(r"By class:\s*(.+?)\.(?:\s|$)", content)
+        if not m:
+            continue
+        pairs = []
+        for chunk in m.group(1).split(","):
+            cm = _re.match(r"\s*(.+?)\s+(\d+)\s*$", chunk.strip())
+            if cm:
+                pairs.append((cm.group(1).strip(), int(cm.group(2))))
+        pairs.sort(key=lambda x: -x[1])
+        for cls, cnt in pairs[:6]:
+            conf = "high" if cnt >= 15 else ("medium" if cnt >= 4 else "low")
+            hyps.append({
+                "vuln_class": cls,
+                "confidence": conf,
+                "rationale": f"DISCLOSED: '{prog_name}' has {cnt} public report(s) in this class on HackerOne — a class this program demonstrably has bugs in and pays for.",
+                "test_sketch": f"Pull the real methodology with mcp_hexbrain_get_testing_playbook(topic='{cls}') and mcp_hexbrain_find_payloads, then target this class on the surface you mapped.",
+                "signal": f"{cnt} disclosed {cls} report(s) on {prog_name}",
+                "source": "hexbrain_disclosed",
+                "status": "open",
+                "updated_at": now,
+            })
+        if hyps:
+            break  # got a real program match; don't spend quota on the next candidate
+
+    # 2. Stack-matched disclosed reports (only if program history gave nothing,
+    #    to stay inside the per-target single-query budget).
+    if not hyps and tech_stack:
+        q = " ".join(tech_stack[:4])
+        r = _call("mcp_hexbrain_search_reports", {"query": q, "limit": 8})
+        sc = r.get("structured_content") if isinstance(r.get("structured_content"), dict) else {}
+        reports = sc.get("reports") or []
+        from collections import Counter as _Counter
+        classes = _Counter(str(rep.get("vuln_class")) for rep in reports if isinstance(rep, dict) and rep.get("vuln_class"))
+        for cls, cnt in classes.most_common(5):
+            if not cls or cls == "None":
+                continue
+            hyps.append({
+                "vuln_class": cls,
+                "confidence": "medium" if cnt >= 2 else "low",
+                "rationale": f"DISCLOSED: {cnt} public report(s) matching this stack ({q}) were this class.",
+                "test_sketch": f"mcp_hexbrain_get_testing_playbook(topic='{cls}') for how it was found on a similar stack, then test it here.",
+                "signal": f"{cnt} disclosed {cls} report(s) for stack '{q}'",
+                "source": "hexbrain_disclosed",
+                "status": "open",
+                "updated_at": now,
+            })
+
+    if isinstance(state, dict):
+        state["_hexbrain_hyps"] = hyps  # cache (even if empty) so we query once
+    if hyps and emit and hasattr(emit, "info"):
+        try:
+            emit.info(f"[hexbrain] folded {len(hyps)} disclosed-report lead(s) into the hypothesis board")
+        except Exception:
+            pass
+    return hyps
+
+
 def _execute_generate_hypotheses(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Turns a fingerprinted tech stack + discovered endpoints into a ranked
@@ -3713,6 +3815,20 @@ def _execute_generate_hypotheses(args: Dict[str, Any], target: Target, emit: Any
             "updated_at": now,
         })
 
+    # Third source: DISCLOSED-REPORT intel (HexBrain), folded in automatically so
+    # the model doesn't have to remember to consult it. What a program has actually
+    # been paid for is one of the strongest priors a human hunter brings; this puts
+    # it on the board every time without a manual mcp_hexbrain_* call.
+    hexbrain_count = 0
+    try:
+        hb_hyps = _hexbrain_hypotheses(target, tech_stack, now, emit)
+        for d in hb_hyps:
+            d["status"] = existing_status.get(d["vuln_class"], d.get("status", "open"))
+            board.append(d)
+        hexbrain_count = len(hb_hyps)
+    except Exception:
+        pass
+
     board.sort(key=lambda h: -{"high": 3, "medium": 2, "low": 1}.get(h.get("confidence"), 0))
 
     target.state["hypotheses"] = board
@@ -3722,7 +3838,8 @@ def _execute_generate_hypotheses(args: Dict[str, Any], target: Target, emit: Any
         pass
 
     if emit and hasattr(emit, "success"):
-        emit.success(f"[✓] Generated {len(board)} hypotheses from tech stack ({', '.join(tech_stack[:6]) or 'none fingerprinted'}) + {len(seen_prior_classes)} prior-confirmed pattern(s).")
+        _hb = f" + {hexbrain_count} disclosed-report lead(s)" if hexbrain_count else ""
+        emit.success(f"[✓] Generated {len(board)} hypotheses from tech stack ({', '.join(tech_stack[:6]) or 'none fingerprinted'}) + {len(seen_prior_classes)} prior-confirmed pattern(s){_hb}.")
 
     return {
         "status": "ok",
