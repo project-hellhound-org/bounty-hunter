@@ -76,6 +76,8 @@
 
 > **What this is:** a controlled benchmark, not a real-world payout record. Bounty Hunter was run end-to-end against an **internal simulated bounty arena** — intentionally-vulnerable targets (e.g. a mock banking/storefront app) with a triage LLM acting as the program, validating each report and assigning a bounty. It's how we measure the thing the project cares about most: telling a *confirmed* bug apart from a false positive and capturing evidence strong enough to score. Every finding above was confirmed with real captured request/response evidence before it was awarded. Figures are simulated and do not represent real bug-bounty earnings.
 
+**Repeatable scoring.** The loop is "upgrade → test on a lab → did it get better?", so that's measured, not eyeballed: [`benchmarks/score.py`](benchmarks/) compares what Beast actually found & recorded against a ground-truth file and reports **recall** (planted bugs found), misses, and false positives. On a multi-host training lab it recently moved **67% → 92% recall at 0 false positives** across a batch of recon/learning upgrades — and caught a finding-dedup regression a manual read would have missed. Ground-truth answer keys stay out of the repo so no lab walkthrough ships with the tool.
+
 ---
 
 ## How It Works
