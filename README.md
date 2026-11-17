@@ -2,16 +2,16 @@
   <img src="Images/hellhound.gif" alt="Hellhound Bounty Hunter Animation" width="100%"/>
 </p>
 
-<p align="center">
-  <img src="Images/logo.png" alt="BEAST logo" width="120">
-</p>
-
 <h1 align="center">BOUNTY HUNTER</h1>
 
 <p align="center">
-  <b>Autonomous AI Bug Bounty & Penetration Testing Framework — runs as <code>beast</code>, built by Project Hellhound</b>
-  <br>
-  <i>Target enumeration, two-tier neural reasoning, 30 methodology skills, persistent artifact blackboard, live SPA crawling, visual evidence capture, and zero-bypass scope guardrails — from recon to submission-ready report.</i>
+  <b>The autonomous AI bug-bounty agent that <ins>exploits</ins>, not just scans — runs as <code>beast</code>, built by Project Hellhound.</b>
+  <br><br>
+  <i>Point it at a target in plain English. It runs the recon, <b>finds and exploits</b> the bug — XSS proven by a real <code>alert()</code> firing in a headless browser, SSRF driven all the way to cloud-metadata IAM credentials, IDOR chained into account takeover — verifies it with a live class-specific check, and writes a submission-ready report. All behind a scope gate that cannot be bypassed.</i>
+</p>
+
+<p align="center">
+  <sub><b>recon → exploit → verify → report, on its own</b> &nbsp;·&nbsp; learns mid-hunt from <b>15k+ disclosed HackerOne reports</b> &nbsp;·&nbsp; refuses to file a bug it can't prove &nbsp;·&nbsp; runs <b>free</b> on Ollama / NVIDIA NIM</sub>
 </p>
 
 <p align="center">
