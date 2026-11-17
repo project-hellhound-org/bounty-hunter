@@ -7664,7 +7664,9 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
     existing_findings = target.findings if isinstance(target.findings, list) else []
     flag_match = _FLAG_TOKEN_PATTERN.search(f"{title} {note}")
     norm_request_ref = _normalize_endpoint(request_ref)
+    _t = title.strip().lower()
     matched_existing = None
+    _cross_host_merge = False
     for f in existing_findings:
         if not isinstance(f, dict):
             continue
@@ -7690,7 +7692,6 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
         # long and specific, so a byte-identical one (len-guarded to avoid merging
         # two short generic labels) is the same finding, not a new one. This is the
         # case that was letting one K8s-JWT leak get recorded 5 times.
-        _t = title.strip().lower()
         if len(_t) >= 25 and f.get("type", "").strip().lower() == _t:
             matched_existing = f
             break
@@ -7708,7 +7709,49 @@ def _execute_record_finding(args: Dict[str, Any], target: Target, emit: Any) -> 
             matched_existing = f
             break
 
+        # 2b. SAME UNDERLYING ISSUE ON A DIFFERENT HOST — one root cause (a shared
+        # JS bundle leaking the same secret, a misconfig templated across subdomains)
+        # recorded once per host. The titles are identical except for the trailing
+        # "on <host>"; same kind. A triager merges these as duplicates of ONE issue —
+        # so merge here, accumulating the affected hosts onto the single finding
+        # instead of filing N near-identical copies. Strip the "on <host>" tail and
+        # compare the remainder, so a genuinely different title (e.g. an impact
+        # finding "... Work Across All Subdomains") with no such tail doesn't collapse.
+        if kind and f.get("kind", "").strip().lower() == kind and _t != f.get("type", "").strip().lower():
+            _strip = lambda s: re.sub(r"\s+on\s+[a-z0-9._-]+\.[a-z0-9._-]+.*$", "", s.strip().lower()).strip()
+            _ta, _fa = _strip(_t), _strip(f.get("type", ""))
+            if len(_ta) >= 20 and _ta == _fa:
+                matched_existing = f
+                _cross_host_merge = True
+                break
+
     if matched_existing is not None:
+        if _cross_host_merge:
+            # One root issue exposed on another host — fold the host onto the single
+            # finding (accumulated impact: "exposed on bank, vibecoded, …") instead
+            # of a separate near-identical report. Pull a host label from the title
+            # ("... on <host>") or the request_ref.
+            def _host_of(s: str) -> str:
+                m = re.search(r"\bon\s+([a-z0-9._-]+\.[a-z0-9._-]+)", str(s), re.I)
+                if m:
+                    return m.group(1)
+                try:
+                    from urllib.parse import urlparse as _up
+                    return _up(request_ref).netloc or request_ref
+                except Exception:
+                    return request_ref
+            _new_host = _host_of(title) or _host_of(request_ref)
+            hosts = matched_existing.setdefault("affected_hosts", [])
+            # seed with the original finding's own host on first cross-host merge
+            if not hosts:
+                _orig = _host_of(matched_existing.get("type", "")) or _host_of(matched_existing.get("target", ""))
+                if _orig:
+                    hosts.append(_orig)
+            if _new_host and _new_host not in hosts:
+                hosts.append(_new_host)
+            _merge_note = (f"Same underlying issue also exposed on {_new_host} "
+                           f"(shared root cause — now affects: {', '.join(hosts)}).")
+            return _merge_into_existing_finding(target, matched_existing, title, _merge_note, request_ref, raw_evidence_matches, emit)
         return _merge_into_existing_finding(target, matched_existing, title, note, request_ref, raw_evidence_matches, emit)
 
     # CAUGHT IN THE WILD (PortSwigger OAuth implicit-flow lab): a finding
