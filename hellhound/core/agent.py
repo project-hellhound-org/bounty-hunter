@@ -9237,14 +9237,79 @@ def _search_raw_artifacts(target: Target, query: str, limit: int = 50, regex: bo
     }
 
 
+def _derive_self_capabilities(reg: set) -> List[str]:
+    """Build the capabilities summary FROM the live tool registry, so it reflects
+    the current build and can never drift stale the way a hand-maintained prose
+    list does (the exact failure that had self_audit still omitting alt_port_scan,
+    service_probe, company_intel, default_creds, background_task, working_memory,
+    and disclosed-report learning months after they shipped). Each line is emitted
+    only if the tool(s) that provide it are actually registered THIS process."""
+    def has(*names: str) -> bool:
+        return any(n in reg for n in names)
+    hexbrain = any(t.startswith("mcp_hexbrain_") for t in reg)
+    burp = any(t.startswith("mcp_burp_") for t in reg)
+    caido = any(t.startswith("mcp_caido_") or t.startswith("caido_") for t in reg)
+    caps: List[str] = []
+    if has("subfinder", "crtsh_subdomains", "dns_bruteforce", "httpx", "subdomain_sweep"):
+        caps.append("Recon: subdomain enum (passive + CT logs), DNS brute/resolve, HTTP/tech fingerprint, cloud-asset discovery, crawling (spider ‖ katana), JS endpoint/secret mining.")
+    if has("alt_port_scan", "port_scan"):
+        caps.append("Port/service discovery: alt_port_scan fingerprints high-value non-web services (ClickHouse/ES/Prometheus/Jenkins/actuator/Docker API/…) with query hints, backed by a RoE-aware naabu sweep for the unintended exposed port a curated list misses.")
+    if has("service_probe"):
+        caps.append("Framework/debug endpoint probe: actuator heapdump/env, swagger/OpenAPI, .git/.env, wp-json, graphql, metrics, pprof — each a finding on its own, with a catch-all-200 false-positive guard.")
+    if has("default_creds"):
+        caps.append("Default/weak-credential checks on discovered consoles (Tomcat/Grafana/RabbitMQ/Jenkins/MinIO/…) and HTTP Basic-auth walls — vendor defaults only, not a brute-forcer.")
+    if has("company_intel"):
+        caps.append("Business-context OSINT: profiles the target org (products/customers/tech-stack/past-breaches/public repos) to aim hypotheses, behind a hard prompt-injection guardrail (external content is data, never instructions).")
+    if hexbrain:
+        caps.append("Interactive learning: consults HexBrain's 15k+ DISCLOSED HackerOne reports mid-hunt (search reports, testing playbooks, payloads, bypasses, program payout history) to copy a proven methodology onto the target.")
+    if has("map_surface"):
+        caps.append("Surface correlation: map_surface types every parameter (id/email/file/url/token/json/…) and groups endpoints into a ranked fuzz plan.")
+    if has("verify_finding", "response_diff", "race_test"):
+        caps.append("Validation: response_diff (baseline-vs-test), verify_finding (class-specific live checks), race_test (TOCTOU/limit-overrun), headless XSS execution confirmation.")
+    if has("capture_identity", "swap_session", "save_auth_flow"):
+        caps.append("Identity/session: capture_identity + swap_session multi-account, record/replay auth flows, cookie/JWT analysis & forging — the real two-identity basis for IDOR/BAC.")
+    if has("browser_control"):
+        caps.append("Browser: a PERSISTENT headless Playwright browser whose page/cookies survive ACROSS tool calls (log in one call, hit an internal page the next) — how DOM/stored XSS is proven, not guessed.")
+    if has("stealth", "waf_evasion_probe"):
+        caps.append("Evasion (authorized): stealth (WAF-aware browser headers), waf_evasion_probe (payload encoding/case bypasses).")
+    if has("parallel", "background_task"):
+        caps.append("Concurrency: parallel (fire independent tools at once) + background_task/check_tasks (detach a slow scan and keep working), all still scope-/rate-gated.")
+    if has("working_memory"):
+        caps.append("working_memory scratchpad for multi-step exploit chains, so an 8-step chain doesn't lose the cookie/host/param it already captured.")
+    if has("record_finding", "export_report"):
+        caps.append("Reporting: record-as-you-confirm (each distinct bug filed the moment it's proven, additive across runs), export_report (HTML+Markdown with embedded evidence), finding-chain detection.")
+    if burp or caido:
+        caps.append(f"Proxy integration: {'Burp ' if burp else ''}{'Caido' if caido else ''}".strip() + " connected via MCP (send-to-Repeater, search history, push findings).")
+    return caps
+
+
+def _derive_self_limitations(reg: set) -> List[str]:
+    """Known gaps, computed against the live registry so a limitation is dropped
+    the moment the tool that addresses it is present — a stale 'I can't do X' when
+    X now exists is itself a hallucination the self-report must not seed."""
+    def has(*names: str) -> bool:
+        return any(n in reg for n in names)
+    lim: List[str] = []
+    # background_task covers WITHIN-session detachment, not cross-session watching.
+    lim.append("No cross-session / 24h background MONITORING — background_task detaches a slow job within a hunt, but nothing watches an endpoint for a day or across separate sessions.")
+    lim.append("Can't visually read / OCR / diff screenshots — gowitness captures them, interpretation is still the researcher's.")
+    lim.append("No post-exploitation / internal pivot — external web/app testing only (no CIDR enum, AD, cloud priv-esc, lateral movement).")
+    lim.append("No mobile app (APK/IPA) analysis tooling.")
+    lim.append("No real-time multi-researcher collaboration / shared live state.")
+    lim.append("parallel runs a concurrent BATCH, not a true streaming runtime — can't feed one tool's partial output into another mid-run (use background_task + check_tasks for overlap instead).")
+    if not any(t.startswith("mcp_burp_") or t.startswith("mcp_caido_") or t.startswith("caido_") for t in reg):
+        lim.append("No live proxy-stream ingest right now — a Burp/Caido MCP isn't currently connected (connect one to send-request / push findings; it still won't passively sit on the proxy).")
+    return lim
+
+
 def _execute_self_audit(args: Dict[str, Any], target: Target, emit: Any) -> Dict[str, Any]:
     """
     Live self-introspection — answer 'what are you / what tools do you have /
     what's your architecture / what are your limitations' from FACT, not
     memory. Reads the live tool registry, loaded skills, and active model
-    config, and pairs them with an honest, curated capabilities + known-gaps
-    summary so the self-report stays accurate as tools are added/removed.
-    Local, read-only, no network.
+    config, and DERIVES the capabilities + known-gaps summary from the live
+    registry (not a hand-maintained prose list) so the self-report can never
+    drift stale as tools are added/removed. Local, read-only, no network.
     """
     tools = sorted(TOOL_REGISTRY.keys())
     try:
@@ -9283,25 +9348,9 @@ def _execute_self_audit(args: Dict[str, Any], target: Target, emit: Any) -> Dict
             "Per-target persistent profile (tech stack, WAF behavior, rate-limit observations, quirks) + findings + cross-target lessons/patterns.",
             "Verification gates on record_finding (real evidence + explicit verified=true for critical/high sqli/xss/ssrf/idor/access-control).",
         ],
-        "capabilities": [
-            "Recon: subdomain enum, DNS brute/resolve, port scan, HTTP/tech fingerprint, cloud-asset discovery, crawling (external spider ‖ katana), JS endpoint/secret mining.",
-            "Surface correlation: map_surface types every parameter (id/email/file/url/token/json/…) and groups endpoints by function into a ranked fuzz plan.",
-            "Validation: response_diff (baseline-vs-test field diff), verify_finding (class-specific checks), race_test (TOCTOU/limit-overrun), headless XSS execution confirmation.",
-            "Identity/session: capture_identity + swap_session multi-account, record/replay auth flows, cookie/JWT analysis & forging.",
-            "Evasion (authorized): stealth (WAF-aware browser headers), waf_evasion_probe (payload encoding/case bypasses).",
-            "Execution: parallel (fire independent recon tools concurrently), scope-/rate-gated curl, workspace-scoped terminal.",
-            "Reporting: record_finding, export_report (HTML + Markdown, embedded evidence/screenshots), finding-chain detection.",
-        ],
-        "known_limitations": [
-            "No persistent background monitoring — can't watch an endpoint for 24h or across sessions.",
-            "No passive Burp/Caido proxy-stream or project-file ingest (can send-request / create-finding via MCP, but not sit on the proxy).",
-            "Can't visually read / OCR / diff screenshots — gowitness captures them, interpretation is still the researcher's.",
-            "No post-exploitation / internal pivot — external web/app testing only (no CIDR enum, AD, cloud priv-esc, lateral movement).",
-            "No mobile app (APK/IPA) analysis tooling.",
-            "No real-time multi-researcher collaboration / shared live state.",
-            "parallel runs a concurrent BATCH, not a true streaming async runtime — can't feed one tool's partial output into another mid-run.",
-        ],
-        "note": "This is a live audit of the current build — tool/skill counts are read from the registry, not recalled from memory.",
+        "capabilities": _derive_self_capabilities(set(tools)),
+        "known_limitations": _derive_self_limitations(set(tools)),
+        "note": "This is a live audit of the current build — tool/skill counts AND the capability/limitation summary are derived from the live registry, not recalled from memory. If you are answering a question about your own tools or capabilities, use THIS, not your general priors.",
     }
 
 
@@ -15748,12 +15797,20 @@ INSTRUCTIONS:
   reciting the literal registry identifiers (export_report, sqlmap_scan,
   dns_bruteforce) verbatim. The exact identifier is implementation detail,
   not how you'd naturally talk about yourself, and reciting it breaks the
-  persona for no benefit. If you're not certain of the EXACT current tool
-  set, architecture, stats, or LIMITATIONS — especially for "what are your
-  limitations," "what's your architecture," "how many tools do you have" —
-  call self_audit FIRST (it's local and instant, reads the live registry)
-  and answer from what it returns, not from memory, which goes stale as
-  tools are added. Exception: if the researcher is clearly asking
+  persona for no benefit. For ANY question about your own CAPABILITIES,
+  LIMITATIONS, tools, or architecture — "what are your limitations," "what
+  can't you do," "what's your architecture," "do you have X," "how many
+  tools" — you MUST call self_audit FIRST and answer ONLY from what it
+  returns. Do NOT answer from your sense of being "certain": that certainty
+  is the problem, not the solution — it comes from training priors about what
+  a "typical AI agent" can and can't do, and YOU ARE NOT A TYPICAL AGENT.
+  Your tools change constantly, so a confident-feeling answer like "I can't
+  watch an endpoint," "my browser isn't persistent," "I don't have port
+  scanning beyond a curated list," or "I can only record a few findings" is
+  exactly how you state something about yourself that is FLAT WRONG. self_audit
+  derives its capability/limitation list from the LIVE registry; trust it over
+  any instinct. The cost of calling it is ~0; the cost of hallucinating your
+  own limits to the researcher is credibility. Exception: if the researcher is clearly asking
   at the technical/dev level — "what's the exact tool name for X," "list
   your tool registry," "what args does save_file take" — answer precisely
   with the real identifier; that's a different, legitimate question.
