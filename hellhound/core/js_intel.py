@@ -145,3 +145,91 @@ def summarize_bundled_hits(hits: List[Dict[str, Any]]) -> str:
     return (f"Bundled-data scan: {lead} client-side exposure(s) — {parts}. "
             "Treat state blobs with other users' records / secrets as sensitive-data-exposure; "
             "confirm the data is cross-user or non-public, then verify_finding + record_finding.")
+
+
+# ── Inline-script endpoint extraction ────────────────────────────────────────
+# js_miner mines endpoints from external .js FILES, and scan_bundled_data finds
+# JSON state blobs — but neither reconstructs an API call that lives in an INLINE
+# <script> as a template literal whose placeholders are filled by literal args at
+# a call site (onclick="loadContent('<uuid>','2','file')"). That pattern hides a
+# real, parameter-bearing endpoint (and a VALID id to reach it) that a path-guessing
+# content-discovery pass never finds — e.g. a staged-files/<fileName> sink where
+# fileName is fetched server-side (SSRF/LFI). This recovers both the template and a
+# concrete, hittable URL by substituting the call-site literals positionally.
+
+_FETCH_TMPL_RE = re.compile(
+    r"""(?:fetch|axios(?:\.(?:get|post|put|delete))?|\$\.(?:get|post|ajax)|\.open)\s*\(\s*"""
+    r"""[`'"]([^`'"]*?/[^`'"]*?)[`'"]""",
+    re.I,
+)
+_FUNC_DEF_RE = re.compile(r"function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*\{")
+_CALL_RE = re.compile(r"""([A-Za-z_$][\w$]*)\s*\(\s*((?:['"][^'"]*['"]\s*,?\s*)+)\)""")
+_STR_LIT_RE = re.compile(r"""['"]([^'"]*)['"]""")
+_PLACEHOLDER_RE = re.compile(r"\$\{\s*([A-Za-z_$][\w$]*)\s*\}")
+
+
+def extract_inline_endpoints(html: str, base_url: str = "") -> List[Dict[str, Any]]:
+    """From page HTML, recover API endpoints defined in inline scripts — both the
+    raw URL template and, where a function's call-site literals can fill its
+    `${param}` placeholders, a CONCRETE hittable URL. Returns a list of
+    {"template","url","params","source":"inline_js"} dicts. Pure, best-effort."""
+    if not html or "/" not in html:
+        return []
+    out: List[Dict[str, Any]] = []
+    seen = set()
+
+    # Map function name -> (param list, fetch template inside its body).
+    func_templates: Dict[str, Dict[str, Any]] = {}
+    for fm in _FUNC_DEF_RE.finditer(html):
+        fname = fm.group(1)
+        params = [p.strip() for p in fm.group(2).split(",") if p.strip()]
+        body = html[fm.end(): fm.end() + 1200]  # look a little way into the body
+        tm = _FETCH_TMPL_RE.search(body)
+        if tm and "${" in tm.group(1):
+            func_templates[fname] = {"params": params, "template": tm.group(1)}
+
+    # Every call site with string-literal args: name -> list of arg-tuples.
+    call_args: Dict[str, List[List[str]]] = {}
+    for cm in _CALL_RE.finditer(html):
+        name = cm.group(1)
+        if name not in func_templates:
+            continue
+        literals = _STR_LIT_RE.findall(cm.group(2))
+        if literals:
+            call_args.setdefault(name, []).append(literals)
+
+    def _add(template: str, url: str, params):
+        key = url or template
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"template": template, "url": url or None, "params": params, "source": "inline_js"})
+
+    # Substitute call-site literals into each function's template placeholders.
+    for fname, info in func_templates.items():
+        tmpl = info["template"]
+        ph = _PLACEHOLDER_RE.findall(tmpl)  # placeholder names, in order
+        param_pos = {p: i for i, p in enumerate(info["params"])}
+        for literals in call_args.get(fname, [])[:5]:
+            concrete = tmpl
+            for name in ph:
+                idx = param_pos.get(name)
+                if idx is not None and idx < len(literals):
+                    concrete = concrete.replace("${" + name + "}", literals[idx]).replace("${ " + name + " }", literals[idx])
+            # Only count it concrete if every placeholder got filled.
+            concrete_url = concrete if "${" not in concrete else ""
+            if concrete_url and base_url and concrete_url.startswith("/"):
+                concrete_url = base_url.rstrip("/") + concrete_url
+            _add(tmpl, concrete_url, ph)
+        if fname not in call_args:
+            _add(tmpl, "", ph)  # template only, no literals to fill it
+
+    # Also surface plain (non-templated) inline fetch URLs the func scan missed.
+    for tm in _FETCH_TMPL_RE.finditer(html):
+        u = tm.group(1)
+        if "${" in u or "/api" not in u.lower() and "/" != u[:1]:
+            continue
+        full = (base_url.rstrip("/") + u) if (base_url and u.startswith("/")) else u
+        _add(u, full if u.startswith("/") else u, [])
+
+    return out

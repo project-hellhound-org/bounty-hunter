@@ -6152,25 +6152,52 @@ def _execute_js_miner(args: Dict[str, Any], target: Target, emit: Any) -> Dict[s
     # __INITIAL_STATE__, __APOLLO_STATE__, window.__INIT_PROFILE__, inline JSON)
     # that bundle a user's own — or OTHER users' — records live in the document,
     # not the JS chunks. This is where the real sensitive-data-exposure leaks are.
+    inline_eps: List[Dict[str, Any]] = []
     try:
-        from hellhound.core.js_intel import scan_bundled_data, summarize_bundled_hits
+        from hellhound.core.js_intel import scan_bundled_data, summarize_bundled_hits, extract_inline_endpoints
         auth = _target_auth_options(target)
         r = _bounded_request(lambda: requests.get(
             url, headers={"User-Agent": "Hellhound/1.0", **auth.get("auth_headers", {})},
             cookies=auth.get("auth_cookies") or None, timeout=12, verify=False, allow_redirects=True))
         if r is not None and getattr(r, "text", None):
             bundled_hits.extend(scan_bundled_data(r.text, url))
+            # INLINE-SCRIPT endpoints: templates whose ${placeholders} are filled by
+            # onclick/call-site literals -> concrete, hittable URLs with a valid id a
+            # path-guessing pass never finds. This is how the staged-files/<fileName>
+            # SSRF sink (fileName fetched server-side) becomes reachable.
+            inline_eps = extract_inline_endpoints(r.text, url)
     except Exception:
         summarize_bundled_hits = lambda h: ""  # noqa: E731
 
     # Feed discovered endpoints into the same spider-intel store every
     # other discovery tool writes to.
     endpoint_urls = [e.get("url") for e in endpoints if isinstance(e, dict) and e.get("url")]
+    # Fold in the concrete inline-script endpoints (real URLs with a valid id).
+    _inline_concrete = [e.get("url") for e in inline_eps if e.get("url")]
+    endpoint_urls.extend(u for u in _inline_concrete if u not in endpoint_urls)
     if endpoint_urls and hasattr(target, "state"):
         try:
             update_from_spider(target, endpoints=endpoint_urls)
         except Exception:
             pass
+    # Flag a server-fetched path/file parameter from an inline endpoint as an
+    # SSRF/LFI candidate so hypothesis generation and gf_patterns pick it up — a
+    # `fileName`/`path`/`url`/`file` segment that the server resolves is the classic
+    # staged-files sink that reaches cloud metadata.
+    if inline_eps and hasattr(target, "state") and isinstance(target.state, dict):
+        _sig = target.state.setdefault("param_signals", [])
+        _sink_re = re.compile(r"(file|path|url|uri|dest|redirect|template|doc|load|fetch|resource|name)", re.I)
+        _already = {s.get("param") for s in _sig if isinstance(s, dict)}
+        for e in inline_eps:
+            for p in (e.get("params") or []):
+                if _sink_re.search(p) and p not in _already:
+                    _already.add(p)
+                    _sig.append({"param": p, "signal": "server-fetched path/file param (SSRF/LFI candidate)",
+                                 "source": "inline_js", "example": e.get("url") or e.get("template")})
+        _eps_state = target.state.setdefault("endpoints", [])
+        for u in _inline_concrete:
+            if u not in _eps_state:
+                _eps_state.append(u)
     # Persist high-signal bundled secrets (JWTs/api keys) into the secrets
     # store so the artifact ledger and reporting pick them up.
     if bundled_hits and hasattr(target, "state") and isinstance(target.state, dict):
