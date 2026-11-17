@@ -12583,6 +12583,23 @@ def _recover_noarg_tool_call(text: str) -> Optional[Dict[str, Any]]:
         # tool call).
         m = re.search(r'"name"\s*:\s*"([a-zA-Z_][a-zA-Z0-9_]*)"\s*,\s*"arguments"', text)
     if not m:
+        # Truncated MID-NAME, no closing quote: `{"tool": "self_aud` — the cut
+        # landed inside the tool name itself, so the quoted-name regexes above
+        # miss it and the turn dead-ends. If the partial uniquely prefixes exactly
+        # one NO-ARG tool, recover that (self_audit is the common victim — it's the
+        # keystone introspection call, and a bare call has nothing to lose). Only
+        # fires on an UNAMBIGUOUS single match, so it can't fabricate the wrong tool.
+        mp = re.search(r'"(?:tool|name)"\s*:\s*"([a-zA-Z_][a-zA-Z0-9_]*)$', text.rstrip())
+        if mp:
+            partial = mp.group(1)
+            noarg_matches = [
+                name for name, spec in TOOL_REGISTRY.items()
+                if name.startswith(partial)
+                and not (isinstance(getattr(spec, "parameters", None), dict)
+                         and spec.parameters.get("required"))
+            ]
+            if len(noarg_matches) == 1:
+                return {"tool": noarg_matches[0], "args": {}}
         return None
     spec = TOOL_REGISTRY.get(m.group(1))
     if spec is None:
