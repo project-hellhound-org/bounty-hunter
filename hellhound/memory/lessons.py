@@ -80,6 +80,75 @@ def _dedup_key(technique: str, outcome: str, tech_signature: List[str]) -> str:
     return f"{technique.strip().lower()}|{outcome}|{','.join(sorted(tech_signature))}"
 
 
+_STOP = frozenset({"the", "a", "an", "to", "for", "of", "in", "on", "and", "or", "with",
+                   "via", "when", "that", "this", "is", "as", "by", "it", "if", "from",
+                   "use", "using", "check", "test", "try"})
+
+
+def _tokens(technique: str) -> set:
+    """Content-word token set for similarity — lowercased alphanumerics, 3+ chars,
+    minus generic filler, so 'Check for password reset token leak in response' and
+    'Password reset token exposed in the response body' read as near-identical."""
+    import re as _re
+    return {t for t in _re.findall(r"[a-z0-9]{3,}", (technique or "").lower()) if t not in _STOP}
+
+
+def _near_dup(a: Dict[str, Any], b: Dict[str, Any], threshold: float = 0.6) -> bool:
+    """True if two SAME-OUTCOME lessons are near-duplicates: high content-token
+    overlap (Jaccard) AND at least one shared signature tag (or both unsignatured),
+    so distinct techniques that merely share a word don't get merged."""
+    if a.get("outcome") != b.get("outcome"):
+        return False
+    sa, sb = set(a.get("tech_signature") or []), set(b.get("tech_signature") or [])
+    if (sa or sb) and not (sa & sb):
+        return False
+    ta, tb = _tokens(a.get("technique", "")), _tokens(b.get("technique", ""))
+    if not ta or not tb:
+        return False
+    jacc = len(ta & tb) / len(ta | tb)
+    return jacc >= threshold
+
+
+def _merge_into(canon: Dict[str, Any], dup: Dict[str, Any]) -> None:
+    """Fold a near-duplicate lesson into the canonical one, preserving signal."""
+    canon["seen_count"] = int(canon.get("seen_count", 1)) + int(dup.get("seen_count", 1))
+    # Keep the longer, more descriptive note and technique wording.
+    if len(dup.get("note", "")) > len(canon.get("note", "")):
+        canon["note"] = dup.get("note", "")
+    if len(dup.get("technique", "")) > len(canon.get("technique", "")):
+        canon["technique"] = dup.get("technique", "")
+    canon["tech_signature"] = sorted(set(canon.get("tech_signature") or []) | set(dup.get("tech_signature") or []))
+    tg = list(dict.fromkeys((canon.get("targets") or []) + (dup.get("targets") or [])))
+    canon["targets"] = tg[-10:]
+    canon["first_seen"] = min(canon.get("first_seen", ""), dup.get("first_seen", "")) or canon.get("first_seen", "")
+    canon["last_seen"] = max(canon.get("last_seen", ""), dup.get("last_seen", "")) or canon.get("last_seen", "")
+
+
+def consolidate_lessons(lessons: List[Dict[str, Any]], threshold: float = 0.6) -> List[Dict[str, Any]]:
+    """Merge NEAR-duplicate lessons (same outcome, overlapping signature, high
+    content-token similarity) into one, so the store doesn't bloat with 16 reworded
+    copies of 'password reset token leak' that crowd out diverse recall. Greedy
+    single pass per outcome bucket — each lesson joins the first canonical it's a
+    near-dup of, else becomes a new canonical. Exact dups are already handled at
+    write time; this catches the semantic ones. Returns the consolidated list."""
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for e in lessons:
+        buckets[e.get("outcome", "")].append(e)
+    out: List[Dict[str, Any]] = []
+    for _outcome, group in buckets.items():
+        # Process higher seen_count first so the proven lesson becomes the canonical.
+        canonicals: List[Dict[str, Any]] = []
+        for e in sorted(group, key=lambda x: -int(x.get("seen_count", 1))):
+            hit = next((c for c in canonicals if _near_dup(c, e, threshold)), None)
+            if hit is not None:
+                _merge_into(hit, e)
+            else:
+                canonicals.append(e)
+        out.extend(canonicals)
+    return out
+
+
 def add_lesson(
     technique: str,
     outcome: str,
@@ -123,6 +192,13 @@ def add_lesson(
         "first_seen": _now_iso(),
         "last_seen": _now_iso(),
     })
+
+    # Merge semantic near-duplicates before pruning — keeps the store diverse
+    # (16 reworded 'password reset token leak' copies collapse to one with a
+    # summed seen_count) instead of letting dead weight push out distinct lessons.
+    # Only when it's actually growing, to keep the O(n*canon) pass off every write.
+    if len(lessons) > 60:
+        lessons = consolidate_lessons(lessons)
 
     # Prune oldest (by last_seen) once over the ceiling — repeatedly-seen
     # lessons (seen_count > 1) are protected from pruning since they're the
