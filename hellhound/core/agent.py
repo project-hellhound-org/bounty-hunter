@@ -3638,6 +3638,18 @@ def _hexbrain_hypotheses(target: Target, tech_stack: List[str], now: str, emit: 
         m = _re.search(r"By class:\s*(.+?)\.(?:\s|$)", content)
         if not m:
             continue
+        # Program ECONOMICS — total disclosed volume + bounties paid, for effort
+        # calibration and report-impact framing ("a class this program has paid out
+        # on N times"). Surfaced in the LEAD BOARD prompt block.
+        econ = _re.search(r"(\d[\d,]*)\s+disclosed reports?,\s*\$([\d,]+)\s+bounties", content)
+        if econ and isinstance(state, dict):
+            top3 = [c.strip() for c in m.group(1).split(",")[:3]]
+            state["_hexbrain_program_econ"] = {
+                "program": prog_name,
+                "reports": econ.group(1),
+                "bounties": econ.group(2),
+                "top_classes": top3,
+            }
         pairs = []
         for chunk in m.group(1).split(","):
             cm = _re.match(r"\s*(.+?)\s+(\d+)\s*$", chunk.strip())
@@ -15510,10 +15522,19 @@ If there is nothing worth generalizing, return an empty array: []"""
                             f"  - [{h.get('confidence', '?')}] {h.get('vuln_class')}{_status_tag}: {h.get('rationale')} "
                             f"-> {h.get('test_sketch')}"
                         )
+                    _econ = (self.target.state or {}).get("_hexbrain_program_econ") if hasattr(self.target, "state") else None
+                    _econ_line = ""
+                    if isinstance(_econ, dict) and _econ.get("reports"):
+                        _econ_line = (
+                            f"  PROGRAM ECONOMICS (HexBrain disclosed data for '{_econ.get('program')}'): "
+                            f"{_econ.get('reports')} public reports, ${_econ.get('bounties')} paid, concentrated in "
+                            f"{', '.join(_econ.get('top_classes', [])[:3])}. Spend effort where this program actually "
+                            f"pays, and frame a finding's impact against what it has rewarded before.\n"
+                        )
                     intel_parts.append(
                         "LEAD BOARD (from generate_hypotheses — ranked candidate vuln classes for this "
                         "target's stack, NOT confirmed findings; call update_hypothesis as you test each "
-                        "one):\n" + "\n".join(lead_lines)
+                        "one):\n" + _econ_line + "\n".join(lead_lines)
                     )
 
             profile_block_text = _format_profile_block(self.target)
