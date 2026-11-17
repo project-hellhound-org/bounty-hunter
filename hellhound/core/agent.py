@@ -1676,6 +1676,19 @@ def _clean_synthesizer_output(text: str, tools_executed: Optional[List[str]] = N
     # saying nothing, since the researcher has no way to know whether it
     # actually ran. Say so plainly instead.
     if tool_name in TOOL_REGISTRY:
+        # self_audit is the keystone introspection call AND it's local, instant,
+        # no-network, and target-independent — so a truncated self_audit must
+        # NEVER dead-end with "say continue" (which just re-truncates). Run it for
+        # real right here and return the formatted answer instead. This is the
+        # last-resort backstop; the loop's _recover_noarg_tool_call normally
+        # catches it first, but Nemotron's truncation is flaky enough to reach here.
+        if tool_name == "self_audit":
+            try:
+                _audit = _format_self_audit_answer(_execute_self_audit({}, None, None))
+                if _audit:
+                    return "\n\n".join(p for p in (before, _audit, after) if p)
+            except Exception:
+                pass
         # `before`/`after` can themselves be more raw tool-call JSON (a
         # whole batch, not just this one object) — never splice that
         # straight into `extra` as if it were prose. Count the real
