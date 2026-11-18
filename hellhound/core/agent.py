@@ -1280,6 +1280,30 @@ _DIAG_QUESTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A question about what's ALREADY been found on this target — "what did we get /
+# find", "summary of findings", "recap", "where do we stand" — is answerable from
+# the findings + investigation summary that are already in context, NOT a reason to
+# run recon again (the bug this guards: a plain "what we got from this target" on a
+# target with recorded findings launched the tool loop and fired a curl). Deliberately
+# past-tense / recap-shaped so an imperative hunt instruction ("find the IDOR", "test
+# SSRF") doesn't match.
+_RESULTS_RECALL_RE = re.compile(
+    r"\bwhat\b[^.?!]{0,45}\b(?:we|you|i)\b[^.?!]{0,25}\b(?:got|get|have|found|find|discover(?:ed)?|turn(?:ed)?\s+up|see|know|collect(?:ed)?)\b"
+    r"|\bwhat(?:'?s| is| are| do we have)\b[^.?!]{0,35}\b(?:finding|result|vuln|bug|exposure|on (?:this|the) target)\b"
+    r"|\b(?:recap|summar(?:y|ise|ize))\b[^.?!]{0,35}(?:finding|result|target|hunt|progress|so far|what|we|you)"
+    r"|\bfindings?\b[^.?!]{0,25}\b(?:so far|on this|for this|recorded|do we have|list|please)\b"
+    r"|\b(?:did|have)\s+we\s+(?:find|found|get|got|discover(?:ed)?)\b"
+    r"|\bwhere\s+(?:do we stand|are we|are we at)\b"
+    r"|\banything\s+(?:found|interesting|so far|yet)\b",
+    re.IGNORECASE,
+)
+# Imperative hunt verbs at the START of the message mean "go do work," not "recap" —
+# never short-circuit those even if a recall keyword appears later in the sentence.
+_IMPERATIVE_HUNT_RE = re.compile(
+    r"^\s*(?:/\w+\s+)?(?:find|hunt|test|scan|exploit|probe|recon|enumerate|check|attack|fuzz|try|go|run|start|continue|keep)\b",
+    re.IGNORECASE,
+)
+
 # CAUGHT IN THE WILD (date-free, just descriptive): connecting to Burp/
 # Caido (even just to probe their tool lists) was happening unconditionally
 # on the very first message of every session — including pure small talk
@@ -15461,6 +15485,58 @@ If there is nothing worth generalizing, return an empty array: []"""
                     on_token=on_token,
                     return_usage=True,
                     cancel_check=cancel_check,
+                    tools=Agent._build_native_tools(exclude=_vendor_excluded_tool_names(self._turn_vendor_lock)),
+                    tool_choice="none",
+                )
+                if answer and not (isinstance(answer, str) and answer.startswith("Error:")):
+                    answer = _clean_synthesizer_output(answer)
+                    self.history.append({"role": "user", "content": user_text})
+                    self.history.append({"role": "assistant", "content": answer})
+                    save_target(self.target)
+                    return answer
+
+        # ── Results-recall short-circuit ──
+        # "what did we get / find on this target", "summary of findings", "recap" —
+        # answerable from the findings + investigation summary ALREADY in context, so
+        # answer directly instead of launching the orchestrator loop (which reflexively
+        # runs recon to "make progress", firing a curl on a target that's already been
+        # worked). Only fires on a real target that actually HAS recorded findings or an
+        # investigation summary — otherwise it falls through to normal handling so a
+        # fresh-target "what did we find?" still gets a proper "nothing yet" answer.
+        if (_RESULTS_RECALL_RE.search(user_text or "")
+                and not _IMPERATIVE_HUNT_RE.search(user_text or "")
+                and self.target and str(getattr(self.target, "name", "default")) != "default"):
+            _findings = self.target.findings if isinstance(getattr(self.target, "findings", None), list) else []
+            try:
+                _summary = build_investigation_summary(self.target)
+            except Exception:
+                _summary = ""
+            if _findings or (_summary and _summary.strip()):
+                _lines = [f"TARGET: {self.target.name}", f"RECORDED FINDINGS: {len(_findings)}"]
+                for i, f in enumerate(_findings, 1):
+                    if not isinstance(f, dict):
+                        continue
+                    _hosts = f.get("affected_hosts")
+                    _scope = f" (also on {', '.join(_hosts[1:])})" if isinstance(_hosts, list) and len(_hosts) > 1 else ""
+                    _lines.append(f"  {i}. [{f.get('severity', '?')}] {f.get('kind', '?')}: "
+                                  f"{str(f.get('type', '')).strip()[:120]} — {str(f.get('target', '')).strip()[:90]}{_scope}")
+                if _summary and _summary.strip():
+                    _lines.append("\nINVESTIGATION SUMMARY (what's been done/seen this engagement):\n" + _summary.strip())
+                recap_prompt = (
+                    f"The researcher is asking what's been found on the CURRENT target so far: \"{user_text}\"\n\n"
+                    f"These are the REAL recorded results for this target — do NOT run any tool, do NOT re-do recon; "
+                    f"just answer from these facts:\n\n" + "\n".join(_lines) + "\n\n"
+                    f"Give a clear, conversational recap: lead with the confirmed findings (severity + what each one is, "
+                    f"plainly), then anything notable still open. If there are no recorded findings yet, say so directly "
+                    f"and summarise what's been looked at. Keep it tight — no formal report structure, no raw JSON."
+                )
+                answer, _tok = ask_neural_core(
+                    prompt=recap_prompt,
+                    system_prompt=("You are recapping, to the researcher operating you, what's been found on the "
+                                   "current target — from the recorded facts you're given, second person, conversational. "
+                                   "Never invent a finding that isn't listed."),
+                    role="synthesizer", thinking=False, history=[], on_token=on_token,
+                    return_usage=True, cancel_check=cancel_check,
                     tools=Agent._build_native_tools(exclude=_vendor_excluded_tool_names(self._turn_vendor_lock)),
                     tool_choice="none",
                 )
