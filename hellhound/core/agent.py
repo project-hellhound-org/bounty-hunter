@@ -1280,29 +1280,6 @@ _DIAG_QUESTION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# A question about what's ALREADY been found on this target — "what did we get /
-# find", "summary of findings", "recap", "where do we stand" — is answerable from
-# the findings + investigation summary that are already in context, NOT a reason to
-# run recon again (the bug this guards: a plain "what we got from this target" on a
-# target with recorded findings launched the tool loop and fired a curl). Deliberately
-# past-tense / recap-shaped so an imperative hunt instruction ("find the IDOR", "test
-# SSRF") doesn't match.
-_RESULTS_RECALL_RE = re.compile(
-    r"\bwhat\b[^.?!]{0,45}\b(?:we|you|i)\b[^.?!]{0,25}\b(?:got|get|have|found|find|discover(?:ed)?|turn(?:ed)?\s+up|see|know|collect(?:ed)?)\b"
-    r"|\bwhat(?:'?s| is| are| do we have)\b[^.?!]{0,35}\b(?:finding|result|vuln|bug|exposure|on (?:this|the) target)\b"
-    r"|\b(?:recap|summar(?:y|ise|ize))\b[^.?!]{0,35}(?:finding|result|target|hunt|progress|so far|what|we|you)"
-    r"|\bfindings?\b[^.?!]{0,25}\b(?:so far|on this|for this|recorded|do we have|list|please)\b"
-    r"|\b(?:did|have)\s+we\s+(?:find|found|get|got|discover(?:ed)?)\b"
-    r"|\bwhere\s+(?:do we stand|are we|are we at)\b"
-    r"|\banything\s+(?:found|interesting|so far|yet)\b",
-    re.IGNORECASE,
-)
-# Imperative hunt verbs at the START of the message mean "go do work," not "recap" —
-# never short-circuit those even if a recall keyword appears later in the sentence.
-_IMPERATIVE_HUNT_RE = re.compile(
-    r"^\s*(?:/\w+\s+)?(?:find|hunt|test|scan|exploit|probe|recon|enumerate|check|attack|fuzz|try|go|run|start|continue|keep)\b",
-    re.IGNORECASE,
-)
 
 # CAUGHT IN THE WILD (date-free, just descriptive): connecting to Burp/
 # Caido (even just to probe their tool lists) was happening unconditionally
@@ -15495,57 +15472,14 @@ If there is nothing worth generalizing, return an empty array: []"""
                     save_target(self.target)
                     return answer
 
-        # ── Results-recall short-circuit ──
-        # "what did we get / find on this target", "summary of findings", "recap" —
-        # answerable from the findings + investigation summary ALREADY in context, so
-        # answer directly instead of launching the orchestrator loop (which reflexively
-        # runs recon to "make progress", firing a curl on a target that's already been
-        # worked). Only fires on a real target that actually HAS recorded findings or an
-        # investigation summary — otherwise it falls through to normal handling so a
-        # fresh-target "what did we find?" still gets a proper "nothing yet" answer.
-        if (_RESULTS_RECALL_RE.search(user_text or "")
-                and not _IMPERATIVE_HUNT_RE.search(user_text or "")
-                and self.target and str(getattr(self.target, "name", "default")) != "default"):
-            _findings = self.target.findings if isinstance(getattr(self.target, "findings", None), list) else []
-            try:
-                _summary = build_investigation_summary(self.target)
-            except Exception:
-                _summary = ""
-            if _findings or (_summary and _summary.strip()):
-                _lines = [f"TARGET: {self.target.name}", f"RECORDED FINDINGS: {len(_findings)}"]
-                for i, f in enumerate(_findings, 1):
-                    if not isinstance(f, dict):
-                        continue
-                    _hosts = f.get("affected_hosts")
-                    _scope = f" (also on {', '.join(_hosts[1:])})" if isinstance(_hosts, list) and len(_hosts) > 1 else ""
-                    _lines.append(f"  {i}. [{f.get('severity', '?')}] {f.get('kind', '?')}: "
-                                  f"{str(f.get('type', '')).strip()[:120]} — {str(f.get('target', '')).strip()[:90]}{_scope}")
-                if _summary and _summary.strip():
-                    _lines.append("\nINVESTIGATION SUMMARY (what's been done/seen this engagement):\n" + _summary.strip())
-                recap_prompt = (
-                    f"The researcher is asking what's been found on the CURRENT target so far: \"{user_text}\"\n\n"
-                    f"These are the REAL recorded results for this target — do NOT run any tool, do NOT re-do recon; "
-                    f"just answer from these facts:\n\n" + "\n".join(_lines) + "\n\n"
-                    f"Give a clear, conversational recap: lead with the confirmed findings (severity + what each one is, "
-                    f"plainly), then anything notable still open. If there are no recorded findings yet, say so directly "
-                    f"and summarise what's been looked at. Keep it tight — no formal report structure, no raw JSON."
-                )
-                answer, _tok = ask_neural_core(
-                    prompt=recap_prompt,
-                    system_prompt=("You are recapping, to the researcher operating you, what's been found on the "
-                                   "current target — from the recorded facts you're given, second person, conversational. "
-                                   "Never invent a finding that isn't listed."),
-                    role="synthesizer", thinking=False, history=[], on_token=on_token,
-                    return_usage=True, cancel_check=cancel_check,
-                    tools=Agent._build_native_tools(exclude=_vendor_excluded_tool_names(self._turn_vendor_lock)),
-                    tool_choice="none",
-                )
-                if answer and not (isinstance(answer, str) and answer.startswith("Error:")):
-                    answer = _clean_synthesizer_output(answer)
-                    self.history.append({"role": "user", "content": user_text})
-                    self.history.append({"role": "assistant", "content": answer})
-                    save_target(self.target)
-                    return answer
+        # NOTE: a "what did we find / recap this target" question is NOT special-
+        # cased here with a regex any more. Deciding whether a message needs a tool,
+        # needs to touch the target, or is answerable from what's already known is the
+        # ORCHESTRATOR's job to REASON about every turn — the findings + investigation
+        # summary are already in its context, and the "DECIDE WHAT THE MESSAGE NEEDS"
+        # rule (step zero of the system prompt) tells it to answer such questions
+        # directly, run no tool. Pattern-matching intent was brittle and un-agentic;
+        # the model thinks about it instead.
 
         # extract_target_from_text is now ONLY a cheap pre-filter for whether
         # this message is worth loading the full tool-calling orchestrator
@@ -15900,6 +15834,12 @@ TARGET HOST (copy exactly, do not retype from memory): '{self._display_host}'
 Every tool call against this target — the very first one included, not just repeats in a loop — must use this exact string verbatim. Retyping/reconstructing it by hand, even once, is how a stray or transposed character slips into a URL and trips the scope guard on a host nobody actually meant to hit.
 
 RULES:
+
+STEP ZERO — DECIDE WHAT THE MESSAGE ACTUALLY NEEDS BEFORE REACHING FOR A TOOL. Think about what the researcher is really asking; don't reflex into a tool. Every message is one of these, and you choose by REASONING about it, not by habit:
+   • A QUESTION you can already answer — "what did we find / what do we have on this target", "recap / summarize the findings", "what's our status", a question about yourself, about how a technique works, or anything answerable from the FINDINGS + INVESTIGATION SUMMARY already shown in "ALREADY GATHERED THIS SESSION" above, or from your own knowledge. ANSWER IT directly in plain text and run NO tool. The results of past work are in your context — a question about what you've already found is answered from there, never by re-running recon. Firing a curl/recon tool at "what did we get on this target" wastes the turn, repeats work you've done, and can burn rate-limited external calls (e.g. HexBrain, 200/day).
+   • A TASK to act on the target — test / find / exploit / enumerate something that hasn't been done yet, or continue an exploit in progress. THEN run the tools and drive it to a result; the autonomous-progression rules below apply in full.
+   The "execute, don't defer" and "you are an autonomous agent in a loop" rules below are about not STALLING once there is real work to do — they are NOT a licence to run a tool at a plain question. If you genuinely can't tell whether the researcher wants you to act or just answer, a one-line clarifying question beats firing a tool at a host you've already worked. Reason first, act second.
+
 0. SETTING THE TARGET (CRITICAL — READ BEFORE ANYTHING ELSE IF TARGET IS "default"):
    - If TARGET above is "default", you have no active hunting target yet. Before you may call ANY network/recon tool, decide: is the researcher's message actually DIRECTING you to test/scan/recon/hunt a specific host right now? If yes, call `set_target` with that exact host first — its result becomes the new TARGET for this and every later turn.
    - Do NOT call `set_target` when a domain/host/URL/IP merely APPEARS in the message without being a hunting instruction — e.g. it's part of an email address someone is quoting, a code/payload example, a general question ("what does a CORS misconfig on X look like"), something the researcher is asking you ABOUT rather than asking you to test, or unrelated conversation. When genuinely unsure whether the researcher means it as a target, don't call it — ask them to confirm, or answer conversationally; you can still call `set_target` on a later turn once they clarify. A wrong guess here means running real tools against a host nobody authorized.
