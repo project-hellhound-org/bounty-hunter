@@ -112,4 +112,4 @@ an unrelated PR.
 ## Questions
 
 Open an issue, or reach the maintainers via the official repository:
-https://github.com/project-hellhound-org/bounty-hunter
+https://github.com/projecthellhound/bounty-hunter

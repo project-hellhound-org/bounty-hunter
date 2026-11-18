@@ -80,8 +80,8 @@ fi
 
 # ── Remote Sync (Ensure Org URL) ──────────────────────────────────────────────
 REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "")
-if [[ "$REMOTE_URL" == *"l4zz3rj0d"* ]]; then
-    NEW_URL=$(echo "$REMOTE_URL" | sed "s/l4zz3rj0d/project-hellhound-org/g")
+if [[ "$REMOTE_URL" =~ (l4zz3rj0d|project-hellhound-org|project-hellhound) ]]; then
+    NEW_URL=$(echo "$REMOTE_URL" | sed -E "s/(l4zz3rj0d|project-hellhound-org|project-hellhound)/projecthellhound/g")
     git remote set-url origin "$NEW_URL" &>/dev/null || true
 fi
 

@@ -97,7 +97,7 @@ if [ ! -f "setup.py" ]; then
         git -C "$INSTALL_TARGET" pull --quiet origin main || true
     else
         info "Cloning Bounty Hunter into $INSTALL_TARGET..."
-        git clone --depth 1 https://github.com/project-hellhound-org/bounty-hunter.git "$INSTALL_TARGET" || error "Failed to clone repository. Ensure git is installed and network connectivity is active."
+        git clone --depth 1 https://github.com/projecthellhound/bounty-hunter.git "$INSTALL_TARGET" || error "Failed to clone repository. Ensure git is installed and network connectivity is active."
     fi
     cd "$INSTALL_TARGET" || error "Could not enter $INSTALL_TARGET"
 fi

@@ -15,9 +15,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/project-hellhound-org/bounty-hunter/stargazers"><img src="https://img.shields.io/github/stars/project-hellhound-org/bounty-hunter?style=flat-square&color=gold" alt="GitHub Stars"/></a>
+  <a href="https://github.com/projecthellhound/bounty-hunter/stargazers"><img src="https://img.shields.io/github/stars/projecthellhound/bounty-hunter?style=flat-square&color=gold" alt="GitHub Stars"/></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10+-blue?style=flat-square&logo=python&logoColor=white" alt="Python Version"/></a>
-  <a href="https://github.com/project-hellhound-org/bounty-hunter/releases"><img src="https://img.shields.io/badge/Release-v13.21-red?style=flat-square" alt="Release Version"/></a>
+  <a href="https://github.com/projecthellhound/bounty-hunter/releases"><img src="https://img.shields.io/badge/Release-v13.21-red?style=flat-square" alt="Release Version"/></a>
   <img src="https://img.shields.io/badge/AI--Powered-Ollama%20%7C%20NVIDIA%20NIM%20%7C%20Claude%20%7C%20Gemini%20%7C%20OpenAI-red?style=flat-square" alt="AI Support"/>
   <img src="https://img.shields.io/badge/Recon-Shuffledns%20%7C%20AlterX%20%7C%20DNSX%20%7C%20Naabu%20%7C%20HTTPX%20%7C%20FFUF%20%7C%20Gowitness-orange?style=flat-square" alt="Recon Toolchain"/>
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20WSL2-lightgrey?style=flat-square" alt="Platform"/>
@@ -126,12 +126,12 @@ Everything you need to install, configure AI backends, and run Bounty Hunter in 
 
 #### Option A: One-Line Remote Installer
 ```bash
-curl -fsSL https://raw.githubusercontent.com/project-hellhound-org/bounty-hunter/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/projecthellhound/bounty-hunter/main/install.sh | bash
 ```
 
 #### Option B: Standard Git Clone
 ```bash
-git clone https://github.com/project-hellhound-org/bounty-hunter.git
+git clone https://github.com/projecthellhound/bounty-hunter.git
 cd bounty-hunter
 chmod +x install.sh
 ./install.sh

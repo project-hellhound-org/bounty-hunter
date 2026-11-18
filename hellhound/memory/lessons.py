@@ -193,6 +193,26 @@ def add_lesson(
         "last_seen": _now_iso(),
     })
 
+    # CONTRADICTION RESOLUTION — a confirmed SUCCESS supersedes a prior FAILED
+    # lesson for the same situation. The end-of-session LLM miner over-labels
+    # "failed" (a technique probed but not recorded shows up failed even when it
+    # actually reached the target, e.g. an SSRF that hit cloud metadata but wasn't
+    # recorded before the turn budget ran out). Once the SAME technique is confirmed
+    # to WORK on a strongly-overlapping stack, the stale failure must not keep
+    # discouraging it. Drop failed lessons whose signature is largely contained in
+    # this worked lesson's (>=2 shared tags and >=60% of the failed one's tags).
+    if outcome == "worked" and len(tech_signature) >= 2:
+        _sig = set(tech_signature)
+        _kept = []
+        for e in lessons:
+            if e.get("outcome") == "failed":
+                _f = set(e.get("tech_signature") or [])
+                _inter = _sig & _f
+                if _f and len(_inter) >= 2 and len(_inter) >= 0.6 * len(_f):
+                    continue  # superseded by this confirmed success
+            _kept.append(e)
+        lessons = _kept
+
     # Merge semantic near-duplicates before pruning — keeps the store diverse
     # (16 reworded 'password reset token leak' copies collapse to one with a
     # summed seen_count) instead of letting dead weight push out distinct lessons.
@@ -234,9 +254,26 @@ def find_relevant_lessons(tech_signature: Any, limit: int = 6) -> List[Dict[str,
         for entry in lessons:
             overlap = len(tech_signature & set(entry.get("tech_signature", [])))
             if overlap > 0:
-                scored.append((overlap, int(entry.get("seen_count", 1)), entry))
-        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        results = [e for _, __, e in scored[:limit]]
+                worked = 1 if entry.get("outcome") == "worked" else 0
+                scored.append((overlap, worked, int(entry.get("seen_count", 1)), entry))
+        # Rank by stack overlap, then WORKED-first at equal overlap, then by how
+        # many targets confirmed it. Recall should LEAD with what actually worked —
+        # a confirmed technique is more actionable than a past failure, and the
+        # end-of-session LLM miner over-labels "failed" (a technique probed but not
+        # recorded shows up failed even when it reached the target).
+        scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        # Cap failed lessons to at most half the slots so recall isn't a wall of
+        # past failures crowding out the wins.
+        results, failed_used = [], 0
+        failed_cap = max(1, limit // 2)
+        for _ov, worked, _sc, entry in scored:
+            if not worked:
+                if failed_used >= failed_cap:
+                    continue
+                failed_used += 1
+            results.append(entry)
+            if len(results) >= limit:
+                break
         if results:
             return results
 
